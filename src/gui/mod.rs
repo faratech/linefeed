@@ -599,6 +599,7 @@ pub struct IrcApp {
     pub channel_list_loading: bool,
     pub show_channel_list: bool,
     pub channel_list_filter: String,
+    pub channel_list_selected: Option<String>,
 
     // Tab completion
     pub tab_completion: Option<TabCompletion>,
@@ -669,6 +670,7 @@ impl IrcApp {
             channel_list_loading: false,
             show_channel_list: false,
             channel_list_filter: String::new(),
+            channel_list_selected: None,
 
             tab_completion: None,
 
@@ -1391,6 +1393,65 @@ impl IrcApp {
         }
         false
     }
+
+    /// Handle keyboard shortcuts
+    fn handle_keyboard_shortcuts(&mut self, ctx: &egui::Context) {
+        // Don't process shortcuts if a dialog is open
+        if self.show_connect_dialog || self.show_settings || self.show_channel_list {
+            return;
+        }
+
+        ctx.input(|i| {
+            // Alt+1-9 to switch channels
+            // Build ordered list: Server (0), then channels sorted alphabetically
+            let mut tabs: Vec<Option<String>> = vec![None]; // Server buffer is index 0 (Alt+1)
+            let mut channel_names: Vec<_> = self.channels.keys().cloned().collect();
+            channel_names.sort_by(|a, b| a.to_lowercase().cmp(&b.to_lowercase()));
+            for name in channel_names {
+                tabs.push(Some(name));
+            }
+
+            // Check Alt+1 through Alt+9
+            let alt = i.modifiers.alt;
+            if alt {
+                for (idx, key) in [
+                    egui::Key::Num1, egui::Key::Num2, egui::Key::Num3,
+                    egui::Key::Num4, egui::Key::Num5, egui::Key::Num6,
+                    egui::Key::Num7, egui::Key::Num8, egui::Key::Num9,
+                ].iter().enumerate() {
+                    if i.key_pressed(*key) {
+                        if idx < tabs.len() {
+                            self.current_channel = tabs[idx].clone();
+                            self.selected_user = None;
+                            // Clear unread for the switched-to channel
+                            if let Some(ref channel_name) = self.current_channel {
+                                if let Some(ch) = self.channels.get_mut(channel_name) {
+                                    ch.unread = 0;
+                                }
+                            } else {
+                                self.server_unread = 0;
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Ctrl+W to close current tab
+            if i.modifiers.ctrl && i.key_pressed(egui::Key::W) {
+                if let Some(channel_name) = self.current_channel.clone() {
+                    if channel_name.starts_with('#') || channel_name.starts_with('&') {
+                        // Part the channel
+                        self.send_command(IrcCommand::Part(channel_name, None));
+                    } else {
+                        // Close query window
+                        self.channels.remove(&channel_name);
+                        self.current_channel = self.channels.keys().next().cloned();
+                    }
+                }
+                // If on server buffer, do nothing (can't close it)
+            }
+        });
+    }
 }
 
 impl eframe::App for IrcApp {
@@ -1404,6 +1465,9 @@ impl eframe::App for IrcApp {
         for msg in messages {
             self.handle_incoming_message(msg);
         }
+
+        // Handle keyboard shortcuts
+        self.handle_keyboard_shortcuts(ctx);
 
         // Request repaint for real-time updates
         ctx.request_repaint();
@@ -1998,36 +2062,70 @@ impl IrcApp {
 
         egui::Window::new("Channel List")
             .resizable(true)
-            .default_size([600.0, 400.0])
+            .default_size([700.0, 450.0])
             .show(ctx, |ui| {
                 // Filter input and status
                 ui.horizontal(|ui| {
                     ui.label("Filter:");
                     ui.add(TextEdit::singleline(&mut self.channel_list_filter).desired_width(200.0));
-                    ui.label(format!("{} channels", self.channel_list.len()));
+                    ui.add_space(10.0);
+
+                    // Count filtered channels
+                    let filter = self.channel_list_filter.to_lowercase();
+                    let filtered_count = if filter.is_empty() {
+                        self.channel_list.len()
+                    } else {
+                        self.channel_list.iter()
+                            .filter(|e| e.name.to_lowercase().contains(&filter)
+                                || e.topic.to_lowercase().contains(&filter))
+                            .count()
+                    };
+                    ui.label(format!("{} of {} channels", filtered_count, self.channel_list.len()));
+
                     if self.channel_list_loading {
                         ui.spinner();
+                        ui.label("Loading...");
                     }
                 });
                 ui.separator();
 
+                // Column widths
+                let channel_width = 150.0;
+                let users_width = 60.0;
+                let topic_width = ui.available_width() - channel_width - users_width - 40.0;
+
                 // Table header
-                egui::Grid::new("channel_list_header")
-                    .num_columns(3)
-                    .spacing([20.0, 4.0])
-                    .show(ui, |ui| {
-                        ui.label(RichText::new("Channel").strong());
-                        ui.label(RichText::new("Users").strong());
-                        ui.label(RichText::new("Topic").strong());
-                        ui.end_row();
-                    });
+                ui.horizontal(|ui| {
+                    ui.add_space(4.0);
+                    ui.allocate_ui_with_layout(
+                        Vec2::new(channel_width, 20.0),
+                        egui::Layout::left_to_right(egui::Align::Center),
+                        |ui| { ui.label(RichText::new("Channel").strong()); }
+                    );
+                    ui.allocate_ui_with_layout(
+                        Vec2::new(users_width, 20.0),
+                        egui::Layout::right_to_left(egui::Align::Center),
+                        |ui| { ui.label(RichText::new("Users").strong()); }
+                    );
+                    ui.add_space(10.0);
+                    ui.allocate_ui_with_layout(
+                        Vec2::new(topic_width, 20.0),
+                        egui::Layout::left_to_right(egui::Align::Center),
+                        |ui| { ui.label(RichText::new("Topic").strong()); }
+                    );
+                });
                 ui.separator();
 
                 // Scrollable channel list
+                let current_selected = self.channel_list_selected.clone();
+                let mut new_selected = current_selected.clone();
+
                 ScrollArea::vertical()
-                    .max_height(300.0)
+                    .auto_shrink([false; 2])
+                    .max_height(350.0)
                     .show(ui, |ui| {
                         let filter = self.channel_list_filter.to_lowercase();
+
                         for entry in &self.channel_list {
                             // Filter by channel name or topic
                             if !filter.is_empty()
@@ -2037,44 +2135,96 @@ impl IrcApp {
                                 continue;
                             }
 
-                            let response = ui.horizontal(|ui| {
-                                ui.set_min_width(580.0);
-                                ui.label(RichText::new(&entry.name).color(Color32::LIGHT_BLUE));
-                                ui.add_space(20.0);
-                                ui.label(entry.user_count.to_string());
-                                ui.add_space(20.0);
-                                // Truncate long topics
-                                let topic_display = if entry.topic.len() > 60 {
-                                    format!("{}...", &entry.topic[..60])
+                            let is_selected = current_selected.as_ref() == Some(&entry.name);
+
+                            // Build the row text
+                            let row_text = format!(
+                                "{:<width_c$} {:>width_u$}  {}",
+                                entry.name,
+                                entry.user_count,
+                                if entry.topic.len() > 80 {
+                                    format!("{}...", &entry.topic.chars().take(80).collect::<String>())
                                 } else {
                                     entry.topic.clone()
-                                };
-                                ui.label(RichText::new(topic_display).color(Color32::GRAY));
-                            }).response;
+                                },
+                                width_c = 20,
+                                width_u = 5
+                            );
 
+                            let response = ui.selectable_label(
+                                is_selected,
+                                RichText::new(&row_text).color(if is_selected {
+                                    Color32::WHITE
+                                } else {
+                                    Color32::LIGHT_BLUE
+                                })
+                            );
+
+                            // Single click to select
+                            if response.clicked() {
+                                new_selected = Some(entry.name.clone());
+                            }
+
+                            // Double click to join
                             if response.double_clicked() {
                                 join_channel = Some(entry.name.clone());
                             }
+
+                            // Right-click context menu
+                            let channel_name = entry.name.clone();
+                            let channel_topic = entry.topic.clone();
+                            let channel_users = entry.user_count;
+                            response.context_menu(|ui| {
+                                ui.label(RichText::new(&channel_name).strong());
+                                ui.label(format!("{} users", channel_users));
+                                if !channel_topic.is_empty() {
+                                    ui.separator();
+                                    ui.label(RichText::new("Topic:").small());
+                                    // Word wrap long topics
+                                    ui.label(RichText::new(&channel_topic).small().color(Color32::GRAY));
+                                }
+                                ui.separator();
+                                if ui.button("Join Channel").clicked() {
+                                    join_channel = Some(channel_name.clone());
+                                    ui.close();
+                                }
+                                if ui.button("Copy Channel Name").clicked() {
+                                    ui.ctx().copy_text(channel_name.clone());
+                                    ui.close();
+                                }
+                            });
                         }
                     });
 
+                // Update selection
+                self.channel_list_selected = new_selected;
+
                 ui.separator();
                 ui.horizontal(|ui| {
-                    if ui.button("Close").clicked() {
-                        close = true;
+                    if ui.button("Join").clicked() {
+                        if let Some(channel) = &self.channel_list_selected {
+                            join_channel = Some(channel.clone());
+                        }
                     }
                     if ui.button("Refresh").clicked() {
+                        self.channel_list.clear();
+                        self.channel_list_selected = None;
                         self.send_command(IrcCommand::List(None));
+                    }
+                    if ui.button("Close").clicked() {
+                        close = true;
                     }
                 });
             });
 
         if close {
             self.show_channel_list = false;
+            self.channel_list_selected = None;
         }
         if let Some(channel) = join_channel {
             self.send_command(IrcCommand::Join(channel));
             self.show_channel_list = false;
+            self.channel_list_selected = None;
         }
     }
 }
