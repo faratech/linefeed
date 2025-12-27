@@ -141,6 +141,10 @@ pub struct IrcApp {
     pub reconnect_delay_secs: u32,
     pub max_reconnect_attempts: u32,
 
+    // Custom messages
+    pub quit_message: String,
+    pub part_message: String,
+
     // Channel info dialog
     pub show_channel_info: bool,
     pub channel_info_target: Option<String>,
@@ -269,6 +273,10 @@ impl IrcApp {
             reconnect_delay_secs: settings.reconnect_delay_secs,
             max_reconnect_attempts: settings.max_reconnect_attempts,
 
+            // Custom messages
+            quit_message: settings.quit_message,
+            part_message: settings.part_message,
+
             show_channel_info: false,
             channel_info_target: None,
 
@@ -324,6 +332,9 @@ impl IrcApp {
             // Connection
             reconnect_delay_secs: self.reconnect_delay_secs,
             max_reconnect_attempts: self.max_reconnect_attempts,
+            // Custom messages
+            quit_message: self.quit_message.clone(),
+            part_message: self.part_message.clone(),
         }
     }
 

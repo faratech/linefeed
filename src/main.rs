@@ -153,6 +153,97 @@ fn load_icon() -> egui::IconData {
     }
 }
 
+/// Load system fonts including emoji support
+fn setup_fonts(ctx: &egui::Context) {
+    let mut fonts = egui::FontDefinitions::default();
+
+    // Try to load system emoji fonts as fallback
+    let emoji_font_paths: &[&str] = if cfg!(windows) {
+        &[
+            "C:\\Windows\\Fonts\\seguiemj.ttf",  // Segoe UI Emoji
+            "C:\\Windows\\Fonts\\segoeui.ttf",   // Segoe UI (fallback)
+        ]
+    } else if cfg!(target_os = "macos") {
+        &[
+            "/System/Library/Fonts/Apple Color Emoji.ttc",
+            "/Library/Fonts/Apple Color Emoji.ttc",
+        ]
+    } else {
+        // Linux
+        &[
+            "/usr/share/fonts/truetype/noto/NotoColorEmoji.ttf",
+            "/usr/share/fonts/noto-emoji/NotoColorEmoji.ttf",
+            "/usr/share/fonts/google-noto-emoji/NotoColorEmoji.ttf",
+            "/usr/share/fonts/truetype/unifont/unifont.ttf",
+        ]
+    };
+
+    for path in emoji_font_paths {
+        if let Ok(font_data) = std::fs::read(path) {
+            fonts.font_data.insert(
+                "emoji".to_owned(),
+                Arc::new(egui::FontData::from_owned(font_data)),
+            );
+
+            // Add emoji font as fallback for all font families
+            for family in [
+                egui::FontFamily::Proportional,
+                egui::FontFamily::Monospace,
+            ] {
+                if let Some(fonts_for_family) = fonts.families.get_mut(&family) {
+                    fonts_for_family.push("emoji".to_owned());
+                }
+            }
+
+            tracing::info!("Loaded emoji font from {}", path);
+            break;
+        }
+    }
+
+    ctx.set_fonts(fonts);
+}
+
+/// Enable Windows Efficiency Mode (EcoQoS) for the current process
+/// This reduces CPU/battery usage by lowering priority and enabling power throttling
+#[cfg(windows)]
+fn enable_efficiency_mode() {
+    use windows::Win32::System::Threading::{
+        GetCurrentProcess, SetPriorityClass, SetProcessInformation,
+        ProcessPowerThrottling, IDLE_PRIORITY_CLASS,
+        PROCESS_POWER_THROTTLING_STATE, PROCESS_POWER_THROTTLING_EXECUTION_SPEED,
+        PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION,
+    };
+
+    unsafe {
+        let handle = GetCurrentProcess();
+
+        // Set to idle priority class (lowest scheduling priority)
+        let _ = SetPriorityClass(handle, IDLE_PRIORITY_CLASS);
+
+        // Enable EcoQoS power throttling
+        let mut throttle_state = PROCESS_POWER_THROTTLING_STATE {
+            Version: 1,
+            ControlMask: PROCESS_POWER_THROTTLING_EXECUTION_SPEED
+                | PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION,
+            StateMask: PROCESS_POWER_THROTTLING_EXECUTION_SPEED
+                | PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION,
+        };
+
+        let _ = SetProcessInformation(
+            handle,
+            ProcessPowerThrottling,
+            &mut throttle_state as *mut _ as *mut _,
+            std::mem::size_of::<PROCESS_POWER_THROTTLING_STATE>() as u32,
+        );
+    }
+    tracing::info!("Efficiency mode enabled (EcoQoS)");
+}
+
+#[cfg(not(windows))]
+fn enable_efficiency_mode() {
+    // No-op on non-Windows platforms
+}
+
 fn main() -> eframe::Result<()> {
     tracing_subscriber::fmt()
         .with_max_level(tracing::Level::DEBUG)
@@ -160,6 +251,9 @@ fn main() -> eframe::Result<()> {
         .init();
 
     tracing::info!("Starting fmIRC");
+
+    // Enable Efficiency Mode to reduce CPU/battery usage
+    enable_efficiency_mode();
 
     // Create tray icon before eframe starts (Windows only)
     #[cfg(windows)]
@@ -181,6 +275,9 @@ fn main() -> eframe::Result<()> {
         "fmIRC",
         options,
         Box::new(|cc| {
+            // Load emoji fonts for comprehensive Unicode support
+            setup_fonts(&cc.egui_ctx);
+
             let mut style = (*cc.egui_ctx.style()).clone();
             style.spacing.item_spacing = egui::vec2(8.0, 4.0);
             cc.egui_ctx.set_style(style);

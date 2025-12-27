@@ -30,7 +30,7 @@ libc = "0.2"
 
 [target.'cfg(windows)'.dependencies]
 tray-icon = "0.19"
-windows = { version = "0.58", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging"] }
+windows = { version = "0.58", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging", "Win32_System_Threading"] }
 
 # Fast incremental dev builds
 [profile.dev]

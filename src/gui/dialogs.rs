@@ -5,6 +5,25 @@ use crate::irc::IrcCommand;
 use super::{IrcApp, ServerFavorite};
 use super::helpers::format_timestamp;
 
+/// Popular IRC network presets (alphabetical)
+const NETWORK_PRESETS: &[(&str, &str, &str, bool)] = &[
+    // (Name, Host, Port, TLS)
+    ("AfterNET", "irc.afternet.org", "6697", true),
+    ("DALnet", "irc.dal.net", "6697", true),
+    ("EFnet", "irc.efnet.org", "6697", true),
+    ("Esper.net", "irc.esper.net", "6697", true),
+    ("GeekShed", "irc.geekshed.net", "6697", true),
+    ("hackint", "irc.hackint.org", "6697", true),
+    ("IRCnet", "irc.ircnet.com", "6667", false),
+    ("Libera Chat", "irc.libera.chat", "6697", true),
+    ("OFTC", "irc.oftc.net", "6697", true),
+    ("QuakeNet", "irc.quakenet.org", "6667", false),
+    ("Rizon", "irc.rizon.net", "6697", true),
+    ("Snoonet", "irc.snoonet.org", "6697", true),
+    ("SwiftIRC", "irc.swiftirc.net", "6697", true),
+    ("Undernet", "irc.undernet.org", "6697", true),
+];
+
 impl IrcApp {
     pub fn show_connect_window(&mut self, ctx: &egui::Context) {
         egui::Window::new("Connect to Server")
@@ -13,6 +32,25 @@ impl IrcApp {
             .default_width(450.0)
             .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
             .show(ctx, |ui| {
+                // ===== Network Presets Section =====
+                egui::CollapsingHeader::new("Quick Connect (Network Presets)")
+                    .default_open(self.server_favorites.is_empty())
+                    .show(ui, |ui| {
+                        ui.horizontal_wrapped(|ui| {
+                            for (name, host, port, tls) in NETWORK_PRESETS {
+                                if ui.small_button(*name).clicked() {
+                                    self.server_host = host.to_string();
+                                    self.server_port = port.to_string();
+                                    self.use_tls = *tls;
+                                }
+                            }
+                        });
+                        ui.add_space(4.0);
+                        ui.label(RichText::new("Click a network to fill in server details, then click Connect below.").small().color(Color32::GRAY));
+                    });
+
+                ui.add_space(4.0);
+
                 // ===== Server Favorites Section =====
                 egui::CollapsingHeader::new("Server Favorites")
                     .default_open(!self.server_favorites.is_empty())
@@ -474,6 +512,19 @@ impl IrcApp {
             });
         }
         ui.label(RichText::new("Logs: ~/.config/fmirc/logs/").small().color(Color32::GRAY));
+
+        ui.add_space(8.0);
+        ui.heading("Custom Messages");
+        ui.add_space(4.0);
+
+        ui.horizontal(|ui| {
+            ui.label("Quit:");
+            ui.add(TextEdit::singleline(&mut self.quit_message).desired_width(200.0).hint_text("fmIRC"));
+        });
+        ui.horizontal(|ui| {
+            ui.label("Part:");
+            ui.add(TextEdit::singleline(&mut self.part_message).desired_width(200.0).hint_text("Leaving"));
+        });
     }
 
     fn settings_tab_about(&mut self, ui: &mut egui::Ui) {

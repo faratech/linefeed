@@ -34,7 +34,13 @@ impl IrcApp {
                     Some(args.to_string())
                 };
                 if let Some(ch) = channel {
-                    self.send_command(IrcCommand::Part(ch, None));
+                    // Use custom part message if set and no explicit message given
+                    let reason = if !self.part_message.is_empty() {
+                        Some(self.part_message.clone())
+                    } else {
+                        None
+                    };
+                    self.send_command(IrcCommand::Part(ch, reason));
                 }
             }
 
@@ -108,7 +114,14 @@ impl IrcApp {
             }
 
             "QUIT" => {
-                let reason = if args.is_empty() { None } else { Some(args.to_string()) };
+                // Use explicit message, or custom quit message, or default
+                let reason = if !args.is_empty() {
+                    Some(args.to_string())
+                } else if !self.quit_message.is_empty() {
+                    Some(self.quit_message.clone())
+                } else {
+                    Some("fmIRC".to_string())
+                };
                 self.send_command(IrcCommand::Quit(reason));
                 self.connected = false;
             }

@@ -65,6 +65,9 @@ pub struct Settings {
     // Connection
     pub reconnect_delay_secs: u32,
     pub max_reconnect_attempts: u32,
+    // Custom messages
+    pub quit_message: String,
+    pub part_message: String,
 }
 
 impl Default for Settings {
@@ -106,6 +109,9 @@ impl Default for Settings {
             // Connection
             reconnect_delay_secs: 5,
             max_reconnect_attempts: 10,
+            // Custom messages
+            quit_message: "fmIRC".to_string(),
+            part_message: String::new(),
         }
     }
 }
