@@ -1,8 +1,11 @@
-#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+#![windows_subsystem = "windows"]
 
 mod irc;
 mod gui;
 mod icon_data;
+
+#[cfg(windows)]
+mod systray;
 
 use eframe::egui;
 use tokio::sync::mpsc;
@@ -10,159 +13,6 @@ use std::sync::Arc;
 
 use irc::{IrcClient, IrcCommand, IrcMessage};
 use gui::{IrcApp, ChatMessage};
-
-// System tray support (Windows only)
-#[cfg(windows)]
-mod tray {
-    use std::sync::atomic::{AtomicBool, Ordering};
-    use crate::icon_data;
-    use windows::Win32::Foundation::HWND;
-    use windows::Win32::UI::WindowsAndMessaging::{
-        FindWindowW, ShowWindow, SetForegroundWindow, FlashWindowEx,
-        SW_HIDE, SW_SHOW, SW_RESTORE, FLASHWINFO, FLASHW_ALL, FLASHW_TIMERNOFG,
-    };
-    use windows::core::w;
-
-    static TRAY_ACTIVE: AtomicBool = AtomicBool::new(false);
-    static EXIT_REQUESTED: AtomicBool = AtomicBool::new(false);
-    static WINDOW_HIDDEN: AtomicBool = AtomicBool::new(false);
-    static RESTORE_REQUESTED: AtomicBool = AtomicBool::new(false);
-
-    fn find_our_window() -> Option<HWND> {
-        unsafe {
-            match FindWindowW(None, w!("fmIRC")) {
-                Ok(hwnd) if !hwnd.is_invalid() => Some(hwnd),
-                _ => None,
-            }
-        }
-    }
-
-    pub fn show_window() {
-        WINDOW_HIDDEN.store(false, Ordering::SeqCst);
-        RESTORE_REQUESTED.store(true, Ordering::SeqCst);
-        if let Some(hwnd) = find_our_window() {
-            unsafe {
-                let _ = ShowWindow(hwnd, SW_SHOW);
-                let _ = ShowWindow(hwnd, SW_RESTORE);
-                let _ = SetForegroundWindow(hwnd);
-            }
-            tracing::info!("Window shown via Win32");
-        } else {
-            tracing::warn!("Could not find window to show");
-        }
-    }
-
-    /// Check and consume restore request (returns true once after show_window)
-    pub fn take_restore_request() -> bool {
-        RESTORE_REQUESTED.swap(false, Ordering::SeqCst)
-    }
-
-    pub fn hide_window() {
-        WINDOW_HIDDEN.store(true, Ordering::SeqCst);
-        if let Some(hwnd) = find_our_window() {
-            unsafe {
-                let _ = ShowWindow(hwnd, SW_HIDE);
-            }
-            tracing::info!("Window hidden to tray");
-        }
-    }
-
-    pub fn is_window_hidden() -> bool {
-        WINDOW_HIDDEN.load(Ordering::SeqCst)
-    }
-
-    pub fn clear_hidden() {
-        WINDOW_HIDDEN.store(false, Ordering::SeqCst);
-    }
-
-    pub fn create_tray_icon() -> Option<tray_icon::TrayIcon> {
-        use tray_icon::{TrayIconBuilder, menu::{Menu, MenuItem, PredefinedMenuItem}};
-        use tray_icon::Icon;
-
-        let menu = Menu::new();
-        let show_item = MenuItem::with_id("show", "Show fmIRC", true, None);
-        let quit_item = MenuItem::with_id("quit", "Quit", true, None);
-        let _ = menu.append(&show_item);
-        let _ = menu.append(&PredefinedMenuItem::separator());
-        let _ = menu.append(&quit_item);
-
-        let icon = Icon::from_rgba(
-            icon_data::ICON_RGBA.to_vec(),
-            icon_data::ICON_WIDTH,
-            icon_data::ICON_HEIGHT,
-        ).ok()?;
-
-        let tray = TrayIconBuilder::new()
-            .with_menu(Box::new(menu))
-            .with_tooltip("fmIRC")
-            .with_icon(icon)
-            .build()
-            .ok()?;
-
-        TRAY_ACTIVE.store(true, Ordering::SeqCst);
-        tracing::info!("System tray icon created");
-        Some(tray)
-    }
-
-    pub fn setup_event_handler() {
-        use tray_icon::menu::MenuEvent;
-        use tray_icon::TrayIconEvent;
-
-        // Menu clicks
-        std::thread::spawn(|| {
-            let rx = MenuEvent::receiver();
-            loop {
-                if let Ok(event) = rx.recv() {
-                    match event.id.0.as_str() {
-                        "show" => show_window(),
-                        "quit" => {
-                            EXIT_REQUESTED.store(true, Ordering::SeqCst);
-                            show_window(); // Show so egui can process close
-                        }
-                        _ => {}
-                    }
-                }
-            }
-        });
-
-        // Double-click on tray icon
-        std::thread::spawn(|| {
-            let rx = TrayIconEvent::receiver();
-            loop {
-                if let Ok(event) = rx.recv() {
-                    if matches!(event, tray_icon::TrayIconEvent::DoubleClick { .. }) {
-                        show_window();
-                    }
-                }
-            }
-        });
-    }
-
-    pub fn is_active() -> bool {
-        TRAY_ACTIVE.load(Ordering::SeqCst)
-    }
-
-    pub fn should_exit() -> bool {
-        EXIT_REQUESTED.load(Ordering::SeqCst)
-    }
-
-    /// Flash the taskbar to alert the user of a notification
-    pub fn flash_window() {
-        if let Some(hwnd) = find_our_window() {
-            unsafe {
-                let mut flash_info = FLASHWINFO {
-                    cbSize: std::mem::size_of::<FLASHWINFO>() as u32,
-                    hwnd,
-                    dwFlags: FLASHW_ALL | FLASHW_TIMERNOFG,
-                    uCount: 3,
-                    dwTimeout: 0,
-                };
-                let _ = FlashWindowEx(&mut flash_info);
-            }
-            tracing::debug!("Flashed taskbar for notification");
-        }
-    }
-}
 
 fn load_icon() -> egui::IconData {
     egui::IconData {
@@ -263,7 +113,49 @@ fn enable_efficiency_mode() {
     // No-op on non-Windows platforms
 }
 
+/// Check if another instance is already running (Windows only)
+/// Returns true if this is the only instance, false if another exists
+#[cfg(windows)]
+fn ensure_single_instance() -> bool {
+    use windows::core::w;
+    use windows::Win32::Foundation::GetLastError;
+    use windows::Win32::System::Threading::CreateMutexW;
+
+    unsafe {
+        // Try to create a named mutex
+        let _mutex = CreateMutexW(None, true, w!("fmIRC_SingleInstance"));
+
+        // If ERROR_ALREADY_EXISTS, another instance has the mutex
+        if GetLastError().is_err() {
+            // Another instance exists - send it a message to show itself
+            systray::activate_existing_instance();
+            return false;
+        }
+
+        // We got the mutex, we're the only instance
+        // Note: We intentionally don't close the mutex handle - it stays open
+        // for the lifetime of the process to prevent other instances
+        true
+    }
+}
+
+#[cfg(not(windows))]
+fn ensure_single_instance() -> bool {
+    true // No single-instance check on non-Windows
+}
+
 fn main() -> eframe::Result<()> {
+    // Check for existing instance FIRST (before any GUI setup)
+    #[cfg(windows)]
+    {
+        systray::setup_event_handler();
+    }
+
+    if !ensure_single_instance() {
+        // Another instance is running, exit silently
+        return Ok(());
+    }
+
     tracing_subscriber::fmt()
         .with_max_level(tracing::Level::DEBUG)
         .with_target(false)
@@ -274,12 +166,11 @@ fn main() -> eframe::Result<()> {
     // Enable Efficiency Mode to reduce CPU/battery usage
     enable_efficiency_mode();
 
-    // Create tray icon before eframe starts (Windows only)
+    // Create tray icon (Windows only)
     #[cfg(windows)]
-    let _tray = {
-        tray::setup_event_handler();
-        tray::create_tray_icon()
-    };
+    {
+        systray::create_tray_icon();
+    }
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
@@ -320,36 +211,26 @@ impl eframe::App for FmIrcApp {
         #[cfg(windows)]
         {
             // Check if quit was requested from tray
-            if tray::is_active() && tray::should_exit() {
+            if systray::is_active() && systray::should_exit() {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                 return;
             }
 
             // Handle restore from tray
-            if tray::take_restore_request() {
+            if systray::take_restore_request() {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
             }
 
             // When hidden to system tray, skip all UI work
-            // But check if user restored via taskbar (not our tray menu)
-            if tray::is_window_hidden() {
-                let minimized = ctx.input(|i| i.viewport().minimized.unwrap_or(true));
-                if !minimized {
-                    // User restored via taskbar, clear our flag
-                    tray::clear_hidden();
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
-                } else {
-                    // Still hidden, skip work
-                    return;
-                }
+            if systray::is_window_hidden() {
+                return;
             }
 
             // Intercept X button when minimize_to_tray is enabled (only when visible)
-            if self.app.minimize_to_tray && tray::is_active() {
+            if self.app.minimize_to_tray && systray::is_active() {
                 if ctx.input(|i| i.viewport().close_requested()) {
                     ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
-                    tray::hide_window();
+                    systray::hide_window();
                     return;
                 }
             }

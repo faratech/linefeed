@@ -465,7 +465,7 @@ impl IrcApp {
         {
             let _ = (title, body); // Used for logging above
             // Flash taskbar via the tray module
-            crate::tray::flash_window();
+            crate::systray::flash_window();
         }
     }
 
