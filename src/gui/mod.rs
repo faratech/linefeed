@@ -7,6 +7,19 @@ use serde::{Deserialize, Serialize};
 use crate::irc::{IrcCommand, IrcMessage};
 use crate::irc::client::ServerConfig;
 
+// Server favorite for quick connect
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ServerFavorite {
+    pub name: String,           // Display name (e.g., "Libera Chat")
+    pub host: String,           // Server host
+    pub port: String,           // Server port
+    pub use_tls: bool,          // Use TLS
+    pub password: String,       // Server password (if any)
+    pub nickname: String,       // Nick to use (empty = use default)
+    pub auto_join: String,      // Channels to auto-join (comma-separated)
+    pub auto_perform: String,   // Commands to run on connect (newline-separated)
+}
+
 // Persistent settings
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -24,6 +37,10 @@ pub struct Settings {
     pub minimize_to_tray: bool,
     pub auto_reconnect: bool,
     pub notifications_enabled: bool,
+    // New features
+    pub ignore_list: Vec<String>,           // Ignored nicks/masks
+    pub server_favorites: Vec<ServerFavorite>, // Saved servers
+    pub auto_perform: String,               // Global auto-perform commands (newline-separated)
 }
 
 impl Default for Settings {
@@ -42,6 +59,9 @@ impl Default for Settings {
             minimize_to_tray: false,
             auto_reconnect: true,
             notifications_enabled: true,
+            ignore_list: Vec::new(),
+            server_favorites: Vec::new(),
+            auto_perform: String::new(),
         }
     }
 }
@@ -647,6 +667,18 @@ pub struct IrcApp {
     pub reconnect_attempts: u32,
     pub last_disconnect_time: Option<std::time::Instant>,
     pub connection_lost: bool,
+
+    // Ignore list
+    pub ignore_list: Vec<String>,
+
+    // Server favorites
+    pub server_favorites: Vec<ServerFavorite>,
+
+    // Auto-perform commands (newline-separated)
+    pub auto_perform: String,
+
+    // Pending auto-perform (to execute after connect)
+    pub pending_auto_perform: Option<Vec<String>>,
 }
 
 impl Default for IrcApp {
@@ -717,6 +749,11 @@ impl IrcApp {
             reconnect_attempts: 0,
             last_disconnect_time: None,
             connection_lost: false,
+
+            ignore_list: settings.ignore_list,
+            server_favorites: settings.server_favorites,
+            auto_perform: settings.auto_perform,
+            pending_auto_perform: None,
         }
     }
 
@@ -735,7 +772,73 @@ impl IrcApp {
             minimize_to_tray: self.minimize_to_tray,
             auto_reconnect: self.auto_reconnect,
             notifications_enabled: self.notifications_enabled,
+            ignore_list: self.ignore_list.clone(),
+            server_favorites: self.server_favorites.clone(),
+            auto_perform: self.auto_perform.clone(),
         }
+    }
+
+    /// Check if a sender is ignored (by nick or mask)
+    fn is_ignored(&self, sender: &str, prefix: Option<&str>) -> bool {
+        let sender_lower = sender.to_lowercase();
+        for pattern in &self.ignore_list {
+            let pattern_lower = pattern.to_lowercase();
+            // Check for exact nick match
+            if pattern_lower == sender_lower {
+                return true;
+            }
+            // Check for wildcard mask match (e.g., *!*@*.spammer.net)
+            if pattern.contains('!') || pattern.contains('@') || pattern.contains('*') {
+                if let Some(full_prefix) = prefix {
+                    if Self::mask_matches(&pattern_lower, &full_prefix.to_lowercase()) {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
+    }
+
+    /// Simple wildcard mask matching
+    fn mask_matches(pattern: &str, text: &str) -> bool {
+        let mut pattern_chars = pattern.chars().peekable();
+        let mut text_chars = text.chars().peekable();
+
+        while let Some(p) = pattern_chars.next() {
+            match p {
+                '*' => {
+                    // Skip consecutive wildcards
+                    while pattern_chars.peek() == Some(&'*') {
+                        pattern_chars.next();
+                    }
+                    // If * is at end, match rest
+                    if pattern_chars.peek().is_none() {
+                        return true;
+                    }
+                    // Try matching rest of pattern at each position
+                    let rest_pattern: String = pattern_chars.collect();
+                    let mut remaining: String = text_chars.collect();
+                    while !remaining.is_empty() {
+                        if Self::mask_matches(&rest_pattern, &remaining) {
+                            return true;
+                        }
+                        remaining = remaining.chars().skip(1).collect();
+                    }
+                    return Self::mask_matches(&rest_pattern, "");
+                }
+                '?' => {
+                    if text_chars.next().is_none() {
+                        return false;
+                    }
+                }
+                c => {
+                    if text_chars.next() != Some(c) {
+                        return false;
+                    }
+                }
+            }
+        }
+        text_chars.next().is_none()
     }
 
     /// Calculate reconnect delay with exponential backoff (1s, 2s, 4s, 8s, max 60s)
@@ -863,6 +966,12 @@ impl IrcApp {
             IrcCommand::Privmsg(target, content) => {
                 let sender = msg.get_sender_nick().unwrap_or_else(|| "???".to_string());
 
+                // Check if sender is ignored
+                if self.is_ignored(&sender, msg.prefix.as_deref()) {
+                    tracing::debug!("Ignoring message from {}", sender);
+                    return;
+                }
+
                 // Handle CTCP requests (except ACTION which is displayed as a message)
                 if self.handle_ctcp_request(&sender, content) {
                     return; // CTCP was handled, don't display as regular message
@@ -935,6 +1044,12 @@ impl IrcApp {
 
             IrcCommand::Notice(target, content) => {
                 let sender = msg.get_sender_nick().unwrap_or_else(|| "Server".to_string());
+
+                // Check if sender is ignored (but not server notices)
+                if msg.prefix.is_some() && self.is_ignored(&sender, msg.prefix.as_deref()) {
+                    tracing::debug!("Ignoring notice from {}", sender);
+                    return;
+                }
 
                 // Check for CTCP reply (starts and ends with \x01)
                 if content.starts_with('\x01') && content.ends_with('\x01') {
@@ -1114,6 +1229,20 @@ impl IrcApp {
                             self.send_command(IrcCommand::Join(channel.clone()));
                             self.add_server_message(ChatMessage::system(&format!("Auto-joining {}", channel)));
                         }
+                    }
+                }
+
+                // Queue auto-perform commands for execution
+                let auto_perform = self.auto_perform.clone();
+                if !auto_perform.is_empty() {
+                    let commands: Vec<String> = auto_perform
+                        .lines()
+                        .filter(|line| !line.trim().is_empty())
+                        .map(|line| line.to_string())
+                        .collect();
+                    if !commands.is_empty() {
+                        self.pending_auto_perform = Some(commands);
+                        self.add_server_message(ChatMessage::system("Running auto-perform commands..."));
                     }
                 }
             }
@@ -2065,12 +2194,48 @@ impl IrcApp {
             }
 
             "IGNORE" => {
-                // TODO: Implement ignore list
-                self.add_message_to_current(ChatMessage::system("Ignore list not yet implemented"));
+                if args.is_empty() {
+                    // List ignored users
+                    if self.ignore_list.is_empty() {
+                        self.add_message_to_current(ChatMessage::system("Ignore list is empty"));
+                    } else {
+                        let list: Vec<String> = self.ignore_list.iter()
+                            .enumerate()
+                            .map(|(i, mask)| format!("  {}. {}", i + 1, mask))
+                            .collect();
+                        self.add_message_to_current(ChatMessage::system("Ignored users/masks:"));
+                        for line in list {
+                            self.add_message_to_current(ChatMessage::system(&line));
+                        }
+                    }
+                } else {
+                    // Add to ignore list
+                    let mask = args.to_string();
+                    if !self.ignore_list.iter().any(|m| m.eq_ignore_ascii_case(&mask)) {
+                        self.ignore_list.push(mask.clone());
+                        self.add_message_to_current(ChatMessage::system(&format!("Now ignoring: {}", mask)));
+                        // Save settings
+                        self.get_settings().save();
+                    } else {
+                        self.add_message_to_current(ChatMessage::system(&format!("Already ignoring: {}", mask)));
+                    }
+                }
             }
 
             "UNIGNORE" => {
-                self.add_message_to_current(ChatMessage::system("Ignore list not yet implemented"));
+                if args.is_empty() {
+                    self.add_message_to_current(ChatMessage::system("Usage: /unignore <nick|mask>"));
+                } else {
+                    let mask_lower = args.to_lowercase();
+                    let before_len = self.ignore_list.len();
+                    self.ignore_list.retain(|m| !m.to_lowercase().eq(&mask_lower));
+                    if self.ignore_list.len() < before_len {
+                        self.add_message_to_current(ChatMessage::system(&format!("No longer ignoring: {}", args)));
+                        self.get_settings().save();
+                    } else {
+                        self.add_message_to_current(ChatMessage::system(&format!("Not in ignore list: {}", args)));
+                    }
+                }
             }
 
             "LASTLOG" | "GREP" | "SEARCH" => {
@@ -2116,6 +2281,37 @@ impl IrcApp {
                 // Server VERSION (not CTCP)
                 let server = if args.is_empty() { None } else { Some(args.to_string()) };
                 self.send_command(IrcCommand::Version(server));
+            }
+
+            "PERFORM" => {
+                if args.is_empty() {
+                    // Show current auto-perform
+                    if self.auto_perform.is_empty() {
+                        self.add_message_to_current(ChatMessage::system("No auto-perform commands set. Use /perform <command> to add."));
+                    } else {
+                        let lines: Vec<String> = self.auto_perform.lines()
+                            .filter(|line| !line.trim().is_empty())
+                            .enumerate()
+                            .map(|(i, line)| format!("  {}. {}", i + 1, line))
+                            .collect();
+                        self.add_message_to_current(ChatMessage::system("Auto-perform commands:"));
+                        for line in lines {
+                            self.add_message_to_current(ChatMessage::system(&line));
+                        }
+                    }
+                } else if args.eq_ignore_ascii_case("clear") {
+                    self.auto_perform.clear();
+                    self.get_settings().save();
+                    self.add_message_to_current(ChatMessage::system("Auto-perform commands cleared."));
+                } else {
+                    // Add to auto-perform
+                    if !self.auto_perform.is_empty() {
+                        self.auto_perform.push('\n');
+                    }
+                    self.auto_perform.push_str(args);
+                    self.get_settings().save();
+                    self.add_message_to_current(ChatMessage::system(&format!("Added to auto-perform: {}", args)));
+                }
             }
 
             "SETTINGS" => {
@@ -2193,6 +2389,9 @@ impl IrcApp {
             ("=== Utility ===", vec![
                 "/clear              - Clear window",
                 "/lastlog <pattern>  - Search messages",
+                "/ignore [mask]      - List or add to ignore list",
+                "/unignore <mask>    - Remove from ignore list",
+                "/perform [cmd]      - View/add auto-perform",
                 "/echo <text>        - Echo to window",
                 "/raw <command>      - Send raw IRC",
                 "/settings           - Open settings",
@@ -2485,6 +2684,25 @@ impl eframe::App for IrcApp {
         };
         for msg in messages {
             self.handle_incoming_message(msg);
+        }
+
+        // Execute pending auto-perform commands (one per frame to avoid flooding)
+        if let Some(ref mut commands) = self.pending_auto_perform.take() {
+            if let Some(cmd) = commands.first().cloned() {
+                // Process command (add / prefix if not present)
+                let cmd = if cmd.starts_with('/') {
+                    cmd
+                } else {
+                    format!("/{}", cmd)
+                };
+                self.process_command(&cmd);
+
+                // Put remaining commands back
+                let remaining: Vec<_> = commands.iter().skip(1).cloned().collect();
+                if !remaining.is_empty() {
+                    self.pending_auto_perform = Some(remaining);
+                }
+            }
         }
 
         // Handle keyboard shortcuts
@@ -3054,6 +3272,31 @@ impl IrcApp {
                 });
 
                 ui.checkbox(&mut self.set_invisible, "Set invisible (+i)");
+
+                ui.add_space(4.0);
+                ui.label("Auto-perform (one command per line):");
+                ui.add(
+                    TextEdit::multiline(&mut self.auto_perform)
+                        .desired_width(300.0)
+                        .desired_rows(3)
+                        .hint_text("/msg NickServ identify pass\n/join #secret key")
+                );
+
+                ui.separator();
+                ui.heading("Ignore List");
+                ui.separator();
+
+                // Display ignore list compactly
+                if self.ignore_list.is_empty() {
+                    ui.label("No users ignored. Use /ignore <nick|mask> to add.");
+                } else {
+                    let ignore_display = self.ignore_list.join(", ");
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label("Ignored:");
+                        ui.label(RichText::new(&ignore_display).color(Color32::GRAY));
+                    });
+                    ui.label("Use /unignore <nick> to remove.");
+                }
 
                 ui.separator();
                 ui.heading("Behavior");
