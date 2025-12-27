@@ -1,9 +1,222 @@
 use std::collections::HashMap;
-use egui::{Color32, RichText, ScrollArea, TextEdit, Vec2};
+use egui::{Color32, Label, RichText, ScrollArea, Sense, TextEdit, Vec2};
 use tokio::sync::mpsc;
 
 use crate::irc::{IrcCommand, IrcMessage};
 use crate::irc::client::ServerConfig;
+
+// IRC color codes (mIRC standard)
+const IRC_COLORS: [Color32; 16] = [
+    Color32::WHITE,                      // 0: White
+    Color32::BLACK,                      // 1: Black
+    Color32::from_rgb(0, 0, 127),        // 2: Blue (navy)
+    Color32::from_rgb(0, 147, 0),        // 3: Green
+    Color32::from_rgb(255, 0, 0),        // 4: Red
+    Color32::from_rgb(127, 0, 0),        // 5: Brown (maroon)
+    Color32::from_rgb(156, 0, 156),      // 6: Purple
+    Color32::from_rgb(252, 127, 0),      // 7: Orange
+    Color32::from_rgb(255, 255, 0),      // 8: Yellow
+    Color32::from_rgb(0, 252, 0),        // 9: Light Green
+    Color32::from_rgb(0, 147, 147),      // 10: Cyan (teal)
+    Color32::from_rgb(0, 255, 255),      // 11: Light Cyan
+    Color32::from_rgb(0, 0, 252),        // 12: Light Blue
+    Color32::from_rgb(255, 0, 255),      // 13: Pink
+    Color32::from_rgb(127, 127, 127),    // 14: Grey
+    Color32::from_rgb(210, 210, 210),    // 15: Light Grey
+];
+
+#[derive(Clone, Debug)]
+struct TextSpan {
+    text: String,
+    fg_color: Option<Color32>,
+    bg_color: Option<Color32>,
+    bold: bool,
+    underline: bool,
+    italic: bool,
+}
+
+fn parse_irc_colors(input: &str) -> Vec<TextSpan> {
+    let mut spans = Vec::new();
+    let mut current_text = String::new();
+    let mut fg_color: Option<Color32> = None;
+    let mut bg_color: Option<Color32> = None;
+    let mut bold = false;
+    let mut underline = false;
+    let mut italic = false;
+
+    let mut chars = input.chars().peekable();
+
+    while let Some(c) = chars.next() {
+        match c {
+            '\x03' => {
+                // Color code - push current span if not empty
+                if !current_text.is_empty() {
+                    spans.push(TextSpan {
+                        text: current_text.clone(),
+                        fg_color,
+                        bg_color,
+                        bold,
+                        underline,
+                        italic,
+                    });
+                    current_text.clear();
+                }
+
+                // Parse foreground color (1-2 digits)
+                let mut fg_str = String::new();
+                while fg_str.len() < 2 {
+                    if let Some(&next) = chars.peek() {
+                        if next.is_ascii_digit() {
+                            fg_str.push(chars.next().unwrap());
+                        } else {
+                            break;
+                        }
+                    } else {
+                        break;
+                    }
+                }
+
+                if let Ok(fg) = fg_str.parse::<usize>() {
+                    fg_color = Some(IRC_COLORS[fg % 16]);
+                } else {
+                    // \x03 with no number resets colors
+                    fg_color = None;
+                    bg_color = None;
+                }
+
+                // Check for background color (comma followed by 1-2 digits)
+                if chars.peek() == Some(&',') {
+                    chars.next(); // consume comma
+                    let mut bg_str = String::new();
+                    while bg_str.len() < 2 {
+                        if let Some(&next) = chars.peek() {
+                            if next.is_ascii_digit() {
+                                bg_str.push(chars.next().unwrap());
+                            } else {
+                                break;
+                            }
+                        } else {
+                            break;
+                        }
+                    }
+                    if let Ok(bg) = bg_str.parse::<usize>() {
+                        bg_color = Some(IRC_COLORS[bg % 16]);
+                    }
+                }
+            }
+            '\x02' => {
+                // Bold toggle
+                if !current_text.is_empty() {
+                    spans.push(TextSpan {
+                        text: current_text.clone(),
+                        fg_color,
+                        bg_color,
+                        bold,
+                        underline,
+                        italic,
+                    });
+                    current_text.clear();
+                }
+                bold = !bold;
+            }
+            '\x1F' => {
+                // Underline toggle
+                if !current_text.is_empty() {
+                    spans.push(TextSpan {
+                        text: current_text.clone(),
+                        fg_color,
+                        bg_color,
+                        bold,
+                        underline,
+                        italic,
+                    });
+                    current_text.clear();
+                }
+                underline = !underline;
+            }
+            '\x1D' | '\x16' => {
+                // Italic toggle (\x1D is proper italic, \x16 is reverse/italic)
+                if !current_text.is_empty() {
+                    spans.push(TextSpan {
+                        text: current_text.clone(),
+                        fg_color,
+                        bg_color,
+                        bold,
+                        underline,
+                        italic,
+                    });
+                    current_text.clear();
+                }
+                italic = !italic;
+            }
+            '\x0F' => {
+                // Reset all formatting
+                if !current_text.is_empty() {
+                    spans.push(TextSpan {
+                        text: current_text.clone(),
+                        fg_color,
+                        bg_color,
+                        bold,
+                        underline,
+                        italic,
+                    });
+                    current_text.clear();
+                }
+                fg_color = None;
+                bg_color = None;
+                bold = false;
+                underline = false;
+                italic = false;
+            }
+            _ => {
+                current_text.push(c);
+            }
+        }
+    }
+
+    // Push remaining text
+    if !current_text.is_empty() {
+        spans.push(TextSpan {
+            text: current_text,
+            fg_color,
+            bg_color,
+            bold,
+            underline,
+            italic,
+        });
+    }
+
+    spans
+}
+
+fn render_irc_text(ui: &mut egui::Ui, text: &str, default_color: Color32) {
+    let spans = parse_irc_colors(text);
+
+    ui.horizontal_wrapped(|ui| {
+        ui.spacing_mut().item_spacing.x = 0.0;
+        for span in spans {
+            let color = span.fg_color.unwrap_or(default_color);
+            let mut rich_text = RichText::new(&span.text).color(color);
+
+            if span.bold {
+                rich_text = rich_text.strong();
+            }
+            if span.underline {
+                rich_text = rich_text.underline();
+            }
+            if span.italic {
+                rich_text = rich_text.italics();
+            }
+
+            // For background colors, we use a different approach
+            if let Some(bg) = span.bg_color {
+                rich_text = rich_text.background_color(bg);
+            }
+
+            ui.label(rich_text);
+        }
+    });
+}
 
 fn current_time_hhmm() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -156,6 +369,20 @@ impl Channel {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct ChannelListEntry {
+    pub name: String,
+    pub user_count: usize,
+    pub topic: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct TabCompletion {
+    pub prefix: String,
+    pub matches: Vec<String>,
+    pub index: usize,
+}
+
 pub struct IrcApp {
     // Connection state
     pub connected: bool,
@@ -176,6 +403,7 @@ pub struct IrcApp {
     pub channels: HashMap<String, Channel>,
     pub current_channel: Option<String>,
     pub server_messages: Vec<ChatMessage>,
+    pub server_unread: usize,
 
     // Input
     pub input_text: String,
@@ -189,6 +417,20 @@ pub struct IrcApp {
     pub show_settings: bool,
     pub scroll_to_bottom: bool,
     pub show_connect_dialog: bool,
+
+    // Command history
+    pub command_history: Vec<String>,
+    pub history_index: Option<usize>,
+    pub history_temp: String,
+
+    // Channel list popup
+    pub channel_list: Vec<ChannelListEntry>,
+    pub channel_list_loading: bool,
+    pub show_channel_list: bool,
+    pub channel_list_filter: String,
+
+    // Tab completion
+    pub tab_completion: Option<TabCompletion>,
 }
 
 impl Default for IrcApp {
@@ -210,6 +452,7 @@ impl Default for IrcApp {
             channels: HashMap::new(),
             current_channel: None,
             server_messages: Vec::new(),
+            server_unread: 0,
 
             input_text: String::new(),
             join_channel: String::new(),
@@ -220,6 +463,17 @@ impl Default for IrcApp {
             show_settings: false,
             scroll_to_bottom: true,
             show_connect_dialog: true,
+
+            command_history: Vec::new(),
+            history_index: None,
+            history_temp: String::new(),
+
+            channel_list: Vec::new(),
+            channel_list_loading: false,
+            show_channel_list: false,
+            channel_list_filter: String::new(),
+
+            tab_completion: None,
         }
     }
 }
@@ -284,7 +538,7 @@ impl IrcApp {
                 let chat_msg = ChatMessage::system(&format!("-{}- {}", sender, content));
 
                 if target == "*" || !self.connected {
-                    self.server_messages.push(chat_msg);
+                    self.add_server_message(chat_msg);
                 } else {
                     self.add_message_to_channel(target, chat_msg);
                 }
@@ -386,7 +640,7 @@ impl IrcApp {
             _ => {
                 // Log unknown messages
                 let sys_msg = ChatMessage::system(&msg.raw);
-                self.server_messages.push(sys_msg);
+                self.add_server_message(sys_msg);
             }
         }
 
@@ -403,7 +657,7 @@ impl IrcApp {
                     self.my_nick = nick.clone();
                 }
                 let msg = params.get(1).cloned().unwrap_or_else(|| "Welcome!".to_string());
-                self.server_messages.push(ChatMessage::system(&msg));
+                self.add_server_message(ChatMessage::system(&msg));
             }
 
             332 => {
@@ -440,7 +694,7 @@ impl IrcApp {
             372 | 375 | 376 => {
                 // MOTD
                 if let Some(text) = params.last() {
-                    self.server_messages.push(ChatMessage::system(text));
+                    self.add_server_message(ChatMessage::system(text));
                 }
             }
 
@@ -451,13 +705,38 @@ impl IrcApp {
                 if let Some(tx) = &self.cmd_tx {
                     let _ = tx.try_send(IrcCommand::Nick(new_nick));
                 }
-                self.server_messages.push(ChatMessage::system("Nickname in use, trying alternative..."));
+                self.add_server_message(ChatMessage::system("Nickname in use, trying alternative..."));
+            }
+
+            321 => {
+                // RPL_LISTSTART - clear old list, start collecting
+                self.channel_list.clear();
+                self.channel_list_loading = true;
+                self.show_channel_list = true;
+            }
+
+            322 => {
+                // RPL_LIST - params: [client, channel, visible_count, topic]
+                if let (Some(channel), Some(count_str)) = (params.get(1), params.get(2)) {
+                    let user_count = count_str.parse().unwrap_or(0);
+                    let topic = params.get(3).cloned().unwrap_or_default();
+                    self.channel_list.push(ChannelListEntry {
+                        name: channel.clone(),
+                        user_count,
+                        topic,
+                    });
+                }
+            }
+
+            323 => {
+                // RPL_LISTEND
+                self.channel_list_loading = false;
             }
 
             _ => {
                 // Show other numerics in server buffer
                 let text = params.join(" ");
-                self.server_messages.push(ChatMessage::system(&format!("[{}] {}", num, text)));
+                self.add_server_message(ChatMessage::system(&format!("[{}] {}", num, text)));
             }
         }
     }
@@ -474,6 +753,14 @@ impl IrcApp {
         }
     }
 
+    fn add_server_message(&mut self, msg: ChatMessage) {
+        self.server_messages.push(msg);
+        // Increment unread if not viewing server buffer
+        if self.current_channel.is_some() {
+            self.server_unread += 1;
+        }
+    }
+
     pub fn send_command(&mut self, cmd: IrcCommand) {
         if let Some(tx) = &self.cmd_tx {
             let _ = tx.try_send(cmd);
@@ -485,6 +772,18 @@ impl IrcApp {
         if input.is_empty() {
             return;
         }
+
+        // Save to history (avoid duplicates of last entry)
+        if self.command_history.last() != Some(&input) {
+            self.command_history.push(input.clone());
+            if self.command_history.len() > 100 {
+                self.command_history.remove(0);
+            }
+        }
+
+        // Reset history browsing state
+        self.history_index = None;
+        self.history_temp.clear();
 
         self.input_text.clear();
 
@@ -627,14 +926,112 @@ impl IrcApp {
                     "/raw <command> - Send raw IRC command",
                 ];
                 for msg in help_msgs {
-                    self.server_messages.push(ChatMessage::system(msg));
+                    self.add_server_message(ChatMessage::system(msg));
                 }
             }
 
             _ => {
-                self.server_messages.push(ChatMessage::system(&format!("Unknown command: {}", cmd)));
+                self.add_server_message(ChatMessage::system(&format!("Unknown command: {}", cmd)));
             }
         }
+    }
+
+    fn history_up(&mut self) {
+        if self.command_history.is_empty() {
+            return;
+        }
+
+        match self.history_index {
+            None => {
+                // Start browsing - save current input
+                self.history_temp = self.input_text.clone();
+                self.history_index = Some(self.command_history.len() - 1);
+                self.input_text = self.command_history.last().unwrap().clone();
+            }
+            Some(i) if i > 0 => {
+                self.history_index = Some(i - 1);
+                self.input_text = self.command_history[i - 1].clone();
+            }
+            _ => {} // At beginning, do nothing
+        }
+    }
+
+    fn history_down(&mut self) {
+        match self.history_index {
+            Some(i) => {
+                if i + 1 < self.command_history.len() {
+                    self.history_index = Some(i + 1);
+                    self.input_text = self.command_history[i + 1].clone();
+                } else {
+                    // Past end of history - restore temp
+                    self.history_index = None;
+                    self.input_text = self.history_temp.clone();
+                    self.history_temp.clear();
+                }
+            }
+            None => {} // Not browsing, do nothing
+        }
+    }
+
+    fn find_nick_completions(&self, prefix: &str) -> Vec<String> {
+        if let Some(channel_name) = &self.current_channel {
+            if let Some(channel) = self.channels.get(channel_name) {
+                let prefix_lower = prefix.to_lowercase();
+                let mut matches: Vec<_> = channel
+                    .users
+                    .iter()
+                    .filter(|(nick, _)| nick.to_lowercase().starts_with(&prefix_lower))
+                    .map(|(nick, _)| nick.clone())
+                    .collect();
+                matches.sort_by(|a, b| a.to_lowercase().cmp(&b.to_lowercase()));
+                return matches;
+            }
+        }
+        Vec::new()
+    }
+
+    fn handle_tab_completion(&mut self) {
+        // Find the word being typed at the end of input
+        let input = self.input_text.clone();
+        let last_space = input.rfind(' ').map(|i| i + 1).unwrap_or(0);
+        let prefix = input[last_space..].to_string();
+
+        if prefix.is_empty() {
+            return;
+        }
+
+        if let Some(ref mut completion) = self.tab_completion {
+            // Already completing - check if prefix still matches
+            if completion.prefix == prefix && !completion.matches.is_empty() {
+                // Cycle to next match
+                completion.index = (completion.index + 1) % completion.matches.len();
+                let nick = completion.matches[completion.index].clone();
+                // Replace the prefix with the nick
+                let suffix = if last_space == 0 { ": " } else { " " };
+                self.input_text = format!("{}{}{}", &input[..last_space], nick, suffix);
+            } else {
+                // Prefix changed, start fresh
+                self.tab_completion = None;
+                self.handle_tab_completion();
+            }
+        } else {
+            // Start new completion
+            let matches = self.find_nick_completions(&prefix);
+            if !matches.is_empty() {
+                let nick = matches[0].clone();
+                let suffix = if last_space == 0 { ": " } else { " " };
+                self.input_text = format!("{}{}{}", &input[..last_space], nick, suffix);
+                self.tab_completion = Some(TabCompletion {
+                    prefix,
+                    matches,
+                    index: 0,
+                });
+            }
+        }
+    }
+
+    fn reset_tab_completion(&mut self) {
+        self.tab_completion = None;
     }
 }
 
@@ -661,6 +1058,11 @@ impl eframe::App for IrcApp {
         // Settings dialog
         if self.show_settings {
             self.show_settings_window(ctx);
+        }
+
+        // Channel list dialog
+        if self.show_channel_list {
+            self.show_channel_list_window(ctx);
         }
 
         // Top panel - toolbar
@@ -709,10 +1111,22 @@ impl eframe::App for IrcApp {
                 ui.heading("Channels");
                 ui.separator();
 
-                // Server buffer
+                // Server buffer with unread notification
                 let server_selected = self.current_channel.is_none();
-                if ui.selectable_label(server_selected, "Server").clicked() {
+                let server_label = if self.server_unread > 0 {
+                    format!("Server ({})", self.server_unread)
+                } else {
+                    "Server".to_string()
+                };
+                let server_text = if self.server_unread > 0 {
+                    // Yellow for server notifications
+                    RichText::new(server_label).strong().color(Color32::from_rgb(255, 255, 100))
+                } else {
+                    RichText::new(server_label)
+                };
+                if ui.selectable_label(server_selected, server_text).clicked() {
                     self.current_channel = None;
+                    self.server_unread = 0;
                 }
 
                 ui.separator();
@@ -743,11 +1157,14 @@ impl eframe::App for IrcApp {
                 }
 
                 // Channel list
+                let mut part_channel: Option<String> = None;
+                let mut close_query: Option<String> = None;
                 ScrollArea::vertical().show(ui, |ui| {
                     let channels: Vec<_> = self.channels.keys().cloned().collect();
                     for channel_name in channels {
                         let is_selected = self.current_channel.as_ref() == Some(&channel_name);
                         let unread = self.channels.get(&channel_name).map(|c| c.unread).unwrap_or(0);
+                        let is_pm = !channel_name.starts_with('#') && !channel_name.starts_with('&');
 
                         let label = if unread > 0 {
                             format!("{} ({})", channel_name, unread)
@@ -755,30 +1172,75 @@ impl eframe::App for IrcApp {
                             channel_name.clone()
                         };
 
+                        // Color based on type and unread status
                         let text = if unread > 0 {
-                            RichText::new(label).strong()
+                            if is_pm {
+                                // PM with unread - orange/red for attention
+                                RichText::new(label).strong().color(Color32::from_rgb(255, 150, 50))
+                            } else {
+                                // Channel with unread - light green
+                                RichText::new(label).strong().color(Color32::from_rgb(100, 255, 100))
+                            }
+                        } else if is_pm {
+                            // PM without unread - light blue to distinguish from channels
+                            RichText::new(label).color(Color32::from_rgb(150, 200, 255))
                         } else {
                             RichText::new(label)
                         };
 
-                        if ui.selectable_label(is_selected, text).clicked() {
+                        let response = ui.selectable_label(is_selected, text);
+                        if response.clicked() {
                             self.current_channel = Some(channel_name.clone());
                             if let Some(ch) = self.channels.get_mut(&channel_name) {
                                 ch.unread = 0;
                             }
                         }
+
+                        // Context menu for channels
+                        let chan_for_menu = channel_name.clone();
+                        response.context_menu(|ui| {
+                            if chan_for_menu.starts_with('#') || chan_for_menu.starts_with('&') {
+                                if ui.button("Part Channel").clicked() {
+                                    part_channel = Some(chan_for_menu.clone());
+                                    ui.close();
+                                }
+                            } else {
+                                // Query window (private message)
+                                if ui.button("Close").clicked() {
+                                    close_query = Some(chan_for_menu.clone());
+                                    ui.close();
+                                }
+                            }
+                        });
                     }
                 });
+
+                // Handle channel context menu actions
+                if let Some(channel) = part_channel {
+                    self.send_command(IrcCommand::Part(channel, None));
+                }
+                if let Some(query) = close_query {
+                    self.channels.remove(&query);
+                    if self.current_channel.as_ref() == Some(&query) {
+                        self.current_channel = self.channels.keys().next().cloned();
+                    }
+                }
             });
 
         // Right panel - user list (only for channels)
+        let mut pm_to_open: Option<String> = None;
+        let mut whois_nick: Option<String> = None;
+        let mut op_nick: Option<(String, String)> = None;  // (channel, nick)
+        let mut voice_nick: Option<(String, String)> = None;
+        let mut kick_nick: Option<(String, String)> = None;
         if let Some(channel_name) = &self.current_channel {
             if channel_name.starts_with('#') || channel_name.starts_with('&') {
+                let chan_for_context = channel_name.clone();
                 egui::SidePanel::right("users")
                     .resizable(true)
                     .default_width(140.0)
                     .show(ctx, |ui| {
-                        if let Some(channel) = self.channels.get(channel_name) {
+                        if let Some(channel) = self.channels.get(&chan_for_context) {
                             ui.heading(format!("Users ({})", channel.users.len()));
                             ui.separator();
                             ScrollArea::vertical().show(ui, |ui| {
@@ -792,7 +1254,41 @@ impl eframe::App for IrcApp {
                                         UserMode::Voice => Color32::from_rgb(200, 200, 100),
                                         UserMode::Normal => Color32::WHITE,
                                     };
-                                    ui.label(RichText::new(format!("{}{}", prefix, nick)).color(color));
+                                    let response = ui.add(
+                                        Label::new(RichText::new(format!("{}{}", prefix, nick)).color(color))
+                                            .sense(Sense::click())
+                                    );
+                                    if response.double_clicked() {
+                                        pm_to_open = Some(nick.clone());
+                                    }
+
+                                    // Context menu for user
+                                    let nick_clone = nick.clone();
+                                    let chan_clone = chan_for_context.clone();
+                                    response.context_menu(|ui| {
+                                        if ui.button("Private Message").clicked() {
+                                            pm_to_open = Some(nick_clone.clone());
+                                            ui.close();
+                                        }
+                                        if ui.button("WHOIS").clicked() {
+                                            whois_nick = Some(nick_clone.clone());
+                                            ui.close();
+                                        }
+                                        ui.separator();
+                                        if ui.button("Op (+o)").clicked() {
+                                            op_nick = Some((chan_clone.clone(), nick_clone.clone()));
+                                            ui.close();
+                                        }
+                                        if ui.button("Voice (+v)").clicked() {
+                                            voice_nick = Some((chan_clone.clone(), nick_clone.clone()));
+                                            ui.close();
+                                        }
+                                        ui.separator();
+                                        if ui.button("Kick").clicked() {
+                                            kick_nick = Some((chan_clone.clone(), nick_clone.clone()));
+                                            ui.close();
+                                        }
+                                    });
                                 }
                             });
                         }
@@ -800,15 +1296,36 @@ impl eframe::App for IrcApp {
             }
         }
 
+        // Handle user list actions
+        if let Some(nick) = pm_to_open {
+            // Create query window if it doesn't exist
+            if !self.channels.contains_key(&nick) {
+                self.channels.insert(nick.clone(), Channel::new());
+            }
+            self.current_channel = Some(nick);
+        }
+        if let Some(nick) = whois_nick {
+            self.send_command(IrcCommand::Whois(nick));
+        }
+        if let Some((channel, nick)) = op_nick {
+            self.send_command(IrcCommand::Mode(channel, Some("+o".to_string()), Some(nick)));
+        }
+        if let Some((channel, nick)) = voice_nick {
+            self.send_command(IrcCommand::Mode(channel, Some("+v".to_string()), Some(nick)));
+        }
+        if let Some((channel, nick)) = kick_nick {
+            self.send_command(IrcCommand::Kick(channel, nick, None));
+        }
+
         // Central panel - chat area
         egui::CentralPanel::default().show(ctx, |ui| {
-            // Topic bar
+            // Topic bar (with IRC color support)
             if let Some(channel_name) = &self.current_channel {
                 if let Some(channel) = self.channels.get(channel_name) {
                     if let Some(topic) = &channel.topic {
                         ui.horizontal(|ui| {
                             ui.label(RichText::new("Topic:").strong());
-                            ui.label(topic);
+                            render_irc_text(ui, topic, Color32::WHITE);
                         });
                         ui.separator();
                     }
@@ -838,14 +1355,18 @@ impl eframe::App for IrcApp {
                                 );
 
                                 if msg.is_system {
-                                    ui.label(RichText::new(&msg.content).color(Color32::GRAY).italics());
+                                    // System messages with IRC color support
+                                    render_irc_text(ui, &msg.content, Color32::GRAY);
                                 } else if msg.is_action {
-                                    ui.label(RichText::new(format!("* {} {}", msg.sender, msg.content))
+                                    // Action messages with IRC color support
+                                    ui.label(RichText::new(format!("* {} ", msg.sender))
                                         .color(Color32::from_rgb(150, 100, 200)));
+                                    render_irc_text(ui, &msg.content, Color32::from_rgb(150, 100, 200));
                                 } else {
+                                    // Regular messages with IRC color support
                                     ui.label(RichText::new(format!("<{}>", msg.sender))
                                         .color(nick_color(&msg.sender)));
-                                    ui.label(&msg.content);
+                                    render_irc_text(ui, &msg.content, Color32::WHITE);
                                 }
                             });
                         }
@@ -854,6 +1375,10 @@ impl eframe::App for IrcApp {
 
             // Input area
             ui.separator();
+            let mut history_up = false;
+            let mut history_down = false;
+            let mut tab_complete = false;
+            let input_before = self.input_text.clone();
             ui.horizontal(|ui| {
                 let response = ui.add(
                     TextEdit::singleline(&mut self.input_text)
@@ -866,10 +1391,39 @@ impl eframe::App for IrcApp {
                     response.request_focus();
                 }
 
+                // Check for history navigation and tab completion while input has focus
+                if response.has_focus() {
+                    if ui.input(|i| i.key_pressed(egui::Key::ArrowUp)) {
+                        history_up = true;
+                    }
+                    if ui.input(|i| i.key_pressed(egui::Key::ArrowDown)) {
+                        history_down = true;
+                    }
+                    if ui.input(|i| i.key_pressed(egui::Key::Tab)) {
+                        tab_complete = true;
+                    }
+                }
+
                 if ui.button("Send").clicked() {
                     self.process_input();
                 }
             });
+
+            // Handle history navigation outside the closure
+            if history_up {
+                self.history_up();
+            }
+            if history_down {
+                self.history_down();
+            }
+
+            // Handle tab completion
+            if tab_complete {
+                self.handle_tab_completion();
+            } else if self.input_text != input_before {
+                // Reset tab completion if input changed (not by Tab)
+                self.reset_tab_completion();
+            }
         });
     }
 }
@@ -990,6 +1544,92 @@ impl IrcApp {
                     self.show_settings = false;
                 }
             });
+    }
+
+    fn show_channel_list_window(&mut self, ctx: &egui::Context) {
+        let mut close = false;
+        let mut join_channel: Option<String> = None;
+
+        egui::Window::new("Channel List")
+            .resizable(true)
+            .default_size([600.0, 400.0])
+            .show(ctx, |ui| {
+                // Filter input and status
+                ui.horizontal(|ui| {
+                    ui.label("Filter:");
+                    ui.add(TextEdit::singleline(&mut self.channel_list_filter).desired_width(200.0));
+                    ui.label(format!("{} channels", self.channel_list.len()));
+                    if self.channel_list_loading {
+                        ui.spinner();
+                    }
+                });
+                ui.separator();
+
+                // Table header
+                egui::Grid::new("channel_list_header")
+                    .num_columns(3)
+                    .spacing([20.0, 4.0])
+                    .show(ui, |ui| {
+                        ui.label(RichText::new("Channel").strong());
+                        ui.label(RichText::new("Users").strong());
+                        ui.label(RichText::new("Topic").strong());
+                        ui.end_row();
+                    });
+                ui.separator();
+
+                // Scrollable channel list
+                ScrollArea::vertical()
+                    .max_height(300.0)
+                    .show(ui, |ui| {
+                        let filter = self.channel_list_filter.to_lowercase();
+                        for entry in &self.channel_list {
+                            // Filter by channel name or topic
+                            if !filter.is_empty()
+                                && !entry.name.to_lowercase().contains(&filter)
+                                && !entry.topic.to_lowercase().contains(&filter)
+                            {
+                                continue;
+                            }
+
+                            let response = ui.horizontal(|ui| {
+                                ui.set_min_width(580.0);
+                                ui.label(RichText::new(&entry.name).color(Color32::LIGHT_BLUE));
+                                ui.add_space(20.0);
+                                ui.label(entry.user_count.to_string());
+                                ui.add_space(20.0);
+                                // Truncate long topics
+                                let topic_display = if entry.topic.len() > 60 {
+                                    format!("{}...", &entry.topic[..60])
+                                } else {
+                                    entry.topic.clone()
+                                };
+                                ui.label(RichText::new(topic_display).color(Color32::GRAY));
+                            }).response;
+
+                            if response.double_clicked() {
+                                join_channel = Some(entry.name.clone());
+                            }
+                        }
+                    });
+
+                ui.separator();
+                ui.horizontal(|ui| {
+                    if ui.button("Close").clicked() {
+                        close = true;
+                    }
+                    if ui.button("Refresh").clicked() {
+                        self.send_command(IrcCommand::List(None));
+                    }
+                });
+            });
+
+        if close {
+            self.show_channel_list = false;
+        }
+        if let Some(channel) = join_channel {
+            self.send_command(IrcCommand::Join(channel));
+            self.show_channel_list = false;
+        }
     }
 }
 

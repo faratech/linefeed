@@ -4,56 +4,71 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-fmIRC is a cross-platform IRC client written in Rust using egui/eframe for the GUI. It supports Windows (ARM64, x86) and Linux with TLS encryption.
+fmIRC is a cross-platform IRC client written in Rust using egui/eframe for the GUI. It supports Windows (ARM64, x86) and Linux with TLS encryption via native-tls (SChannel on Windows, OpenSSL on Linux).
 
 ## Build Commands
 
 ```bash
-# Build all platforms (Linux, Windows ARM64, Windows x86)
+# Full distribution build (all platforms + UPX compression)
 ./build.sh
 
-# Build single platform
-cargo build --release                                    # Linux native
-cargo build --release --target aarch64-pc-windows-gnullvm  # Windows ARM64
-cargo build --release --target i686-pc-windows-gnullvm     # Windows x86
+# Development builds (fast, ~7s incremental)
+cargo build                              # Linux debug
+cargo build --release                    # Linux release (thin LTO)
 
-# Run (Linux with display)
-./target/release/fmirc
+# Distribution builds (slow, smallest binaries)
+cargo build --profile dist               # Linux
+cargo build --profile dist --target aarch64-pc-windows-gnullvm  # Windows ARM64
+cargo build --profile dist --target i686-pc-windows-gnullvm     # Windows x86
 ```
 
-Output binaries go to `./dist/`.
+Output binaries: `./dist/` (from build.sh) or `./target/<profile>/` (from cargo).
 
-## Cross-Compilation Requirements
+## Build Profiles
 
-Windows cross-compilation requires llvm-mingw toolchain at `/root/toolchains/llvm-mingw/`. The `.cargo/config.toml` configures linkers and static CRT linking for standalone executables.
+- `dev`: Fast incremental builds, no optimization
+- `release`: Thin LTO, parallel codegen - balance of speed and size
+- `dist`: Full LTO, single codegen unit - smallest binaries, slowest build
+
+## Tools
+
+- `tools/update-deps.py`: Automatically updates Cargo.toml dependencies to latest versions
+  - `--check`: Show outdated deps without modifying
+  - `--pin`: Update and pin exact versions
+  - `--dry-run`: Show changes without writing
+- `tools/gen-icon.py`: Converts `assets/fmirc.png` to raw RGBA in `src/icon_data.rs`
+
+## Cross-Compilation
+
+Windows cross-compilation requires llvm-mingw toolchain at `/root/toolchains/llvm-mingw/`. The `.cargo/config.toml` configures linkers and static CRT linking.
 
 ## Architecture
 
 ```
 src/
-├── main.rs      # Application entry, eframe setup, icon loading, connection management
+├── main.rs          # Entry point, FmIrcApp wrapper, connection thread spawning
+├── icon_data.rs     # Generated: embedded icon as raw RGBA bytes
 ├── gui/
-│   └── mod.rs   # IrcApp struct, egui UI (panels, dialogs, message display, user list)
+│   └── mod.rs       # IrcApp: UI state, egui rendering, message handling
 └── irc/
-    ├── mod.rs      # Module exports
-    ├── client.rs   # IrcClient: TCP/TLS connection, read/write loops, PING handling
-    └── message.rs  # IrcCommand enum, IrcMessage parsing, IRC protocol formatting
+    ├── mod.rs       # Re-exports
+    ├── client.rs    # IrcClient: async TCP/TLS connection, read/write loops
+    └── message.rs   # IrcCommand enum, IrcMessage parsing, IRC protocol
 ```
 
 **Key types:**
-- `IrcApp` (gui): Main application state, channels, UI rendering
-- `IrcClient` (irc/client): Async connection handler using tokio
-- `IrcCommand` (irc/message): Enum for all IRC commands with Display impl for wire format
-- `IrcMessage` (irc/message): Parsed incoming message with prefix, command, tags
-- `Channel` (gui): Channel state with users (nick + mode prefix), messages, topic
-- `UserMode` (gui): Op/voice/etc modes with prefix characters (@, +, %, etc.)
+- `FmIrcApp` (main.rs): eframe::App wrapper that owns IrcApp and connection thread
+- `IrcApp` (gui): UI state, channel data, processes incoming messages and user input
+- `IrcClient` (irc/client): Async connection using tokio, handles TLS via native-tls
+- `IrcCommand` (irc/message): Enum for IRC commands, implements Display for wire format
+- `IrcMessage` (irc/message): Parsed incoming message with tags, prefix, command
+- `Channel` (gui): Channel state with sorted user list (by mode), messages, topic
+- `UserMode` (gui): Op/voice/etc modes (~, &, @, %, +) with ordering for user list
 
-**Communication flow:**
-1. `FmIrcApp` spawns connection thread with tokio runtime
-2. `IrcClient::connect()` establishes TCP/TLS connection
-3. Two mpsc channels: `cmd_tx` (GUI→client for outgoing), `msg_rx` (client→GUI for incoming)
-4. Client handles PING/PONG automatically; all other messages sent to GUI
+**Threading model:**
+1. Main thread runs egui event loop via `FmIrcApp::update()`
+2. Connection thread spawns with single-threaded tokio runtime
+3. Two mpsc channels bridge threads: `cmd_tx` (GUI→IRC), `msg_rx` (IRC→GUI)
+4. IrcClient automatically handles PING/PONG; all messages forwarded to GUI
 
-## Windows Resource Embedding
-
-`build.rs` manually invokes windres to embed the application icon for Windows Explorer display. Icon source: `assets/fmirc.ico`.
+**build.rs:** Compiles Windows resources (icon, version info) using target-specific windres from llvm-mingw toolchain.
