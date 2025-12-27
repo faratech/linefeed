@@ -1,15 +1,18 @@
 mod helpers;
 mod formatting;
+mod dialogs;
+mod commands;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use egui::{Color32, RichText, ScrollArea, TextEdit, Vec2};
+use egui::{Color32, RichText, ScrollArea, TextEdit};
 use tokio::sync::mpsc;
 use serde::{Deserialize, Serialize};
 
 use crate::irc::{IrcCommand, IrcMessage};
 use crate::irc::client::ServerConfig;
-use helpers::{is_channel, nick_to_mask, current_time_hhmm, mask_matches};
+use crate::irc::numerics::*;
+use helpers::{is_channel, current_time_hhmm, mask_matches};
 use formatting::{render_irc_text, nick_color};
 
 // Server favorite for quick connect
@@ -854,8 +857,7 @@ impl IrcApp {
 
     fn handle_numeric(&mut self, num: u16, params: &[String]) {
         match num {
-            1 => {
-                // RPL_WELCOME
+            RPL_WELCOME => {
                 self.connected = true;
                 self.connecting = false;
                 self.reset_reconnect_state(); // Reset reconnect attempts on successful connection
@@ -903,8 +905,7 @@ impl IrcApp {
                 }
             }
 
-            332 => {
-                // RPL_TOPIC
+            RPL_TOPIC => {
                 if let (Some(channel), Some(topic)) = (params.get(1), params.get(2)) {
                     if let Some(ch) = self.channels.get_mut(channel) {
                         ch.topic = Some(topic.clone());
@@ -913,8 +914,7 @@ impl IrcApp {
                 }
             }
 
-            353 => {
-                // RPL_NAMREPLY
+            RPL_NAMREPLY => {
                 if let Some(channel) = params.get(2) {
                     if let Some(names) = params.get(3) {
                         if let Some(ch) = self.channels.get_mut(channel) {
@@ -930,19 +930,16 @@ impl IrcApp {
                 }
             }
 
-            366 => {
-                // RPL_ENDOFNAMES
+            RPL_ENDOFNAMES => {
             }
 
-            372 | 375 | 376 => {
-                // MOTD
+            RPL_MOTD | RPL_MOTDSTART | RPL_ENDOFMOTD => {
                 if let Some(text) = params.last() {
                     self.add_server_message(ChatMessage::system(text));
                 }
             }
 
-            433 => {
-                // ERR_NICKNAMEINUSE
+            ERR_NICKNAMEINUSE => {
                 let new_nick = format!("{}_", self.my_nick);
                 self.my_nick = new_nick.clone();
                 if let Some(tx) = &self.cmd_tx {
@@ -951,15 +948,15 @@ impl IrcApp {
                 self.add_server_message(ChatMessage::system("Nickname in use, trying alternative..."));
             }
 
-            321 => {
-                // RPL_LISTSTART - clear old list, start collecting
+            RPL_LISTSTART => {
+                // Clear old list, start collecting
                 self.channel_list.clear();
                 self.channel_list_loading = true;
                 self.show_channel_list = true;
             }
 
-            322 => {
-                // RPL_LIST - params: [client, channel, visible_count, topic]
+            RPL_LIST => {
+                // params: [client, channel, visible_count, topic]
                 if let (Some(channel), Some(count_str)) = (params.get(1), params.get(2)) {
                     let user_count = count_str.parse().unwrap_or(0);
                     let topic = params.get(3).cloned().unwrap_or_default();
@@ -971,28 +968,25 @@ impl IrcApp {
                 }
             }
 
-            323 => {
-                // RPL_LISTEND
+            RPL_LISTEND => {
                 self.channel_list_loading = false;
             }
 
-            305 => {
-                // RPL_UNAWAY - You are no longer marked as being away
+            RPL_UNAWAY => {
                 if let Some(text) = params.get(1) {
                     self.add_server_message(ChatMessage::system(text));
                 }
             }
 
-            306 => {
-                // RPL_NOWAWAY - You have been marked as being away
+            RPL_NOWAWAY => {
                 if let Some(text) = params.get(1) {
                     self.add_server_message(ChatMessage::system(text));
                 }
             }
 
-            // WHOIS responses - route to current window
-            311 => {
-                // RPL_WHOISUSER: <nick> <user> <host> * :<realname>
+            // WHOIS responses
+            RPL_WHOISUSER => {
+                // <nick> <user> <host> * :<realname>
                 if let (Some(nick), Some(user), Some(host)) = (params.get(1), params.get(2), params.get(3)) {
                     let realname = params.get(5).cloned().unwrap_or_default();
                     self.add_message_to_current(ChatMessage::system(
@@ -1001,8 +995,8 @@ impl IrcApp {
                 }
             }
 
-            312 => {
-                // RPL_WHOISSERVER: <nick> <server> :<serverinfo>
+            RPL_WHOISSERVER => {
+                // <nick> <server> :<serverinfo>
                 if let (Some(nick), Some(server)) = (params.get(1), params.get(2)) {
                     let info = params.get(3).cloned().unwrap_or_default();
                     self.add_message_to_current(ChatMessage::system(
@@ -1011,8 +1005,7 @@ impl IrcApp {
                 }
             }
 
-            313 => {
-                // RPL_WHOISOPERATOR: <nick> :is an IRC operator
+            RPL_WHOISOPERATOR => {
                 if let Some(nick) = params.get(1) {
                     self.add_message_to_current(ChatMessage::system(
                         &format!("[WHOIS] {} is an IRC operator", nick)
@@ -1020,8 +1013,8 @@ impl IrcApp {
                 }
             }
 
-            317 => {
-                // RPL_WHOISIDLE: <nick> <seconds> <signon> :seconds idle, signon time
+            RPL_WHOISIDLE => {
+                // <nick> <seconds> <signon> :seconds idle, signon time
                 if let (Some(nick), Some(idle_secs)) = (params.get(1), params.get(2)) {
                     let idle: u64 = idle_secs.parse().unwrap_or(0);
                     let idle_str = if idle >= 3600 {
@@ -1037,8 +1030,7 @@ impl IrcApp {
                 }
             }
 
-            318 => {
-                // RPL_ENDOFWHOIS: <nick> :End of /WHOIS list
+            RPL_ENDOFWHOIS => {
                 if let Some(nick) = params.get(1) {
                     self.add_message_to_current(ChatMessage::system(
                         &format!("[WHOIS] End of WHOIS for {}", nick)
@@ -1046,8 +1038,7 @@ impl IrcApp {
                 }
             }
 
-            319 => {
-                // RPL_WHOISCHANNELS: <nick> :<channels>
+            RPL_WHOISCHANNELS => {
                 if let (Some(nick), Some(channels)) = (params.get(1), params.get(2)) {
                     self.add_message_to_current(ChatMessage::system(
                         &format!("[WHOIS] {} is on: {}", nick, channels)
@@ -1055,8 +1046,7 @@ impl IrcApp {
                 }
             }
 
-            330 => {
-                // RPL_WHOISACCOUNT: <nick> <account> :is logged in as
+            RPL_WHOISACCOUNT => {
                 if let (Some(nick), Some(account)) = (params.get(1), params.get(2)) {
                     self.add_message_to_current(ChatMessage::system(
                         &format!("[WHOIS] {} is logged in as {}", nick, account)
@@ -1064,8 +1054,7 @@ impl IrcApp {
                 }
             }
 
-            338 => {
-                // RPL_WHOISACTUALLY: <nick> <user@host> <ip> :actually using host
+            RPL_WHOISACTUALLY => {
                 if let (Some(nick), Some(host)) = (params.get(1), params.get(2)) {
                     let ip = params.get(3).cloned().unwrap_or_default();
                     self.add_message_to_current(ChatMessage::system(
@@ -1074,8 +1063,7 @@ impl IrcApp {
                 }
             }
 
-            671 => {
-                // RPL_WHOISSECURE: <nick> :is using a secure connection
+            RPL_WHOISSECURE => {
                 if let Some(nick) = params.get(1) {
                     self.add_message_to_current(ChatMessage::system(
                         &format!("[WHOIS] {} is using a secure connection", nick)
@@ -1083,9 +1071,9 @@ impl IrcApp {
                 }
             }
 
-            // WHO responses - route to current window
-            352 => {
-                // RPL_WHOREPLY: <channel> <user> <host> <server> <nick> <H|G>[*][@|+] :<hopcount> <realname>
+            // WHO responses
+            RPL_WHOREPLY => {
+                // <channel> <user> <host> <server> <nick> <H|G>[*][@|+] :<hopcount> <realname>
                 if let (Some(channel), Some(user), Some(host), Some(_server), Some(nick), Some(flags)) =
                     (params.get(1), params.get(2), params.get(3), params.get(4), params.get(5), params.get(6))
                 {
@@ -1097,14 +1085,12 @@ impl IrcApp {
                 }
             }
 
-            315 => {
-                // RPL_ENDOFWHO: <name> :End of /WHO list
+            RPL_ENDOFWHO => {
                 self.add_message_to_current(ChatMessage::system("[WHO] End of WHO list"));
             }
 
-            // Error numerics - route to current window
-            401 => {
-                // ERR_NOSUCHNICK: <nick> :No such nick/channel
+            // Error numerics
+            ERR_NOSUCHNICK => {
                 if let Some(nick) = params.get(1) {
                     self.add_message_to_current(ChatMessage::system(
                         &format!("No such nick/channel: {}", nick)
@@ -1112,8 +1098,7 @@ impl IrcApp {
                 }
             }
 
-            403 => {
-                // ERR_NOSUCHCHANNEL: <channel> :No such channel
+            ERR_NOSUCHCHANNEL => {
                 if let Some(channel) = params.get(1) {
                     self.add_message_to_current(ChatMessage::system(
                         &format!("No such channel: {}", channel)
@@ -1121,8 +1106,7 @@ impl IrcApp {
                 }
             }
 
-            404 => {
-                // ERR_CANNOTSENDTOCHAN: <channel> :Cannot send to channel
+            ERR_CANNOTSENDTOCHAN => {
                 if let Some(channel) = params.get(1) {
                     self.add_message_to_current(ChatMessage::system(
                         &format!("Cannot send to channel: {}", channel)
@@ -1130,8 +1114,7 @@ impl IrcApp {
                 }
             }
 
-            442 => {
-                // ERR_NOTONCHANNEL: <channel> :You're not on that channel
+            ERR_NOTONCHANNEL => {
                 if let Some(channel) = params.get(1) {
                     self.add_message_to_current(ChatMessage::system(
                         &format!("You're not on that channel: {}", channel)
@@ -1139,8 +1122,7 @@ impl IrcApp {
                 }
             }
 
-            473 => {
-                // ERR_INVITEONLYCHAN: <channel> :Cannot join channel (+i)
+            ERR_INVITEONLYCHAN => {
                 if let Some(channel) = params.get(1) {
                     self.add_message_to_current(ChatMessage::system(
                         &format!("Cannot join {} (invite only)", channel)
@@ -1148,8 +1130,7 @@ impl IrcApp {
                 }
             }
 
-            474 => {
-                // ERR_BANNEDFROMCHAN: <channel> :Cannot join channel (+b)
+            ERR_BANNEDFROMCHAN => {
                 if let Some(channel) = params.get(1) {
                     self.add_message_to_current(ChatMessage::system(
                         &format!("Cannot join {} (banned)", channel)
@@ -1157,8 +1138,7 @@ impl IrcApp {
                 }
             }
 
-            475 => {
-                // ERR_BADCHANNELKEY: <channel> :Cannot join channel (+k)
+            ERR_BADCHANNELKEY => {
                 if let Some(channel) = params.get(1) {
                     self.add_message_to_current(ChatMessage::system(
                         &format!("Cannot join {} (bad key)", channel)
@@ -1238,825 +1218,6 @@ impl IrcApp {
             let msg = ChatMessage::new(&self.my_nick, &input);
             self.add_message_to_channel(channel, msg);
             self.send_command(IrcCommand::Privmsg(channel.clone(), input));
-        }
-    }
-
-    fn process_command(&mut self, input: &str) {
-        let parts: Vec<&str> = input[1..].splitn(2, ' ').collect();
-        let cmd = parts[0].to_uppercase();
-        let args = parts.get(1).copied().unwrap_or("");
-
-        match cmd.as_str() {
-            "JOIN" | "J" => {
-                let channel = if args.starts_with('#') {
-                    args.to_string()
-                } else {
-                    format!("#{}", args)
-                };
-                self.send_command(IrcCommand::Join(channel));
-            }
-
-            "PART" | "LEAVE" => {
-                let channel = if args.is_empty() {
-                    self.current_channel.clone()
-                } else {
-                    Some(args.to_string())
-                };
-                if let Some(ch) = channel {
-                    self.send_command(IrcCommand::Part(ch, None));
-                }
-            }
-
-            "MSG" | "PRIVMSG" | "QUERY" => {
-                let msg_parts: Vec<&str> = args.splitn(2, ' ').collect();
-                if let (Some(target), Some(message)) = (msg_parts.get(0), msg_parts.get(1)) {
-                    self.send_command(IrcCommand::Privmsg(target.to_string(), message.to_string()));
-                    let chat_msg = ChatMessage::new(&self.my_nick, message);
-                    self.add_message_to_channel(target, chat_msg);
-                }
-            }
-
-            "ME" => {
-                if let Some(channel) = &self.current_channel.clone() {
-                    let action = format!("\x01ACTION {}\x01", args);
-                    self.send_command(IrcCommand::Privmsg(channel.clone(), action));
-                    let msg = ChatMessage::action(&self.my_nick, args);
-                    self.add_message_to_channel(channel, msg);
-                }
-            }
-
-            "NICK" => {
-                self.send_command(IrcCommand::Nick(args.to_string()));
-            }
-
-            "TOPIC" => {
-                if let Some(channel) = &self.current_channel.clone() {
-                    if args.is_empty() {
-                        self.send_command(IrcCommand::Topic(channel.clone(), None));
-                    } else {
-                        self.send_command(IrcCommand::Topic(channel.clone(), Some(args.to_string())));
-                    }
-                }
-            }
-
-            "QUIT" => {
-                let reason = if args.is_empty() { None } else { Some(args.to_string()) };
-                self.send_command(IrcCommand::Quit(reason));
-                self.connected = false;
-            }
-
-            "AWAY" => {
-                if args.is_empty() {
-                    // Clear away status
-                    self.send_command(IrcCommand::Away(None));
-                    self.add_server_message(ChatMessage::system("You are no longer marked as away"));
-                } else {
-                    self.send_command(IrcCommand::Away(Some(args.to_string())));
-                    self.add_server_message(ChatMessage::system(&format!("You are now marked as away: {}", args)));
-                }
-            }
-
-            "RAW" | "QUOTE" => {
-                self.send_command(IrcCommand::Raw(args.to_string()));
-            }
-
-            "CTCP" => {
-                // /ctcp <nick> <command> [args]
-                let parts: Vec<&str> = args.splitn(3, ' ').collect();
-                if parts.len() >= 2 {
-                    let target = parts[0];
-                    let ctcp_cmd = parts[1].to_uppercase();
-                    let ctcp_args = parts.get(2).copied().unwrap_or("");
-                    let ctcp_msg = if ctcp_args.is_empty() {
-                        format!("\x01{}\x01", ctcp_cmd)
-                    } else {
-                        format!("\x01{} {}\x01", ctcp_cmd, ctcp_args)
-                    };
-                    self.send_command(IrcCommand::Privmsg(target.to_string(), ctcp_msg));
-                    self.add_message_to_current(ChatMessage::system(
-                        &format!("[CTCP] Sent {} to {}", ctcp_cmd, target)
-                    ));
-                } else {
-                    self.add_message_to_current(ChatMessage::system(
-                        "Usage: /ctcp <nick> <command> [args]"
-                    ));
-                }
-            }
-
-            "VERSION" => {
-                // Convenience: /version <nick> is shorthand for /ctcp <nick> VERSION
-                if !args.is_empty() {
-                    let ctcp_msg = "\x01VERSION\x01".to_string();
-                    self.send_command(IrcCommand::Privmsg(args.to_string(), ctcp_msg));
-                    self.add_message_to_current(ChatMessage::system(
-                        &format!("[CTCP] Sent VERSION to {}", args)
-                    ));
-                } else {
-                    self.add_message_to_current(ChatMessage::system(
-                        "Usage: /version <nick>"
-                    ));
-                }
-            }
-
-            "PING" if !args.is_empty() && !args.starts_with('#') => {
-                // /ping <nick> - Send CTCP PING to measure latency
-                use std::time::{SystemTime, UNIX_EPOCH};
-                let timestamp = SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_millis();
-                let ctcp_msg = format!("\x01PING {}\x01", timestamp);
-                self.send_command(IrcCommand::Privmsg(args.to_string(), ctcp_msg));
-                self.add_message_to_current(ChatMessage::system(
-                    &format!("[CTCP] Sent PING to {}", args)
-                ));
-            }
-
-            "CLEAR" => {
-                if let Some(channel) = &self.current_channel {
-                    if let Some(ch) = self.channels.get_mut(channel) {
-                        ch.messages.clear();
-                    }
-                } else {
-                    self.server_messages.clear();
-                }
-            }
-
-            "WHO" => {
-                if !args.is_empty() {
-                    self.send_command(IrcCommand::Who(args.to_string()));
-                } else if let Some(channel) = &self.current_channel.clone() {
-                    self.send_command(IrcCommand::Who(channel.clone()));
-                }
-            }
-
-            "WHOIS" => {
-                if !args.is_empty() {
-                    self.send_command(IrcCommand::Whois(args.to_string()));
-                } else {
-                    self.add_message_to_current(ChatMessage::system("Usage: /whois <nick>"));
-                }
-            }
-
-            "WHOWAS" => {
-                if !args.is_empty() {
-                    self.send_command(IrcCommand::Whowas(args.to_string()));
-                } else {
-                    self.add_message_to_current(ChatMessage::system("Usage: /whowas <nick>"));
-                }
-            }
-
-            "NAMES" => {
-                if !args.is_empty() {
-                    self.send_command(IrcCommand::Names(Some(args.to_string())));
-                } else if let Some(channel) = &self.current_channel.clone() {
-                    self.send_command(IrcCommand::Names(Some(channel.clone())));
-                }
-            }
-
-            "LIST" => {
-                if args.is_empty() {
-                    self.send_command(IrcCommand::List(None));
-                } else {
-                    self.send_command(IrcCommand::List(Some(args.to_string())));
-                }
-            }
-
-            // === Channel Operator Commands ===
-
-            "KICK" | "K" => {
-                let parts: Vec<&str> = args.splitn(2, ' ').collect();
-                if let Some(nick) = parts.get(0) {
-                    if !nick.is_empty() {
-                        if let Some(channel) = &self.current_channel.clone() {
-                            if is_channel(&channel) {
-                                let reason = parts.get(1).map(|s| s.to_string());
-                                self.send_command(IrcCommand::Kick(channel.clone(), nick.to_string(), reason));
-                            }
-                        }
-                    }
-                } else {
-                    self.add_message_to_current(ChatMessage::system("Usage: /kick <nick> [reason]"));
-                }
-            }
-
-            "BAN" => {
-                if !args.is_empty() {
-                    if let Some(channel) = &self.current_channel.clone() {
-                        if is_channel(&channel) {
-                            // Convert nick to ban mask if it's just a nick
-                            let mask = nick_to_mask(args);
-                            self.send_command(IrcCommand::Mode(channel.clone(), Some("+b".to_string()), Some(mask)));
-                        }
-                    }
-                } else {
-                    // Show ban list
-                    if let Some(channel) = &self.current_channel.clone() {
-                        self.send_command(IrcCommand::Mode(channel.clone(), Some("+b".to_string()), None));
-                    }
-                }
-            }
-
-            "UNBAN" => {
-                if !args.is_empty() {
-                    if let Some(channel) = &self.current_channel.clone() {
-                        if is_channel(&channel) {
-                            let mask = nick_to_mask(args);
-                            self.send_command(IrcCommand::Mode(channel.clone(), Some("-b".to_string()), Some(mask)));
-                        }
-                    }
-                } else {
-                    self.add_message_to_current(ChatMessage::system("Usage: /unban <nick|mask>"));
-                }
-            }
-
-            "KICKBAN" | "KB" => {
-                let parts: Vec<&str> = args.splitn(2, ' ').collect();
-                if let Some(nick) = parts.get(0) {
-                    if !nick.is_empty() {
-                        if let Some(channel) = &self.current_channel.clone() {
-                            if is_channel(&channel) {
-                                // Ban first, then kick
-                                let mask = format!("{}!*@*", nick);
-                                self.send_command(IrcCommand::Mode(channel.clone(), Some("+b".to_string()), Some(mask)));
-                                let reason = parts.get(1).map(|s| s.to_string());
-                                self.send_command(IrcCommand::Kick(channel.clone(), nick.to_string(), reason));
-                            }
-                        }
-                    }
-                } else {
-                    self.add_message_to_current(ChatMessage::system("Usage: /kickban <nick> [reason]"));
-                }
-            }
-
-            "OP" => {
-                if !args.is_empty() {
-                    if let Some(channel) = &self.current_channel.clone() {
-                        if is_channel(&channel) {
-                            for nick in args.split_whitespace() {
-                                self.send_command(IrcCommand::Mode(channel.clone(), Some("+o".to_string()), Some(nick.to_string())));
-                            }
-                        }
-                    }
-                } else {
-                    self.add_message_to_current(ChatMessage::system("Usage: /op <nick> [nick2] ..."));
-                }
-            }
-
-            "DEOP" => {
-                if !args.is_empty() {
-                    if let Some(channel) = &self.current_channel.clone() {
-                        if is_channel(&channel) {
-                            for nick in args.split_whitespace() {
-                                self.send_command(IrcCommand::Mode(channel.clone(), Some("-o".to_string()), Some(nick.to_string())));
-                            }
-                        }
-                    }
-                } else {
-                    self.add_message_to_current(ChatMessage::system("Usage: /deop <nick> [nick2] ..."));
-                }
-            }
-
-            "VOICE" | "V" => {
-                if !args.is_empty() {
-                    if let Some(channel) = &self.current_channel.clone() {
-                        if is_channel(&channel) {
-                            for nick in args.split_whitespace() {
-                                self.send_command(IrcCommand::Mode(channel.clone(), Some("+v".to_string()), Some(nick.to_string())));
-                            }
-                        }
-                    }
-                } else {
-                    self.add_message_to_current(ChatMessage::system("Usage: /voice <nick> [nick2] ..."));
-                }
-            }
-
-            "DEVOICE" => {
-                if !args.is_empty() {
-                    if let Some(channel) = &self.current_channel.clone() {
-                        if is_channel(&channel) {
-                            for nick in args.split_whitespace() {
-                                self.send_command(IrcCommand::Mode(channel.clone(), Some("-v".to_string()), Some(nick.to_string())));
-                            }
-                        }
-                    }
-                } else {
-                    self.add_message_to_current(ChatMessage::system("Usage: /devoice <nick> [nick2] ..."));
-                }
-            }
-
-            "HALFOP" | "HOP" => {
-                if !args.is_empty() {
-                    if let Some(channel) = &self.current_channel.clone() {
-                        if is_channel(&channel) {
-                            for nick in args.split_whitespace() {
-                                self.send_command(IrcCommand::Mode(channel.clone(), Some("+h".to_string()), Some(nick.to_string())));
-                            }
-                        }
-                    }
-                }
-            }
-
-            "DEHALFOP" | "DEHOP" => {
-                if !args.is_empty() {
-                    if let Some(channel) = &self.current_channel.clone() {
-                        if is_channel(&channel) {
-                            for nick in args.split_whitespace() {
-                                self.send_command(IrcCommand::Mode(channel.clone(), Some("-h".to_string()), Some(nick.to_string())));
-                            }
-                        }
-                    }
-                }
-            }
-
-            "MODE" | "M" => {
-                if !args.is_empty() {
-                    let parts: Vec<&str> = args.splitn(3, ' ').collect();
-                    let target = parts[0];
-                    let mode = parts.get(1).map(|s| s.to_string());
-                    let param = parts.get(2).map(|s| s.to_string());
-                    self.send_command(IrcCommand::Mode(target.to_string(), mode, param));
-                } else if let Some(channel) = &self.current_channel.clone() {
-                    // Query channel modes
-                    self.send_command(IrcCommand::Mode(channel.clone(), None, None));
-                }
-            }
-
-            // === Messaging Commands ===
-
-            "NOTICE" | "N" => {
-                let parts: Vec<&str> = args.splitn(2, ' ').collect();
-                if let (Some(target), Some(message)) = (parts.get(0), parts.get(1)) {
-                    self.send_command(IrcCommand::Notice(target.to_string(), message.to_string()));
-                    self.add_message_to_current(ChatMessage::system(&format!("-> -{}- {}", target, message)));
-                } else {
-                    self.add_message_to_current(ChatMessage::system("Usage: /notice <target> <message>"));
-                }
-            }
-
-            "ONOTICE" => {
-                // Send notice to channel ops
-                let message = args;
-                if !message.is_empty() {
-                    if let Some(channel) = &self.current_channel.clone() {
-                        if is_channel(&channel) {
-                            let target = format!("@{}", channel);
-                            self.send_command(IrcCommand::Notice(target.clone(), message.to_string()));
-                            self.add_message_to_current(ChatMessage::system(&format!("-> -{}- {}", target, message)));
-                        }
-                    }
-                } else {
-                    self.add_message_to_current(ChatMessage::system("Usage: /onotice <message>"));
-                }
-            }
-
-            "AMSG" => {
-                // Send message to all channels
-                if !args.is_empty() {
-                    for channel_name in self.channels.keys().cloned().collect::<Vec<_>>() {
-                        if is_channel(&channel_name) {
-                            self.send_command(IrcCommand::Privmsg(channel_name.clone(), args.to_string()));
-                            let msg = ChatMessage::new(&self.my_nick, args);
-                            self.add_message_to_channel(&channel_name, msg);
-                        }
-                    }
-                } else {
-                    self.add_message_to_current(ChatMessage::system("Usage: /amsg <message>"));
-                }
-            }
-
-            "AME" => {
-                // Send action to all channels
-                if !args.is_empty() {
-                    let action = format!("\x01ACTION {}\x01", args);
-                    for channel_name in self.channels.keys().cloned().collect::<Vec<_>>() {
-                        if is_channel(&channel_name) {
-                            self.send_command(IrcCommand::Privmsg(channel_name.clone(), action.clone()));
-                            let msg = ChatMessage::action(&self.my_nick, args);
-                            self.add_message_to_channel(&channel_name, msg);
-                        }
-                    }
-                } else {
-                    self.add_message_to_current(ChatMessage::system("Usage: /ame <action>"));
-                }
-            }
-
-            "SAY" => {
-                // Force send as message (even if starts with /)
-                if let Some(channel) = &self.current_channel.clone() {
-                    if !args.is_empty() {
-                        let msg = ChatMessage::new(&self.my_nick, args);
-                        self.add_message_to_channel(channel, msg);
-                        self.send_command(IrcCommand::Privmsg(channel.clone(), args.to_string()));
-                    }
-                }
-            }
-
-            "DESCRIBE" => {
-                // Send action to specific target: /describe <target> <action>
-                let parts: Vec<&str> = args.splitn(2, ' ').collect();
-                if let (Some(target), Some(action_text)) = (parts.get(0), parts.get(1)) {
-                    let action = format!("\x01ACTION {}\x01", action_text);
-                    self.send_command(IrcCommand::Privmsg(target.to_string(), action));
-                    let msg = ChatMessage::action(&self.my_nick, action_text);
-                    self.add_message_to_channel(target, msg);
-                } else {
-                    self.add_message_to_current(ChatMessage::system("Usage: /describe <target> <action>"));
-                }
-            }
-
-            // === Channel Management ===
-
-            "INVITE" => {
-                let parts: Vec<&str> = args.splitn(2, ' ').collect();
-                if let Some(nick) = parts.get(0) {
-                    let channel = parts.get(1).map(|s| s.to_string())
-                        .or_else(|| self.current_channel.clone())
-                        .unwrap_or_default();
-                    if !nick.is_empty() && !channel.is_empty() {
-                        self.send_command(IrcCommand::Invite(nick.to_string(), channel.clone()));
-                        self.add_message_to_current(ChatMessage::system(&format!("Inviting {} to {}", nick, channel)));
-                    }
-                } else {
-                    self.add_message_to_current(ChatMessage::system("Usage: /invite <nick> [#channel]"));
-                }
-            }
-
-            "CYCLE" | "REJOIN" => {
-                let channel = if args.is_empty() {
-                    self.current_channel.clone()
-                } else {
-                    Some(args.to_string())
-                };
-                if let Some(ch) = channel {
-                    if is_channel(&ch) {
-                        self.send_command(IrcCommand::Part(ch.clone(), Some("Cycling".to_string())));
-                        self.send_command(IrcCommand::Join(ch));
-                    }
-                }
-            }
-
-            "KNOCK" => {
-                // Request invite to a channel
-                if !args.is_empty() {
-                    let channel = if args.starts_with('#') { args.to_string() } else { format!("#{}", args) };
-                    self.send_command(IrcCommand::Raw(format!("KNOCK {}", channel)));
-                    self.add_message_to_current(ChatMessage::system(&format!("Knocking on {}", channel)));
-                } else {
-                    self.add_message_to_current(ChatMessage::system("Usage: /knock <#channel>"));
-                }
-            }
-
-            "CLOSE" | "WC" => {
-                // Close current window
-                if let Some(channel_name) = self.current_channel.clone() {
-                    if is_channel(&channel_name) {
-                        self.send_command(IrcCommand::Part(channel_name, None));
-                    } else {
-                        self.channels.remove(&channel_name);
-                        self.current_channel = self.channels.keys().next().cloned();
-                    }
-                }
-            }
-
-            // === Server Info Commands ===
-
-            "MOTD" => {
-                let server = if args.is_empty() { None } else { Some(args.to_string()) };
-                self.send_command(IrcCommand::Motd(server));
-            }
-
-            "TIME" => {
-                let server = if args.is_empty() { None } else { Some(args.to_string()) };
-                self.send_command(IrcCommand::Time(server));
-            }
-
-            "ADMIN" => {
-                let server = if args.is_empty() { None } else { Some(args.to_string()) };
-                self.send_command(IrcCommand::Admin(server));
-            }
-
-            "INFO" => {
-                let server = if args.is_empty() { None } else { Some(args.to_string()) };
-                self.send_command(IrcCommand::Info(server));
-            }
-
-            "LUSERS" => {
-                self.send_command(IrcCommand::Lusers);
-            }
-
-            "LINKS" => {
-                let mask = if args.is_empty() { None } else { Some(args.to_string()) };
-                self.send_command(IrcCommand::Links(mask));
-            }
-
-            "STATS" => {
-                if !args.is_empty() {
-                    self.send_command(IrcCommand::Stats(args.to_string()));
-                } else {
-                    self.add_message_to_current(ChatMessage::system("Usage: /stats <query> (c=servers, m=commands, o=opers, u=uptime)"));
-                }
-            }
-
-            "TRACE" => {
-                let target = if args.is_empty() { None } else { Some(args.to_string()) };
-                self.send_command(IrcCommand::Trace(target));
-            }
-
-            "USERHOST" => {
-                if !args.is_empty() {
-                    self.send_command(IrcCommand::Userhost(args.to_string()));
-                } else {
-                    self.add_message_to_current(ChatMessage::system("Usage: /userhost <nick> [nick2] ..."));
-                }
-            }
-
-            "ISON" => {
-                if !args.is_empty() {
-                    self.send_command(IrcCommand::Ison(args.to_string()));
-                } else {
-                    self.add_message_to_current(ChatMessage::system("Usage: /ison <nick> [nick2] ..."));
-                }
-            }
-
-            "WALLOPS" => {
-                if !args.is_empty() {
-                    self.send_command(IrcCommand::Wallops(args.to_string()));
-                } else {
-                    self.add_message_to_current(ChatMessage::system("Usage: /wallops <message>"));
-                }
-            }
-
-            // === Connection Commands ===
-
-            "SERVER" => {
-                if !args.is_empty() {
-                    // Parse server:port or server port format
-                    let parts: Vec<&str> = if args.contains(':') {
-                        args.splitn(2, ':').collect()
-                    } else {
-                        args.splitn(2, ' ').collect()
-                    };
-                    self.server_host = parts[0].to_string();
-                    if let Some(port) = parts.get(1) {
-                        self.server_port = port.to_string();
-                    }
-                    // Disconnect from current server if connected
-                    if self.connected {
-                        self.send_command(IrcCommand::Quit(Some("Changing servers".to_string())));
-                        self.connected = false;
-                    }
-                    // Trigger reconnect
-                    self.connecting = true;
-                    self.add_server_message(ChatMessage::system(&format!("Connecting to {}:{}...", self.server_host, self.server_port)));
-                } else {
-                    self.add_message_to_current(ChatMessage::system(&format!("Current server: {}:{}", self.server_host, self.server_port)));
-                }
-            }
-
-            "DISCONNECT" => {
-                if self.connected {
-                    let reason = if args.is_empty() { None } else { Some(args.to_string()) };
-                    self.send_command(IrcCommand::Quit(reason));
-                    self.connected = false;
-                    self.auto_reconnect = false; // Disable auto-reconnect on manual disconnect
-                    self.add_server_message(ChatMessage::system("Disconnected from server"));
-                }
-            }
-
-            "RECONNECT" => {
-                if self.connected {
-                    self.send_command(IrcCommand::Quit(Some("Reconnecting".to_string())));
-                    self.connected = false;
-                }
-                self.connecting = true;
-                self.add_server_message(ChatMessage::system("Reconnecting..."));
-            }
-
-            // === Utility Commands ===
-
-            "ECHO" => {
-                if !args.is_empty() {
-                    self.add_message_to_current(ChatMessage::system(args));
-                }
-            }
-
-            "IGNORE" => {
-                if args.is_empty() {
-                    // List ignored users
-                    if self.ignore_list.is_empty() {
-                        self.add_message_to_current(ChatMessage::system("Ignore list is empty"));
-                    } else {
-                        let list: Vec<String> = self.ignore_list.iter()
-                            .enumerate()
-                            .map(|(i, mask)| format!("  {}. {}", i + 1, mask))
-                            .collect();
-                        self.add_message_to_current(ChatMessage::system("Ignored users/masks:"));
-                        for line in list {
-                            self.add_message_to_current(ChatMessage::system(&line));
-                        }
-                    }
-                } else {
-                    // Add to ignore list
-                    let mask = args.to_string();
-                    if !self.ignore_list.iter().any(|m| m.eq_ignore_ascii_case(&mask)) {
-                        self.ignore_list.push(mask.clone());
-                        self.add_message_to_current(ChatMessage::system(&format!("Now ignoring: {}", mask)));
-                        // Save settings
-                        self.get_settings().save();
-                    } else {
-                        self.add_message_to_current(ChatMessage::system(&format!("Already ignoring: {}", mask)));
-                    }
-                }
-            }
-
-            "UNIGNORE" => {
-                if args.is_empty() {
-                    self.add_message_to_current(ChatMessage::system("Usage: /unignore <nick|mask>"));
-                } else {
-                    let mask_lower = args.to_lowercase();
-                    let before_len = self.ignore_list.len();
-                    self.ignore_list.retain(|m| !m.to_lowercase().eq(&mask_lower));
-                    if self.ignore_list.len() < before_len {
-                        self.add_message_to_current(ChatMessage::system(&format!("No longer ignoring: {}", args)));
-                        self.get_settings().save();
-                    } else {
-                        self.add_message_to_current(ChatMessage::system(&format!("Not in ignore list: {}", args)));
-                    }
-                }
-            }
-
-            "LASTLOG" | "GREP" | "SEARCH" => {
-                if !args.is_empty() {
-                    let pattern = args.to_lowercase();
-
-                    // Collect matching messages first to avoid borrow issues
-                    let matches: Vec<String> = {
-                        let messages = if let Some(channel_name) = &self.current_channel {
-                            self.channels.get(channel_name).map(|c| &c.messages)
-                        } else {
-                            Some(&self.server_messages)
-                        };
-
-                        if let Some(msgs) = messages {
-                            msgs.iter()
-                                .rev()
-                                .take(500)
-                                .filter(|msg| {
-                                    msg.content.to_lowercase().contains(&pattern) ||
-                                    msg.sender.to_lowercase().contains(&pattern)
-                                })
-                                .take(50)
-                                .map(|msg| format!("[{}] <{}> {}", msg.timestamp, msg.sender, msg.content))
-                                .collect()
-                        } else {
-                            Vec::new()
-                        }
-                    };
-
-                    // Now display results
-                    self.add_message_to_current(ChatMessage::system(&format!("Searching for: {}", args)));
-                    for match_line in &matches {
-                        self.add_message_to_current(ChatMessage::system(match_line));
-                    }
-                    self.add_message_to_current(ChatMessage::system(&format!("Found {} matches", matches.len())));
-                } else {
-                    self.add_message_to_current(ChatMessage::system("Usage: /lastlog <pattern>"));
-                }
-            }
-
-            "SVERSION" => {
-                // Server VERSION (not CTCP)
-                let server = if args.is_empty() { None } else { Some(args.to_string()) };
-                self.send_command(IrcCommand::Version(server));
-            }
-
-            "PERFORM" => {
-                if args.is_empty() {
-                    // Show current auto-perform
-                    if self.auto_perform.is_empty() {
-                        self.add_message_to_current(ChatMessage::system("No auto-perform commands set. Use /perform <command> to add."));
-                    } else {
-                        let lines: Vec<String> = self.auto_perform.lines()
-                            .filter(|line| !line.trim().is_empty())
-                            .enumerate()
-                            .map(|(i, line)| format!("  {}. {}", i + 1, line))
-                            .collect();
-                        self.add_message_to_current(ChatMessage::system("Auto-perform commands:"));
-                        for line in lines {
-                            self.add_message_to_current(ChatMessage::system(&line));
-                        }
-                    }
-                } else if args.eq_ignore_ascii_case("clear") {
-                    self.auto_perform.clear();
-                    self.get_settings().save();
-                    self.add_message_to_current(ChatMessage::system("Auto-perform commands cleared."));
-                } else {
-                    // Add to auto-perform
-                    if !self.auto_perform.is_empty() {
-                        self.auto_perform.push('\n');
-                    }
-                    self.auto_perform.push_str(args);
-                    self.get_settings().save();
-                    self.add_message_to_current(ChatMessage::system(&format!("Added to auto-perform: {}", args)));
-                }
-            }
-
-            "SETTINGS" => {
-                self.show_settings = true;
-            }
-
-            "HELP" | "H" | "?" => {
-                self.show_help();
-            }
-
-            _ => {
-                self.add_message_to_current(ChatMessage::system(&format!("Unknown command: {}. Type /help for list.", cmd)));
-            }
-        }
-    }
-
-    fn show_help(&mut self) {
-        let help_sections = vec![
-            ("=== Basic Commands ===", vec![
-                "/join #channel      - Join a channel (alias: /j)",
-                "/part [#channel]    - Leave channel (alias: /leave)",
-                "/msg <nick> <text>  - Send private message (alias: /query)",
-                "/me <action>        - Send action message",
-                "/nick <newnick>     - Change nickname",
-                "/quit [message]     - Disconnect from server",
-            ]),
-            ("=== Channel Commands ===", vec![
-                "/topic [text]       - View or set topic",
-                "/names [#channel]   - List users in channel",
-                "/list [pattern]     - List channels",
-                "/cycle              - Part and rejoin (alias: /hop, /rejoin)",
-                "/invite <nick>      - Invite user to channel",
-                "/knock <#channel>   - Request invite",
-            ]),
-            ("=== Operator Commands ===", vec![
-                "/kick <nick> [why]  - Kick user (alias: /k)",
-                "/ban <mask>         - Ban user (+b)",
-                "/unban <mask>       - Remove ban (-b)",
-                "/kickban <nick>     - Ban and kick (alias: /kb)",
-                "/op <nick>          - Give ops (+o)",
-                "/deop <nick>        - Remove ops (-o)",
-                "/voice <nick>       - Give voice (+v)",
-                "/devoice <nick>     - Remove voice (-v)",
-                "/mode <+/-modes>    - Set channel/user modes",
-            ]),
-            ("=== Messaging ===", vec![
-                "/notice <tgt> <msg> - Send notice (alias: /n)",
-                "/onotice <message>  - Notice to channel ops",
-                "/amsg <message>     - Message all channels",
-                "/ame <action>       - Action to all channels",
-                "/say <text>         - Send as message (even if /)",
-                "/describe <t> <act> - Send action to target",
-            ]),
-            ("=== Info Commands ===", vec![
-                "/whois <nick>       - User info",
-                "/whowas <nick>      - Offline user info",
-                "/who <mask>         - Query users",
-                "/userhost <nick>    - Get user@host",
-                "/ison <nicks>       - Check if online",
-                "/motd               - Show MOTD",
-                "/lusers             - Network stats",
-                "/time               - Server time",
-            ]),
-            ("=== CTCP ===", vec![
-                "/ctcp <n> <cmd>     - Send CTCP request",
-                "/version <nick>     - Query version",
-                "/ping <nick>        - Measure latency",
-            ]),
-            ("=== Connection ===", vec![
-                "/server <host:port> - Connect to server",
-                "/disconnect         - Disconnect",
-                "/reconnect          - Reconnect",
-                "/away [message]     - Set/clear away",
-            ]),
-            ("=== Utility ===", vec![
-                "/clear              - Clear window",
-                "/lastlog <pattern>  - Search messages",
-                "/ignore [mask]      - List or add to ignore list",
-                "/unignore <mask>    - Remove from ignore list",
-                "/perform [cmd]      - View/add auto-perform",
-                "/echo <text>        - Echo to window",
-                "/raw <command>      - Send raw IRC",
-                "/settings           - Open settings",
-            ]),
-            ("=== Shortcuts ===", vec![
-                "Alt+1-9             - Switch tabs",
-                "Ctrl+W              - Close tab",
-                "Up/Down             - Command history",
-                "Tab                 - Nick completion",
-            ]),
-        ];
-
-        for (section, commands) in help_sections {
-            self.add_message_to_current(ChatMessage::system(section));
-            for cmd in commands {
-                self.add_message_to_current(ChatMessage::system(cmd));
-            }
         }
     }
 
@@ -2779,496 +1940,6 @@ impl eframe::App for IrcApp {
                 self.reset_tab_completion();
             }
         });
-    }
-}
-
-impl IrcApp {
-    fn show_connect_window(&mut self, ctx: &egui::Context) {
-        egui::Window::new("Connect to Server")
-            .collapsible(false)
-            .resizable(true)
-            .default_width(450.0)
-            .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
-            .show(ctx, |ui| {
-                // ===== Server Favorites Section =====
-                egui::CollapsingHeader::new("Server Favorites")
-                    .default_open(!self.server_favorites.is_empty())
-                    .show(ui, |ui| {
-                        if self.server_favorites.is_empty() {
-                            ui.label("No saved favorites. Fill in connection details and click 'Save as Favorite'.");
-                        } else {
-                            // Favorites list with selection
-                            ScrollArea::vertical()
-                                .max_height(120.0)
-                                .show(ui, |ui| {
-                                    let mut clicked_idx = None;
-                                    for (idx, fav) in self.server_favorites.iter().enumerate() {
-                                        let is_selected = self.selected_favorite == Some(idx);
-                                        let text = format!("{} ({}:{})", fav.name, fav.host, fav.port);
-                                        let response = ui.selectable_label(is_selected, &text);
-                                        if response.clicked() {
-                                            clicked_idx = Some(idx);
-                                        }
-                                        if response.double_clicked() {
-                                            // Load and connect on double-click
-                                            clicked_idx = Some(idx);
-                                        }
-                                    }
-                                    if let Some(idx) = clicked_idx {
-                                        self.selected_favorite = Some(idx);
-                                    }
-                                });
-
-                            ui.horizontal(|ui| {
-                                // Load button
-                                let has_selection = self.selected_favorite.is_some();
-                                if ui.add_enabled(has_selection, egui::Button::new("Load")).clicked() {
-                                    if let Some(idx) = self.selected_favorite {
-                                        if let Some(fav) = self.server_favorites.get(idx).cloned() {
-                                            self.load_favorite(&fav);
-                                        }
-                                    }
-                                }
-
-                                // Delete button
-                                if ui.add_enabled(has_selection, egui::Button::new("Delete")).clicked() {
-                                    if let Some(idx) = self.selected_favorite {
-                                        self.server_favorites.remove(idx);
-                                        self.selected_favorite = None;
-                                        self.save_settings();
-                                    }
-                                }
-
-                                // Connect button
-                                if ui.add_enabled(has_selection, egui::Button::new("Connect")).clicked() {
-                                    if let Some(idx) = self.selected_favorite {
-                                        if let Some(fav) = self.server_favorites.get(idx).cloned() {
-                                            self.load_favorite(&fav);
-                                            self.save_settings();
-                                            self.show_connect_dialog = false;
-                                            self.connecting = true;
-                                            self.my_nick = self.nickname.clone();
-                                        }
-                                    }
-                                }
-                            });
-                        }
-                    });
-
-                ui.separator();
-
-                // ===== Server Details =====
-                ui.horizontal(|ui| {
-                    ui.label("Server:");
-                    ui.add(TextEdit::singleline(&mut self.server_host).desired_width(200.0));
-                });
-
-                ui.horizontal(|ui| {
-                    ui.label("Port:");
-                    ui.add(TextEdit::singleline(&mut self.server_port).desired_width(80.0));
-                    ui.checkbox(&mut self.use_tls, "Use TLS");
-                });
-
-                if self.use_tls {
-                    ui.horizontal(|ui| {
-                        ui.add_space(50.0);
-                        ui.checkbox(&mut self.accept_invalid_certs, "Accept invalid certs (insecure)");
-                    });
-                }
-
-                ui.separator();
-
-                ui.horizontal(|ui| {
-                    ui.label("Nickname:");
-                    ui.add(TextEdit::singleline(&mut self.nickname).desired_width(150.0));
-                });
-
-                ui.horizontal(|ui| {
-                    ui.label("Username:");
-                    ui.add(TextEdit::singleline(&mut self.username).desired_width(150.0));
-                });
-
-                ui.horizontal(|ui| {
-                    ui.label("Real name:");
-                    ui.add(TextEdit::singleline(&mut self.realname).desired_width(200.0));
-                });
-
-                ui.horizontal(|ui| {
-                    ui.label("Password:");
-                    ui.add(TextEdit::singleline(&mut self.password).password(true).desired_width(150.0));
-                    ui.label("(optional)");
-                });
-
-                ui.separator();
-                ui.heading("On Connect");
-                ui.add_space(4.0);
-
-                ui.horizontal(|ui| {
-                    ui.label("Auto-join:");
-                    ui.add(
-                        TextEdit::singleline(&mut self.auto_join_channels)
-                            .desired_width(200.0)
-                            .hint_text("#chan1, #chan2")
-                    );
-                });
-
-                ui.horizontal(|ui| {
-                    ui.checkbox(&mut self.set_invisible, "Set invisible (+i)");
-                });
-                ui.checkbox(&mut self.auto_reconnect, "Auto-reconnect on disconnect");
-
-                ui.separator();
-
-                // ===== Save as Favorite =====
-                if self.show_save_favorite_dialog {
-                    ui.horizontal(|ui| {
-                        ui.label("Name:");
-                        ui.add(TextEdit::singleline(&mut self.new_favorite_name).desired_width(150.0));
-                        if ui.button("Save").clicked() && !self.new_favorite_name.is_empty() {
-                            let new_fav = ServerFavorite {
-                                name: self.new_favorite_name.clone(),
-                                host: self.server_host.clone(),
-                                port: self.server_port.clone(),
-                                use_tls: self.use_tls,
-                                password: self.password.clone(),
-                                nickname: self.nickname.clone(),
-                                auto_join: self.auto_join_channels.clone(),
-                                auto_perform: self.auto_perform.clone(),
-                            };
-                            self.server_favorites.push(new_fav);
-                            self.selected_favorite = Some(self.server_favorites.len() - 1);
-                            self.save_settings();
-                            self.new_favorite_name.clear();
-                            self.show_save_favorite_dialog = false;
-                        }
-                        if ui.button("Cancel").clicked() {
-                            self.new_favorite_name.clear();
-                            self.show_save_favorite_dialog = false;
-                        }
-                    });
-                } else {
-                    if ui.button("Save as Favorite").clicked() {
-                        // Pre-fill with server name if empty
-                        if self.new_favorite_name.is_empty() {
-                            self.new_favorite_name = self.server_host.clone();
-                        }
-                        self.show_save_favorite_dialog = true;
-                    }
-                }
-
-                ui.separator();
-
-                // ===== Connect/Cancel Buttons =====
-                ui.horizontal(|ui| {
-                    if ui.button("Connect").clicked() {
-                        self.save_settings();
-                        self.show_connect_dialog = false;
-                        self.connecting = true;
-                        self.my_nick = self.nickname.clone();
-                    }
-                    if ui.button("Cancel").clicked() {
-                        self.show_connect_dialog = false;
-                    }
-                });
-            });
-    }
-
-    fn show_settings_window(&mut self, ctx: &egui::Context) {
-        egui::Window::new("Settings")
-            .collapsible(false)
-            .resizable(false)
-            .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
-            .show(ctx, |ui| {
-                ui.heading("Connection Defaults");
-                ui.separator();
-
-                ui.horizontal(|ui| {
-                    ui.label("Default Server:");
-                    ui.add(TextEdit::singleline(&mut self.server_host).desired_width(200.0));
-                });
-
-                ui.horizontal(|ui| {
-                    ui.label("Default Port:");
-                    ui.add(TextEdit::singleline(&mut self.server_port).desired_width(80.0));
-                });
-
-                ui.horizontal(|ui| {
-                    ui.checkbox(&mut self.use_tls, "Use TLS by default");
-                });
-
-                ui.separator();
-                ui.heading("Identity");
-                ui.separator();
-
-                ui.horizontal(|ui| {
-                    ui.label("Nickname:");
-                    ui.add(TextEdit::singleline(&mut self.nickname).desired_width(150.0));
-                });
-
-                ui.horizontal(|ui| {
-                    ui.label("Username:");
-                    ui.add(TextEdit::singleline(&mut self.username).desired_width(150.0));
-                });
-
-                ui.horizontal(|ui| {
-                    ui.label("Real name:");
-                    ui.add(TextEdit::singleline(&mut self.realname).desired_width(200.0));
-                });
-
-                ui.separator();
-                ui.heading("On Connect");
-                ui.separator();
-
-                ui.horizontal(|ui| {
-                    ui.label("Auto-join:");
-                    ui.add(
-                        TextEdit::singleline(&mut self.auto_join_channels)
-                            .desired_width(200.0)
-                            .hint_text("#chan1, #chan2")
-                    );
-                });
-
-                ui.checkbox(&mut self.set_invisible, "Set invisible (+i)");
-
-                ui.add_space(4.0);
-                ui.label("Auto-perform (one command per line):");
-                ui.add(
-                    TextEdit::multiline(&mut self.auto_perform)
-                        .desired_width(300.0)
-                        .desired_rows(3)
-                        .hint_text("/msg NickServ identify pass\n/join #secret key")
-                );
-
-                ui.separator();
-                ui.heading("Ignore List");
-                ui.separator();
-
-                // Display ignore list compactly
-                if self.ignore_list.is_empty() {
-                    ui.label("No users ignored. Use /ignore <nick|mask> to add.");
-                } else {
-                    let ignore_display = self.ignore_list.join(", ");
-                    ui.horizontal_wrapped(|ui| {
-                        ui.label("Ignored:");
-                        ui.label(RichText::new(&ignore_display).color(Color32::GRAY));
-                    });
-                    ui.label("Use /unignore <nick> to remove.");
-                }
-
-                ui.separator();
-                ui.heading("Behavior");
-                ui.separator();
-
-                ui.checkbox(&mut self.auto_reconnect, "Auto-reconnect on disconnect");
-                ui.checkbox(&mut self.notifications_enabled, "Desktop notifications for highlights/PMs");
-
-                let tray_response = ui.checkbox(&mut self.minimize_to_tray, "Minimize to system tray");
-                if self.minimize_to_tray {
-                    tray_response.on_hover_text("System tray support requires platform-specific setup");
-                }
-
-                ui.separator();
-                ui.heading("About");
-                ui.separator();
-                ui.label("fmIRC v0.0.1");
-                ui.label("A cross-platform IRC client");
-
-                ui.separator();
-                if ui.button("Close").clicked() {
-                    self.save_settings();
-                    self.show_settings = false;
-                }
-            });
-    }
-
-    fn show_channel_list_window(&mut self, ctx: &egui::Context) {
-        let mut close = false;
-        let mut join_channel: Option<String> = None;
-
-        egui::Window::new("Channel List")
-            .resizable(true)
-            .default_size([700.0, 450.0])
-            .show(ctx, |ui| {
-                // Filter input and status
-                ui.horizontal(|ui| {
-                    ui.label("Filter:");
-                    ui.add(TextEdit::singleline(&mut self.channel_list_filter).desired_width(200.0));
-                    ui.add_space(10.0);
-
-                    // Count filtered channels
-                    let filter = self.channel_list_filter.to_lowercase();
-                    let filtered_count = if filter.is_empty() {
-                        self.channel_list.len()
-                    } else {
-                        self.channel_list.iter()
-                            .filter(|e| e.name.to_lowercase().contains(&filter)
-                                || e.topic.to_lowercase().contains(&filter))
-                            .count()
-                    };
-                    ui.label(format!("{} of {} channels", filtered_count, self.channel_list.len()));
-
-                    if self.channel_list_loading {
-                        ui.spinner();
-                        ui.label("Loading...");
-                    }
-                });
-                ui.separator();
-
-                // Column widths
-                let channel_width = 150.0;
-                let users_width = 60.0;
-                let topic_width = ui.available_width() - channel_width - users_width - 40.0;
-
-                // Table header
-                ui.horizontal(|ui| {
-                    ui.add_space(4.0);
-                    ui.allocate_ui_with_layout(
-                        Vec2::new(channel_width, 20.0),
-                        egui::Layout::left_to_right(egui::Align::Center),
-                        |ui| { ui.label(RichText::new("Channel").strong()); }
-                    );
-                    ui.allocate_ui_with_layout(
-                        Vec2::new(users_width, 20.0),
-                        egui::Layout::right_to_left(egui::Align::Center),
-                        |ui| { ui.label(RichText::new("Users").strong()); }
-                    );
-                    ui.add_space(10.0);
-                    ui.allocate_ui_with_layout(
-                        Vec2::new(topic_width, 20.0),
-                        egui::Layout::left_to_right(egui::Align::Center),
-                        |ui| { ui.label(RichText::new("Topic").strong()); }
-                    );
-                });
-                ui.separator();
-
-                // Scrollable channel list with proper column layout
-                let current_selected = self.channel_list_selected.clone();
-                let mut new_selected = current_selected.clone();
-
-                ScrollArea::vertical()
-                    .auto_shrink([false; 2])
-                    .max_height(350.0)
-                    .show(ui, |ui| {
-                        let filter = self.channel_list_filter.to_lowercase();
-
-                        // Use Grid for proper column alignment
-                        egui::Grid::new("channel_list_grid")
-                            .num_columns(3)
-                            .min_col_width(0.0)
-                            .spacing([8.0, 2.0])
-                            .striped(true)
-                            .show(ui, |ui| {
-                                for entry in &self.channel_list {
-                                    // Filter by channel name or topic
-                                    if !filter.is_empty()
-                                        && !entry.name.to_lowercase().contains(&filter)
-                                        && !entry.topic.to_lowercase().contains(&filter)
-                                    {
-                                        continue;
-                                    }
-
-                                    let is_selected = current_selected.as_ref() == Some(&entry.name);
-                                    let row_color = if is_selected {
-                                        Color32::WHITE
-                                    } else {
-                                        Color32::from_rgb(180, 210, 255)
-                                    };
-
-                                    // Column 1: Channel name (clickable)
-                                    let response = ui.add_sized(
-                                        [channel_width, 18.0],
-                                        egui::Button::new(RichText::new(&entry.name).color(row_color))
-                                            .selected(is_selected)
-                                            .frame(false)
-                                    );
-
-                                    // Single click to select
-                                    if response.clicked() {
-                                        new_selected = Some(entry.name.clone());
-                                    }
-
-                                    // Double click to join
-                                    if response.double_clicked() {
-                                        join_channel = Some(entry.name.clone());
-                                    }
-
-                                    // Right-click context menu
-                                    let channel_name = entry.name.clone();
-                                    let channel_topic = entry.topic.clone();
-                                    let channel_users = entry.user_count;
-                                    response.context_menu(|ui| {
-                                        ui.label(RichText::new(&channel_name).strong());
-                                        ui.label(format!("{} users", channel_users));
-                                        if !channel_topic.is_empty() {
-                                            ui.separator();
-                                            ui.label(RichText::new("Topic:").small());
-                                            ui.add(egui::Label::new(
-                                                RichText::new(&channel_topic).small().color(Color32::GRAY)
-                                            ).wrap_mode(egui::TextWrapMode::Wrap));
-                                        }
-                                        ui.separator();
-                                        if ui.button("Join Channel").clicked() {
-                                            join_channel = Some(channel_name.clone());
-                                            ui.close();
-                                        }
-                                        if ui.button("Copy Channel Name").clicked() {
-                                            ui.ctx().copy_text(channel_name.clone());
-                                            ui.close();
-                                        }
-                                    });
-
-                                    // Column 2: User count (right-aligned)
-                                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                        ui.set_min_width(users_width);
-                                        ui.label(RichText::new(format!("{}", entry.user_count)).color(Color32::LIGHT_GREEN));
-                                    });
-
-                                    // Column 3: Topic (truncated)
-                                    let topic_display = if entry.topic.len() > 70 {
-                                        format!("{}...", entry.topic.chars().take(70).collect::<String>())
-                                    } else {
-                                        entry.topic.clone()
-                                    };
-                                    ui.add_sized(
-                                        [topic_width, 18.0],
-                                        egui::Label::new(RichText::new(&topic_display).color(Color32::GRAY))
-                                    );
-
-                                    ui.end_row();
-                                }
-                            });
-                    });
-
-                // Update selection
-                self.channel_list_selected = new_selected;
-
-                ui.separator();
-                ui.horizontal(|ui| {
-                    if ui.button("Join").clicked() {
-                        if let Some(channel) = &self.channel_list_selected {
-                            join_channel = Some(channel.clone());
-                        }
-                    }
-                    if ui.button("Refresh").clicked() {
-                        self.channel_list.clear();
-                        self.channel_list_selected = None;
-                        self.send_command(IrcCommand::List(None));
-                    }
-                    if ui.button("Close").clicked() {
-                        close = true;
-                    }
-                });
-            });
-
-        if close {
-            self.show_channel_list = false;
-            self.channel_list_selected = None;
-        }
-        if let Some(channel) = join_channel {
-            self.send_command(IrcCommand::Join(channel));
-            self.show_channel_list = false;
-            self.channel_list_selected = None;
-        }
     }
 }
 

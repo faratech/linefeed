@@ -91,7 +91,7 @@ impl IrcClient {
         &mut self,
         stream: TcpStream,
         incoming_tx: mpsc::Sender<IrcMessage>,
-        mut outgoing_rx: mpsc::Receiver<IrcCommand>,
+        outgoing_rx: mpsc::Receiver<IrcCommand>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         // Set up native TLS
         let mut tls_builder = native_tls::TlsConnector::builder();
@@ -126,55 +126,28 @@ impl IrcClient {
             raw: String::new(),
         }).await;
 
-        let (reader, mut writer) = tokio::io::split(tls_stream);
-        let reader = BufReader::new(reader);
-
-        // Send registration
-        self.send_registration(&mut writer, &incoming_tx).await?;
-
-        // Create channel for sending
-        let (send_tx, mut send_rx) = mpsc::channel::<String>(100);
-        self.tx = Some(send_tx);
-
-        // Spawn writer task
-        let writer_handle = tokio::spawn(async move {
-            loop {
-                tokio::select! {
-                    Some(cmd) = outgoing_rx.recv() => {
-                        let line = format!("{}\r\n", cmd);
-                        tracing::debug!("> {}", line.trim());
-                        if let Err(e) = writer.write_all(line.as_bytes()).await {
-                            tracing::error!("Write error: {}", e);
-                            break;
-                        }
-                        let _ = writer.flush().await;
-                    }
-                    Some(raw) = send_rx.recv() => {
-                        tracing::debug!("> {}", raw.trim());
-                        if let Err(e) = writer.write_all(raw.as_bytes()).await {
-                            tracing::error!("Write error: {}", e);
-                            break;
-                        }
-                        let _ = writer.flush().await;
-                    }
-                    else => break,
-                }
-            }
-        });
-
-        // Read loop
-        self.read_loop(reader, incoming_tx).await;
-
-        writer_handle.abort();
-        Ok(())
+        self.run_connection(tls_stream, incoming_tx, outgoing_rx).await
     }
 
     async fn handle_plain_connection(
         &mut self,
         stream: TcpStream,
         incoming_tx: mpsc::Sender<IrcMessage>,
-        mut outgoing_rx: mpsc::Receiver<IrcCommand>,
+        outgoing_rx: mpsc::Receiver<IrcCommand>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.run_connection(stream, incoming_tx, outgoing_rx).await
+    }
+
+    /// Common connection handler for both TLS and plain connections
+    async fn run_connection<S>(
+        &mut self,
+        stream: S,
+        incoming_tx: mpsc::Sender<IrcMessage>,
+        mut outgoing_rx: mpsc::Receiver<IrcCommand>,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
+    where
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+    {
         let (reader, mut writer) = tokio::io::split(stream);
         let reader = BufReader::new(reader);
 
