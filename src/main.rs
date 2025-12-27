@@ -71,6 +71,10 @@ mod tray {
         WINDOW_HIDDEN.load(Ordering::SeqCst)
     }
 
+    pub fn clear_hidden() {
+        WINDOW_HIDDEN.store(false, Ordering::SeqCst);
+    }
+
     pub fn create_tray_icon() -> Option<tray_icon::TrayIcon> {
         use tray_icon::{TrayIconBuilder, menu::{Menu, MenuItem, PredefinedMenuItem}};
         use tray_icon::Icon;
@@ -321,22 +325,29 @@ impl eframe::App for FmIrcApp {
                 return;
             }
 
-            // Handle restore from tray - tell egui we're no longer minimized
+            // Handle restore from tray
             if tray::take_restore_request() {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
             }
 
             // When hidden to system tray, skip all UI work
+            // But check if user restored via taskbar (not our tray menu)
             if tray::is_window_hidden() {
-                // No repaint, no work - messages queue until window shown
-                return;
+                let minimized = ctx.input(|i| i.viewport().minimized.unwrap_or(true));
+                if !minimized {
+                    // User restored via taskbar, clear our flag
+                    tray::clear_hidden();
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+                } else {
+                    // Still hidden, skip work
+                    return;
+                }
             }
 
             // Intercept X button when minimize_to_tray is enabled (only when visible)
             if self.app.minimize_to_tray && tray::is_active() {
                 if ctx.input(|i| i.viewport().close_requested()) {
                     ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-                    // Tell egui we're minimized so it stops rendering
                     ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
                     tray::hide_window();
                     return;
