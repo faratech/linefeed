@@ -830,6 +830,15 @@ impl IrcApp {
                 self.channel_list_loading = false;
             }
 
+            RPL_AWAY => {
+                // <nick> :<away message> - shown during WHOIS or when messaging away user
+                if let (Some(nick), Some(message)) = (params.get(1), params.get(2)) {
+                    self.add_message_to_current(ChatMessage::system(
+                        &format!("[WHOIS] {} is away: {}", nick, message)
+                    ));
+                }
+            }
+
             RPL_UNAWAY => {
                 if let Some(text) = params.get(1) {
                     self.add_server_message(ChatMessage::system(text));

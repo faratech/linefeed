@@ -10,6 +10,7 @@ pub const RPL_MYINFO: u16 = 4;
 pub const RPL_ISUPPORT: u16 = 5;
 
 // Away status
+pub const RPL_AWAY: u16 = 301;
 pub const RPL_UNAWAY: u16 = 305;
 pub const RPL_NOWAWAY: u16 = 306;
 

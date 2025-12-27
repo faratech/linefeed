@@ -81,7 +81,7 @@ impl Default for Settings {
             sasl_password: String::new(),
             logging_enabled: true,
             logging_load_history: true,
-            logging_history_lines: 100,
+            logging_history_lines: 1000,
         }
     }
 }
