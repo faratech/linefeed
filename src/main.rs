@@ -26,6 +26,7 @@ mod tray {
     static TRAY_ACTIVE: AtomicBool = AtomicBool::new(false);
     static EXIT_REQUESTED: AtomicBool = AtomicBool::new(false);
     static WINDOW_HIDDEN: AtomicBool = AtomicBool::new(false);
+    static RESTORE_REQUESTED: AtomicBool = AtomicBool::new(false);
 
     fn find_our_window() -> Option<HWND> {
         unsafe {
@@ -38,6 +39,7 @@ mod tray {
 
     pub fn show_window() {
         WINDOW_HIDDEN.store(false, Ordering::SeqCst);
+        RESTORE_REQUESTED.store(true, Ordering::SeqCst);
         if let Some(hwnd) = find_our_window() {
             unsafe {
                 let _ = ShowWindow(hwnd, SW_SHOW);
@@ -48,6 +50,11 @@ mod tray {
         } else {
             tracing::warn!("Could not find window to show");
         }
+    }
+
+    /// Check and consume restore request (returns true once after show_window)
+    pub fn take_restore_request() -> bool {
+        RESTORE_REQUESTED.swap(false, Ordering::SeqCst)
     }
 
     pub fn hide_window() {
@@ -312,6 +319,11 @@ impl eframe::App for FmIrcApp {
             if tray::is_active() && tray::should_exit() {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                 return;
+            }
+
+            // Handle restore from tray - tell egui we're no longer minimized
+            if tray::take_restore_request() {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
             }
 
             // When hidden to system tray, skip all UI work
