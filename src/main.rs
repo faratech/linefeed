@@ -2,6 +2,7 @@
 
 mod irc;
 mod gui;
+mod icon_data;
 
 use eframe::egui;
 use tokio::sync::mpsc;
@@ -10,17 +11,12 @@ use std::sync::Arc;
 use irc::{IrcClient, IrcCommand, IrcMessage};
 use gui::IrcApp;
 
-// Embed the icon at compile time
-const ICON_BYTES: &[u8] = include_bytes!("../assets/icon.png");
-
-fn load_icon() -> Option<egui::IconData> {
-    let image = image::load_from_memory(ICON_BYTES).ok()?.into_rgba8();
-    let (width, height) = image.dimensions();
-    Some(egui::IconData {
-        rgba: image.into_raw(),
-        width,
-        height,
-    })
+fn load_icon() -> egui::IconData {
+    egui::IconData {
+        rgba: icon_data::ICON_RGBA.to_vec(),
+        width: icon_data::ICON_WIDTH,
+        height: icon_data::ICON_HEIGHT,
+    }
 }
 
 fn main() -> eframe::Result<()> {
@@ -32,18 +28,12 @@ fn main() -> eframe::Result<()> {
 
     tracing::info!("Starting fmIRC");
 
-    // Load icon
-    let icon = load_icon();
-
     // Native options for the window
-    let mut viewport = egui::ViewportBuilder::default()
+    let viewport = egui::ViewportBuilder::default()
         .with_inner_size([1024.0, 768.0])
         .with_min_inner_size([640.0, 480.0])
-        .with_title("fmIRC");
-
-    if let Some(icon_data) = icon {
-        viewport = viewport.with_icon(Arc::new(icon_data));
-    }
+        .with_title("fmIRC")
+        .with_icon(Arc::new(load_icon()));
 
     let options = eframe::NativeOptions {
         viewport,

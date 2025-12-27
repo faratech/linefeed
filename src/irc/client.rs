@@ -1,10 +1,6 @@
-use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
-use tokio_rustls::rustls::{ClientConfig, RootCertStore};
-use tokio_rustls::rustls::pki_types::ServerName;
-use tokio_rustls::TlsConnector;
 
 use super::message::{IrcCommand, IrcMessage};
 
@@ -97,30 +93,23 @@ impl IrcClient {
         incoming_tx: mpsc::Sender<IrcMessage>,
         mut outgoing_rx: mpsc::Receiver<IrcCommand>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        // Set up TLS
-        let mut root_store = RootCertStore::empty();
-        root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+        // Set up native TLS
+        let mut tls_builder = native_tls::TlsConnector::builder();
 
-        let tls_config = if self.config.accept_invalid_certs {
+        if self.config.accept_invalid_certs {
             tracing::warn!("Accepting invalid certificates (insecure!)");
-            ClientConfig::builder()
-                .dangerous()
-                .with_custom_certificate_verifier(Arc::new(NoCertificateVerification))
-                .with_no_client_auth()
-        } else {
-            ClientConfig::builder()
-                .with_root_certificates(root_store)
-                .with_no_client_auth()
-        };
+            tls_builder.danger_accept_invalid_certs(true);
+            tls_builder.danger_accept_invalid_hostnames(true);
+        }
 
-        let connector = TlsConnector::from(Arc::new(tls_config));
+        let tls_connector = tls_builder.build()
+            .map_err(|e| format!("Failed to create TLS connector: {}", e))?;
 
-        let server_name: ServerName<'_> = self.config.host.clone().try_into()
-            .map_err(|e| format!("Invalid server name '{}': {:?}", self.config.host, e))?;
+        let connector = tokio_native_tls::TlsConnector::from(tls_connector);
 
-        tracing::info!("Starting TLS handshake with {:?}", server_name);
+        tracing::info!("Starting TLS handshake with {}", self.config.host);
 
-        let tls_stream = match connector.connect(server_name, stream).await {
+        let tls_stream = match connector.connect(&self.config.host, stream).await {
             Ok(s) => s,
             Err(e) => {
                 let msg = format!("TLS handshake failed: {}. Try disabling TLS or enabling 'Accept invalid certs'", e);
@@ -318,55 +307,5 @@ impl IrcClient {
                 }
             }
         }
-    }
-}
-
-// Custom certificate verifier that accepts all certificates (insecure!)
-#[derive(Debug)]
-struct NoCertificateVerification;
-
-impl tokio_rustls::rustls::client::danger::ServerCertVerifier for NoCertificateVerification {
-    fn verify_server_cert(
-        &self,
-        _end_entity: &tokio_rustls::rustls::pki_types::CertificateDer<'_>,
-        _intermediates: &[tokio_rustls::rustls::pki_types::CertificateDer<'_>],
-        _server_name: &ServerName<'_>,
-        _ocsp_response: &[u8],
-        _now: tokio_rustls::rustls::pki_types::UnixTime,
-    ) -> Result<tokio_rustls::rustls::client::danger::ServerCertVerified, tokio_rustls::rustls::Error> {
-        Ok(tokio_rustls::rustls::client::danger::ServerCertVerified::assertion())
-    }
-
-    fn verify_tls12_signature(
-        &self,
-        _message: &[u8],
-        _cert: &tokio_rustls::rustls::pki_types::CertificateDer<'_>,
-        _dss: &tokio_rustls::rustls::DigitallySignedStruct,
-    ) -> Result<tokio_rustls::rustls::client::danger::HandshakeSignatureValid, tokio_rustls::rustls::Error> {
-        Ok(tokio_rustls::rustls::client::danger::HandshakeSignatureValid::assertion())
-    }
-
-    fn verify_tls13_signature(
-        &self,
-        _message: &[u8],
-        _cert: &tokio_rustls::rustls::pki_types::CertificateDer<'_>,
-        _dss: &tokio_rustls::rustls::DigitallySignedStruct,
-    ) -> Result<tokio_rustls::rustls::client::danger::HandshakeSignatureValid, tokio_rustls::rustls::Error> {
-        Ok(tokio_rustls::rustls::client::danger::HandshakeSignatureValid::assertion())
-    }
-
-    fn supported_verify_schemes(&self) -> Vec<tokio_rustls::rustls::SignatureScheme> {
-        vec![
-            tokio_rustls::rustls::SignatureScheme::RSA_PKCS1_SHA256,
-            tokio_rustls::rustls::SignatureScheme::RSA_PKCS1_SHA384,
-            tokio_rustls::rustls::SignatureScheme::RSA_PKCS1_SHA512,
-            tokio_rustls::rustls::SignatureScheme::ECDSA_NISTP256_SHA256,
-            tokio_rustls::rustls::SignatureScheme::ECDSA_NISTP384_SHA384,
-            tokio_rustls::rustls::SignatureScheme::ECDSA_NISTP521_SHA512,
-            tokio_rustls::rustls::SignatureScheme::RSA_PSS_SHA256,
-            tokio_rustls::rustls::SignatureScheme::RSA_PSS_SHA384,
-            tokio_rustls::rustls::SignatureScheme::RSA_PSS_SHA512,
-            tokio_rustls::rustls::SignatureScheme::ED25519,
-        ]
     }
 }

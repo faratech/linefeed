@@ -1,10 +1,35 @@
 use std::collections::HashMap;
-use chrono::Local;
 use egui::{Color32, RichText, ScrollArea, TextEdit, Vec2};
 use tokio::sync::mpsc;
 
 use crate::irc::{IrcCommand, IrcMessage};
 use crate::irc::client::ServerConfig;
+
+fn current_time_hhmm() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+
+    #[cfg(unix)]
+    let (hours, minutes) = {
+        let t = secs as libc::time_t;
+        let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+        unsafe { libc::localtime_r(&t, &mut tm) };
+        (tm.tm_hour as u64, tm.tm_min as u64)
+    };
+
+    #[cfg(not(unix))]
+    let (hours, minutes) = {
+        // Fallback to UTC on non-unix (Windows handled by winapi if needed)
+        let hours = (secs % 86400) / 3600;
+        let minutes = (secs % 3600) / 60;
+        (hours, minutes)
+    };
+
+    format!("{:02}:{:02}", hours, minutes)
+}
 
 #[derive(Debug, Clone)]
 pub struct ChatMessage {
@@ -18,7 +43,7 @@ pub struct ChatMessage {
 impl ChatMessage {
     pub fn new(sender: &str, content: &str) -> Self {
         Self {
-            timestamp: Local::now().format("%H:%M").to_string(),
+            timestamp: current_time_hhmm(),
             sender: sender.to_string(),
             content: content.to_string(),
             is_action: false,
@@ -28,7 +53,7 @@ impl ChatMessage {
 
     pub fn system(content: &str) -> Self {
         Self {
-            timestamp: Local::now().format("%H:%M").to_string(),
+            timestamp: current_time_hhmm(),
             sender: "*".to_string(),
             content: content.to_string(),
             is_action: false,
@@ -38,7 +63,7 @@ impl ChatMessage {
 
     pub fn action(sender: &str, content: &str) -> Self {
         Self {
-            timestamp: Local::now().format("%H:%M").to_string(),
+            timestamp: current_time_hhmm(),
             sender: sender.to_string(),
             content: content.to_string(),
             is_action: true,
