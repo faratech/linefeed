@@ -219,9 +219,13 @@ impl IrcApp {
     pub fn show_settings_window(&mut self, ctx: &egui::Context) {
         egui::Window::new("Settings")
             .collapsible(false)
-            .resizable(false)
+            .resizable(true)
+            .default_size([350.0, 450.0])
             .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
             .show(ctx, |ui| {
+                ScrollArea::vertical()
+                    .auto_shrink([false; 2])
+                    .show(ui, |ui| {
                 ui.heading("Connection Defaults");
                 ui.separator();
 
@@ -347,6 +351,8 @@ impl IrcApp {
                 ui.separator();
                 ui.label("fmIRC v0.0.1");
                 ui.label("A cross-platform IRC client");
+                ui.add_space(8.0);
+                }); // End ScrollArea
 
                 ui.separator();
                 if ui.button("Close").clicked() {
