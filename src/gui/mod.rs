@@ -838,6 +838,12 @@ impl IrcApp {
         match &msg.command {
             IrcCommand::Privmsg(target, content) => {
                 let sender = msg.get_sender_nick().unwrap_or_else(|| "???".to_string());
+
+                // Handle CTCP requests (except ACTION which is displayed as a message)
+                if self.handle_ctcp_request(&sender, content) {
+                    return; // CTCP was handled, don't display as regular message
+                }
+
                 let is_action = content.starts_with("\x01ACTION ") && content.ends_with('\x01');
 
                 // Check if the message mentions our nick (case-insensitive word boundary check)
@@ -905,6 +911,40 @@ impl IrcApp {
 
             IrcCommand::Notice(target, content) => {
                 let sender = msg.get_sender_nick().unwrap_or_else(|| "Server".to_string());
+
+                // Check for CTCP reply (starts and ends with \x01)
+                if content.starts_with('\x01') && content.ends_with('\x01') {
+                    let ctcp_content = &content[1..content.len()-1];
+                    let parts: Vec<&str> = ctcp_content.splitn(2, ' ').collect();
+                    let ctcp_cmd = parts[0];
+                    let ctcp_reply = parts.get(1).copied().unwrap_or("");
+
+                    // Handle CTCP PING reply to show latency
+                    if ctcp_cmd.eq_ignore_ascii_case("PING") {
+                        if let Ok(sent_time) = ctcp_reply.parse::<u128>() {
+                            use std::time::{SystemTime, UNIX_EPOCH};
+                            let now = SystemTime::now()
+                                .duration_since(UNIX_EPOCH)
+                                .unwrap_or_default()
+                                .as_millis();
+                            let latency = now.saturating_sub(sent_time);
+                            self.add_message_to_current(ChatMessage::system(
+                                &format!("[CTCP PING reply] {} - {}ms", sender, latency)
+                            ));
+                        } else {
+                            self.add_message_to_current(ChatMessage::system(
+                                &format!("[CTCP PING reply] {} - {}", sender, ctcp_reply)
+                            ));
+                        }
+                    } else {
+                        // Other CTCP replies (VERSION, TIME, etc.)
+                        self.add_message_to_current(ChatMessage::system(
+                            &format!("[CTCP {} reply] {} - {}", ctcp_cmd, sender, ctcp_reply)
+                        ));
+                    }
+                    return;
+                }
+
                 let chat_msg = ChatMessage::system(&format!("-{}- {}", sender, content));
 
                 if target == "*" || !self.connected {
@@ -1141,10 +1181,188 @@ impl IrcApp {
                 }
             }
 
+            // WHOIS responses - route to current window
+            311 => {
+                // RPL_WHOISUSER: <nick> <user> <host> * :<realname>
+                if let (Some(nick), Some(user), Some(host)) = (params.get(1), params.get(2), params.get(3)) {
+                    let realname = params.get(5).cloned().unwrap_or_default();
+                    self.add_message_to_current(ChatMessage::system(
+                        &format!("[WHOIS] {} ({}@{}) - {}", nick, user, host, realname)
+                    ));
+                }
+            }
+
+            312 => {
+                // RPL_WHOISSERVER: <nick> <server> :<serverinfo>
+                if let (Some(nick), Some(server)) = (params.get(1), params.get(2)) {
+                    let info = params.get(3).cloned().unwrap_or_default();
+                    self.add_message_to_current(ChatMessage::system(
+                        &format!("[WHOIS] {} is on server {} ({})", nick, server, info)
+                    ));
+                }
+            }
+
+            313 => {
+                // RPL_WHOISOPERATOR: <nick> :is an IRC operator
+                if let Some(nick) = params.get(1) {
+                    self.add_message_to_current(ChatMessage::system(
+                        &format!("[WHOIS] {} is an IRC operator", nick)
+                    ));
+                }
+            }
+
+            317 => {
+                // RPL_WHOISIDLE: <nick> <seconds> <signon> :seconds idle, signon time
+                if let (Some(nick), Some(idle_secs)) = (params.get(1), params.get(2)) {
+                    let idle: u64 = idle_secs.parse().unwrap_or(0);
+                    let idle_str = if idle >= 3600 {
+                        format!("{}h {}m", idle / 3600, (idle % 3600) / 60)
+                    } else if idle >= 60 {
+                        format!("{}m {}s", idle / 60, idle % 60)
+                    } else {
+                        format!("{}s", idle)
+                    };
+                    self.add_message_to_current(ChatMessage::system(
+                        &format!("[WHOIS] {} has been idle for {}", nick, idle_str)
+                    ));
+                }
+            }
+
+            318 => {
+                // RPL_ENDOFWHOIS: <nick> :End of /WHOIS list
+                if let Some(nick) = params.get(1) {
+                    self.add_message_to_current(ChatMessage::system(
+                        &format!("[WHOIS] End of WHOIS for {}", nick)
+                    ));
+                }
+            }
+
+            319 => {
+                // RPL_WHOISCHANNELS: <nick> :<channels>
+                if let (Some(nick), Some(channels)) = (params.get(1), params.get(2)) {
+                    self.add_message_to_current(ChatMessage::system(
+                        &format!("[WHOIS] {} is on: {}", nick, channels)
+                    ));
+                }
+            }
+
+            330 => {
+                // RPL_WHOISACCOUNT: <nick> <account> :is logged in as
+                if let (Some(nick), Some(account)) = (params.get(1), params.get(2)) {
+                    self.add_message_to_current(ChatMessage::system(
+                        &format!("[WHOIS] {} is logged in as {}", nick, account)
+                    ));
+                }
+            }
+
+            338 => {
+                // RPL_WHOISACTUALLY: <nick> <user@host> <ip> :actually using host
+                if let (Some(nick), Some(host)) = (params.get(1), params.get(2)) {
+                    let ip = params.get(3).cloned().unwrap_or_default();
+                    self.add_message_to_current(ChatMessage::system(
+                        &format!("[WHOIS] {} is actually using host {} ({})", nick, host, ip)
+                    ));
+                }
+            }
+
+            671 => {
+                // RPL_WHOISSECURE: <nick> :is using a secure connection
+                if let Some(nick) = params.get(1) {
+                    self.add_message_to_current(ChatMessage::system(
+                        &format!("[WHOIS] {} is using a secure connection", nick)
+                    ));
+                }
+            }
+
+            // WHO responses - route to current window
+            352 => {
+                // RPL_WHOREPLY: <channel> <user> <host> <server> <nick> <H|G>[*][@|+] :<hopcount> <realname>
+                if let (Some(channel), Some(user), Some(host), Some(_server), Some(nick), Some(flags)) =
+                    (params.get(1), params.get(2), params.get(3), params.get(4), params.get(5), params.get(6))
+                {
+                    let realname = params.get(7).cloned().unwrap_or_default();
+                    let away = if flags.starts_with('G') { " (away)" } else { "" };
+                    self.add_message_to_current(ChatMessage::system(
+                        &format!("[WHO] {} {}@{} {} {}{}", nick, user, host, channel, realname, away)
+                    ));
+                }
+            }
+
+            315 => {
+                // RPL_ENDOFWHO: <name> :End of /WHO list
+                self.add_message_to_current(ChatMessage::system("[WHO] End of WHO list"));
+            }
+
+            // Error numerics - route to current window
+            401 => {
+                // ERR_NOSUCHNICK: <nick> :No such nick/channel
+                if let Some(nick) = params.get(1) {
+                    self.add_message_to_current(ChatMessage::system(
+                        &format!("No such nick/channel: {}", nick)
+                    ));
+                }
+            }
+
+            403 => {
+                // ERR_NOSUCHCHANNEL: <channel> :No such channel
+                if let Some(channel) = params.get(1) {
+                    self.add_message_to_current(ChatMessage::system(
+                        &format!("No such channel: {}", channel)
+                    ));
+                }
+            }
+
+            404 => {
+                // ERR_CANNOTSENDTOCHAN: <channel> :Cannot send to channel
+                if let Some(channel) = params.get(1) {
+                    self.add_message_to_current(ChatMessage::system(
+                        &format!("Cannot send to channel: {}", channel)
+                    ));
+                }
+            }
+
+            442 => {
+                // ERR_NOTONCHANNEL: <channel> :You're not on that channel
+                if let Some(channel) = params.get(1) {
+                    self.add_message_to_current(ChatMessage::system(
+                        &format!("You're not on that channel: {}", channel)
+                    ));
+                }
+            }
+
+            473 => {
+                // ERR_INVITEONLYCHAN: <channel> :Cannot join channel (+i)
+                if let Some(channel) = params.get(1) {
+                    self.add_message_to_current(ChatMessage::system(
+                        &format!("Cannot join {} (invite only)", channel)
+                    ));
+                }
+            }
+
+            474 => {
+                // ERR_BANNEDFROMCHAN: <channel> :Cannot join channel (+b)
+                if let Some(channel) = params.get(1) {
+                    self.add_message_to_current(ChatMessage::system(
+                        &format!("Cannot join {} (banned)", channel)
+                    ));
+                }
+            }
+
+            475 => {
+                // ERR_BADCHANNELKEY: <channel> :Cannot join channel (+k)
+                if let Some(channel) = params.get(1) {
+                    self.add_message_to_current(ChatMessage::system(
+                        &format!("Cannot join {} (bad key)", channel)
+                    ));
+                }
+            }
+
             _ => {
-                // Show other numerics in server buffer
-                let text = params.join(" ");
-                self.add_server_message(ChatMessage::system(&format!("[{}] {}", num, text)));
+                // Show other numerics in current window for visibility
+                let text = params.iter().skip(1).cloned().collect::<Vec<_>>().join(" ");
+                if !text.is_empty() {
+                    self.add_message_to_current(ChatMessage::system(&format!("[{}] {}", num, text)));
+                }
             }
         }
     }
@@ -1166,6 +1384,15 @@ impl IrcApp {
         // Increment unread if not viewing server buffer
         if self.current_channel.is_some() {
             self.server_unread += 1;
+        }
+    }
+
+    /// Add a message to the current window (channel or server buffer)
+    fn add_message_to_current(&mut self, msg: ChatMessage) {
+        if let Some(channel_name) = &self.current_channel.clone() {
+            self.add_message_to_channel(channel_name, msg);
+        } else {
+            self.add_server_message(msg);
         }
     }
 
@@ -1284,6 +1511,58 @@ impl IrcApp {
                 self.send_command(IrcCommand::Raw(args.to_string()));
             }
 
+            "CTCP" => {
+                // /ctcp <nick> <command> [args]
+                let parts: Vec<&str> = args.splitn(3, ' ').collect();
+                if parts.len() >= 2 {
+                    let target = parts[0];
+                    let ctcp_cmd = parts[1].to_uppercase();
+                    let ctcp_args = parts.get(2).copied().unwrap_or("");
+                    let ctcp_msg = if ctcp_args.is_empty() {
+                        format!("\x01{}\x01", ctcp_cmd)
+                    } else {
+                        format!("\x01{} {}\x01", ctcp_cmd, ctcp_args)
+                    };
+                    self.send_command(IrcCommand::Privmsg(target.to_string(), ctcp_msg));
+                    self.add_message_to_current(ChatMessage::system(
+                        &format!("[CTCP] Sent {} to {}", ctcp_cmd, target)
+                    ));
+                } else {
+                    self.add_message_to_current(ChatMessage::system(
+                        "Usage: /ctcp <nick> <command> [args]"
+                    ));
+                }
+            }
+
+            "VERSION" => {
+                // Convenience: /version <nick> is shorthand for /ctcp <nick> VERSION
+                if !args.is_empty() {
+                    let ctcp_msg = "\x01VERSION\x01".to_string();
+                    self.send_command(IrcCommand::Privmsg(args.to_string(), ctcp_msg));
+                    self.add_message_to_current(ChatMessage::system(
+                        &format!("[CTCP] Sent VERSION to {}", args)
+                    ));
+                } else {
+                    self.add_message_to_current(ChatMessage::system(
+                        "Usage: /version <nick>"
+                    ));
+                }
+            }
+
+            "PING" if !args.is_empty() && !args.starts_with('#') => {
+                // /ping <nick> - Send CTCP PING to measure latency
+                use std::time::{SystemTime, UNIX_EPOCH};
+                let timestamp = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis();
+                let ctcp_msg = format!("\x01PING {}\x01", timestamp);
+                self.send_command(IrcCommand::Privmsg(args.to_string(), ctcp_msg));
+                self.add_message_to_current(ChatMessage::system(
+                    &format!("[CTCP] Sent PING to {}", args)
+                ));
+            }
+
             "CLEAR" => {
                 if let Some(channel) = &self.current_channel {
                     if let Some(ch) = self.channels.get_mut(channel) {
@@ -1339,14 +1618,19 @@ impl IrcApp {
                     "/whois <nick> - Get detailed user info",
                     "/names [#channel] - List users in channel",
                     "/list [pattern] - List channels",
+                    "/ctcp <nick> <command> [args] - Send CTCP request",
+                    "/version <nick> - Query client version (CTCP)",
+                    "/ping <nick> - Measure latency (CTCP PING)",
                     "/settings - Open settings",
                     "/quit [message] - Disconnect from server",
                     "/away [message] - Set away status, or clear if no message",
                     "/clear - Clear current channel messages",
                     "/raw <command> - Send raw IRC command",
+                    "",
+                    "Shortcuts: Alt+1-9 switch tabs, Ctrl+W close tab",
                 ];
                 for msg in help_msgs {
-                    self.add_server_message(ChatMessage::system(msg));
+                    self.add_message_to_current(ChatMessage::system(msg));
                 }
             }
 
@@ -1452,6 +1736,92 @@ impl IrcApp {
 
     fn reset_tab_completion(&mut self) {
         self.tab_completion = None;
+    }
+
+    /// Handle CTCP request and send reply if applicable
+    /// Returns true if the message was a CTCP request that was handled
+    fn handle_ctcp_request(&mut self, sender: &str, content: &str) -> bool {
+        // CTCP messages start and end with \x01
+        if !content.starts_with('\x01') || !content.ends_with('\x01') {
+            return false;
+        }
+
+        // Extract CTCP command and args
+        let ctcp_content = &content[1..content.len()-1];
+        let parts: Vec<&str> = ctcp_content.splitn(2, ' ').collect();
+        let ctcp_cmd = parts[0].to_uppercase();
+        let ctcp_args = parts.get(1).copied().unwrap_or("");
+
+        // ACTION is not a request, it's a message type - don't reply
+        if ctcp_cmd == "ACTION" {
+            return false;
+        }
+
+        // Build the reply based on the CTCP command
+        let reply = match ctcp_cmd.as_str() {
+            "VERSION" => {
+                Some(format!("\x01VERSION fmIRC v0.0.1 - Rust/egui cross-platform IRC client\x01"))
+            }
+            "TIME" => {
+                // Get current local time
+                use std::time::{SystemTime, UNIX_EPOCH};
+                let secs = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+
+                #[cfg(unix)]
+                let time_str = {
+                    let t = secs as libc::time_t;
+                    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+                    unsafe { libc::localtime_r(&t, &mut tm) };
+                    format!("{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
+                        tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday,
+                        tm.tm_hour, tm.tm_min, tm.tm_sec)
+                };
+
+                #[cfg(not(unix))]
+                let time_str = {
+                    let days = secs / 86400;
+                    let hours = (secs % 86400) / 3600;
+                    let mins = (secs % 3600) / 60;
+                    let s = secs % 60;
+                    format!("Day {} {:02}:{:02}:{:02} UTC", days, hours, mins, s)
+                };
+
+                Some(format!("\x01TIME {}\x01", time_str))
+            }
+            "PING" => {
+                // Echo back the ping argument
+                Some(format!("\x01PING {}\x01", ctcp_args))
+            }
+            "CLIENTINFO" => {
+                Some(format!("\x01CLIENTINFO ACTION PING VERSION TIME CLIENTINFO SOURCE USERINFO\x01"))
+            }
+            "SOURCE" => {
+                Some(format!("\x01SOURCE https://github.com/user/fmirc\x01"))
+            }
+            "USERINFO" => {
+                Some(format!("\x01USERINFO {}\x01", self.realname))
+            }
+            _ => None
+        };
+
+        // Send the reply if we have one
+        if let Some(reply_msg) = reply {
+            self.send_command(IrcCommand::Notice(sender.to_string(), reply_msg));
+            // Log the CTCP request/reply
+            self.add_message_to_current(ChatMessage::system(
+                &format!("[CTCP] {} from {} - replied", ctcp_cmd, sender)
+            ));
+            true
+        } else {
+            // Unknown CTCP, log it but don't reply
+            self.add_message_to_current(ChatMessage::system(
+                &format!("[CTCP] Unknown {} from {}", ctcp_cmd, sender)
+            ));
+            true
+        }
     }
 
     /// Check if a message contains a mention of our nick
@@ -2198,7 +2568,7 @@ impl IrcApp {
                 });
                 ui.separator();
 
-                // Scrollable channel list
+                // Scrollable channel list with proper column layout
                 let current_selected = self.channel_list_selected.clone();
                 let mut new_selected = current_selected.clone();
 
@@ -2208,74 +2578,93 @@ impl IrcApp {
                     .show(ui, |ui| {
                         let filter = self.channel_list_filter.to_lowercase();
 
-                        for entry in &self.channel_list {
-                            // Filter by channel name or topic
-                            if !filter.is_empty()
-                                && !entry.name.to_lowercase().contains(&filter)
-                                && !entry.topic.to_lowercase().contains(&filter)
-                            {
-                                continue;
-                            }
+                        // Use Grid for proper column alignment
+                        egui::Grid::new("channel_list_grid")
+                            .num_columns(3)
+                            .min_col_width(0.0)
+                            .spacing([8.0, 2.0])
+                            .striped(true)
+                            .show(ui, |ui| {
+                                for entry in &self.channel_list {
+                                    // Filter by channel name or topic
+                                    if !filter.is_empty()
+                                        && !entry.name.to_lowercase().contains(&filter)
+                                        && !entry.topic.to_lowercase().contains(&filter)
+                                    {
+                                        continue;
+                                    }
 
-                            let is_selected = current_selected.as_ref() == Some(&entry.name);
+                                    let is_selected = current_selected.as_ref() == Some(&entry.name);
+                                    let row_color = if is_selected {
+                                        Color32::WHITE
+                                    } else {
+                                        Color32::from_rgb(180, 210, 255)
+                                    };
 
-                            // Build the row text
-                            let row_text = format!(
-                                "{:<width_c$} {:>width_u$}  {}",
-                                entry.name,
-                                entry.user_count,
-                                if entry.topic.len() > 80 {
-                                    format!("{}...", &entry.topic.chars().take(80).collect::<String>())
-                                } else {
-                                    entry.topic.clone()
-                                },
-                                width_c = 20,
-                                width_u = 5
-                            );
+                                    // Column 1: Channel name (clickable)
+                                    let response = ui.add_sized(
+                                        [channel_width, 18.0],
+                                        egui::SelectableLabel::new(
+                                            is_selected,
+                                            RichText::new(&entry.name).color(row_color)
+                                        )
+                                    );
 
-                            let response = ui.selectable_label(
-                                is_selected,
-                                RichText::new(&row_text).color(if is_selected {
-                                    Color32::WHITE
-                                } else {
-                                    Color32::LIGHT_BLUE
-                                })
-                            );
+                                    // Single click to select
+                                    if response.clicked() {
+                                        new_selected = Some(entry.name.clone());
+                                    }
 
-                            // Single click to select
-                            if response.clicked() {
-                                new_selected = Some(entry.name.clone());
-                            }
+                                    // Double click to join
+                                    if response.double_clicked() {
+                                        join_channel = Some(entry.name.clone());
+                                    }
 
-                            // Double click to join
-                            if response.double_clicked() {
-                                join_channel = Some(entry.name.clone());
-                            }
+                                    // Right-click context menu
+                                    let channel_name = entry.name.clone();
+                                    let channel_topic = entry.topic.clone();
+                                    let channel_users = entry.user_count;
+                                    response.context_menu(|ui| {
+                                        ui.label(RichText::new(&channel_name).strong());
+                                        ui.label(format!("{} users", channel_users));
+                                        if !channel_topic.is_empty() {
+                                            ui.separator();
+                                            ui.label(RichText::new("Topic:").small());
+                                            ui.add(egui::Label::new(
+                                                RichText::new(&channel_topic).small().color(Color32::GRAY)
+                                            ).wrap_mode(egui::TextWrapMode::Wrap));
+                                        }
+                                        ui.separator();
+                                        if ui.button("Join Channel").clicked() {
+                                            join_channel = Some(channel_name.clone());
+                                            ui.close();
+                                        }
+                                        if ui.button("Copy Channel Name").clicked() {
+                                            ui.ctx().copy_text(channel_name.clone());
+                                            ui.close();
+                                        }
+                                    });
 
-                            // Right-click context menu
-                            let channel_name = entry.name.clone();
-                            let channel_topic = entry.topic.clone();
-                            let channel_users = entry.user_count;
-                            response.context_menu(|ui| {
-                                ui.label(RichText::new(&channel_name).strong());
-                                ui.label(format!("{} users", channel_users));
-                                if !channel_topic.is_empty() {
-                                    ui.separator();
-                                    ui.label(RichText::new("Topic:").small());
-                                    // Word wrap long topics
-                                    ui.label(RichText::new(&channel_topic).small().color(Color32::GRAY));
-                                }
-                                ui.separator();
-                                if ui.button("Join Channel").clicked() {
-                                    join_channel = Some(channel_name.clone());
-                                    ui.close();
-                                }
-                                if ui.button("Copy Channel Name").clicked() {
-                                    ui.ctx().copy_text(channel_name.clone());
-                                    ui.close();
+                                    // Column 2: User count (right-aligned)
+                                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                        ui.set_min_width(users_width);
+                                        ui.label(RichText::new(format!("{}", entry.user_count)).color(Color32::LIGHT_GREEN));
+                                    });
+
+                                    // Column 3: Topic (truncated)
+                                    let topic_display = if entry.topic.len() > 70 {
+                                        format!("{}...", entry.topic.chars().take(70).collect::<String>())
+                                    } else {
+                                        entry.topic.clone()
+                                    };
+                                    ui.add_sized(
+                                        [topic_width, 18.0],
+                                        egui::Label::new(RichText::new(&topic_display).color(Color32::GRAY))
+                                    );
+
+                                    ui.end_row();
                                 }
                             });
-                        }
                     });
 
                 // Update selection
