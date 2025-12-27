@@ -366,29 +366,53 @@ fn render_irc_text(ui: &mut egui::Ui, text: &str, default_color: Color32) {
 }
 
 fn current_time_hhmm() -> String {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let secs = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-
     #[cfg(unix)]
     let (hours, minutes) = {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let secs = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
         let t = secs as libc::time_t;
         let mut tm: libc::tm = unsafe { std::mem::zeroed() };
         unsafe { libc::localtime_r(&t, &mut tm) };
         (tm.tm_hour as u64, tm.tm_min as u64)
     };
 
-    #[cfg(not(unix))]
+    #[cfg(windows)]
     let (hours, minutes) = {
-        // Fallback to UTC on non-unix (Windows handled by winapi if needed)
+        // Use Windows SYSTEMTIME for local time
+        use std::mem::MaybeUninit;
+        #[repr(C)]
+        struct SYSTEMTIME {
+            year: u16, month: u16, day_of_week: u16, day: u16,
+            hour: u16, minute: u16, second: u16, milliseconds: u16,
+        }
+        unsafe extern "system" {
+            fn GetLocalTime(lpSystemTime: *mut SYSTEMTIME);
+        }
+        let mut st = MaybeUninit::<SYSTEMTIME>::uninit();
+        unsafe {
+            GetLocalTime(st.as_mut_ptr());
+            let st = st.assume_init();
+            (st.hour as u64, st.minute as u64)
+        }
+    };
+
+    #[cfg(not(any(unix, windows)))]
+    let (hours, minutes) = {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let secs = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        // Fallback to UTC
         let hours = (secs % 86400) / 3600;
         let minutes = (secs % 3600) / 60;
         (hours, minutes)
     };
 
-    format!("{:02}:{:02}", hours, minutes)
+    format!("[{:02}:{:02}]", hours, minutes)
 }
 
 #[derive(Debug, Clone)]
@@ -3249,27 +3273,30 @@ impl IrcApp {
     }
 }
 
+/// Get a consistent color for a nickname
+/// Uses a curated palette of colors that are visually distinct and readable on dark backgrounds
 fn nick_color(nick: &str) -> Color32 {
+    // Curated palette of distinct, readable colors for dark backgrounds
+    const NICK_COLORS: [Color32; 16] = [
+        Color32::from_rgb(255, 100, 100),  // Light red
+        Color32::from_rgb(100, 255, 100),  // Light green
+        Color32::from_rgb(100, 200, 255),  // Light blue
+        Color32::from_rgb(255, 200, 100),  // Orange/gold
+        Color32::from_rgb(255, 100, 255),  // Pink/magenta
+        Color32::from_rgb(100, 255, 255),  // Cyan
+        Color32::from_rgb(255, 255, 100),  // Yellow
+        Color32::from_rgb(200, 150, 255),  // Light purple
+        Color32::from_rgb(255, 150, 150),  // Salmon
+        Color32::from_rgb(150, 255, 200),  // Mint
+        Color32::from_rgb(150, 200, 255),  // Sky blue
+        Color32::from_rgb(255, 200, 150),  // Peach
+        Color32::from_rgb(200, 255, 150),  // Lime
+        Color32::from_rgb(255, 150, 200),  // Rose
+        Color32::from_rgb(150, 255, 255),  // Aqua
+        Color32::from_rgb(255, 220, 180),  // Tan
+    ];
+
+    // Hash the nick to get a consistent index
     let hash: u32 = nick.bytes().fold(0, |acc, b| acc.wrapping_add(b as u32).wrapping_mul(31));
-    let hue = (hash % 360) as f32;
-
-    // Convert HSL to RGB (simplified)
-    let c = 0.6;
-    let x = c * (1.0 - ((hue / 60.0) % 2.0 - 1.0).abs());
-    let m = 0.3;
-
-    let (r, g, b) = match (hue / 60.0) as u32 {
-        0 => (c, x, 0.0),
-        1 => (x, c, 0.0),
-        2 => (0.0, c, x),
-        3 => (0.0, x, c),
-        4 => (x, 0.0, c),
-        _ => (c, 0.0, x),
-    };
-
-    Color32::from_rgb(
-        ((r + m) * 255.0) as u8,
-        ((g + m) * 255.0) as u8,
-        ((b + m) * 255.0) as u8,
-    )
+    NICK_COLORS[(hash as usize) % NICK_COLORS.len()]
 }
