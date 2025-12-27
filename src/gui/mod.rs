@@ -497,6 +497,7 @@ impl IrcApp {
         self.sasl_username = fav.sasl_username.clone();
         self.sasl_password = fav.sasl_password.clone();
     }
+
 }
 
 fn rand_suffix() -> u32 {

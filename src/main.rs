@@ -19,12 +19,13 @@ mod tray {
     use windows::Win32::Foundation::HWND;
     use windows::Win32::UI::WindowsAndMessaging::{
         FindWindowW, ShowWindow, SetForegroundWindow, FlashWindowEx,
-        SW_HIDE, SW_SHOW, FLASHWINFO, FLASHW_ALL, FLASHW_TIMERNOFG,
+        SW_HIDE, SW_SHOW, SW_RESTORE, FLASHWINFO, FLASHW_ALL, FLASHW_TIMERNOFG,
     };
     use windows::core::w;
 
     static TRAY_ACTIVE: AtomicBool = AtomicBool::new(false);
     static EXIT_REQUESTED: AtomicBool = AtomicBool::new(false);
+    static WINDOW_HIDDEN: AtomicBool = AtomicBool::new(false);
 
     fn find_our_window() -> Option<HWND> {
         unsafe {
@@ -36,9 +37,11 @@ mod tray {
     }
 
     pub fn show_window() {
+        WINDOW_HIDDEN.store(false, Ordering::SeqCst);
         if let Some(hwnd) = find_our_window() {
             unsafe {
                 let _ = ShowWindow(hwnd, SW_SHOW);
+                let _ = ShowWindow(hwnd, SW_RESTORE);
                 let _ = SetForegroundWindow(hwnd);
             }
             tracing::info!("Window shown via Win32");
@@ -48,12 +51,17 @@ mod tray {
     }
 
     pub fn hide_window() {
+        WINDOW_HIDDEN.store(true, Ordering::SeqCst);
         if let Some(hwnd) = find_our_window() {
             unsafe {
                 let _ = ShowWindow(hwnd, SW_HIDE);
             }
-            tracing::info!("Window hidden via Win32");
+            tracing::info!("Window hidden to tray");
         }
+    }
+
+    pub fn is_window_hidden() -> bool {
+        WINDOW_HIDDEN.load(Ordering::SeqCst)
     }
 
     pub fn create_tray_icon() -> Option<tray_icon::TrayIcon> {
@@ -306,11 +314,20 @@ impl eframe::App for FmIrcApp {
                 return;
             }
 
-            // Intercept X button when minimize_to_tray is enabled
+            // When hidden to system tray, skip all UI work
+            if tray::is_window_hidden() {
+                // No repaint, no work - messages queue until window shown
+                return;
+            }
+
+            // Intercept X button when minimize_to_tray is enabled (only when visible)
             if self.app.minimize_to_tray && tray::is_active() {
                 if ctx.input(|i| i.viewport().close_requested()) {
                     ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                    // Tell egui we're minimized so it stops rendering
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
                     tray::hide_window();
+                    return;
                 }
             }
         }

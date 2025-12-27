@@ -28,15 +28,20 @@ def get_outdated_deps() -> dict[str, dict]:
     content = CARGO_TOML.read_text()
 
     # Parse dependencies from Cargo.toml
+    # Includes [dependencies] and [target.'cfg(...)'.dependencies] sections
     deps = {}
     in_deps = False
 
     for line in content.splitlines():
-        if line.strip() == "[dependencies]":
+        # Match [dependencies] or [target.'cfg(...)'.dependencies]
+        if line.strip() == "[dependencies]" or "dependencies]" in line:
             in_deps = True
             continue
         elif line.startswith("[") and in_deps:
-            break
+            # Check if this is another dependencies section or a different section
+            if "dependencies]" not in line:
+                in_deps = False
+            continue
         elif in_deps and "=" in line and not line.strip().startswith("#"):
             # Parse dependency line
             match = re.match(r'^(\S+)\s*=\s*(?:"([^"]+)"|{[^}]*version\s*=\s*"([^"]+)")', line)
