@@ -111,6 +111,15 @@ pub fn days_to_ymd(days: u64) -> (u32, u32, u32) {
     (y as u32, m, d)
 }
 
+/// Truncate a string to N characters efficiently, adding "..." if truncated
+/// Uses char_indices to avoid collecting into a Vec
+pub fn truncate_chars(s: &str, max_chars: usize) -> String {
+    match s.char_indices().nth(max_chars) {
+        Some((idx, _)) => format!("{}...", &s[..idx]),
+        None => s.to_string(),
+    }
+}
+
 /// Simple wildcard mask matching for ignore list
 /// Supports * (any chars) and ? (single char)
 pub fn mask_matches(pattern: &str, text: &str) -> bool {

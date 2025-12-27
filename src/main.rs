@@ -341,8 +341,13 @@ impl eframe::App for FmIrcApp {
         // Main UI update
         self.app.update(ctx, frame);
 
-        // Keep event loop alive for IRC processing
-        ctx.request_repaint_after(std::time::Duration::from_millis(100));
+        // Only repaint periodically for background tasks (lag meter, auto-away, connection checks)
+        // IRC messages trigger immediate repaint via IrcApp::update()
+        // User input triggers repaint automatically via egui
+        if self.app.connected || self.app.connecting {
+            ctx.request_repaint_after(std::time::Duration::from_millis(1000));
+        }
+        // When disconnected and not connecting, no need to poll - egui handles UI events
     }
 }
 

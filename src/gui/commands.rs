@@ -821,6 +821,7 @@ impl IrcApp {
                     // Add to ignore list
                     let mask = args.to_string();
                     if !self.ignore_list.iter().any(|m| m.eq_ignore_ascii_case(&mask)) {
+                        self.ignore_list_lower.push(mask.to_lowercase());
                         self.ignore_list.push(mask.clone());
                         self.add_message_to_current(ChatMessage::system(&format!("Now ignoring: {}", mask)));
                         // Save settings
@@ -839,6 +840,8 @@ impl IrcApp {
                     let before_len = self.ignore_list.len();
                     self.ignore_list.retain(|m| !m.to_lowercase().eq(&mask_lower));
                     if self.ignore_list.len() < before_len {
+                        // Rebuild cached lowercase list
+                        self.ignore_list_lower = self.ignore_list.iter().map(|s| s.to_lowercase()).collect();
                         self.add_message_to_current(ChatMessage::system(&format!("No longer ignoring: {}", args)));
                         self.get_settings().save();
                     } else {

@@ -12,7 +12,7 @@ use tokio::sync::mpsc;
 use crate::irc::{IrcCommand, IrcMessage};
 use crate::irc::client::ServerConfig;
 use crate::irc::numerics::*;
-use helpers::{is_channel, mask_matches, format_timestamp};
+use helpers::{is_channel, mask_matches, format_timestamp, truncate_chars};
 use formatting::{render_irc_text, nick_color};
 pub use types::{ServerFavorite, Settings, ChatMessage, Channel, UserMode, ChannelListEntry, TabCompletion, BanEntry};
 pub struct IrcApp {
@@ -137,6 +137,11 @@ pub struct IrcApp {
     // Highlights
     pub highlight_words: String,
 
+    // Cached lowercase versions for efficient comparison (updated when source changes)
+    my_nick_lower: String,
+    ignore_list_lower: Vec<String>,
+    highlight_words_lower: Vec<String>,
+
     // Reconnect settings
     pub reconnect_delay_secs: u32,
     pub max_reconnect_attempts: u32,
@@ -231,6 +236,14 @@ impl IrcApp {
             last_disconnect_time: None,
             connection_lost: false,
 
+            // Cached lowercase versions (computed before moving owned values)
+            my_nick_lower: settings.nickname.to_lowercase(),
+            ignore_list_lower: settings.ignore_list.iter().map(|s| s.to_lowercase()).collect(),
+            highlight_words_lower: settings.highlight_words.split(',')
+                .map(|s| s.trim().to_lowercase())
+                .filter(|s| !s.is_empty())
+                .collect(),
+
             ignore_list: settings.ignore_list,
             server_favorites: settings.server_favorites,
             auto_perform: settings.auto_perform,
@@ -267,7 +280,7 @@ impl IrcApp {
             ctcp_replies_enabled: settings.ctcp_replies_enabled,
 
             // Highlights
-            highlight_words: settings.highlight_words,
+            highlight_words: settings.highlight_words.clone(),
 
             // Reconnect settings
             reconnect_delay_secs: settings.reconnect_delay_secs,
@@ -339,18 +352,18 @@ impl IrcApp {
     }
 
     /// Check if a sender is ignored (by nick or mask)
+    /// Uses cached ignore_list_lower to avoid allocation per message
     fn is_ignored(&self, sender: &str, prefix: Option<&str>) -> bool {
         let sender_lower = sender.to_lowercase();
-        for pattern in &self.ignore_list {
-            let pattern_lower = pattern.to_lowercase();
-            // Check for exact nick match
-            if pattern_lower == sender_lower {
+        for (pattern, pattern_lower) in self.ignore_list.iter().zip(self.ignore_list_lower.iter()) {
+            // Check for exact nick match using cached lowercase
+            if pattern_lower == &sender_lower {
                 return true;
             }
             // Check for wildcard mask match (e.g., *!*@*.spammer.net)
             if pattern.contains('!') || pattern.contains('@') || pattern.contains('*') {
                 if let Some(full_prefix) = prefix {
-                    if mask_matches(&pattern_lower, &full_prefix.to_lowercase()) {
+                    if mask_matches(pattern_lower, &full_prefix.to_lowercase()) {
                         return true;
                     }
                 }
@@ -456,8 +469,18 @@ impl IrcApp {
         }
     }
 
-    fn save_settings(&self) {
+    fn save_settings(&mut self) {
+        self.update_cached_lowercase();
         self.get_settings().save();
+    }
+
+    /// Update cached lowercase versions of strings for efficient comparison
+    fn update_cached_lowercase(&mut self) {
+        self.highlight_words_lower = self.highlight_words.split(',')
+            .map(|s| s.trim().to_lowercase())
+            .filter(|s| !s.is_empty())
+            .collect();
+        self.ignore_list_lower = self.ignore_list.iter().map(|s| s.to_lowercase()).collect();
     }
 
     /// Load a server favorite into the connection form
@@ -558,27 +581,17 @@ impl IrcApp {
                 // Skip if we sent it ourselves
                 let is_from_self = sender.eq_ignore_ascii_case(&self.my_nick);
                 if is_pm && !is_from_self {
-                    let msg_preview = if content.len() > 50 {
-                        format!("{}...", &content.chars().take(50).collect::<String>())
-                    } else {
-                        content.clone()
-                    };
                     // PMs always notify (force=true)
                     self.send_notification(
                         &format!("PM from {}", sender),
-                        &msg_preview,
+                        &truncate_chars(&content, 50),
                         true
                     );
                 } else if is_highlight && !is_from_self {
-                    let msg_preview = if content.len() > 50 {
-                        format!("{}...", &content.chars().take(50).collect::<String>())
-                    } else {
-                        content.clone()
-                    };
                     // Highlights only notify when not focused
                     self.send_notification(
                         &format!("{} mentioned you in {}", sender, target_name),
-                        &msg_preview,
+                        &truncate_chars(&content, 50),
                         false
                     );
                 }
@@ -729,6 +742,7 @@ impl IrcApp {
                 let old_nick = msg.get_sender_nick().unwrap_or_default();
                 if old_nick.eq_ignore_ascii_case(&self.my_nick) {
                     self.my_nick = new_nick.clone();
+                    self.my_nick_lower = new_nick.to_lowercase();
                 }
                 let sys_msg = ChatMessage::system(&format!(
                     "{} is now known as {}", old_nick, new_nick
@@ -809,6 +823,7 @@ impl IrcApp {
                 self.reset_reconnect_state(); // Reset reconnect attempts on successful connection
                 if let Some(nick) = params.get(0) {
                     self.my_nick = nick.clone();
+                    self.my_nick_lower = nick.to_lowercase();
                 }
                 let msg = params.get(1).cloned().unwrap_or_else(|| "Welcome!".to_string());
                 self.add_server_message(ChatMessage::system(&msg));
@@ -959,6 +974,7 @@ impl IrcApp {
             ERR_NICKNAMEINUSE => {
                 let new_nick = format!("{}_", self.my_nick);
                 self.my_nick = new_nick.clone();
+                self.my_nick_lower = new_nick.to_lowercase();
                 if let Some(tx) = &self.cmd_tx {
                     let _ = tx.try_send(IrcCommand::Nick(new_nick));
                 }
@@ -1594,25 +1610,20 @@ impl IrcApp {
         let content_lower = content.to_lowercase();
 
         // Check for nick as a word (with word boundaries)
-        if !self.my_nick.is_empty() {
-            let nick_lower = self.my_nick.to_lowercase();
+        // Uses cached my_nick_lower to avoid allocation per message
+        if !self.my_nick_lower.is_empty() {
             for word in content_lower.split(|c: char| !c.is_alphanumeric() && c != '_') {
-                if word == nick_lower {
+                if word == self.my_nick_lower {
                     return true;
                 }
             }
         }
 
-        // Check for highlight words
-        if !self.highlight_words.is_empty() {
-            for highlight in self.highlight_words.split(',') {
-                let highlight = highlight.trim().to_lowercase();
-                if !highlight.is_empty() {
-                    for word in content_lower.split(|c: char| !c.is_alphanumeric() && c != '_') {
-                        if word == highlight {
-                            return true;
-                        }
-                    }
+        // Check for highlight words using cached lowercase versions
+        for highlight in &self.highlight_words_lower {
+            for word in content_lower.split(|c: char| !c.is_alphanumeric() && c != '_') {
+                if word == highlight {
+                    return true;
                 }
             }
         }
@@ -1688,8 +1699,13 @@ impl eframe::App for IrcApp {
         } else {
             Vec::new()
         };
+        let had_messages = !messages.is_empty();
         for msg in messages {
             self.handle_incoming_message(msg);
+        }
+        // Only request immediate repaint if we received messages
+        if had_messages {
+            ctx.request_repaint();
         }
 
         // Execute pending auto-perform commands (one per frame to avoid flooding)
@@ -1752,9 +1768,6 @@ impl eframe::App for IrcApp {
             self.ping_sent_time = Some(std::time::Instant::now());
             self.send_command(IrcCommand::Ping("LAG".to_string()));
         }
-
-        // Request repaint for real-time updates
-        ctx.request_repaint();
 
         // Connect dialog
         if self.show_connect_dialog && !self.connected && !self.connecting {
