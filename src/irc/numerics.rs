@@ -27,6 +27,7 @@ pub const RPL_WHOISSPECIAL: u16 = 320;  // Non-standard: special user info/title
 pub const RPL_WHOISACCOUNT: u16 = 330;
 pub const RPL_WHOISBOT: u16 = 335;      // User is a bot
 pub const RPL_WHOISACTUALLY: u16 = 338;
+pub const RPL_WHOISMARKS: u16 = 339;      // User marks/flags (network-specific)
 pub const RPL_WHOISHOST: u16 = 378;     // Actual host (shown to opers)
 pub const RPL_WHOISMODES: u16 = 379;    // User modes
 pub const RPL_WHOISSECURE: u16 = 671;   // TLS connection

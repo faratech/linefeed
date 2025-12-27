@@ -1049,6 +1049,15 @@ impl IrcApp {
                 }
             }
 
+            RPL_WHOISMARKS => {
+                // Format: 339 <me> <nick> :is marked: <mark>
+                if let (Some(nick), Some(text)) = (params.get(1), params.get(2)) {
+                    self.add_message_to_current(ChatMessage::system(
+                        &format!("[WHOIS] {} {}", nick, text)
+                    ));
+                }
+            }
+
             RPL_WHOISSECURE => {
                 if let Some(nick) = params.get(1) {
                     self.add_message_to_current(ChatMessage::system(
