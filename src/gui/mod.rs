@@ -1,3 +1,6 @@
+mod helpers;
+mod formatting;
+
 use std::collections::HashMap;
 use std::path::PathBuf;
 use egui::{Color32, RichText, ScrollArea, TextEdit, Vec2};
@@ -6,6 +9,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::irc::{IrcCommand, IrcMessage};
 use crate::irc::client::ServerConfig;
+use helpers::{is_channel, nick_to_mask, current_time_hhmm, mask_matches};
+use formatting::{render_irc_text, nick_color};
 
 // Server favorite for quick connect
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -103,336 +108,6 @@ impl Settings {
             }
         }
     }
-}
-
-// IRC color codes (mIRC standard)
-const IRC_COLORS: [Color32; 16] = [
-    Color32::WHITE,                      // 0: White
-    Color32::BLACK,                      // 1: Black
-    Color32::from_rgb(0, 0, 127),        // 2: Blue (navy)
-    Color32::from_rgb(0, 147, 0),        // 3: Green
-    Color32::from_rgb(255, 0, 0),        // 4: Red
-    Color32::from_rgb(127, 0, 0),        // 5: Brown (maroon)
-    Color32::from_rgb(156, 0, 156),      // 6: Purple
-    Color32::from_rgb(252, 127, 0),      // 7: Orange
-    Color32::from_rgb(255, 255, 0),      // 8: Yellow
-    Color32::from_rgb(0, 252, 0),        // 9: Light Green
-    Color32::from_rgb(0, 147, 147),      // 10: Cyan (teal)
-    Color32::from_rgb(0, 255, 255),      // 11: Light Cyan
-    Color32::from_rgb(0, 0, 252),        // 12: Light Blue
-    Color32::from_rgb(255, 0, 255),      // 13: Pink
-    Color32::from_rgb(127, 127, 127),    // 14: Grey
-    Color32::from_rgb(210, 210, 210),    // 15: Light Grey
-];
-
-#[derive(Clone, Debug)]
-struct TextSpan {
-    text: String,
-    fg_color: Option<Color32>,
-    bg_color: Option<Color32>,
-    bold: bool,
-    underline: bool,
-    italic: bool,
-}
-
-fn parse_irc_colors(input: &str) -> Vec<TextSpan> {
-    let mut spans = Vec::new();
-    let mut current_text = String::new();
-    let mut fg_color: Option<Color32> = None;
-    let mut bg_color: Option<Color32> = None;
-    let mut bold = false;
-    let mut underline = false;
-    let mut italic = false;
-
-    let mut chars = input.chars().peekable();
-
-    while let Some(c) = chars.next() {
-        match c {
-            '\x03' => {
-                // Color code - push current span if not empty
-                if !current_text.is_empty() {
-                    spans.push(TextSpan {
-                        text: current_text.clone(),
-                        fg_color,
-                        bg_color,
-                        bold,
-                        underline,
-                        italic,
-                    });
-                    current_text.clear();
-                }
-
-                // Parse foreground color (1-2 digits)
-                let mut fg_str = String::new();
-                while fg_str.len() < 2 {
-                    if let Some(&next) = chars.peek() {
-                        if next.is_ascii_digit() {
-                            fg_str.push(chars.next().unwrap());
-                        } else {
-                            break;
-                        }
-                    } else {
-                        break;
-                    }
-                }
-
-                if let Ok(fg) = fg_str.parse::<usize>() {
-                    fg_color = Some(IRC_COLORS[fg % 16]);
-                } else {
-                    // \x03 with no number resets colors
-                    fg_color = None;
-                    bg_color = None;
-                }
-
-                // Check for background color (comma followed by 1-2 digits)
-                if chars.peek() == Some(&',') {
-                    chars.next(); // consume comma
-                    let mut bg_str = String::new();
-                    while bg_str.len() < 2 {
-                        if let Some(&next) = chars.peek() {
-                            if next.is_ascii_digit() {
-                                bg_str.push(chars.next().unwrap());
-                            } else {
-                                break;
-                            }
-                        } else {
-                            break;
-                        }
-                    }
-                    if let Ok(bg) = bg_str.parse::<usize>() {
-                        bg_color = Some(IRC_COLORS[bg % 16]);
-                    }
-                }
-            }
-            '\x02' => {
-                // Bold toggle
-                if !current_text.is_empty() {
-                    spans.push(TextSpan {
-                        text: current_text.clone(),
-                        fg_color,
-                        bg_color,
-                        bold,
-                        underline,
-                        italic,
-                    });
-                    current_text.clear();
-                }
-                bold = !bold;
-            }
-            '\x1F' => {
-                // Underline toggle
-                if !current_text.is_empty() {
-                    spans.push(TextSpan {
-                        text: current_text.clone(),
-                        fg_color,
-                        bg_color,
-                        bold,
-                        underline,
-                        italic,
-                    });
-                    current_text.clear();
-                }
-                underline = !underline;
-            }
-            '\x1D' | '\x16' => {
-                // Italic toggle (\x1D is proper italic, \x16 is reverse/italic)
-                if !current_text.is_empty() {
-                    spans.push(TextSpan {
-                        text: current_text.clone(),
-                        fg_color,
-                        bg_color,
-                        bold,
-                        underline,
-                        italic,
-                    });
-                    current_text.clear();
-                }
-                italic = !italic;
-            }
-            '\x0F' => {
-                // Reset all formatting
-                if !current_text.is_empty() {
-                    spans.push(TextSpan {
-                        text: current_text.clone(),
-                        fg_color,
-                        bg_color,
-                        bold,
-                        underline,
-                        italic,
-                    });
-                    current_text.clear();
-                }
-                fg_color = None;
-                bg_color = None;
-                bold = false;
-                underline = false;
-                italic = false;
-            }
-            _ => {
-                current_text.push(c);
-            }
-        }
-    }
-
-    // Push remaining text
-    if !current_text.is_empty() {
-        spans.push(TextSpan {
-            text: current_text,
-            fg_color,
-            bg_color,
-            bold,
-            underline,
-            italic,
-        });
-    }
-
-    spans
-}
-
-/// Split text into URL and non-URL segments
-fn split_urls(text: &str) -> Vec<(String, bool)> {
-    let mut result = Vec::new();
-    let mut remaining = text;
-
-    while !remaining.is_empty() {
-        // Find the start of a URL
-        let url_starts = ["http://", "https://", "www."];
-        let mut earliest_url: Option<(usize, &str)> = None;
-
-        for prefix in &url_starts {
-            if let Some(pos) = remaining.find(prefix) {
-                if earliest_url.is_none() || pos < earliest_url.unwrap().0 {
-                    earliest_url = Some((pos, prefix));
-                }
-            }
-        }
-
-        match earliest_url {
-            Some((pos, _)) => {
-                // Add text before the URL
-                if pos > 0 {
-                    result.push((remaining[..pos].to_string(), false));
-                }
-
-                // Find the end of the URL (first whitespace or end of string)
-                let url_start = pos;
-                let after_url = &remaining[url_start..];
-                let url_end = after_url
-                    .find(|c: char| c.is_whitespace() || c == '>' || c == ')' || c == ']' || c == '"' || c == '\'')
-                    .unwrap_or(after_url.len());
-
-                let url = &after_url[..url_end];
-                result.push((url.to_string(), true));
-
-                remaining = &remaining[url_start + url_end..];
-            }
-            None => {
-                // No more URLs, add the rest as plain text
-                result.push((remaining.to_string(), false));
-                break;
-            }
-        }
-    }
-
-    result
-}
-
-fn render_irc_text(ui: &mut egui::Ui, text: &str, default_color: Color32) {
-    let spans = parse_irc_colors(text);
-
-    ui.horizontal_wrapped(|ui| {
-        ui.spacing_mut().item_spacing.x = 0.0;
-        for span in spans {
-            let color = span.fg_color.unwrap_or(default_color);
-
-            // Split the span text into URL and non-URL parts
-            let segments = split_urls(&span.text);
-
-            for (segment, is_url) in segments {
-                if is_url {
-                    // Render as clickable hyperlink
-                    let url = if segment.starts_with("www.") {
-                        format!("https://{}", segment)
-                    } else {
-                        segment.clone()
-                    };
-                    ui.hyperlink_to(
-                        RichText::new(&segment).color(Color32::from_rgb(100, 150, 255)).underline(),
-                        &url
-                    );
-                } else {
-                    // Render as regular text with formatting
-                    let mut rich_text = RichText::new(&segment).color(color);
-
-                    if span.bold {
-                        rich_text = rich_text.strong();
-                    }
-                    if span.underline {
-                        rich_text = rich_text.underline();
-                    }
-                    if span.italic {
-                        rich_text = rich_text.italics();
-                    }
-
-                    if let Some(bg) = span.bg_color {
-                        rich_text = rich_text.background_color(bg);
-                    }
-
-                    ui.label(rich_text);
-                }
-            }
-        }
-    });
-}
-
-fn current_time_hhmm() -> String {
-    #[cfg(unix)]
-    let (hours, minutes) = {
-        use std::time::{SystemTime, UNIX_EPOCH};
-        let secs = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        let t = secs as libc::time_t;
-        let mut tm: libc::tm = unsafe { std::mem::zeroed() };
-        unsafe { libc::localtime_r(&t, &mut tm) };
-        (tm.tm_hour as u64, tm.tm_min as u64)
-    };
-
-    #[cfg(windows)]
-    let (hours, minutes) = {
-        // Use Windows SYSTEMTIME for local time
-        use std::mem::MaybeUninit;
-        #[repr(C)]
-        struct SYSTEMTIME {
-            year: u16, month: u16, day_of_week: u16, day: u16,
-            hour: u16, minute: u16, second: u16, milliseconds: u16,
-        }
-        unsafe extern "system" {
-            fn GetLocalTime(lpSystemTime: *mut SYSTEMTIME);
-        }
-        let mut st = MaybeUninit::<SYSTEMTIME>::uninit();
-        unsafe {
-            GetLocalTime(st.as_mut_ptr());
-            let st = st.assume_init();
-            (st.hour as u64, st.minute as u64)
-        }
-    };
-
-    #[cfg(not(any(unix, windows)))]
-    let (hours, minutes) = {
-        use std::time::{SystemTime, UNIX_EPOCH};
-        let secs = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        // Fallback to UTC
-        let hours = (secs % 86400) / 3600;
-        let minutes = (secs % 3600) / 60;
-        (hours, minutes)
-    };
-
-    format!("[{:02}:{:02}]", hours, minutes)
 }
 
 #[derive(Debug, Clone)]
@@ -800,55 +475,13 @@ impl IrcApp {
             // Check for wildcard mask match (e.g., *!*@*.spammer.net)
             if pattern.contains('!') || pattern.contains('@') || pattern.contains('*') {
                 if let Some(full_prefix) = prefix {
-                    if Self::mask_matches(&pattern_lower, &full_prefix.to_lowercase()) {
+                    if mask_matches(&pattern_lower, &full_prefix.to_lowercase()) {
                         return true;
                     }
                 }
             }
         }
         false
-    }
-
-    /// Simple wildcard mask matching
-    fn mask_matches(pattern: &str, text: &str) -> bool {
-        let mut pattern_chars = pattern.chars().peekable();
-        let mut text_chars = text.chars().peekable();
-
-        while let Some(p) = pattern_chars.next() {
-            match p {
-                '*' => {
-                    // Skip consecutive wildcards
-                    while pattern_chars.peek() == Some(&'*') {
-                        pattern_chars.next();
-                    }
-                    // If * is at end, match rest
-                    if pattern_chars.peek().is_none() {
-                        return true;
-                    }
-                    // Try matching rest of pattern at each position
-                    let rest_pattern: String = pattern_chars.collect();
-                    let mut remaining: String = text_chars.collect();
-                    while !remaining.is_empty() {
-                        if Self::mask_matches(&rest_pattern, &remaining) {
-                            return true;
-                        }
-                        remaining = remaining.chars().skip(1).collect();
-                    }
-                    return Self::mask_matches(&rest_pattern, "");
-                }
-                '?' => {
-                    if text_chars.next().is_none() {
-                        return false;
-                    }
-                }
-                c => {
-                    if text_chars.next() != Some(c) {
-                        return false;
-                    }
-                }
-            }
-        }
-        text_chars.next().is_none()
     }
 
     /// Calculate reconnect delay with exponential backoff (1s, 2s, 4s, 8s, max 60s)
@@ -943,6 +576,19 @@ impl IrcApp {
     fn save_settings(&self) {
         self.get_settings().save();
     }
+
+    /// Load a server favorite into the connection form
+    fn load_favorite(&mut self, fav: &ServerFavorite) {
+        self.server_host = fav.host.clone();
+        self.server_port = fav.port.clone();
+        self.use_tls = fav.use_tls;
+        self.password = fav.password.clone();
+        if !fav.nickname.is_empty() {
+            self.nickname = fav.nickname.clone();
+        }
+        self.auto_join_channels = fav.auto_join.clone();
+        self.auto_perform = fav.auto_perform.clone();
+    }
 }
 
 fn rand_suffix() -> u32 {
@@ -1011,7 +657,7 @@ impl IrcApp {
                 // Determine target channel/query
                 let is_pm = !target.starts_with('#') && !target.starts_with('&')
                     && target.eq_ignore_ascii_case(&self.my_nick);
-                let target_name = if target.starts_with('#') || target.starts_with('&') {
+                let target_name = if is_channel(&target) {
                     target.clone()
                 } else if is_pm {
                     // Private message to us - use sender as channel
@@ -1231,7 +877,7 @@ impl IrcApp {
                     for chan in auto_join.split(',') {
                         let chan = chan.trim();
                         if !chan.is_empty() {
-                            let channel = if chan.starts_with('#') || chan.starts_with('&') {
+                            let channel = if is_channel(chan) {
                                 chan.to_string()
                             } else {
                                 format!("#{}", chan)
@@ -1783,7 +1429,7 @@ impl IrcApp {
                 if let Some(nick) = parts.get(0) {
                     if !nick.is_empty() {
                         if let Some(channel) = &self.current_channel.clone() {
-                            if channel.starts_with('#') || channel.starts_with('&') {
+                            if is_channel(&channel) {
                                 let reason = parts.get(1).map(|s| s.to_string());
                                 self.send_command(IrcCommand::Kick(channel.clone(), nick.to_string(), reason));
                             }
@@ -1797,13 +1443,9 @@ impl IrcApp {
             "BAN" => {
                 if !args.is_empty() {
                     if let Some(channel) = &self.current_channel.clone() {
-                        if channel.starts_with('#') || channel.starts_with('&') {
+                        if is_channel(&channel) {
                             // Convert nick to ban mask if it's just a nick
-                            let mask = if args.contains('!') || args.contains('@') || args.contains('*') {
-                                args.to_string()
-                            } else {
-                                format!("{}!*@*", args)
-                            };
+                            let mask = nick_to_mask(args);
                             self.send_command(IrcCommand::Mode(channel.clone(), Some("+b".to_string()), Some(mask)));
                         }
                     }
@@ -1818,12 +1460,8 @@ impl IrcApp {
             "UNBAN" => {
                 if !args.is_empty() {
                     if let Some(channel) = &self.current_channel.clone() {
-                        if channel.starts_with('#') || channel.starts_with('&') {
-                            let mask = if args.contains('!') || args.contains('@') || args.contains('*') {
-                                args.to_string()
-                            } else {
-                                format!("{}!*@*", args)
-                            };
+                        if is_channel(&channel) {
+                            let mask = nick_to_mask(args);
                             self.send_command(IrcCommand::Mode(channel.clone(), Some("-b".to_string()), Some(mask)));
                         }
                     }
@@ -1837,7 +1475,7 @@ impl IrcApp {
                 if let Some(nick) = parts.get(0) {
                     if !nick.is_empty() {
                         if let Some(channel) = &self.current_channel.clone() {
-                            if channel.starts_with('#') || channel.starts_with('&') {
+                            if is_channel(&channel) {
                                 // Ban first, then kick
                                 let mask = format!("{}!*@*", nick);
                                 self.send_command(IrcCommand::Mode(channel.clone(), Some("+b".to_string()), Some(mask)));
@@ -1854,7 +1492,7 @@ impl IrcApp {
             "OP" => {
                 if !args.is_empty() {
                     if let Some(channel) = &self.current_channel.clone() {
-                        if channel.starts_with('#') || channel.starts_with('&') {
+                        if is_channel(&channel) {
                             for nick in args.split_whitespace() {
                                 self.send_command(IrcCommand::Mode(channel.clone(), Some("+o".to_string()), Some(nick.to_string())));
                             }
@@ -1868,7 +1506,7 @@ impl IrcApp {
             "DEOP" => {
                 if !args.is_empty() {
                     if let Some(channel) = &self.current_channel.clone() {
-                        if channel.starts_with('#') || channel.starts_with('&') {
+                        if is_channel(&channel) {
                             for nick in args.split_whitespace() {
                                 self.send_command(IrcCommand::Mode(channel.clone(), Some("-o".to_string()), Some(nick.to_string())));
                             }
@@ -1882,7 +1520,7 @@ impl IrcApp {
             "VOICE" | "V" => {
                 if !args.is_empty() {
                     if let Some(channel) = &self.current_channel.clone() {
-                        if channel.starts_with('#') || channel.starts_with('&') {
+                        if is_channel(&channel) {
                             for nick in args.split_whitespace() {
                                 self.send_command(IrcCommand::Mode(channel.clone(), Some("+v".to_string()), Some(nick.to_string())));
                             }
@@ -1896,7 +1534,7 @@ impl IrcApp {
             "DEVOICE" => {
                 if !args.is_empty() {
                     if let Some(channel) = &self.current_channel.clone() {
-                        if channel.starts_with('#') || channel.starts_with('&') {
+                        if is_channel(&channel) {
                             for nick in args.split_whitespace() {
                                 self.send_command(IrcCommand::Mode(channel.clone(), Some("-v".to_string()), Some(nick.to_string())));
                             }
@@ -1910,7 +1548,7 @@ impl IrcApp {
             "HALFOP" | "HOP" => {
                 if !args.is_empty() {
                     if let Some(channel) = &self.current_channel.clone() {
-                        if channel.starts_with('#') || channel.starts_with('&') {
+                        if is_channel(&channel) {
                             for nick in args.split_whitespace() {
                                 self.send_command(IrcCommand::Mode(channel.clone(), Some("+h".to_string()), Some(nick.to_string())));
                             }
@@ -1922,7 +1560,7 @@ impl IrcApp {
             "DEHALFOP" | "DEHOP" => {
                 if !args.is_empty() {
                     if let Some(channel) = &self.current_channel.clone() {
-                        if channel.starts_with('#') || channel.starts_with('&') {
+                        if is_channel(&channel) {
                             for nick in args.split_whitespace() {
                                 self.send_command(IrcCommand::Mode(channel.clone(), Some("-h".to_string()), Some(nick.to_string())));
                             }
@@ -1961,7 +1599,7 @@ impl IrcApp {
                 let message = args;
                 if !message.is_empty() {
                     if let Some(channel) = &self.current_channel.clone() {
-                        if channel.starts_with('#') || channel.starts_with('&') {
+                        if is_channel(&channel) {
                             let target = format!("@{}", channel);
                             self.send_command(IrcCommand::Notice(target.clone(), message.to_string()));
                             self.add_message_to_current(ChatMessage::system(&format!("-> -{}- {}", target, message)));
@@ -1976,7 +1614,7 @@ impl IrcApp {
                 // Send message to all channels
                 if !args.is_empty() {
                     for channel_name in self.channels.keys().cloned().collect::<Vec<_>>() {
-                        if channel_name.starts_with('#') || channel_name.starts_with('&') {
+                        if is_channel(&channel_name) {
                             self.send_command(IrcCommand::Privmsg(channel_name.clone(), args.to_string()));
                             let msg = ChatMessage::new(&self.my_nick, args);
                             self.add_message_to_channel(&channel_name, msg);
@@ -1992,7 +1630,7 @@ impl IrcApp {
                 if !args.is_empty() {
                     let action = format!("\x01ACTION {}\x01", args);
                     for channel_name in self.channels.keys().cloned().collect::<Vec<_>>() {
-                        if channel_name.starts_with('#') || channel_name.starts_with('&') {
+                        if is_channel(&channel_name) {
                             self.send_command(IrcCommand::Privmsg(channel_name.clone(), action.clone()));
                             let msg = ChatMessage::action(&self.my_nick, args);
                             self.add_message_to_channel(&channel_name, msg);
@@ -2051,7 +1689,7 @@ impl IrcApp {
                     Some(args.to_string())
                 };
                 if let Some(ch) = channel {
-                    if ch.starts_with('#') || ch.starts_with('&') {
+                    if is_channel(&ch) {
                         self.send_command(IrcCommand::Part(ch.clone(), Some("Cycling".to_string())));
                         self.send_command(IrcCommand::Join(ch));
                     }
@@ -2072,7 +1710,7 @@ impl IrcApp {
             "CLOSE" | "WC" => {
                 // Close current window
                 if let Some(channel_name) = self.current_channel.clone() {
-                    if channel_name.starts_with('#') || channel_name.starts_with('&') {
+                    if is_channel(&channel_name) {
                         self.send_command(IrcCommand::Part(channel_name, None));
                     } else {
                         self.channels.remove(&channel_name);
@@ -2669,7 +2307,7 @@ impl IrcApp {
             // Ctrl+W to close current tab
             if i.modifiers.ctrl && i.key_pressed(egui::Key::W) {
                 if let Some(channel_name) = self.current_channel.clone() {
-                    if channel_name.starts_with('#') || channel_name.starts_with('&') {
+                    if is_channel(&channel_name) {
                         // Part the channel
                         self.send_command(IrcCommand::Part(channel_name, None));
                     } else {
@@ -2875,7 +2513,7 @@ impl eframe::App for IrcApp {
                         // Context menu for channels
                         let chan_for_menu = channel_name.clone();
                         response.context_menu(|ui| {
-                            if chan_for_menu.starts_with('#') || chan_for_menu.starts_with('&') {
+                            if is_channel(&chan_for_menu) {
                                 if ui.button("Part Channel").clicked() {
                                     part_channel = Some(chan_for_menu.clone());
                                     ui.close();
@@ -2910,7 +2548,7 @@ impl eframe::App for IrcApp {
         let mut voice_nick: Option<(String, String)> = None;
         let mut kick_nick: Option<(String, String)> = None;
         if let Some(channel_name) = &self.current_channel {
-            if channel_name.starts_with('#') || channel_name.starts_with('&') {
+            if is_channel(&channel_name) {
                 let chan_for_context = channel_name.clone();
                 egui::SidePanel::right("users")
                     .resizable(true)
@@ -3187,15 +2825,7 @@ impl IrcApp {
                                 if ui.add_enabled(has_selection, egui::Button::new("Load")).clicked() {
                                     if let Some(idx) = self.selected_favorite {
                                         if let Some(fav) = self.server_favorites.get(idx).cloned() {
-                                            self.server_host = fav.host;
-                                            self.server_port = fav.port;
-                                            self.use_tls = fav.use_tls;
-                                            self.password = fav.password;
-                                            if !fav.nickname.is_empty() {
-                                                self.nickname = fav.nickname;
-                                            }
-                                            self.auto_join_channels = fav.auto_join;
-                                            self.auto_perform = fav.auto_perform;
+                                            self.load_favorite(&fav);
                                         }
                                     }
                                 }
@@ -3213,17 +2843,7 @@ impl IrcApp {
                                 if ui.add_enabled(has_selection, egui::Button::new("Connect")).clicked() {
                                     if let Some(idx) = self.selected_favorite {
                                         if let Some(fav) = self.server_favorites.get(idx).cloned() {
-                                            // Load favorite settings
-                                            self.server_host = fav.host;
-                                            self.server_port = fav.port;
-                                            self.use_tls = fav.use_tls;
-                                            self.password = fav.password;
-                                            if !fav.nickname.is_empty() {
-                                                self.nickname = fav.nickname;
-                                            }
-                                            self.auto_join_channels = fav.auto_join;
-                                            self.auto_perform = fav.auto_perform;
-                                            // Connect
+                                            self.load_favorite(&fav);
                                             self.save_settings();
                                             self.show_connect_dialog = false;
                                             self.connecting = true;
@@ -3652,30 +3272,3 @@ impl IrcApp {
     }
 }
 
-/// Get a consistent color for a nickname
-/// Uses a curated palette of colors that are visually distinct and readable on dark backgrounds
-fn nick_color(nick: &str) -> Color32 {
-    // Curated palette of distinct, readable colors for dark backgrounds
-    const NICK_COLORS: [Color32; 16] = [
-        Color32::from_rgb(255, 100, 100),  // Light red
-        Color32::from_rgb(100, 255, 100),  // Light green
-        Color32::from_rgb(100, 200, 255),  // Light blue
-        Color32::from_rgb(255, 200, 100),  // Orange/gold
-        Color32::from_rgb(255, 100, 255),  // Pink/magenta
-        Color32::from_rgb(100, 255, 255),  // Cyan
-        Color32::from_rgb(255, 255, 100),  // Yellow
-        Color32::from_rgb(200, 150, 255),  // Light purple
-        Color32::from_rgb(255, 150, 150),  // Salmon
-        Color32::from_rgb(150, 255, 200),  // Mint
-        Color32::from_rgb(150, 200, 255),  // Sky blue
-        Color32::from_rgb(255, 200, 150),  // Peach
-        Color32::from_rgb(200, 255, 150),  // Lime
-        Color32::from_rgb(255, 150, 200),  // Rose
-        Color32::from_rgb(150, 255, 255),  // Aqua
-        Color32::from_rgb(255, 220, 180),  // Tan
-    ];
-
-    // Hash the nick to get a consistent index
-    let hash: u32 = nick.bytes().fold(0, |acc, b| acc.wrapping_add(b as u32).wrapping_mul(31));
-    NICK_COLORS[(hash as usize) % NICK_COLORS.len()]
-}
