@@ -38,12 +38,37 @@ impl IrcApp {
                 }
             }
 
-            "MSG" | "PRIVMSG" | "QUERY" => {
+            "MSG" | "PRIVMSG" => {
                 let msg_parts: Vec<&str> = args.splitn(2, ' ').collect();
                 if let (Some(target), Some(message)) = (msg_parts.get(0), msg_parts.get(1)) {
                     self.send_command(IrcCommand::Privmsg(target.to_string(), message.to_string()));
                     let chat_msg = ChatMessage::new(&self.my_nick, message);
                     self.add_message_to_channel(target, chat_msg);
+                }
+            }
+
+            "QUERY" | "Q" => {
+                let msg_parts: Vec<&str> = args.splitn(2, ' ').collect();
+                if let Some(&target) = msg_parts.get(0) {
+                    if target.is_empty() {
+                        self.add_server_message(ChatMessage::system("Usage: /query <nick> [message]"));
+                        return;
+                    }
+                    // Open query window (loads history via add_message_to_channel)
+                    if !self.channels.contains_key(target) {
+                        // Create the query window with a system message to trigger history load
+                        let sys_msg = ChatMessage::system(&format!("Conversation with {}", target));
+                        self.add_message_to_channel(target, sys_msg);
+                    }
+                    self.current_channel = Some(target.to_string());
+                    // If there's a message, send it
+                    if let Some(&message) = msg_parts.get(1) {
+                        if !message.is_empty() {
+                            self.send_command(IrcCommand::Privmsg(target.to_string(), message.to_string()));
+                            let chat_msg = ChatMessage::new(&self.my_nick, message);
+                            self.add_message_to_channel(target, chat_msg);
+                        }
+                    }
                 }
             }
 

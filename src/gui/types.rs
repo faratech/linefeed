@@ -49,6 +49,10 @@ pub struct Settings {
     // SASL authentication
     pub sasl_username: String,
     pub sasl_password: String,
+    // Logging
+    pub logging_enabled: bool,
+    pub logging_load_history: bool,
+    pub logging_history_lines: usize,
 }
 
 impl Default for Settings {
@@ -75,6 +79,9 @@ impl Default for Settings {
             auto_away_message: "Auto-away".to_string(),
             sasl_username: String::new(),
             sasl_password: String::new(),
+            logging_enabled: true,
+            logging_load_history: true,
+            logging_history_lines: 100,
         }
     }
 }

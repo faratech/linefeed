@@ -326,6 +326,22 @@ impl IrcApp {
                 }
 
                 ui.separator();
+                ui.heading("Logging");
+                ui.separator();
+
+                ui.checkbox(&mut self.logging_load_history, "Load chat history on join");
+                if self.logging_load_history {
+                    ui.horizontal(|ui| {
+                        ui.label("    Load last");
+                        let mut lines = self.logging_history_lines as i32;
+                        ui.add(egui::DragValue::new(&mut lines).speed(10).range(10..=1000));
+                        self.logging_history_lines = lines.max(10) as usize;
+                        ui.label("lines");
+                    });
+                }
+                ui.label("Logs are stored in ~/.config/fmirc/logs/");
+
+                ui.separator();
                 ui.heading("About");
                 ui.separator();
                 ui.label("fmIRC v0.0.1");

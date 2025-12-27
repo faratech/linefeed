@@ -3,6 +3,7 @@ mod formatting;
 mod dialogs;
 mod commands;
 mod types;
+mod logging;
 
 use std::collections::HashMap;
 use egui::{Color32, RichText, ScrollArea, TextEdit};
@@ -115,6 +116,11 @@ pub struct IrcApp {
     // SASL authentication
     pub sasl_username: String,
     pub sasl_password: String,
+
+    // Logging
+    pub log_manager: logging::LogManager,
+    pub logging_load_history: bool,
+    pub logging_history_lines: usize,
 }
 
 impl Default for IrcApp {
@@ -207,6 +213,9 @@ impl IrcApp {
             auto_away_message: settings.auto_away_message,
             sasl_username: settings.sasl_username,
             sasl_password: settings.sasl_password,
+            log_manager: logging::LogManager::new(settings.logging_enabled),
+            logging_load_history: settings.logging_load_history,
+            logging_history_lines: settings.logging_history_lines,
         }
     }
 
@@ -233,6 +242,9 @@ impl IrcApp {
             auto_away_message: self.auto_away_message.clone(),
             sasl_username: self.sasl_username.clone(),
             sasl_password: self.sasl_password.clone(),
+            logging_enabled: true, // Always save as enabled (managed by log_manager)
+            logging_load_history: self.logging_load_history,
+            logging_history_lines: self.logging_history_lines,
         }
     }
 
@@ -544,6 +556,22 @@ impl IrcApp {
                         // Check for pending key and store it
                         if let Some(key) = self.pending_channel_keys.remove(&channel.to_lowercase()) {
                             new_channel.key = Some(key);
+                        }
+                        // Load chat history from log file
+                        if self.logging_load_history {
+                            let history = self.log_manager.load_history(
+                                &self.server_host,
+                                channel,
+                                self.logging_history_lines,
+                            );
+                            if !history.is_empty() {
+                                new_channel.messages.push(ChatMessage::system(
+                                    &format!("--- {} lines of history loaded ---", history.len())
+                                ));
+                                new_channel.messages.extend(history);
+                            }
+                            // Log session start
+                            self.log_manager.log_session_start(&self.server_host, channel);
                         }
                         self.channels.insert(channel.clone(), new_channel);
                     }
@@ -998,9 +1026,29 @@ impl IrcApp {
     }
 
     fn add_message_to_channel(&mut self, channel: &str, msg: ChatMessage) {
-        if !self.channels.contains_key(channel) {
-            self.channels.insert(channel.to_string(), Channel::new());
+        let is_new = !self.channels.contains_key(channel);
+        if is_new {
+            let mut new_channel = Channel::new();
+            // Load chat history for new query windows (non-channels)
+            if self.logging_load_history && !is_channel(channel) {
+                let history = self.log_manager.load_history(
+                    &self.server_host,
+                    channel,
+                    self.logging_history_lines,
+                );
+                if !history.is_empty() {
+                    new_channel.messages.push(ChatMessage::system(
+                        &format!("--- {} lines of history loaded ---", history.len())
+                    ));
+                    new_channel.messages.extend(history);
+                }
+                self.log_manager.log_session_start(&self.server_host, channel);
+            }
+            self.channels.insert(channel.to_string(), new_channel);
         }
+        // Log message to disk
+        self.log_manager.log_message(&self.server_host, channel, &msg);
+
         if let Some(ch) = self.channels.get_mut(channel) {
             ch.messages.push(msg);
             if self.current_channel.as_ref() != Some(&channel.to_string()) {
