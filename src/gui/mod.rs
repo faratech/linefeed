@@ -1,9 +1,85 @@
 use std::collections::HashMap;
+use std::path::PathBuf;
 use egui::{Color32, Label, RichText, ScrollArea, Sense, TextEdit, Vec2};
 use tokio::sync::mpsc;
+use serde::{Deserialize, Serialize};
 
 use crate::irc::{IrcCommand, IrcMessage};
 use crate::irc::client::ServerConfig;
+
+// Persistent settings
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Settings {
+    pub server_host: String,
+    pub server_port: String,
+    pub use_tls: bool,
+    pub accept_invalid_certs: bool,
+    pub nickname: String,
+    pub username: String,
+    pub realname: String,
+    pub password: String,
+    pub auto_join_channels: String,
+    pub set_invisible: bool,
+    pub minimize_to_tray: bool,
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Self {
+            server_host: "irc.afternet.org".to_string(),
+            server_port: "6697".to_string(),
+            use_tls: true,
+            accept_invalid_certs: false,
+            nickname: String::new(), // Will be generated if empty
+            username: "fmirc".to_string(),
+            realname: "fmIRC".to_string(),
+            password: String::new(),
+            auto_join_channels: String::new(),
+            set_invisible: false,
+            minimize_to_tray: false,
+        }
+    }
+}
+
+impl Settings {
+    fn config_path() -> Option<PathBuf> {
+        dirs::config_dir().map(|p| p.join("fmirc").join("settings.json"))
+    }
+
+    pub fn load() -> Self {
+        if let Some(path) = Self::config_path() {
+            if path.exists() {
+                if let Ok(data) = std::fs::read_to_string(&path) {
+                    if let Ok(settings) = serde_json::from_str(&data) {
+                        tracing::info!("Loaded settings from {:?}", path);
+                        return settings;
+                    }
+                }
+            }
+        }
+        tracing::info!("Using default settings");
+        Self::default()
+    }
+
+    pub fn save(&self) {
+        if let Some(path) = Self::config_path() {
+            if let Some(parent) = path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            match serde_json::to_string_pretty(self) {
+                Ok(data) => {
+                    if let Err(e) = std::fs::write(&path, data) {
+                        tracing::error!("Failed to save settings: {}", e);
+                    } else {
+                        tracing::debug!("Saved settings to {:?}", path);
+                    }
+                }
+                Err(e) => tracing::error!("Failed to serialize settings: {}", e),
+            }
+        }
+    }
+}
 
 // IRC color codes (mIRC standard)
 const IRC_COLORS: [Color32; 16] = [
@@ -431,23 +507,40 @@ pub struct IrcApp {
 
     // Tab completion
     pub tab_completion: Option<TabCompletion>,
+
+    // Connection options
+    pub auto_join_channels: String,
+    pub set_invisible: bool,
+    pub minimize_to_tray: bool,
 }
 
 impl Default for IrcApp {
     fn default() -> Self {
+        Self::with_settings(Settings::load())
+    }
+}
+
+impl IrcApp {
+    fn with_settings(settings: Settings) -> Self {
+        let nickname = if settings.nickname.is_empty() {
+            format!("fmIRC_{}", rand_suffix())
+        } else {
+            settings.nickname.clone()
+        };
+
         Self {
             connected: false,
             connecting: false,
             my_nick: String::new(),
 
-            server_host: "irc.afternet.org".to_string(),
-            server_port: "6697".to_string(),
-            use_tls: true,
-            accept_invalid_certs: false,
-            nickname: format!("fmIRC_{}", rand_suffix()),
-            username: "fmirc".to_string(),
-            realname: "fmIRC".to_string(),
-            password: String::new(),
+            server_host: settings.server_host,
+            server_port: settings.server_port,
+            use_tls: settings.use_tls,
+            accept_invalid_certs: settings.accept_invalid_certs,
+            nickname,
+            username: settings.username,
+            realname: settings.realname,
+            password: settings.password,
 
             channels: HashMap::new(),
             current_channel: None,
@@ -474,7 +567,31 @@ impl Default for IrcApp {
             channel_list_filter: String::new(),
 
             tab_completion: None,
+
+            auto_join_channels: settings.auto_join_channels,
+            set_invisible: settings.set_invisible,
+            minimize_to_tray: settings.minimize_to_tray,
         }
+    }
+
+    fn get_settings(&self) -> Settings {
+        Settings {
+            server_host: self.server_host.clone(),
+            server_port: self.server_port.clone(),
+            use_tls: self.use_tls,
+            accept_invalid_certs: self.accept_invalid_certs,
+            nickname: self.nickname.clone(),
+            username: self.username.clone(),
+            realname: self.realname.clone(),
+            password: self.password.clone(),
+            auto_join_channels: self.auto_join_channels.clone(),
+            set_invisible: self.set_invisible,
+            minimize_to_tray: self.minimize_to_tray,
+        }
+    }
+
+    fn save_settings(&self) {
+        self.get_settings().save();
     }
 }
 
@@ -658,6 +775,29 @@ impl IrcApp {
                 }
                 let msg = params.get(1).cloned().unwrap_or_else(|| "Welcome!".to_string());
                 self.add_server_message(ChatMessage::system(&msg));
+
+                // Set invisible mode if requested
+                if self.set_invisible {
+                    self.send_command(IrcCommand::Mode(self.my_nick.clone(), Some("+i".to_string()), None));
+                    self.add_server_message(ChatMessage::system("Setting user mode +i (invisible)"));
+                }
+
+                // Auto-join channels
+                let auto_join = self.auto_join_channels.clone();
+                if !auto_join.is_empty() {
+                    for chan in auto_join.split(',') {
+                        let chan = chan.trim();
+                        if !chan.is_empty() {
+                            let channel = if chan.starts_with('#') || chan.starts_with('&') {
+                                chan.to_string()
+                            } else {
+                                format!("#{}", chan)
+                            };
+                            self.send_command(IrcCommand::Join(channel.clone()));
+                            self.add_server_message(ChatMessage::system(&format!("Auto-joining {}", channel)));
+                        }
+                    }
+                }
             }
 
             332 => {
@@ -1477,9 +1617,27 @@ impl IrcApp {
                 });
 
                 ui.separator();
+                ui.heading("On Connect");
+                ui.add_space(4.0);
+
+                ui.horizontal(|ui| {
+                    ui.label("Auto-join:");
+                    ui.add(
+                        TextEdit::singleline(&mut self.auto_join_channels)
+                            .desired_width(200.0)
+                            .hint_text("#chan1, #chan2")
+                    );
+                });
+
+                ui.horizontal(|ui| {
+                    ui.checkbox(&mut self.set_invisible, "Set invisible (+i)");
+                });
+
+                ui.separator();
 
                 ui.horizontal(|ui| {
                     if ui.button("Connect").clicked() {
+                        self.save_settings();
                         self.show_connect_dialog = false;
                         self.connecting = true;
                         self.my_nick = self.nickname.clone();
@@ -1534,6 +1692,30 @@ impl IrcApp {
                 });
 
                 ui.separator();
+                ui.heading("On Connect");
+                ui.separator();
+
+                ui.horizontal(|ui| {
+                    ui.label("Auto-join:");
+                    ui.add(
+                        TextEdit::singleline(&mut self.auto_join_channels)
+                            .desired_width(200.0)
+                            .hint_text("#chan1, #chan2")
+                    );
+                });
+
+                ui.checkbox(&mut self.set_invisible, "Set invisible (+i)");
+
+                ui.separator();
+                ui.heading("Behavior");
+                ui.separator();
+
+                let tray_response = ui.checkbox(&mut self.minimize_to_tray, "Minimize to system tray");
+                if self.minimize_to_tray {
+                    tray_response.on_hover_text("System tray support requires platform-specific setup");
+                }
+
+                ui.separator();
                 ui.heading("About");
                 ui.separator();
                 ui.label("fmIRC v0.0.1");
@@ -1541,6 +1723,7 @@ impl IrcApp {
 
                 ui.separator();
                 if ui.button("Close").clicked() {
+                    self.save_settings();
                     self.show_settings = false;
                 }
             });

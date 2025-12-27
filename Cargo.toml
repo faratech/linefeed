@@ -19,12 +19,17 @@ native-tls = "0.2.14"  # for TlsConnector::builder()
 
 # Utilities
 serde = { version = "1.0.228", features = ["derive"] }
-serde_json = "1.0.147"
+serde_json = "1.0.148"
 tracing = "0.1.44"
 tracing-subscriber = "0.3.22"
+dirs = "6.0.0"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+tray-icon = "0.19"
+windows = { version = "0.58", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging"] }
 
 # Fast incremental dev builds
 [profile.dev]
