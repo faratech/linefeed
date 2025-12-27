@@ -11,7 +11,7 @@ use tokio::sync::mpsc;
 use crate::irc::{IrcCommand, IrcMessage};
 use crate::irc::client::ServerConfig;
 use crate::irc::numerics::*;
-use helpers::{is_channel, mask_matches};
+use helpers::{is_channel, mask_matches, days_to_ymd};
 use formatting::{render_irc_text, nick_color};
 pub use types::{ServerFavorite, Settings, ChatMessage, Channel, UserMode, ChannelListEntry, TabCompletion};
 pub struct IrcApp {
@@ -522,7 +522,16 @@ impl IrcApp {
                 if target == "*" || !self.connected {
                     self.add_server_message(chat_msg);
                 } else {
-                    self.add_message_to_channel(target, chat_msg);
+                    // For private notices (target is our nick), route to sender's window
+                    // This handles NickServ, X3, and other service responses
+                    let is_private = !target.starts_with('#') && !target.starts_with('&')
+                        && target.eq_ignore_ascii_case(&self.my_nick);
+                    let target_name = if is_private {
+                        sender.clone()  // Route to sender's query window
+                    } else {
+                        target.clone()
+                    };
+                    self.add_message_to_channel(&target_name, chat_msg);
                 }
             }
 
@@ -693,6 +702,48 @@ impl IrcApp {
                 }
             }
 
+            RPL_TOPICWHOTIME => {
+                // Format: 333 <nick> <channel> <setter> <timestamp>
+                if let (Some(channel), Some(setter), Some(ts_str)) =
+                    (params.get(1), params.get(2), params.get(3))
+                {
+                    let time_str = if let Ok(ts) = ts_str.parse::<i64>() {
+                        // Convert Unix timestamp to human-readable format
+                        use std::time::{UNIX_EPOCH, Duration};
+                        if let Some(datetime) = UNIX_EPOCH.checked_add(Duration::from_secs(ts as u64)) {
+                            // Format as local time
+                            let elapsed = datetime.duration_since(UNIX_EPOCH).unwrap_or_default();
+                            let secs = elapsed.as_secs();
+                            // Calculate date components (simplified UTC)
+                            let days = secs / 86400;
+                            let time_secs = secs % 86400;
+                            let hours = time_secs / 3600;
+                            let minutes = (time_secs % 3600) / 60;
+
+                            // Days since 1970-01-01
+                            let (year, month, day) = days_to_ymd(days);
+                            let month_name = match month {
+                                1 => "Jan", 2 => "Feb", 3 => "Mar", 4 => "Apr",
+                                5 => "May", 6 => "Jun", 7 => "Jul", 8 => "Aug",
+                                9 => "Sep", 10 => "Oct", 11 => "Nov", 12 => "Dec",
+                                _ => "???",
+                            };
+                            format!("{} {}, {} {:02}:{:02} UTC", month_name, day, year, hours, minutes)
+                        } else {
+                            ts_str.clone()
+                        }
+                    } else {
+                        ts_str.clone()
+                    };
+
+                    if let Some(ch) = self.channels.get_mut(channel) {
+                        ch.messages.push(ChatMessage::system(
+                            &format!("Topic set by {} on {}", setter, time_str)
+                        ));
+                    }
+                }
+            }
+
             RPL_NAMREPLY => {
                 if let Some(channel) = params.get(2) {
                     if let Some(names) = params.get(3) {
@@ -846,6 +897,15 @@ impl IrcApp {
                 if let Some(nick) = params.get(1) {
                     self.add_message_to_current(ChatMessage::system(
                         &format!("[WHOIS] {} is using a secure connection", nick)
+                    ));
+                }
+            }
+
+            RPL_WHOISSPECIAL => {
+                // <nick> :<special info> - used by some networks for custom titles/info
+                if let (Some(nick), Some(info)) = (params.get(1), params.get(2)) {
+                    self.add_message_to_current(ChatMessage::system(
+                        &format!("[WHOIS] {} - {}", nick, info)
                     ));
                 }
             }

@@ -20,6 +20,7 @@ pub const RPL_WHOISOPERATOR: u16 = 313;
 pub const RPL_WHOISIDLE: u16 = 317;
 pub const RPL_ENDOFWHOIS: u16 = 318;
 pub const RPL_WHOISCHANNELS: u16 = 319;
+pub const RPL_WHOISSPECIAL: u16 = 320;  // Non-standard: special user info/title
 pub const RPL_WHOISACCOUNT: u16 = 330;
 pub const RPL_WHOISACTUALLY: u16 = 338;
 pub const RPL_WHOISSECURE: u16 = 671;  // Non-standard, but widely used

@@ -23,7 +23,7 @@ serde_json = "1.0.148"
 tracing = "0.1.44"
 tracing-subscriber = "0.3.22"
 dirs = "6.0.0"
-base64 = "0.22"  # For SASL authentication
+base64 = "0.22.1"  # For SASL authentication
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
