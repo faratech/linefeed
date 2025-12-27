@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
-use egui::{Color32, Label, RichText, ScrollArea, Sense, TextEdit, Vec2};
+use egui::{Color32, RichText, ScrollArea, TextEdit, Vec2};
 use tokio::sync::mpsc;
 use serde::{Deserialize, Serialize};
 
@@ -22,6 +22,7 @@ pub struct Settings {
     pub auto_join_channels: String,
     pub set_invisible: bool,
     pub minimize_to_tray: bool,
+    pub auto_reconnect: bool,
 }
 
 impl Default for Settings {
@@ -36,8 +37,9 @@ impl Default for Settings {
             realname: "fmIRC".to_string(),
             password: String::new(),
             auto_join_channels: String::new(),
-            set_invisible: false,
+            set_invisible: true,
             minimize_to_tray: false,
+            auto_reconnect: true,
         }
     }
 }
@@ -265,6 +267,54 @@ fn parse_irc_colors(input: &str) -> Vec<TextSpan> {
     spans
 }
 
+/// Split text into URL and non-URL segments
+fn split_urls(text: &str) -> Vec<(String, bool)> {
+    let mut result = Vec::new();
+    let mut remaining = text;
+
+    while !remaining.is_empty() {
+        // Find the start of a URL
+        let url_starts = ["http://", "https://", "www."];
+        let mut earliest_url: Option<(usize, &str)> = None;
+
+        for prefix in &url_starts {
+            if let Some(pos) = remaining.find(prefix) {
+                if earliest_url.is_none() || pos < earliest_url.unwrap().0 {
+                    earliest_url = Some((pos, prefix));
+                }
+            }
+        }
+
+        match earliest_url {
+            Some((pos, _)) => {
+                // Add text before the URL
+                if pos > 0 {
+                    result.push((remaining[..pos].to_string(), false));
+                }
+
+                // Find the end of the URL (first whitespace or end of string)
+                let url_start = pos;
+                let after_url = &remaining[url_start..];
+                let url_end = after_url
+                    .find(|c: char| c.is_whitespace() || c == '>' || c == ')' || c == ']' || c == '"' || c == '\'')
+                    .unwrap_or(after_url.len());
+
+                let url = &after_url[..url_end];
+                result.push((url.to_string(), true));
+
+                remaining = &remaining[url_start + url_end..];
+            }
+            None => {
+                // No more URLs, add the rest as plain text
+                result.push((remaining.to_string(), false));
+                break;
+            }
+        }
+    }
+
+    result
+}
+
 fn render_irc_text(ui: &mut egui::Ui, text: &str, default_color: Color32) {
     let spans = parse_irc_colors(text);
 
@@ -272,24 +322,43 @@ fn render_irc_text(ui: &mut egui::Ui, text: &str, default_color: Color32) {
         ui.spacing_mut().item_spacing.x = 0.0;
         for span in spans {
             let color = span.fg_color.unwrap_or(default_color);
-            let mut rich_text = RichText::new(&span.text).color(color);
 
-            if span.bold {
-                rich_text = rich_text.strong();
-            }
-            if span.underline {
-                rich_text = rich_text.underline();
-            }
-            if span.italic {
-                rich_text = rich_text.italics();
-            }
+            // Split the span text into URL and non-URL parts
+            let segments = split_urls(&span.text);
 
-            // For background colors, we use a different approach
-            if let Some(bg) = span.bg_color {
-                rich_text = rich_text.background_color(bg);
-            }
+            for (segment, is_url) in segments {
+                if is_url {
+                    // Render as clickable hyperlink
+                    let url = if segment.starts_with("www.") {
+                        format!("https://{}", segment)
+                    } else {
+                        segment.clone()
+                    };
+                    ui.hyperlink_to(
+                        RichText::new(&segment).color(Color32::from_rgb(100, 150, 255)).underline(),
+                        &url
+                    );
+                } else {
+                    // Render as regular text with formatting
+                    let mut rich_text = RichText::new(&segment).color(color);
 
-            ui.label(rich_text);
+                    if span.bold {
+                        rich_text = rich_text.strong();
+                    }
+                    if span.underline {
+                        rich_text = rich_text.underline();
+                    }
+                    if span.italic {
+                        rich_text = rich_text.italics();
+                    }
+
+                    if let Some(bg) = span.bg_color {
+                        rich_text = rich_text.background_color(bg);
+                    }
+
+                    ui.label(rich_text);
+                }
+            }
         }
     });
 }
@@ -327,6 +396,7 @@ pub struct ChatMessage {
     pub content: String,
     pub is_action: bool,
     pub is_system: bool,
+    pub is_highlight: bool,
 }
 
 impl ChatMessage {
@@ -337,6 +407,7 @@ impl ChatMessage {
             content: content.to_string(),
             is_action: false,
             is_system: false,
+            is_highlight: false,
         }
     }
 
@@ -347,6 +418,7 @@ impl ChatMessage {
             content: content.to_string(),
             is_action: false,
             is_system: true,
+            is_highlight: false,
         }
     }
 
@@ -357,6 +429,29 @@ impl ChatMessage {
             content: content.to_string(),
             is_action: true,
             is_system: false,
+            is_highlight: false,
+        }
+    }
+
+    pub fn highlighted(sender: &str, content: &str) -> Self {
+        Self {
+            timestamp: current_time_hhmm(),
+            sender: sender.to_string(),
+            content: content.to_string(),
+            is_action: false,
+            is_system: false,
+            is_highlight: true,
+        }
+    }
+
+    pub fn action_highlighted(sender: &str, content: &str) -> Self {
+        Self {
+            timestamp: current_time_hhmm(),
+            sender: sender.to_string(),
+            content: content.to_string(),
+            is_action: true,
+            is_system: false,
+            is_highlight: true,
         }
     }
 }
@@ -508,10 +603,19 @@ pub struct IrcApp {
     // Tab completion
     pub tab_completion: Option<TabCompletion>,
 
+    // User list selection
+    pub selected_user: Option<String>,
+
     // Connection options
     pub auto_join_channels: String,
     pub set_invisible: bool,
     pub minimize_to_tray: bool,
+    pub auto_reconnect: bool,
+
+    // Auto-reconnect state
+    pub reconnect_attempts: u32,
+    pub last_disconnect_time: Option<std::time::Instant>,
+    pub connection_lost: bool,
 }
 
 impl Default for IrcApp {
@@ -568,9 +672,16 @@ impl IrcApp {
 
             tab_completion: None,
 
+            selected_user: None,
+
             auto_join_channels: settings.auto_join_channels,
             set_invisible: settings.set_invisible,
             minimize_to_tray: settings.minimize_to_tray,
+            auto_reconnect: settings.auto_reconnect,
+
+            reconnect_attempts: 0,
+            last_disconnect_time: None,
+            connection_lost: false,
         }
     }
 
@@ -587,7 +698,60 @@ impl IrcApp {
             auto_join_channels: self.auto_join_channels.clone(),
             set_invisible: self.set_invisible,
             minimize_to_tray: self.minimize_to_tray,
+            auto_reconnect: self.auto_reconnect,
         }
+    }
+
+    /// Calculate reconnect delay with exponential backoff (1s, 2s, 4s, 8s, max 60s)
+    pub fn get_reconnect_delay(&self) -> std::time::Duration {
+        let base_delay = 1u64;
+        let max_delay = 60u64;
+        let delay = base_delay.saturating_mul(2u64.saturating_pow(self.reconnect_attempts.min(6)));
+        std::time::Duration::from_secs(delay.min(max_delay))
+    }
+
+    /// Check if we should attempt reconnection now
+    pub fn should_reconnect(&self) -> bool {
+        if !self.auto_reconnect || !self.connection_lost || self.connecting {
+            return false;
+        }
+
+        if let Some(disconnect_time) = self.last_disconnect_time {
+            let elapsed = disconnect_time.elapsed();
+            let delay = self.get_reconnect_delay();
+            elapsed >= delay
+        } else {
+            true
+        }
+    }
+
+    /// Reset reconnection state (called on successful connect)
+    pub fn reset_reconnect_state(&mut self) {
+        self.reconnect_attempts = 0;
+        self.last_disconnect_time = None;
+        self.connection_lost = false;
+    }
+
+    /// Mark connection as lost (called on disconnect)
+    pub fn mark_connection_lost(&mut self) {
+        self.connected = false;
+        self.connection_lost = true;
+        self.last_disconnect_time = Some(std::time::Instant::now());
+        self.cmd_tx = None;
+        self.msg_rx = None;
+    }
+
+    /// Prepare for reconnection attempt
+    pub fn start_reconnect(&mut self) {
+        self.reconnect_attempts += 1;
+        self.connecting = true;
+        self.connection_lost = false;
+        let delay = self.get_reconnect_delay();
+        self.add_server_message(ChatMessage::system(&format!(
+            "Reconnecting... (attempt {}, next retry in {:?})",
+            self.reconnect_attempts,
+            delay
+        )));
     }
 
     fn save_settings(&self) {
@@ -627,12 +791,21 @@ impl IrcApp {
                 let sender = msg.get_sender_nick().unwrap_or_else(|| "???".to_string());
                 let is_action = content.starts_with("\x01ACTION ") && content.ends_with('\x01');
 
+                // Check if the message mentions our nick (case-insensitive word boundary check)
+                let is_highlight = self.check_nick_mention(content);
+
                 let chat_msg = if is_action {
                     let action_text = content
                         .strip_prefix("\x01ACTION ")
                         .and_then(|s| s.strip_suffix('\x01'))
                         .unwrap_or(content);
-                    ChatMessage::action(&sender, action_text)
+                    if is_highlight {
+                        ChatMessage::action_highlighted(&sender, action_text)
+                    } else {
+                        ChatMessage::action(&sender, action_text)
+                    }
+                } else if is_highlight {
+                    ChatMessage::highlighted(&sender, content)
                 } else {
                     ChatMessage::new(&sender, content)
                 };
@@ -770,6 +943,7 @@ impl IrcApp {
                 // RPL_WELCOME
                 self.connected = true;
                 self.connecting = false;
+                self.reset_reconnect_state(); // Reset reconnect attempts on successful connection
                 if let Some(nick) = params.get(0) {
                     self.my_nick = nick.clone();
                 }
@@ -873,6 +1047,20 @@ impl IrcApp {
                 self.channel_list_loading = false;
             }
 
+            305 => {
+                // RPL_UNAWAY - You are no longer marked as being away
+                if let Some(text) = params.get(1) {
+                    self.add_server_message(ChatMessage::system(text));
+                }
+            }
+
+            306 => {
+                // RPL_NOWAWAY - You have been marked as being away
+                if let Some(text) = params.get(1) {
+                    self.add_server_message(ChatMessage::system(text));
+                }
+            }
+
             _ => {
                 // Show other numerics in server buffer
                 let text = params.join(" ");
@@ -893,7 +1081,7 @@ impl IrcApp {
         }
     }
 
-    fn add_server_message(&mut self, msg: ChatMessage) {
+    pub fn add_server_message(&mut self, msg: ChatMessage) {
         self.server_messages.push(msg);
         // Increment unread if not viewing server buffer
         if self.current_channel.is_some() {
@@ -1001,6 +1189,17 @@ impl IrcApp {
                 self.connected = false;
             }
 
+            "AWAY" => {
+                if args.is_empty() {
+                    // Clear away status
+                    self.send_command(IrcCommand::Away(None));
+                    self.add_server_message(ChatMessage::system("You are no longer marked as away"));
+                } else {
+                    self.send_command(IrcCommand::Away(Some(args.to_string())));
+                    self.add_server_message(ChatMessage::system(&format!("You are now marked as away: {}", args)));
+                }
+            }
+
             "RAW" | "QUOTE" => {
                 self.send_command(IrcCommand::Raw(args.to_string()));
             }
@@ -1062,6 +1261,7 @@ impl IrcApp {
                     "/list [pattern] - List channels",
                     "/settings - Open settings",
                     "/quit [message] - Disconnect from server",
+                    "/away [message] - Set away status, or clear if no message",
                     "/clear - Clear current channel messages",
                     "/raw <command> - Send raw IRC command",
                 ];
@@ -1173,6 +1373,24 @@ impl IrcApp {
     fn reset_tab_completion(&mut self) {
         self.tab_completion = None;
     }
+
+    /// Check if a message contains a mention of our nick
+    fn check_nick_mention(&self, content: &str) -> bool {
+        if self.my_nick.is_empty() {
+            return false;
+        }
+
+        let content_lower = content.to_lowercase();
+        let nick_lower = self.my_nick.to_lowercase();
+
+        // Check for nick as a word (with word boundaries)
+        for word in content_lower.split(|c: char| !c.is_alphanumeric() && c != '_') {
+            if word == nick_lower {
+                return true;
+            }
+        }
+        false
+    }
 }
 
 impl eframe::App for IrcApp {
@@ -1267,6 +1485,7 @@ impl eframe::App for IrcApp {
                 if ui.selectable_label(server_selected, server_text).clicked() {
                     self.current_channel = None;
                     self.server_unread = 0;
+                    self.selected_user = None; // Clear user selection when switching
                 }
 
                 ui.separator();
@@ -1331,6 +1550,7 @@ impl eframe::App for IrcApp {
                         let response = ui.selectable_label(is_selected, text);
                         if response.clicked() {
                             self.current_channel = Some(channel_name.clone());
+                            self.selected_user = None; // Clear user selection when switching channels
                             if let Some(ch) = self.channels.get_mut(&channel_name) {
                                 ch.unread = 0;
                             }
@@ -1383,9 +1603,16 @@ impl eframe::App for IrcApp {
                         if let Some(channel) = self.channels.get(&chan_for_context) {
                             ui.heading(format!("Users ({})", channel.users.len()));
                             ui.separator();
+                            // Get selected user for this render
+                            let current_selected = self.selected_user.clone();
+                            let mut new_selected: Option<String> = current_selected.clone();
+
                             ScrollArea::vertical().show(ui, |ui| {
                                 for (nick, mode) in &channel.users {
                                     let prefix = mode.prefix();
+                                    let is_selected = current_selected.as_ref() == Some(nick);
+
+                                    // Color based on mode
                                     let color = match mode {
                                         UserMode::Owner => Color32::from_rgb(255, 100, 100),
                                         UserMode::Admin => Color32::from_rgb(255, 150, 100),
@@ -1394,10 +1621,16 @@ impl eframe::App for IrcApp {
                                         UserMode::Voice => Color32::from_rgb(200, 200, 100),
                                         UserMode::Normal => Color32::WHITE,
                                     };
-                                    let response = ui.add(
-                                        Label::new(RichText::new(format!("{}{}", prefix, nick)).color(color))
-                                            .sense(Sense::click())
-                                    );
+
+                                    let text = RichText::new(format!("{}{}", prefix, nick)).color(color);
+                                    let response = ui.selectable_label(is_selected, text);
+
+                                    // Single click to select
+                                    if response.clicked() {
+                                        new_selected = Some(nick.clone());
+                                    }
+
+                                    // Double click to open PM
                                     if response.double_clicked() {
                                         pm_to_open = Some(nick.clone());
                                     }
@@ -1431,6 +1664,9 @@ impl eframe::App for IrcApp {
                                     });
                                 }
                             });
+
+                            // Update selected user
+                            self.selected_user = new_selected;
                         }
                     });
             }
@@ -1487,27 +1723,51 @@ impl eframe::App for IrcApp {
 
                     if let Some(msgs) = messages {
                         for msg in msgs {
-                            ui.horizontal(|ui| {
-                                ui.label(
-                                    RichText::new(&msg.timestamp)
-                                        .color(Color32::GRAY)
-                                        .monospace()
-                                );
+                            // Use a frame for highlighted messages to show background
+                            let frame = if msg.is_highlight {
+                                egui::Frame::NONE.fill(Color32::from_rgb(60, 40, 20))
+                            } else {
+                                egui::Frame::NONE
+                            };
 
-                                if msg.is_system {
-                                    // System messages with IRC color support
-                                    render_irc_text(ui, &msg.content, Color32::GRAY);
-                                } else if msg.is_action {
-                                    // Action messages with IRC color support
-                                    ui.label(RichText::new(format!("* {} ", msg.sender))
-                                        .color(Color32::from_rgb(150, 100, 200)));
-                                    render_irc_text(ui, &msg.content, Color32::from_rgb(150, 100, 200));
-                                } else {
-                                    // Regular messages with IRC color support
-                                    ui.label(RichText::new(format!("<{}>", msg.sender))
-                                        .color(nick_color(&msg.sender)));
-                                    render_irc_text(ui, &msg.content, Color32::WHITE);
-                                }
+                            frame.show(ui, |ui| {
+                                ui.horizontal(|ui| {
+                                    // Highlight indicator
+                                    if msg.is_highlight {
+                                        ui.label(RichText::new("*").color(Color32::YELLOW).strong());
+                                    }
+
+                                    ui.label(
+                                        RichText::new(&msg.timestamp)
+                                            .color(Color32::GRAY)
+                                            .monospace()
+                                    );
+
+                                    if msg.is_system {
+                                        // System messages with IRC color support
+                                        render_irc_text(ui, &msg.content, Color32::GRAY);
+                                    } else if msg.is_action {
+                                        // Action messages - highlighted actions use yellow
+                                        let action_color = if msg.is_highlight {
+                                            Color32::YELLOW
+                                        } else {
+                                            Color32::from_rgb(150, 100, 200)
+                                        };
+                                        ui.label(RichText::new(format!("* {} ", msg.sender))
+                                            .color(action_color));
+                                        render_irc_text(ui, &msg.content, action_color);
+                                    } else {
+                                        // Regular messages - highlighted messages use yellow text
+                                        ui.label(RichText::new(format!("<{}>", msg.sender))
+                                            .color(nick_color(&msg.sender)));
+                                        let text_color = if msg.is_highlight {
+                                            Color32::YELLOW
+                                        } else {
+                                            Color32::WHITE
+                                        };
+                                        render_irc_text(ui, &msg.content, text_color);
+                                    }
+                                });
                             });
                         }
                     }
@@ -1632,6 +1892,7 @@ impl IrcApp {
                 ui.horizontal(|ui| {
                     ui.checkbox(&mut self.set_invisible, "Set invisible (+i)");
                 });
+                ui.checkbox(&mut self.auto_reconnect, "Auto-reconnect on disconnect");
 
                 ui.separator();
 
@@ -1709,6 +1970,8 @@ impl IrcApp {
                 ui.separator();
                 ui.heading("Behavior");
                 ui.separator();
+
+                ui.checkbox(&mut self.auto_reconnect, "Auto-reconnect on disconnect");
 
                 let tray_response = ui.checkbox(&mut self.minimize_to_tray, "Minimize to system tray");
                 if self.minimize_to_tray {

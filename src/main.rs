@@ -9,7 +9,7 @@ use tokio::sync::mpsc;
 use std::sync::Arc;
 
 use irc::{IrcClient, IrcCommand, IrcMessage};
-use gui::IrcApp;
+use gui::{IrcApp, ChatMessage};
 
 // System tray support (Windows only)
 #[cfg(windows)]
@@ -200,9 +200,27 @@ impl eframe::App for FmIrcApp {
             }
         }
 
+        // Check if connection thread has finished (connection lost)
+        if let Some(ref handle) = self.connection_thread {
+            if handle.is_finished() {
+                self.connection_thread = None;
+                if self.app.connected {
+                    // Connection was lost unexpectedly
+                    self.app.mark_connection_lost();
+                    self.app.add_server_message(ChatMessage::system("Connection lost"));
+                    tracing::warn!("Connection lost, will attempt reconnect");
+                }
+            }
+        }
+
         // Start connection if requested
         if self.app.connecting && self.connection_thread.is_none() {
             self.start_connection(ctx.clone());
+        }
+
+        // Auto-reconnect if enabled and connection was lost
+        if self.app.should_reconnect() {
+            self.app.start_reconnect();
         }
 
         // Main UI update

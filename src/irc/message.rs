@@ -7,6 +7,7 @@ pub enum IrcCommand {
     Nick(String),
     User { username: String, realname: String },
     Quit(Option<String>),
+    Away(Option<String>),
 
     // Channel
     Join(String),
@@ -129,6 +130,7 @@ impl IrcMessage {
                 params.get(1).cloned(),
             ),
             "QUIT" => IrcCommand::Quit(params.get(0).cloned()),
+            "AWAY" => IrcCommand::Away(params.get(0).cloned()),
             "NICK" => IrcCommand::Nick(params.get(0).cloned().unwrap_or_default()),
             "TOPIC" => IrcCommand::Topic(
                 params.get(0).cloned().unwrap_or_default(),
@@ -196,6 +198,13 @@ impl fmt::Display for IrcCommand {
                     write!(f, "QUIT :{}", m)
                 } else {
                     write!(f, "QUIT")
+                }
+            }
+            IrcCommand::Away(msg) => {
+                if let Some(m) = msg {
+                    write!(f, "AWAY :{}", m)
+                } else {
+                    write!(f, "AWAY")
                 }
             }
             IrcCommand::Join(channel) => write!(f, "JOIN {}", channel),
