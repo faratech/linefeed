@@ -33,6 +33,9 @@ pub enum IrcCommand {
     Userhost(String),   // space-separated nicks
     Ison(String),       // space-separated nicks
 
+    // IRCv3 Monitor (friend list)
+    Monitor(String, Option<String>),  // (subcommand: +/-/C/L/S, optional targets)
+
     // Server info
     Time(Option<String>),
     Motd(Option<String>),
@@ -296,6 +299,13 @@ impl fmt::Display for IrcCommand {
             IrcCommand::Whowas(nick) => write!(f, "WHOWAS {}", nick),
             IrcCommand::Userhost(nicks) => write!(f, "USERHOST {}", nicks),
             IrcCommand::Ison(nicks) => write!(f, "ISON {}", nicks),
+            IrcCommand::Monitor(subcmd, targets) => {
+                if let Some(t) = targets {
+                    write!(f, "MONITOR {} {}", subcmd, t)
+                } else {
+                    write!(f, "MONITOR {}", subcmd)
+                }
+            }
             IrcCommand::Time(server) => {
                 if let Some(s) = server {
                     write!(f, "TIME {}", s)

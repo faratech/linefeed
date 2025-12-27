@@ -978,6 +978,51 @@ impl IrcApp {
                 }
             }
 
+            RPL_WHOISCERTFP => {
+                // <nick> :has client certificate fingerprint <fingerprint>
+                if let (Some(nick), Some(fp)) = (params.get(1), params.get(2)) {
+                    self.add_message_to_current(ChatMessage::system(
+                        &format!("[WHOIS] {} has TLS fingerprint: {}", nick, fp)
+                    ));
+                }
+            }
+
+            RPL_WHOISREGNICK => {
+                // <nick> :is a registered nick
+                if let Some(nick) = params.get(1) {
+                    self.add_message_to_current(ChatMessage::system(
+                        &format!("[WHOIS] {} is a registered nick", nick)
+                    ));
+                }
+            }
+
+            RPL_WHOISBOT => {
+                // <nick> :is a Bot
+                if let Some(nick) = params.get(1) {
+                    self.add_message_to_current(ChatMessage::system(
+                        &format!("[WHOIS] {} is a bot", nick)
+                    ));
+                }
+            }
+
+            RPL_WHOISHOST => {
+                // <nick> :is connecting from <host> <ip>
+                if let (Some(nick), Some(info)) = (params.get(1), params.get(2)) {
+                    self.add_message_to_current(ChatMessage::system(
+                        &format!("[WHOIS] {} - {}", nick, info)
+                    ));
+                }
+            }
+
+            RPL_WHOISMODES => {
+                // <nick> :is using modes <modes>
+                if let (Some(nick), Some(modes)) = (params.get(1), params.get(2)) {
+                    self.add_message_to_current(ChatMessage::system(
+                        &format!("[WHOIS] {} is using modes {}", nick, modes)
+                    ));
+                }
+            }
+
             // WHO responses
             RPL_WHOREPLY => {
                 // <channel> <user> <host> <server> <nick> <H|G>[*][@|+] :<hopcount> <realname>
@@ -1051,6 +1096,64 @@ impl IrcApp {
                     self.pending_channel_keys.remove(&channel.to_lowercase());
                     self.add_message_to_current(ChatMessage::system(
                         &format!("Cannot join {} (bad or missing channel key). Use: /join {} <key>", channel, channel)
+                    ));
+                }
+            }
+
+            // Quiet list (mode +q)
+            RPL_QUIETLIST => {
+                // <channel> <mode> <mask> <setter> <timestamp>
+                if let (Some(channel), Some(mask)) = (params.get(1), params.get(3)) {
+                    self.add_message_to_current(ChatMessage::system(
+                        &format!("[QUIET] {} - {}", channel, mask)
+                    ));
+                }
+            }
+
+            RPL_ENDOFQUIETLIST => {
+                if let Some(channel) = params.get(1) {
+                    self.add_message_to_current(ChatMessage::system(
+                        &format!("[QUIET] End of quiet list for {}", channel)
+                    ));
+                }
+            }
+
+            // IRCv3 Monitor
+            RPL_MONONLINE => {
+                // :server 730 <nick> :target1,target2,...
+                if let Some(targets) = params.get(1) {
+                    self.add_message_to_current(ChatMessage::system(
+                        &format!("[MONITOR] Online: {}", targets)
+                    ));
+                }
+            }
+
+            RPL_MONOFFLINE => {
+                // :server 731 <nick> :target1,target2,...
+                if let Some(targets) = params.get(1) {
+                    self.add_message_to_current(ChatMessage::system(
+                        &format!("[MONITOR] Offline: {}", targets)
+                    ));
+                }
+            }
+
+            RPL_MONLIST => {
+                // :server 732 <nick> :target1,target2,...
+                if let Some(targets) = params.get(1) {
+                    self.add_message_to_current(ChatMessage::system(
+                        &format!("[MONITOR] List: {}", targets)
+                    ));
+                }
+            }
+
+            RPL_ENDOFMONLIST => {
+                self.add_message_to_current(ChatMessage::system("[MONITOR] End of monitor list"));
+            }
+
+            ERR_MONLISTFULL => {
+                if let Some(limit) = params.get(1) {
+                    self.add_message_to_current(ChatMessage::system(
+                        &format!("[MONITOR] List is full (limit: {})", limit)
                     ));
                 }
             }
