@@ -122,6 +122,24 @@ impl IrcApp {
                 });
 
                 ui.separator();
+                ui.heading("SASL Authentication");
+                ui.add_space(4.0);
+
+                ui.horizontal(|ui| {
+                    ui.label("SASL User:");
+                    ui.add(TextEdit::singleline(&mut self.sasl_username).desired_width(150.0));
+                });
+
+                ui.horizontal(|ui| {
+                    ui.label("SASL Pass:");
+                    ui.add(TextEdit::singleline(&mut self.sasl_password).password(true).desired_width(150.0));
+                });
+
+                if !self.sasl_username.is_empty() || !self.sasl_password.is_empty() {
+                    ui.label(RichText::new("For Libera Chat, OFTC, etc. Uses SASL PLAIN.").small().color(Color32::GRAY));
+                }
+
+                ui.separator();
                 ui.heading("On Connect");
                 ui.add_space(4.0);
 
@@ -156,6 +174,8 @@ impl IrcApp {
                                 nickname: self.nickname.clone(),
                                 auto_join: self.auto_join_channels.clone(),
                                 auto_perform: self.auto_perform.clone(),
+                                sasl_username: self.sasl_username.clone(),
+                                sasl_password: self.sasl_password.clone(),
                             };
                             self.server_favorites.push(new_fav);
                             self.selected_favorite = Some(self.server_favorites.len() - 1);

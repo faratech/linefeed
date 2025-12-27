@@ -50,6 +50,9 @@ pub enum IrcCommand {
     // CAP negotiation
     Cap(String, Option<String>),
 
+    // SASL authentication
+    Authenticate(String),
+
     // Raw/unknown
     Raw(String),
 }
@@ -168,6 +171,9 @@ impl IrcMessage {
             "CAP" => IrcCommand::Cap(
                 params.get(0).cloned().unwrap_or_default(),
                 params.get(1).cloned(),
+            ),
+            "AUTHENTICATE" => IrcCommand::Authenticate(
+                params.get(0).cloned().unwrap_or_default(),
             ),
             _ => {
                 // Try to parse as numeric
@@ -348,6 +354,7 @@ impl fmt::Display for IrcCommand {
                     write!(f, "CAP {}", sub)
                 }
             }
+            IrcCommand::Authenticate(data) => write!(f, "AUTHENTICATE {}", data),
             IrcCommand::Numeric(num, params) => {
                 write!(f, "{:03} {}", num, params.join(" "))
             }

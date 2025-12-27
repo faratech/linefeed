@@ -111,6 +111,10 @@ pub struct IrcApp {
     pub auto_away_enabled: bool,
     pub auto_away_minutes: u32,
     pub auto_away_message: String,
+
+    // SASL authentication
+    pub sasl_username: String,
+    pub sasl_password: String,
 }
 
 impl Default for IrcApp {
@@ -201,6 +205,8 @@ impl IrcApp {
             auto_away_enabled: settings.auto_away_enabled,
             auto_away_minutes: settings.auto_away_minutes,
             auto_away_message: settings.auto_away_message,
+            sasl_username: settings.sasl_username,
+            sasl_password: settings.sasl_password,
         }
     }
 
@@ -225,6 +231,8 @@ impl IrcApp {
             auto_away_enabled: self.auto_away_enabled,
             auto_away_minutes: self.auto_away_minutes,
             auto_away_message: self.auto_away_message.clone(),
+            sasl_username: self.sasl_username.clone(),
+            sasl_password: self.sasl_password.clone(),
         }
     }
 
@@ -353,6 +361,8 @@ impl IrcApp {
         }
         self.auto_join_channels = fav.auto_join.clone();
         self.auto_perform = fav.auto_perform.clone();
+        self.sasl_username = fav.sasl_username.clone();
+        self.sasl_password = fav.sasl_password.clone();
     }
 }
 
@@ -379,6 +389,8 @@ impl IrcApp {
             username: self.username.clone(),
             realname: self.realname.clone(),
             password: if self.password.is_empty() { None } else { Some(self.password.clone()) },
+            sasl_username: if self.sasl_username.is_empty() { None } else { Some(self.sasl_username.clone()) },
+            sasl_password: if self.sasl_password.is_empty() { None } else { Some(self.sasl_password.clone()) },
         }
     }
 

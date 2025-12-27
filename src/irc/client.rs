@@ -1,6 +1,7 @@
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
+use base64::prelude::*;
 
 use super::message::{IrcCommand, IrcMessage};
 
@@ -14,6 +15,9 @@ pub struct ServerConfig {
     pub username: String,
     pub realname: String,
     pub password: Option<String>,
+    // SASL authentication
+    pub sasl_username: Option<String>,
+    pub sasl_password: Option<String>,
 }
 
 impl Default for ServerConfig {
@@ -27,6 +31,8 @@ impl Default for ServerConfig {
             username: "rustirc".to_string(),
             realname: "fmIRC".to_string(),
             password: None,
+            sasl_username: None,
+            sasl_password: None,
         }
     }
 }
@@ -149,10 +155,10 @@ impl IrcClient {
         S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
     {
         let (reader, mut writer) = tokio::io::split(stream);
-        let reader = BufReader::new(reader);
+        let mut reader = BufReader::new(reader);
 
-        // Send registration
-        self.send_registration(&mut writer, &incoming_tx).await?;
+        // Send registration (may include SASL handshake)
+        self.send_registration(&mut writer, &mut reader, &incoming_tx).await?;
 
         // Create channel for sending
         let (send_tx, mut send_rx) = mpsc::channel::<String>(100);
@@ -191,12 +197,22 @@ impl IrcClient {
         Ok(())
     }
 
-    async fn send_registration<W: tokio::io::AsyncWrite + Unpin>(
+    async fn send_registration<W, R>(
         &self,
         writer: &mut W,
+        reader: &mut R,
         incoming_tx: &mpsc::Sender<IrcMessage>,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
+    where
+        W: tokio::io::AsyncWrite + Unpin,
+        R: tokio::io::AsyncBufRead + Unpin,
+    {
         let config = &self.config;
+
+        // SASL authentication if configured
+        if config.sasl_username.is_some() && config.sasl_password.is_some() {
+            self.do_sasl_auth(writer, reader, incoming_tx).await?;
+        }
 
         // Send PASS if configured
         if let Some(ref pass) = config.password {
@@ -229,6 +245,211 @@ impl IrcClient {
             command: IrcCommand::Notice("*".to_string(), "Registration sent, waiting for response...".to_string()),
             raw: String::new(),
         }).await;
+
+        Ok(())
+    }
+
+    /// Perform SASL PLAIN authentication
+    async fn do_sasl_auth<W, R>(
+        &self,
+        writer: &mut W,
+        reader: &mut R,
+        incoming_tx: &mpsc::Sender<IrcMessage>,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
+    where
+        W: tokio::io::AsyncWrite + Unpin,
+        R: tokio::io::AsyncBufRead + Unpin,
+    {
+        let config = &self.config;
+        let sasl_user = config.sasl_username.as_ref().unwrap();
+        let sasl_pass = config.sasl_password.as_ref().unwrap();
+
+        let _ = incoming_tx.send(IrcMessage {
+            tags: None,
+            prefix: None,
+            command: IrcCommand::Notice("*".to_string(), "Starting SASL authentication...".to_string()),
+            raw: String::new(),
+        }).await;
+
+        // Step 1: Request capabilities
+        let cap_ls = "CAP LS 302\r\n";
+        tracing::debug!("> {}", cap_ls.trim());
+        writer.write_all(cap_ls.as_bytes()).await?;
+        writer.flush().await?;
+
+        // Step 2: Read CAP LS response and check for SASL
+        let mut line = String::new();
+        let mut sasl_available = false;
+
+        loop {
+            line.clear();
+            if reader.read_line(&mut line).await? == 0 {
+                return Err("Connection closed during CAP negotiation".into());
+            }
+            let trimmed = line.trim();
+            tracing::debug!("< {}", trimmed);
+
+            if let Some(msg) = IrcMessage::parse(trimmed) {
+                // Forward to GUI for display
+                let _ = incoming_tx.send(msg.clone()).await;
+
+                if let IrcCommand::Cap(subcmd, params) = &msg.command {
+                    if subcmd == "LS" || subcmd == "*" {
+                        if let Some(caps) = params {
+                            // Check if sasl is in the capability list
+                            let caps_lower = caps.to_lowercase();
+                            if caps_lower.contains("sasl") {
+                                sasl_available = true;
+                            }
+                        }
+                        // CAP LS can be multi-line, wait for one without * prefix
+                        if subcmd == "LS" {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        if !sasl_available {
+            let _ = incoming_tx.send(IrcMessage {
+                tags: None,
+                prefix: None,
+                command: IrcCommand::Notice("*".to_string(), "Server does not support SASL, continuing without authentication".to_string()),
+                raw: String::new(),
+            }).await;
+            // Send CAP END and continue
+            let cap_end = "CAP END\r\n";
+            tracing::debug!("> {}", cap_end.trim());
+            writer.write_all(cap_end.as_bytes()).await?;
+            writer.flush().await?;
+            return Ok(());
+        }
+
+        // Step 3: Request SASL capability
+        let cap_req = "CAP REQ :sasl\r\n";
+        tracing::debug!("> {}", cap_req.trim());
+        writer.write_all(cap_req.as_bytes()).await?;
+        writer.flush().await?;
+
+        // Step 4: Wait for CAP ACK
+        loop {
+            line.clear();
+            if reader.read_line(&mut line).await? == 0 {
+                return Err("Connection closed during SASL".into());
+            }
+            let trimmed = line.trim();
+            tracing::debug!("< {}", trimmed);
+
+            if let Some(msg) = IrcMessage::parse(trimmed) {
+                let _ = incoming_tx.send(msg.clone()).await;
+
+                if let IrcCommand::Cap(subcmd, params) = &msg.command {
+                    if subcmd == "ACK" {
+                        if let Some(caps) = params {
+                            if caps.to_lowercase().contains("sasl") {
+                                break;
+                            }
+                        }
+                    } else if subcmd == "NAK" {
+                        let _ = incoming_tx.send(IrcMessage {
+                            tags: None,
+                            prefix: None,
+                            command: IrcCommand::Notice("*".to_string(), "Server rejected SASL capability".to_string()),
+                            raw: String::new(),
+                        }).await;
+                        let cap_end = "CAP END\r\n";
+                        writer.write_all(cap_end.as_bytes()).await?;
+                        writer.flush().await?;
+                        return Ok(());
+                    }
+                }
+            }
+        }
+
+        // Step 5: Start SASL PLAIN
+        let auth_plain = "AUTHENTICATE PLAIN\r\n";
+        tracing::debug!("> {}", auth_plain.trim());
+        writer.write_all(auth_plain.as_bytes()).await?;
+        writer.flush().await?;
+
+        // Step 6: Wait for AUTHENTICATE +
+        loop {
+            line.clear();
+            if reader.read_line(&mut line).await? == 0 {
+                return Err("Connection closed during SASL".into());
+            }
+            let trimmed = line.trim();
+            tracing::debug!("< {}", trimmed);
+
+            if let Some(msg) = IrcMessage::parse(trimmed) {
+                let _ = incoming_tx.send(msg.clone()).await;
+
+                if let IrcCommand::Authenticate(data) = &msg.command {
+                    if data == "+" {
+                        break;
+                    }
+                }
+            }
+        }
+
+        // Step 7: Send credentials (base64 of \0username\0password)
+        let credentials = format!("\0{}\0{}", sasl_user, sasl_pass);
+        let encoded = BASE64_STANDARD.encode(credentials.as_bytes());
+        let auth_creds = format!("AUTHENTICATE {}\r\n", encoded);
+        tracing::debug!("> AUTHENTICATE <credentials>");
+        writer.write_all(auth_creds.as_bytes()).await?;
+        writer.flush().await?;
+
+        // Step 8: Wait for 903 (success) or 904 (failure)
+        loop {
+            line.clear();
+            if reader.read_line(&mut line).await? == 0 {
+                return Err("Connection closed during SASL".into());
+            }
+            let trimmed = line.trim();
+            tracing::debug!("< {}", trimmed);
+
+            if let Some(msg) = IrcMessage::parse(trimmed) {
+                let _ = incoming_tx.send(msg.clone()).await;
+
+                if let IrcCommand::Numeric(num, _params) = &msg.command {
+                    match *num {
+                        903 => {
+                            // RPL_SASLSUCCESS
+                            let _ = incoming_tx.send(IrcMessage {
+                                tags: None,
+                                prefix: None,
+                                command: IrcCommand::Notice("*".to_string(), "SASL authentication successful!".to_string()),
+                                raw: String::new(),
+                            }).await;
+                            break;
+                        }
+                        904 | 905 | 906 => {
+                            // ERR_SASLFAIL, ERR_SASLTOOLONG, ERR_SASLABORTED
+                            let _ = incoming_tx.send(IrcMessage {
+                                tags: None,
+                                prefix: None,
+                                command: IrcCommand::Notice("*".to_string(), "SASL authentication failed!".to_string()),
+                                raw: String::new(),
+                            }).await;
+                            break;
+                        }
+                        900 => {
+                            // RPL_LOGGEDIN - also indicates success
+                            continue;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+
+        // Step 9: Send CAP END
+        let cap_end = "CAP END\r\n";
+        tracing::debug!("> {}", cap_end.trim());
+        writer.write_all(cap_end.as_bytes()).await?;
+        writer.flush().await?;
 
         Ok(())
     }

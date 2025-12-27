@@ -75,6 +75,17 @@ pub const ERR_BANNEDFROMCHAN: u16 = 474;
 pub const ERR_BADCHANNELKEY: u16 = 475;
 pub const ERR_CHANOPRIVSNEEDED: u16 = 482;
 
+// SASL authentication (IRCv3)
+pub const RPL_LOGGEDIN: u16 = 900;
+pub const RPL_LOGGEDOUT: u16 = 901;
+pub const RPL_NICKLOCKED: u16 = 902;
+pub const RPL_SASLSUCCESS: u16 = 903;
+pub const ERR_SASLFAIL: u16 = 904;
+pub const ERR_SASLTOOLONG: u16 = 905;
+pub const ERR_SASLABORTED: u16 = 906;
+pub const ERR_SASLALREADY: u16 = 907;
+pub const RPL_SASLMECHS: u16 = 908;
+
 /// Categorize a numeric code
 pub fn numeric_category(code: u16) -> NumericCategory {
     match code {
@@ -82,6 +93,7 @@ pub fn numeric_category(code: u16) -> NumericCategory {
         200..=399 => NumericCategory::Reply,
         400..=599 => NumericCategory::Error,
         600..=699 => NumericCategory::Extended,
+        900..=908 => NumericCategory::Sasl,
         _ => NumericCategory::Unknown,
     }
 }
@@ -92,5 +104,6 @@ pub enum NumericCategory {
     Reply,
     Error,
     Extended,
+    Sasl,
     Unknown,
 }

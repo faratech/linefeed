@@ -821,6 +821,7 @@ dependencies = [
 name = "fmirc"
 version = "0.0.1"
 dependencies = [
+ "base64",
  "dirs",
  "eframe",
  "egui",

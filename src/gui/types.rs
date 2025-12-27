@@ -15,6 +15,11 @@ pub struct ServerFavorite {
     pub nickname: String,       // Nick to use (empty = use default)
     pub auto_join: String,      // Channels to auto-join (comma-separated)
     pub auto_perform: String,   // Commands to run on connect (newline-separated)
+    // SASL authentication
+    #[serde(default)]
+    pub sasl_username: String,
+    #[serde(default)]
+    pub sasl_password: String,
 }
 
 /// Persistent settings
@@ -41,6 +46,9 @@ pub struct Settings {
     pub auto_away_enabled: bool,
     pub auto_away_minutes: u32,
     pub auto_away_message: String,
+    // SASL authentication
+    pub sasl_username: String,
+    pub sasl_password: String,
 }
 
 impl Default for Settings {
@@ -65,6 +73,8 @@ impl Default for Settings {
             auto_away_enabled: false,
             auto_away_minutes: 10,
             auto_away_message: "Auto-away".to_string(),
+            sasl_username: String::new(),
+            sasl_password: String::new(),
         }
     }
 }
