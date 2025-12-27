@@ -16,10 +16,11 @@ pub fn nick_to_mask(arg: &str) -> String {
     }
 }
 
-/// Get current local time as [HH:MM] string
-pub fn current_time_hhmm() -> String {
+/// Get current local time formatted according to preference
+/// "short" = [HH:MM], "long" = [HH:MM:SS], "full" = [MM-DD HH:MM]
+pub fn current_time_formatted(format: &str) -> String {
     #[cfg(unix)]
-    let (hours, minutes) = {
+    let (month, day, hours, minutes, seconds) = {
         use std::time::{SystemTime, UNIX_EPOCH};
         let secs = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -28,11 +29,11 @@ pub fn current_time_hhmm() -> String {
         let t = secs as libc::time_t;
         let mut tm: libc::tm = unsafe { std::mem::zeroed() };
         unsafe { libc::localtime_r(&t, &mut tm) };
-        (tm.tm_hour as u64, tm.tm_min as u64)
+        ((tm.tm_mon + 1) as u64, tm.tm_mday as u64, tm.tm_hour as u64, tm.tm_min as u64, tm.tm_sec as u64)
     };
 
     #[cfg(windows)]
-    let (hours, minutes) = {
+    let (month, day, hours, minutes, seconds) = {
         use std::mem::MaybeUninit;
         #[repr(C)]
         struct SYSTEMTIME {
@@ -46,24 +47,31 @@ pub fn current_time_hhmm() -> String {
         unsafe {
             GetLocalTime(st.as_mut_ptr());
             let st = st.assume_init();
-            (st.hour as u64, st.minute as u64)
+            (st.month as u64, st.day as u64, st.hour as u64, st.minute as u64, st.second as u64)
         }
     };
 
     #[cfg(not(any(unix, windows)))]
-    let (hours, minutes) = {
+    let (month, day, hours, minutes, seconds) = {
         use std::time::{SystemTime, UNIX_EPOCH};
         let secs = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
-        // Fallback to UTC
+        // Fallback to UTC - approximate month/day
+        let days = secs / 86400;
+        let (_, m, d) = days_to_ymd(days);
         let hours = (secs % 86400) / 3600;
         let minutes = (secs % 3600) / 60;
-        (hours, minutes)
+        let seconds = secs % 60;
+        (m as u64, d as u64, hours, minutes, seconds)
     };
 
-    format!("[{:02}:{:02}]", hours, minutes)
+    match format {
+        "long" => format!("[{:02}:{:02}:{:02}]", hours, minutes, seconds),
+        "full" => format!("[{:02}-{:02} {:02}:{:02}]", month, day, hours, minutes),
+        _ => format!("[{:02}:{:02}]", hours, minutes), // "short" or default
+    }
 }
 
 /// Format a Unix timestamp as a human-readable string

@@ -122,6 +122,22 @@ pub struct IrcApp {
     pub logging_load_history: bool,
     pub logging_history_lines: usize,
 
+    // Display settings
+    pub timestamp_format: String,
+    pub hide_join_part: bool,
+    pub font_size: f32,
+    pub max_scrollback: usize,
+
+    // Privacy
+    pub ctcp_replies_enabled: bool,
+
+    // Highlights
+    pub highlight_words: String,
+
+    // Reconnect settings
+    pub reconnect_delay_secs: u32,
+    pub max_reconnect_attempts: u32,
+
     // Channel info dialog
     pub show_channel_info: bool,
     pub channel_info_target: Option<String>,
@@ -228,6 +244,23 @@ impl IrcApp {
             log_manager: logging::LogManager::new(settings.logging_enabled),
             logging_load_history: settings.logging_load_history,
             logging_history_lines: settings.logging_history_lines,
+
+            // Display settings
+            timestamp_format: settings.timestamp_format,
+            hide_join_part: settings.hide_join_part,
+            font_size: settings.font_size,
+            max_scrollback: settings.max_scrollback,
+
+            // Privacy
+            ctcp_replies_enabled: settings.ctcp_replies_enabled,
+
+            // Highlights
+            highlight_words: settings.highlight_words,
+
+            // Reconnect settings
+            reconnect_delay_secs: settings.reconnect_delay_secs,
+            max_reconnect_attempts: settings.max_reconnect_attempts,
+
             show_channel_info: false,
             channel_info_target: None,
 
@@ -267,6 +300,18 @@ impl IrcApp {
             logging_enabled: true, // Always save as enabled (managed by log_manager)
             logging_load_history: self.logging_load_history,
             logging_history_lines: self.logging_history_lines,
+            // Display
+            timestamp_format: self.timestamp_format.clone(),
+            hide_join_part: self.hide_join_part,
+            font_size: self.font_size,
+            max_scrollback: self.max_scrollback,
+            // Privacy
+            ctcp_replies_enabled: self.ctcp_replies_enabled,
+            // Highlights
+            highlight_words: self.highlight_words.clone(),
+            // Connection
+            reconnect_delay_secs: self.reconnect_delay_secs,
+            max_reconnect_attempts: self.max_reconnect_attempts,
         }
     }
 
@@ -293,8 +338,9 @@ impl IrcApp {
 
     /// Calculate reconnect delay with exponential backoff (1s, 2s, 4s, 8s, max 60s)
     pub fn get_reconnect_delay(&self) -> std::time::Duration {
-        let base_delay = 1u64;
-        let max_delay = 60u64;
+        let base_delay = self.reconnect_delay_secs as u64;
+        let max_delay = 120u64;
+        // Exponential backoff: delay * 2^attempt, capped at max_delay
         let delay = base_delay.saturating_mul(2u64.saturating_pow(self.reconnect_attempts.min(6)));
         std::time::Duration::from_secs(delay.min(max_delay))
     }
@@ -302,6 +348,11 @@ impl IrcApp {
     /// Check if we should attempt reconnection now
     pub fn should_reconnect(&self) -> bool {
         if !self.auto_reconnect || !self.connection_lost || self.connecting {
+            return false;
+        }
+
+        // Check if we've exceeded max attempts
+        if self.reconnect_attempts >= self.max_reconnect_attempts {
             return false;
         }
 
@@ -451,20 +502,21 @@ impl IrcApp {
                 // Check if the message mentions our nick (case-insensitive word boundary check)
                 let is_highlight = self.check_nick_mention(content);
 
+                let fmt = &self.timestamp_format;
                 let chat_msg = if is_action {
                     let action_text = content
                         .strip_prefix("\x01ACTION ")
                         .and_then(|s| s.strip_suffix('\x01'))
                         .unwrap_or(content);
                     if is_highlight {
-                        ChatMessage::action_highlighted(&sender, action_text)
+                        ChatMessage::action_highlighted_fmt(&sender, action_text, fmt)
                     } else {
-                        ChatMessage::action(&sender, action_text)
+                        ChatMessage::action_fmt(&sender, action_text, fmt)
                     }
                 } else if is_highlight {
-                    ChatMessage::highlighted(&sender, content)
+                    ChatMessage::highlighted_fmt(&sender, content, fmt)
                 } else {
-                    ChatMessage::new(&sender, content)
+                    ChatMessage::new_fmt(&sender, content, fmt)
                 };
 
                 // Determine target channel/query
@@ -603,8 +655,10 @@ impl IrcApp {
                     let sys_msg = ChatMessage::system(&format!("Now talking in {}", channel));
                     self.add_message_to_channel(channel, sys_msg);
                 } else {
-                    let sys_msg = ChatMessage::system(&format!("{} has joined {}", sender, channel));
-                    self.add_message_to_channel(channel, sys_msg);
+                    if !self.hide_join_part {
+                        let sys_msg = ChatMessage::system(&format!("{} has joined {}", sender, channel));
+                        self.add_message_to_channel(channel, sys_msg);
+                    }
                     if let Some(ch) = self.channels.get_mut(channel) {
                         ch.add_user(&sender, UserMode::Normal);
                     }
@@ -620,10 +674,12 @@ impl IrcApp {
                         self.current_channel = self.channels.keys().next().cloned();
                     }
                 } else {
-                    let sys_msg = ChatMessage::system(&format!(
-                        "{} has left {} ({})", sender, channel, reason_str
-                    ));
-                    self.add_message_to_channel(channel, sys_msg);
+                    if !self.hide_join_part {
+                        let sys_msg = ChatMessage::system(&format!(
+                            "{} has left {} ({})", sender, channel, reason_str
+                        ));
+                        self.add_message_to_channel(channel, sys_msg);
+                    }
                     if let Some(ch) = self.channels.get_mut(channel) {
                         ch.remove_user(&sender);
                     }
@@ -633,12 +689,14 @@ impl IrcApp {
             IrcCommand::Quit(reason) => {
                 let sender = msg.get_sender_nick().unwrap_or_default();
                 let reason_str = reason.as_deref().unwrap_or("Quit");
-                let sys_msg = ChatMessage::system(&format!("{} has quit ({})", sender, reason_str));
 
-                // Add quit message to all channels the user was in
+                // Remove user from all channels, optionally show quit message
                 for (_, channel) in self.channels.iter_mut() {
                     if channel.has_user(&sender) {
-                        channel.messages.push(sys_msg.clone());
+                        if !self.hide_join_part {
+                            let sys_msg = ChatMessage::system(&format!("{} has quit ({})", sender, reason_str));
+                            channel.messages.push(sys_msg);
+                        }
                         channel.remove_user(&sender);
                     }
                 }
@@ -1224,6 +1282,11 @@ impl IrcApp {
 
         if let Some(ch) = self.channels.get_mut(channel) {
             ch.messages.push(msg);
+            // Limit scrollback
+            if ch.messages.len() > self.max_scrollback {
+                let excess = ch.messages.len() - self.max_scrollback;
+                ch.messages.drain(0..excess);
+            }
             if self.current_channel.as_ref() != Some(&channel.to_string()) {
                 ch.unread += 1;
             }
@@ -1232,6 +1295,11 @@ impl IrcApp {
 
     pub fn add_server_message(&mut self, msg: ChatMessage) {
         self.server_messages.push(msg);
+        // Limit scrollback
+        if self.server_messages.len() > self.max_scrollback {
+            let excess = self.server_messages.len() - self.max_scrollback;
+            self.server_messages.drain(0..excess);
+        }
         // Increment unread if not viewing server buffer
         if self.current_channel.is_some() {
             self.server_unread += 1;
@@ -1277,7 +1345,7 @@ impl IrcApp {
             self.process_command(&input);
         } else if let Some(channel) = &self.current_channel.clone() {
             // Send message to current channel
-            let msg = ChatMessage::new(&self.my_nick, &input);
+            let msg = ChatMessage::new_fmt(&self.my_nick, &input, &self.timestamp_format);
             self.add_message_to_channel(channel, msg);
             self.send_command(IrcCommand::Privmsg(channel.clone(), input));
         }
@@ -1450,13 +1518,18 @@ impl IrcApp {
             _ => None
         };
 
-        // Send the reply if we have one
+        // Send the reply if we have one and CTCP replies are enabled
         if let Some(reply_msg) = reply {
-            self.send_command(IrcCommand::Notice(sender.to_string(), reply_msg));
-            // Log the CTCP request/reply
-            self.add_message_to_current(ChatMessage::system(
-                &format!("[CTCP] {} from {} - replied", ctcp_cmd, sender)
-            ));
+            if self.ctcp_replies_enabled {
+                self.send_command(IrcCommand::Notice(sender.to_string(), reply_msg));
+                self.add_message_to_current(ChatMessage::system(
+                    &format!("[CTCP] {} from {} - replied", ctcp_cmd, sender)
+                ));
+            } else {
+                self.add_message_to_current(ChatMessage::system(
+                    &format!("[CTCP] {} from {} - ignored (replies disabled)", ctcp_cmd, sender)
+                ));
+            }
             true
         } else {
             // Unknown CTCP, log it but don't reply
@@ -1467,21 +1540,34 @@ impl IrcApp {
         }
     }
 
-    /// Check if a message contains a mention of our nick
+    /// Check if a message contains a mention of our nick or highlight words
     fn check_nick_mention(&self, content: &str) -> bool {
-        if self.my_nick.is_empty() {
-            return false;
-        }
-
         let content_lower = content.to_lowercase();
-        let nick_lower = self.my_nick.to_lowercase();
 
         // Check for nick as a word (with word boundaries)
-        for word in content_lower.split(|c: char| !c.is_alphanumeric() && c != '_') {
-            if word == nick_lower {
-                return true;
+        if !self.my_nick.is_empty() {
+            let nick_lower = self.my_nick.to_lowercase();
+            for word in content_lower.split(|c: char| !c.is_alphanumeric() && c != '_') {
+                if word == nick_lower {
+                    return true;
+                }
             }
         }
+
+        // Check for highlight words
+        if !self.highlight_words.is_empty() {
+            for highlight in self.highlight_words.split(',') {
+                let highlight = highlight.trim().to_lowercase();
+                if !highlight.is_empty() {
+                    for word in content_lower.split(|c: char| !c.is_alphanumeric() && c != '_') {
+                        if word == highlight {
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+
         false
     }
 

@@ -2,7 +2,7 @@
 
 use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
-use super::helpers::current_time_hhmm;
+use super::helpers::current_time_formatted;
 
 /// Server favorite for quick connect
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -53,6 +53,18 @@ pub struct Settings {
     pub logging_enabled: bool,
     pub logging_load_history: bool,
     pub logging_history_lines: usize,
+    // Display
+    pub timestamp_format: String,  // "short" = HH:MM, "long" = HH:MM:SS, "full" = MM-DD HH:MM
+    pub hide_join_part: bool,
+    pub font_size: f32,
+    pub max_scrollback: usize,
+    // Privacy
+    pub ctcp_replies_enabled: bool,
+    // Highlights
+    pub highlight_words: String,  // comma-separated
+    // Connection
+    pub reconnect_delay_secs: u32,
+    pub max_reconnect_attempts: u32,
 }
 
 impl Default for Settings {
@@ -82,6 +94,18 @@ impl Default for Settings {
             logging_enabled: true,
             logging_load_history: true,
             logging_history_lines: 1000,
+            // Display
+            timestamp_format: "short".to_string(),
+            hide_join_part: false,
+            font_size: 14.0,
+            max_scrollback: 1000,
+            // Privacy
+            ctcp_replies_enabled: true,
+            // Highlights
+            highlight_words: String::new(),
+            // Connection
+            reconnect_delay_secs: 5,
+            max_reconnect_attempts: 10,
         }
     }
 }
@@ -138,8 +162,12 @@ pub struct ChatMessage {
 
 impl ChatMessage {
     pub fn new(sender: &str, content: &str) -> Self {
+        Self::new_fmt(sender, content, "short")
+    }
+
+    pub fn new_fmt(sender: &str, content: &str, format: &str) -> Self {
         Self {
-            timestamp: current_time_hhmm(),
+            timestamp: current_time_formatted(format),
             sender: sender.to_string(),
             content: content.to_string(),
             is_action: false,
@@ -149,8 +177,12 @@ impl ChatMessage {
     }
 
     pub fn system(content: &str) -> Self {
+        Self::system_fmt(content, "short")
+    }
+
+    pub fn system_fmt(content: &str, format: &str) -> Self {
         Self {
-            timestamp: current_time_hhmm(),
+            timestamp: current_time_formatted(format),
             sender: "*".to_string(),
             content: content.to_string(),
             is_action: false,
@@ -160,8 +192,12 @@ impl ChatMessage {
     }
 
     pub fn action(sender: &str, content: &str) -> Self {
+        Self::action_fmt(sender, content, "short")
+    }
+
+    pub fn action_fmt(sender: &str, content: &str, format: &str) -> Self {
         Self {
-            timestamp: current_time_hhmm(),
+            timestamp: current_time_formatted(format),
             sender: sender.to_string(),
             content: content.to_string(),
             is_action: true,
@@ -170,9 +206,9 @@ impl ChatMessage {
         }
     }
 
-    pub fn highlighted(sender: &str, content: &str) -> Self {
+    pub fn highlighted_fmt(sender: &str, content: &str, format: &str) -> Self {
         Self {
-            timestamp: current_time_hhmm(),
+            timestamp: current_time_formatted(format),
             sender: sender.to_string(),
             content: content.to_string(),
             is_action: false,
@@ -181,9 +217,9 @@ impl ChatMessage {
         }
     }
 
-    pub fn action_highlighted(sender: &str, content: &str) -> Self {
+    pub fn action_highlighted_fmt(sender: &str, content: &str, format: &str) -> Self {
         Self {
-            timestamp: current_time_hhmm(),
+            timestamp: current_time_formatted(format),
             sender: sender.to_string(),
             content: content.to_string(),
             is_action: true,

@@ -228,14 +228,17 @@ impl IrcApp {
                     if ui.selectable_label(self.settings_tab == 0, "Connection").clicked() {
                         self.settings_tab = 0;
                     }
-                    if ui.selectable_label(self.settings_tab == 1, "Automation").clicked() {
+                    if ui.selectable_label(self.settings_tab == 1, "Display").clicked() {
                         self.settings_tab = 1;
                     }
-                    if ui.selectable_label(self.settings_tab == 2, "Behavior").clicked() {
+                    if ui.selectable_label(self.settings_tab == 2, "Automation").clicked() {
                         self.settings_tab = 2;
                     }
-                    if ui.selectable_label(self.settings_tab == 3, "About").clicked() {
+                    if ui.selectable_label(self.settings_tab == 3, "Behavior").clicked() {
                         self.settings_tab = 3;
+                    }
+                    if ui.selectable_label(self.settings_tab == 4, "About").clicked() {
+                        self.settings_tab = 4;
                     }
                 });
                 ui.separator();
@@ -243,9 +246,10 @@ impl IrcApp {
                 // Tab content
                 match self.settings_tab {
                     0 => self.settings_tab_connection(ui),
-                    1 => self.settings_tab_automation(ui),
-                    2 => self.settings_tab_behavior(ui),
-                    3 => self.settings_tab_about(ui),
+                    1 => self.settings_tab_display(ui),
+                    2 => self.settings_tab_automation(ui),
+                    3 => self.settings_tab_behavior(ui),
+                    4 => self.settings_tab_about(ui),
                     _ => {}
                 }
 
@@ -298,6 +302,64 @@ impl IrcApp {
             });
     }
 
+    fn settings_tab_display(&mut self, ui: &mut egui::Ui) {
+        ui.heading("Timestamps");
+        ui.add_space(4.0);
+
+        ui.horizontal(|ui| {
+            ui.label("Format:");
+            egui::ComboBox::from_id_salt("timestamp_format")
+                .selected_text(match self.timestamp_format.as_str() {
+                    "short" => "HH:MM",
+                    "long" => "HH:MM:SS",
+                    "full" => "MM-DD HH:MM",
+                    _ => "HH:MM",
+                })
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut self.timestamp_format, "short".to_string(), "HH:MM");
+                    ui.selectable_value(&mut self.timestamp_format, "long".to_string(), "HH:MM:SS");
+                    ui.selectable_value(&mut self.timestamp_format, "full".to_string(), "MM-DD HH:MM");
+                });
+        });
+
+        ui.add_space(8.0);
+        ui.heading("Messages");
+        ui.add_space(4.0);
+
+        ui.checkbox(&mut self.hide_join_part, "Hide join/part/quit messages");
+
+        ui.horizontal(|ui| {
+            ui.label("Max scrollback:");
+            let mut lines = self.max_scrollback as i32;
+            ui.add(egui::DragValue::new(&mut lines).speed(100).range(100..=10000));
+            self.max_scrollback = lines.max(100) as usize;
+            ui.label("lines");
+        });
+
+        ui.add_space(8.0);
+        ui.heading("Font");
+        ui.add_space(4.0);
+
+        ui.horizontal(|ui| {
+            ui.label("Size:");
+            ui.add(egui::DragValue::new(&mut self.font_size).speed(0.5).range(10.0..=24.0));
+            ui.label("px");
+        });
+        ui.label(RichText::new("Restart required for font changes").small().color(Color32::GRAY));
+
+        ui.add_space(8.0);
+        ui.heading("Highlights");
+        ui.add_space(4.0);
+
+        ui.label("Extra highlight words (comma-separated):");
+        ui.add(
+            TextEdit::singleline(&mut self.highlight_words)
+                .desired_width(300.0)
+                .hint_text("urgent, alert, your-other-nick")
+        );
+        ui.label(RichText::new("Your nick is always highlighted").small().color(Color32::GRAY));
+    }
+
     fn settings_tab_automation(&mut self, ui: &mut egui::Ui) {
         ui.heading("On Connect");
         ui.add_space(4.0);
@@ -344,12 +406,36 @@ impl IrcApp {
         ui.add_space(4.0);
 
         ui.checkbox(&mut self.auto_reconnect, "Auto-reconnect on disconnect");
+        if self.auto_reconnect {
+            ui.horizontal(|ui| {
+                ui.add_space(20.0);
+                ui.label("Delay:");
+                let mut secs = self.reconnect_delay_secs as i32;
+                ui.add(egui::DragValue::new(&mut secs).speed(1).range(1..=60));
+                self.reconnect_delay_secs = secs.max(1) as u32;
+                ui.label("sec");
+            });
+            ui.horizontal(|ui| {
+                ui.add_space(20.0);
+                ui.label("Max attempts:");
+                let mut attempts = self.max_reconnect_attempts as i32;
+                ui.add(egui::DragValue::new(&mut attempts).speed(1).range(1..=100));
+                self.max_reconnect_attempts = attempts.max(1) as u32;
+            });
+        }
+
         ui.checkbox(&mut self.notifications_enabled, "Desktop notifications for highlights/PMs");
 
         let tray_response = ui.checkbox(&mut self.minimize_to_tray, "Minimize to system tray");
         if self.minimize_to_tray {
             tray_response.on_hover_text("System tray support requires platform-specific setup");
         }
+
+        ui.add_space(8.0);
+        ui.heading("Privacy");
+        ui.add_space(4.0);
+
+        ui.checkbox(&mut self.ctcp_replies_enabled, "Reply to CTCP requests (VERSION, TIME, etc.)");
 
         ui.add_space(8.0);
         ui.heading("Auto-Away");
