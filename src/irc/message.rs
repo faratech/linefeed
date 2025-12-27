@@ -15,18 +15,34 @@ pub enum IrcCommand {
     Topic(String, Option<String>),
     Names(Option<String>),
     List(Option<String>),
-    Kick(String, String, Option<String>),
+    Kick(String, String, Option<String>),  // channel, nick, reason
+    Invite(String, String),                 // nick, channel
 
     // Messaging
     Privmsg(String, String),
     Notice(String, String),
+    Wallops(String),
 
     // Server queries
     Ping(String),
     Pong(String),
     Who(String),
     Whois(String),
+    Whowas(String),
     Mode(String, Option<String>, Option<String>),
+    Userhost(String),   // space-separated nicks
+    Ison(String),       // space-separated nicks
+
+    // Server info
+    Time(Option<String>),
+    Motd(Option<String>),
+    Admin(Option<String>),
+    Info(Option<String>),
+    Version(Option<String>),  // Server VERSION (not CTCP)
+    Lusers,
+    Links(Option<String>),
+    Stats(String),
+    Trace(Option<String>),
 
     // Numeric replies (server responses)
     Numeric(u16, Vec<String>),
@@ -258,6 +274,62 @@ impl fmt::Display for IrcCommand {
                     write!(f, "KICK {} {} :{}", channel, user, r)
                 } else {
                     write!(f, "KICK {} {}", channel, user)
+                }
+            }
+            IrcCommand::Invite(nick, channel) => write!(f, "INVITE {} {}", nick, channel),
+            IrcCommand::Wallops(msg) => write!(f, "WALLOPS :{}", msg),
+            IrcCommand::Whowas(nick) => write!(f, "WHOWAS {}", nick),
+            IrcCommand::Userhost(nicks) => write!(f, "USERHOST {}", nicks),
+            IrcCommand::Ison(nicks) => write!(f, "ISON {}", nicks),
+            IrcCommand::Time(server) => {
+                if let Some(s) = server {
+                    write!(f, "TIME {}", s)
+                } else {
+                    write!(f, "TIME")
+                }
+            }
+            IrcCommand::Motd(server) => {
+                if let Some(s) = server {
+                    write!(f, "MOTD {}", s)
+                } else {
+                    write!(f, "MOTD")
+                }
+            }
+            IrcCommand::Admin(server) => {
+                if let Some(s) = server {
+                    write!(f, "ADMIN {}", s)
+                } else {
+                    write!(f, "ADMIN")
+                }
+            }
+            IrcCommand::Info(server) => {
+                if let Some(s) = server {
+                    write!(f, "INFO {}", s)
+                } else {
+                    write!(f, "INFO")
+                }
+            }
+            IrcCommand::Version(server) => {
+                if let Some(s) = server {
+                    write!(f, "VERSION {}", s)
+                } else {
+                    write!(f, "VERSION")
+                }
+            }
+            IrcCommand::Lusers => write!(f, "LUSERS"),
+            IrcCommand::Links(mask) => {
+                if let Some(m) = mask {
+                    write!(f, "LINKS {}", m)
+                } else {
+                    write!(f, "LINKS")
+                }
+            }
+            IrcCommand::Stats(query) => write!(f, "STATS {}", query),
+            IrcCommand::Trace(target) => {
+                if let Some(t) = target {
+                    write!(f, "TRACE {}", t)
+                } else {
+                    write!(f, "TRACE")
                 }
             }
             IrcCommand::Cap(sub, param) => {
