@@ -23,6 +23,7 @@ pub struct Settings {
     pub set_invisible: bool,
     pub minimize_to_tray: bool,
     pub auto_reconnect: bool,
+    pub notifications_enabled: bool,
 }
 
 impl Default for Settings {
@@ -40,6 +41,7 @@ impl Default for Settings {
             set_invisible: true,
             minimize_to_tray: false,
             auto_reconnect: true,
+            notifications_enabled: true,
         }
     }
 }
@@ -612,6 +614,10 @@ pub struct IrcApp {
     pub set_invisible: bool,
     pub minimize_to_tray: bool,
     pub auto_reconnect: bool,
+    pub notifications_enabled: bool,
+
+    // Window focus tracking (for notifications)
+    pub window_focused: bool,
 
     // Auto-reconnect state
     pub reconnect_attempts: u32,
@@ -680,6 +686,9 @@ impl IrcApp {
             set_invisible: settings.set_invisible,
             minimize_to_tray: settings.minimize_to_tray,
             auto_reconnect: settings.auto_reconnect,
+            notifications_enabled: settings.notifications_enabled,
+
+            window_focused: true,
 
             reconnect_attempts: 0,
             last_disconnect_time: None,
@@ -701,6 +710,7 @@ impl IrcApp {
             set_invisible: self.set_invisible,
             minimize_to_tray: self.minimize_to_tray,
             auto_reconnect: self.auto_reconnect,
+            notifications_enabled: self.notifications_enabled,
         }
     }
 
@@ -754,6 +764,43 @@ impl IrcApp {
             self.reconnect_attempts,
             delay
         )));
+    }
+
+    /// Send a desktop notification
+    pub fn send_notification(&self, title: &str, body: &str, force: bool) {
+        // Always log the notification
+        tracing::info!("Notification: {} - {}", title, body);
+
+        if !self.notifications_enabled {
+            tracing::debug!("Notifications disabled, skipping");
+            return;
+        }
+
+        // Skip if window is focused (unless force=true for PMs)
+        if self.window_focused && !force {
+            tracing::debug!("Window focused, skipping notification");
+            return;
+        }
+
+        // Use notify-send on Linux (usually pre-installed)
+        #[cfg(unix)]
+        {
+            let title = title.to_string();
+            let body = body.to_string();
+            std::thread::spawn(move || {
+                let _ = std::process::Command::new("notify-send")
+                    .args(["-a", "fmIRC", "-t", "5000", &title, &body])
+                    .spawn();
+            });
+        }
+
+        // On Windows, flash the taskbar to alert the user
+        #[cfg(windows)]
+        {
+            let _ = (title, body); // Used for logging above
+            // Flash taskbar via the tray module
+            crate::tray::flash_window();
+        }
     }
 
     fn save_settings(&self) {
@@ -813,14 +860,45 @@ impl IrcApp {
                 };
 
                 // Determine target channel/query
+                let is_pm = !target.starts_with('#') && !target.starts_with('&')
+                    && target.eq_ignore_ascii_case(&self.my_nick);
                 let target_name = if target.starts_with('#') || target.starts_with('&') {
                     target.clone()
-                } else if target.eq_ignore_ascii_case(&self.my_nick) {
+                } else if is_pm {
                     // Private message to us - use sender as channel
                     sender.clone()
                 } else {
                     target.clone()
                 };
+
+                // Send desktop notification for highlights and PMs
+                // Skip if we sent it ourselves
+                let is_from_self = sender.eq_ignore_ascii_case(&self.my_nick);
+                if is_pm && !is_from_self {
+                    let msg_preview = if content.len() > 50 {
+                        format!("{}...", &content.chars().take(50).collect::<String>())
+                    } else {
+                        content.clone()
+                    };
+                    // PMs always notify (force=true)
+                    self.send_notification(
+                        &format!("PM from {}", sender),
+                        &msg_preview,
+                        true
+                    );
+                } else if is_highlight && !is_from_self {
+                    let msg_preview = if content.len() > 50 {
+                        format!("{}...", &content.chars().take(50).collect::<String>())
+                    } else {
+                        content.clone()
+                    };
+                    // Highlights only notify when not focused
+                    self.send_notification(
+                        &format!("{} mentioned you in {}", sender, target_name),
+                        &msg_preview,
+                        false
+                    );
+                }
 
                 self.add_message_to_channel(&target_name, chat_msg);
             }
@@ -1469,6 +1547,9 @@ impl eframe::App for IrcApp {
         // Handle keyboard shortcuts
         self.handle_keyboard_shortcuts(ctx);
 
+        // Track window focus for notifications
+        self.window_focused = ctx.input(|i| i.focused);
+
         // Request repaint for real-time updates
         ctx.request_repaint();
 
@@ -2036,6 +2117,7 @@ impl IrcApp {
                 ui.separator();
 
                 ui.checkbox(&mut self.auto_reconnect, "Auto-reconnect on disconnect");
+                ui.checkbox(&mut self.notifications_enabled, "Desktop notifications for highlights/PMs");
 
                 let tray_response = ui.checkbox(&mut self.minimize_to_tray, "Minimize to system tray");
                 if self.minimize_to_tray {

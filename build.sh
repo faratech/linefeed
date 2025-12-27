@@ -4,7 +4,17 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
+# Use all available CPU cores for compilation
+export CARGO_BUILD_JOBS=$(nproc)
+
+# Use sccache for faster rebuilds (if available)
+if command -v sccache &> /dev/null; then
+    export RUSTC_WRAPPER=sccache
+fi
+
 echo "=== fmIRC Build Script ==="
+echo "Using $CARGO_BUILD_JOBS parallel jobs"
+[ -n "$RUSTC_WRAPPER" ] && echo "Using sccache for caching"
 echo ""
 
 # Update dependencies to latest

@@ -18,7 +18,8 @@ mod tray {
     use crate::icon_data;
     use windows::Win32::Foundation::HWND;
     use windows::Win32::UI::WindowsAndMessaging::{
-        FindWindowW, ShowWindow, SetForegroundWindow, SW_HIDE, SW_SHOW,
+        FindWindowW, ShowWindow, SetForegroundWindow, FlashWindowEx,
+        SW_HIDE, SW_SHOW, FLASHWINFO, FLASHW_ALL, FLASHW_TIMERNOFG,
     };
     use windows::core::w;
 
@@ -124,6 +125,23 @@ mod tray {
 
     pub fn should_exit() -> bool {
         EXIT_REQUESTED.load(Ordering::SeqCst)
+    }
+
+    /// Flash the taskbar to alert the user of a notification
+    pub fn flash_window() {
+        if let Some(hwnd) = find_our_window() {
+            unsafe {
+                let mut flash_info = FLASHWINFO {
+                    cbSize: std::mem::size_of::<FLASHWINFO>() as u32,
+                    hwnd,
+                    dwFlags: FLASHW_ALL | FLASHW_TIMERNOFG,
+                    uCount: 3,
+                    dwTimeout: 0,
+                };
+                let _ = FlashWindowEx(&mut flash_info);
+            }
+            tracing::debug!("Flashed taskbar for notification");
+        }
     }
 }
 
