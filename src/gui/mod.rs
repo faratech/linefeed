@@ -12,9 +12,9 @@ use tokio::sync::mpsc;
 use crate::irc::{IrcCommand, IrcMessage};
 use crate::irc::client::ServerConfig;
 use crate::irc::numerics::*;
-use helpers::{is_channel, mask_matches, days_to_ymd};
+use helpers::{is_channel, mask_matches, format_timestamp};
 use formatting::{render_irc_text, nick_color};
-pub use types::{ServerFavorite, Settings, ChatMessage, Channel, UserMode, ChannelListEntry, TabCompletion};
+pub use types::{ServerFavorite, Settings, ChatMessage, Channel, UserMode, ChannelListEntry, TabCompletion, BanEntry};
 pub struct IrcApp {
     // Connection state
     pub connected: bool,
@@ -121,6 +121,10 @@ pub struct IrcApp {
     pub log_manager: logging::LogManager,
     pub logging_load_history: bool,
     pub logging_history_lines: usize,
+
+    // Channel info dialog
+    pub show_channel_info: bool,
+    pub channel_info_target: Option<String>,
 }
 
 impl Default for IrcApp {
@@ -216,6 +220,8 @@ impl IrcApp {
             log_manager: logging::LogManager::new(settings.logging_enabled),
             logging_load_history: settings.logging_load_history,
             logging_history_lines: settings.logging_history_lines,
+            show_channel_info: false,
+            channel_info_target: None,
         }
     }
 
@@ -730,40 +736,40 @@ impl IrcApp {
                 }
             }
 
+            RPL_CHANNELMODEIS => {
+                // Format: 324 <nick> <channel> <modes> [<mode params>...]
+                if let (Some(channel), Some(modes)) = (params.get(1), params.get(2)) {
+                    if let Some(ch) = self.channels.get_mut(channel) {
+                        ch.modes = modes.clone();
+                        ch.mode_params = params[3..].to_vec();
+                    }
+                }
+            }
+
+            RPL_CREATIONTIME => {
+                // Format: 329 <nick> <channel> <timestamp>
+                if let (Some(channel), Some(ts_str)) = (params.get(1), params.get(2)) {
+                    let ts: u64 = ts_str.parse().unwrap_or(0);
+                    if let Some(ch) = self.channels.get_mut(channel) {
+                        ch.created = Some(ts);
+                    }
+                }
+            }
+
             RPL_TOPICWHOTIME => {
                 // Format: 333 <nick> <channel> <setter> <timestamp>
                 if let (Some(channel), Some(setter), Some(ts_str)) =
                     (params.get(1), params.get(2), params.get(3))
                 {
-                    let time_str = if let Ok(ts) = ts_str.parse::<i64>() {
-                        // Convert Unix timestamp to human-readable format
-                        use std::time::{UNIX_EPOCH, Duration};
-                        if let Some(datetime) = UNIX_EPOCH.checked_add(Duration::from_secs(ts as u64)) {
-                            // Format as local time
-                            let elapsed = datetime.duration_since(UNIX_EPOCH).unwrap_or_default();
-                            let secs = elapsed.as_secs();
-                            // Calculate date components (simplified UTC)
-                            let days = secs / 86400;
-                            let time_secs = secs % 86400;
-                            let hours = time_secs / 3600;
-                            let minutes = (time_secs % 3600) / 60;
+                    let ts: u64 = ts_str.parse().unwrap_or(0);
 
-                            // Days since 1970-01-01
-                            let (year, month, day) = days_to_ymd(days);
-                            let month_name = match month {
-                                1 => "Jan", 2 => "Feb", 3 => "Mar", 4 => "Apr",
-                                5 => "May", 6 => "Jun", 7 => "Jul", 8 => "Aug",
-                                9 => "Sep", 10 => "Oct", 11 => "Nov", 12 => "Dec",
-                                _ => "???",
-                            };
-                            format!("{} {}, {} {:02}:{:02} UTC", month_name, day, year, hours, minutes)
-                        } else {
-                            ts_str.clone()
-                        }
-                    } else {
-                        ts_str.clone()
-                    };
+                    // Store topic setter info
+                    if let Some(ch) = self.channels.get_mut(channel) {
+                        ch.topic_set_by = Some(setter.clone());
+                        ch.topic_set_time = Some(ts);
+                    }
 
+                    let time_str = format_timestamp(ts);
                     if let Some(ch) = self.channels.get_mut(channel) {
                         ch.messages.push(ChatMessage::system(
                             &format!("Topic set by {} on {}", setter, time_str)
@@ -789,6 +795,31 @@ impl IrcApp {
             }
 
             RPL_ENDOFNAMES => {
+            }
+
+            RPL_BANLIST => {
+                // Format: 367 <nick> <channel> <banmask> <setter> <timestamp>
+                if let (Some(channel), Some(mask), Some(setter), Some(ts_str)) =
+                    (params.get(1), params.get(2), params.get(3), params.get(4))
+                {
+                    let ts: u64 = ts_str.parse().unwrap_or(0);
+                    if let Some(ch) = self.channels.get_mut(channel) {
+                        ch.bans.push(BanEntry {
+                            mask: mask.clone(),
+                            set_by: setter.clone(),
+                            set_time: ts,
+                        });
+                    }
+                }
+            }
+
+            RPL_ENDOFBANLIST => {
+                // Format: 368 <nick> <channel> :End of channel ban list
+                if let Some(channel) = params.get(1) {
+                    if let Some(ch) = self.channels.get_mut(channel) {
+                        ch.ban_list_complete = true;
+                    }
+                }
             }
 
             RPL_MOTD | RPL_MOTDSTART | RPL_ENDOFMOTD => {
@@ -1465,6 +1496,11 @@ impl eframe::App for IrcApp {
             self.show_channel_list_window(ctx);
         }
 
+        // Channel info dialog
+        if self.show_channel_info {
+            self.show_channel_info_window(ctx);
+        }
+
         // Top panel - toolbar
         egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
             ui.horizontal(|ui| {
@@ -1609,10 +1645,24 @@ impl eframe::App for IrcApp {
                             }
                         }
 
+                        // Double-click to open channel info
+                        if response.double_clicked() && is_channel(&channel_name) {
+                            self.channel_info_target = Some(channel_name.clone());
+                            self.show_channel_info = true;
+                            // Request fresh mode info
+                            self.send_command(IrcCommand::Mode(channel_name.clone(), None, None));
+                        }
+
                         // Context menu for channels
                         let chan_for_menu = channel_name.clone();
                         response.context_menu(|ui| {
                             if is_channel(&chan_for_menu) {
+                                if ui.button("Channel Info").clicked() {
+                                    self.channel_info_target = Some(chan_for_menu.clone());
+                                    self.show_channel_info = true;
+                                    self.send_command(IrcCommand::Mode(chan_for_menu.clone(), None, None));
+                                    ui.close();
+                                }
                                 if ui.button("Part Channel").clicked() {
                                     part_channel = Some(chan_for_menu.clone());
                                     ui.close();
@@ -1748,14 +1798,27 @@ impl eframe::App for IrcApp {
 
         // Central panel - chat area
         egui::CentralPanel::default().show(ctx, |ui| {
-            // Topic bar (with IRC color support)
+            // Channel header with modes and topic
             if let Some(channel_name) = &self.current_channel {
                 if let Some(channel) = self.channels.get(channel_name) {
+                    // Show channel name and modes for channels
+                    if is_channel(channel_name) && !channel.modes.is_empty() {
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new(channel_name).strong());
+                            ui.label(RichText::new(format!("[{}]", channel.modes))
+                                .color(Color32::from_rgb(150, 150, 150)));
+                            ui.label(RichText::new(format!("({} users)", channel.users.len()))
+                                .small()
+                                .color(Color32::GRAY));
+                        });
+                    }
                     if let Some(topic) = &channel.topic {
                         ui.horizontal(|ui| {
                             ui.label(RichText::new("Topic:").strong());
                             render_irc_text(ui, topic, Color32::WHITE);
                         });
+                    }
+                    if is_channel(channel_name) || channel.topic.is_some() {
                         ui.separator();
                     }
                 }

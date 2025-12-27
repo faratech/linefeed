@@ -66,6 +66,26 @@ pub fn current_time_hhmm() -> String {
     format!("[{:02}:{:02}]", hours, minutes)
 }
 
+/// Format a Unix timestamp as a human-readable string
+pub fn format_timestamp(ts: u64) -> String {
+    if ts == 0 {
+        return "Unknown".to_string();
+    }
+    let days = ts / 86400;
+    let time_secs = ts % 86400;
+    let hours = time_secs / 3600;
+    let minutes = (time_secs % 3600) / 60;
+
+    let (year, month, day) = days_to_ymd(days);
+    let month_name = match month {
+        1 => "Jan", 2 => "Feb", 3 => "Mar", 4 => "Apr",
+        5 => "May", 6 => "Jun", 7 => "Jul", 8 => "Aug",
+        9 => "Sep", 10 => "Oct", 11 => "Nov", 12 => "Dec",
+        _ => "???",
+    };
+    format!("{} {}, {} {:02}:{:02} UTC", month_name, day, year, hours, minutes)
+}
+
 /// Convert days since Unix epoch (1970-01-01) to (year, month, day)
 pub fn days_to_ymd(days: u64) -> (u32, u32, u32) {
     // Algorithm based on Howard Hinnant's date algorithms

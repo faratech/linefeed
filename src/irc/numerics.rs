@@ -35,9 +35,23 @@ pub const RPL_LISTSTART: u16 = 321;
 pub const RPL_LIST: u16 = 322;
 pub const RPL_LISTEND: u16 = 323;
 
+// Channel info
+pub const RPL_CHANNELMODEIS: u16 = 324;
+pub const RPL_CREATIONTIME: u16 = 329;
+
 // Topic
 pub const RPL_TOPIC: u16 = 332;
 pub const RPL_TOPICWHOTIME: u16 = 333;
+
+// Ban list
+pub const RPL_BANLIST: u16 = 367;
+pub const RPL_ENDOFBANLIST: u16 = 368;
+
+// Invite/except lists
+pub const RPL_INVITELIST: u16 = 346;
+pub const RPL_ENDOFINVITELIST: u16 = 347;
+pub const RPL_EXCEPTLIST: u16 = 348;
+pub const RPL_ENDOFEXCEPTLIST: u16 = 349;
 
 // Names list
 pub const RPL_NAMREPLY: u16 = 353;

@@ -3,6 +3,7 @@
 use egui::{Color32, RichText, ScrollArea, TextEdit, Vec2};
 use crate::irc::IrcCommand;
 use super::{IrcApp, ServerFavorite};
+use super::helpers::format_timestamp;
 
 impl IrcApp {
     pub fn show_connect_window(&mut self, ctx: &egui::Context) {
@@ -542,6 +543,156 @@ impl IrcApp {
             self.send_command(IrcCommand::Join(channel, None));
             self.show_channel_list = false;
             self.channel_list_selected = None;
+        }
+    }
+
+    pub fn show_channel_info_window(&mut self, ctx: &egui::Context) {
+        let channel_name = match &self.channel_info_target {
+            Some(name) => name.clone(),
+            None => return,
+        };
+
+        let channel_data = self.channels.get(&channel_name).cloned();
+
+        let mut close = false;
+
+        egui::Window::new(format!("Channel Info: {}", channel_name))
+            .collapsible(false)
+            .resizable(true)
+            .default_size([500.0, 400.0])
+            .show(ctx, |ui| {
+                if let Some(ch) = channel_data {
+                    // Channel name and modes
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new(&channel_name).strong().size(16.0));
+                        if !ch.modes.is_empty() {
+                            ui.label(RichText::new(format!("({})", ch.modes)).color(Color32::GRAY));
+                        }
+                    });
+                    ui.separator();
+
+                    egui::Grid::new("channel_info_grid")
+                        .num_columns(2)
+                        .spacing([10.0, 6.0])
+                        .show(ui, |ui| {
+                            // User count
+                            ui.label("Users:");
+                            ui.label(format!("{}", ch.users.len()));
+                            ui.end_row();
+
+                            // Created
+                            ui.label("Created:");
+                            if let Some(ts) = ch.created {
+                                ui.label(format_timestamp(ts));
+                            } else {
+                                ui.label("Unknown");
+                            }
+                            ui.end_row();
+
+                            // Modes with params
+                            if !ch.modes.is_empty() {
+                                ui.label("Modes:");
+                                let mode_str = if ch.mode_params.is_empty() {
+                                    ch.modes.clone()
+                                } else {
+                                    format!("{} {}", ch.modes, ch.mode_params.join(" "))
+                                };
+                                ui.label(mode_str);
+                                ui.end_row();
+                            }
+                        });
+
+                    ui.separator();
+
+                    // Topic section
+                    ui.label(RichText::new("Topic").strong());
+                    if let Some(topic) = &ch.topic {
+                        ui.add(egui::Label::new(topic).wrap());
+                        if let Some(setter) = &ch.topic_set_by {
+                            let time_str = ch.topic_set_time
+                                .map(|ts| format_timestamp(ts))
+                                .unwrap_or_else(|| "Unknown".to_string());
+                            ui.label(RichText::new(format!("Set by {} on {}", setter, time_str))
+                                .small()
+                                .color(Color32::GRAY));
+                        }
+                    } else {
+                        ui.label(RichText::new("No topic set").italics().color(Color32::GRAY));
+                    }
+
+                    ui.separator();
+
+                    // Ban list section
+                    ui.collapsing(format!("Ban List ({})", ch.bans.len()), |ui| {
+                        if ch.bans.is_empty() {
+                            if ch.ban_list_complete {
+                                ui.label(RichText::new("No bans").italics().color(Color32::GRAY));
+                            } else {
+                                if ui.button("Load Ban List").clicked() {
+                                    self.send_command(IrcCommand::Mode(
+                                        channel_name.clone(),
+                                        Some("+b".to_string()),
+                                        None,
+                                    ));
+                                }
+                            }
+                        } else {
+                            ScrollArea::vertical()
+                                .max_height(150.0)
+                                .show(ui, |ui| {
+                                    for ban in &ch.bans {
+                                        ui.horizontal(|ui| {
+                                            ui.label(RichText::new(&ban.mask).monospace());
+                                            ui.label(RichText::new(format!("by {} on {}",
+                                                ban.set_by, format_timestamp(ban.set_time)))
+                                                .small()
+                                                .color(Color32::GRAY));
+                                        });
+                                    }
+                                });
+                        }
+                    });
+
+                    ui.separator();
+
+                    // User list section
+                    ui.collapsing(format!("Users ({})", ch.users.len()), |ui| {
+                        ScrollArea::vertical()
+                            .max_height(150.0)
+                            .show(ui, |ui| {
+                                ui.horizontal_wrapped(|ui| {
+                                    for (nick, mode) in &ch.users {
+                                        let prefix = mode.prefix();
+                                        let display = format!("{}{}", prefix, nick);
+                                        ui.label(&display);
+                                    }
+                                });
+                            });
+                    });
+                } else {
+                    ui.label("Channel not found");
+                }
+
+                ui.separator();
+                ui.horizontal(|ui| {
+                    if ui.button("Refresh").clicked() {
+                        // Request fresh channel info
+                        self.send_command(IrcCommand::Mode(channel_name.clone(), None, None));
+                        // Clear and re-request ban list
+                        if let Some(ch) = self.channels.get_mut(&channel_name) {
+                            ch.bans.clear();
+                            ch.ban_list_complete = false;
+                        }
+                    }
+                    if ui.button("Close").clicked() {
+                        close = true;
+                    }
+                });
+            });
+
+        if close {
+            self.show_channel_info = false;
+            self.channel_info_target = None;
         }
     }
 }

@@ -228,24 +228,46 @@ impl UserMode {
     }
 }
 
+/// Ban list entry
+#[derive(Debug, Clone)]
+pub struct BanEntry {
+    pub mask: String,
+    pub set_by: String,
+    pub set_time: u64,
+}
+
 /// An IRC channel with users and messages
 #[derive(Debug, Clone)]
 pub struct Channel {
     pub topic: Option<String>,
+    pub topic_set_by: Option<String>,
+    pub topic_set_time: Option<u64>,
+    pub modes: String,  // Channel modes like "+nt"
+    pub mode_params: Vec<String>,  // Mode parameters (limit, key, etc.)
+    pub created: Option<u64>,  // Channel creation timestamp
     pub users: Vec<(String, UserMode)>,
     pub messages: Vec<ChatMessage>,
     pub unread: usize,
     pub key: Option<String>,  // Channel key for auto-rejoin
+    pub bans: Vec<BanEntry>,
+    pub ban_list_complete: bool,
 }
 
 impl Channel {
     pub fn new() -> Self {
         Self {
             topic: None,
+            topic_set_by: None,
+            topic_set_time: None,
+            modes: String::new(),
+            mode_params: Vec::new(),
+            created: None,
             users: Vec::new(),
             messages: Vec::new(),
             unread: 0,
             key: None,
+            bans: Vec::new(),
+            ban_list_complete: false,
         }
     }
 
