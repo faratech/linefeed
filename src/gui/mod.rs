@@ -679,6 +679,11 @@ pub struct IrcApp {
 
     // Pending auto-perform (to execute after connect)
     pub pending_auto_perform: Option<Vec<String>>,
+
+    // Server favorites UI state
+    pub selected_favorite: Option<usize>,
+    pub new_favorite_name: String,
+    pub show_save_favorite_dialog: bool,
 }
 
 impl Default for IrcApp {
@@ -754,6 +759,11 @@ impl IrcApp {
             server_favorites: settings.server_favorites,
             auto_perform: settings.auto_perform,
             pending_auto_perform: None,
+
+            // Server favorites UI state
+            selected_favorite: None,
+            new_favorite_name: String::new(),
+            show_save_favorite_dialog: false,
         }
     }
 
@@ -3138,9 +3148,96 @@ impl IrcApp {
     fn show_connect_window(&mut self, ctx: &egui::Context) {
         egui::Window::new("Connect to Server")
             .collapsible(false)
-            .resizable(false)
+            .resizable(true)
+            .default_width(450.0)
             .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
             .show(ctx, |ui| {
+                // ===== Server Favorites Section =====
+                egui::CollapsingHeader::new("Server Favorites")
+                    .default_open(!self.server_favorites.is_empty())
+                    .show(ui, |ui| {
+                        if self.server_favorites.is_empty() {
+                            ui.label("No saved favorites. Fill in connection details and click 'Save as Favorite'.");
+                        } else {
+                            // Favorites list with selection
+                            ScrollArea::vertical()
+                                .max_height(120.0)
+                                .show(ui, |ui| {
+                                    let mut clicked_idx = None;
+                                    for (idx, fav) in self.server_favorites.iter().enumerate() {
+                                        let is_selected = self.selected_favorite == Some(idx);
+                                        let text = format!("{} ({}:{})", fav.name, fav.host, fav.port);
+                                        let response = ui.selectable_label(is_selected, &text);
+                                        if response.clicked() {
+                                            clicked_idx = Some(idx);
+                                        }
+                                        if response.double_clicked() {
+                                            // Load and connect on double-click
+                                            clicked_idx = Some(idx);
+                                        }
+                                    }
+                                    if let Some(idx) = clicked_idx {
+                                        self.selected_favorite = Some(idx);
+                                    }
+                                });
+
+                            ui.horizontal(|ui| {
+                                // Load button
+                                let has_selection = self.selected_favorite.is_some();
+                                if ui.add_enabled(has_selection, egui::Button::new("Load")).clicked() {
+                                    if let Some(idx) = self.selected_favorite {
+                                        if let Some(fav) = self.server_favorites.get(idx).cloned() {
+                                            self.server_host = fav.host;
+                                            self.server_port = fav.port;
+                                            self.use_tls = fav.use_tls;
+                                            self.password = fav.password;
+                                            if !fav.nickname.is_empty() {
+                                                self.nickname = fav.nickname;
+                                            }
+                                            self.auto_join_channels = fav.auto_join;
+                                            self.auto_perform = fav.auto_perform;
+                                        }
+                                    }
+                                }
+
+                                // Delete button
+                                if ui.add_enabled(has_selection, egui::Button::new("Delete")).clicked() {
+                                    if let Some(idx) = self.selected_favorite {
+                                        self.server_favorites.remove(idx);
+                                        self.selected_favorite = None;
+                                        self.save_settings();
+                                    }
+                                }
+
+                                // Connect button
+                                if ui.add_enabled(has_selection, egui::Button::new("Connect")).clicked() {
+                                    if let Some(idx) = self.selected_favorite {
+                                        if let Some(fav) = self.server_favorites.get(idx).cloned() {
+                                            // Load favorite settings
+                                            self.server_host = fav.host;
+                                            self.server_port = fav.port;
+                                            self.use_tls = fav.use_tls;
+                                            self.password = fav.password;
+                                            if !fav.nickname.is_empty() {
+                                                self.nickname = fav.nickname;
+                                            }
+                                            self.auto_join_channels = fav.auto_join;
+                                            self.auto_perform = fav.auto_perform;
+                                            // Connect
+                                            self.save_settings();
+                                            self.show_connect_dialog = false;
+                                            self.connecting = true;
+                                            self.my_nick = self.nickname.clone();
+                                        }
+                                    }
+                                }
+                            });
+                        }
+                    });
+
+                ui.separator();
+
+                // ===== Server Details =====
                 ui.horizontal(|ui| {
                     ui.label("Server:");
                     ui.add(TextEdit::singleline(&mut self.server_host).desired_width(200.0));
@@ -3202,6 +3299,46 @@ impl IrcApp {
 
                 ui.separator();
 
+                // ===== Save as Favorite =====
+                if self.show_save_favorite_dialog {
+                    ui.horizontal(|ui| {
+                        ui.label("Name:");
+                        ui.add(TextEdit::singleline(&mut self.new_favorite_name).desired_width(150.0));
+                        if ui.button("Save").clicked() && !self.new_favorite_name.is_empty() {
+                            let new_fav = ServerFavorite {
+                                name: self.new_favorite_name.clone(),
+                                host: self.server_host.clone(),
+                                port: self.server_port.clone(),
+                                use_tls: self.use_tls,
+                                password: self.password.clone(),
+                                nickname: self.nickname.clone(),
+                                auto_join: self.auto_join_channels.clone(),
+                                auto_perform: self.auto_perform.clone(),
+                            };
+                            self.server_favorites.push(new_fav);
+                            self.selected_favorite = Some(self.server_favorites.len() - 1);
+                            self.save_settings();
+                            self.new_favorite_name.clear();
+                            self.show_save_favorite_dialog = false;
+                        }
+                        if ui.button("Cancel").clicked() {
+                            self.new_favorite_name.clear();
+                            self.show_save_favorite_dialog = false;
+                        }
+                    });
+                } else {
+                    if ui.button("Save as Favorite").clicked() {
+                        // Pre-fill with server name if empty
+                        if self.new_favorite_name.is_empty() {
+                            self.new_favorite_name = self.server_host.clone();
+                        }
+                        self.show_save_favorite_dialog = true;
+                    }
+                }
+
+                ui.separator();
+
+                // ===== Connect/Cancel Buttons =====
                 ui.horizontal(|ui| {
                     if ui.button("Connect").clicked() {
                         self.save_settings();
@@ -3420,10 +3557,9 @@ impl IrcApp {
                                     // Column 1: Channel name (clickable)
                                     let response = ui.add_sized(
                                         [channel_width, 18.0],
-                                        egui::SelectableLabel::new(
-                                            is_selected,
-                                            RichText::new(&entry.name).color(row_color)
-                                        )
+                                        egui::Button::new(RichText::new(&entry.name).color(row_color))
+                                            .selected(is_selected)
+                                            .frame(false)
                                     );
 
                                     // Single click to select
