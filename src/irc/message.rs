@@ -10,7 +10,7 @@ pub enum IrcCommand {
     Away(Option<String>),
 
     // Channel
-    Join(String),
+    Join(String, Option<String>),  // (channel, optional key)
     Part(String, Option<String>),
     Topic(String, Option<String>),
     Names(Option<String>),
@@ -140,7 +140,10 @@ impl IrcMessage {
                 params.get(0).cloned().unwrap_or_default(),
                 params.get(1).cloned().unwrap_or_default(),
             ),
-            "JOIN" => IrcCommand::Join(params.get(0).cloned().unwrap_or_default()),
+            "JOIN" => IrcCommand::Join(
+                params.get(0).cloned().unwrap_or_default(),
+                params.get(1).cloned(),
+            ),
             "PART" => IrcCommand::Part(
                 params.get(0).cloned().unwrap_or_default(),
                 params.get(1).cloned(),
@@ -223,7 +226,13 @@ impl fmt::Display for IrcCommand {
                     write!(f, "AWAY")
                 }
             }
-            IrcCommand::Join(channel) => write!(f, "JOIN {}", channel),
+            IrcCommand::Join(channel, key) => {
+                if let Some(k) = key {
+                    write!(f, "JOIN {} {}", channel, k)
+                } else {
+                    write!(f, "JOIN {}", channel)
+                }
+            }
             IrcCommand::Part(channel, msg) => {
                 if let Some(m) = msg {
                     write!(f, "PART {} :{}", channel, m)

@@ -98,6 +98,19 @@ pub struct IrcApp {
     pub selected_favorite: Option<usize>,
     pub new_favorite_name: String,
     pub show_save_favorite_dialog: bool,
+
+    // Pending channel keys (for storing key when joining +k channels)
+    pub pending_channel_keys: HashMap<String, String>,
+
+    // Away status tracking
+    pub away_status: Option<String>,
+    pub last_activity: std::time::Instant,
+    pub auto_away_triggered: bool,
+
+    // Auto-away settings
+    pub auto_away_enabled: bool,
+    pub auto_away_minutes: u32,
+    pub auto_away_message: String,
 }
 
 impl Default for IrcApp {
@@ -178,6 +191,16 @@ impl IrcApp {
             selected_favorite: None,
             new_favorite_name: String::new(),
             show_save_favorite_dialog: false,
+
+            pending_channel_keys: HashMap::new(),
+
+            // Away status
+            away_status: None,
+            last_activity: std::time::Instant::now(),
+            auto_away_triggered: false,
+            auto_away_enabled: settings.auto_away_enabled,
+            auto_away_minutes: settings.auto_away_minutes,
+            auto_away_message: settings.auto_away_message,
         }
     }
 
@@ -199,6 +222,9 @@ impl IrcApp {
             ignore_list: self.ignore_list.clone(),
             server_favorites: self.server_favorites.clone(),
             auto_perform: self.auto_perform.clone(),
+            auto_away_enabled: self.auto_away_enabled,
+            auto_away_minutes: self.auto_away_minutes,
+            auto_away_message: self.auto_away_message.clone(),
         }
     }
 
@@ -488,12 +514,17 @@ impl IrcApp {
                 }
             }
 
-            IrcCommand::Join(channel) => {
+            IrcCommand::Join(channel, _key) => {
                 let sender = msg.get_sender_nick().unwrap_or_default();
                 if sender.eq_ignore_ascii_case(&self.my_nick) {
                     // We joined a channel
                     if !self.channels.contains_key(channel) {
-                        self.channels.insert(channel.clone(), Channel::new());
+                        let mut new_channel = Channel::new();
+                        // Check for pending key and store it
+                        if let Some(key) = self.pending_channel_keys.remove(&channel.to_lowercase()) {
+                            new_channel.key = Some(key);
+                        }
+                        self.channels.insert(channel.clone(), new_channel);
                     }
                     self.current_channel = Some(channel.clone());
                     let sys_msg = ChatMessage::system(&format!("Now talking in {}", channel));
@@ -620,7 +651,7 @@ impl IrcApp {
                             } else {
                                 format!("#{}", chan)
                             };
-                            self.send_command(IrcCommand::Join(channel.clone()));
+                            self.send_command(IrcCommand::Join(channel.clone(), None));
                             self.add_server_message(ChatMessage::system(&format!("Auto-joining {}", channel)));
                         }
                     }
@@ -876,8 +907,10 @@ impl IrcApp {
 
             ERR_BADCHANNELKEY => {
                 if let Some(channel) = params.get(1) {
+                    // Remove any pending key since it was wrong
+                    self.pending_channel_keys.remove(&channel.to_lowercase());
                     self.add_message_to_current(ChatMessage::system(
-                        &format!("Cannot join {} (bad key)", channel)
+                        &format!("Cannot join {} (bad or missing channel key). Use: /join {} <key>", channel, channel)
                     ));
                 }
             }
@@ -1256,6 +1289,35 @@ impl eframe::App for IrcApp {
         // Track window focus for notifications
         self.window_focused = ctx.input(|i| i.focused);
 
+        // Track user activity for auto-away
+        let has_activity = ctx.input(|i| {
+            !i.keys_down.is_empty() || i.pointer.any_click() || i.pointer.any_pressed()
+        });
+        if has_activity {
+            self.last_activity = std::time::Instant::now();
+
+            // Clear auto-away on user activity
+            if self.auto_away_triggered && self.away_status.is_some() {
+                self.send_command(IrcCommand::Away(None));
+                self.away_status = None;
+                self.auto_away_triggered = false;
+                self.add_server_message(ChatMessage::system("You are no longer away (auto-detected activity)"));
+            }
+        }
+
+        // Check for idle timeout and set auto-away
+        if self.connected && self.away_status.is_none() && self.auto_away_enabled {
+            let idle_duration = self.last_activity.elapsed();
+            let timeout = std::time::Duration::from_secs(self.auto_away_minutes as u64 * 60);
+            if idle_duration >= timeout {
+                let msg = self.auto_away_message.clone();
+                self.send_command(IrcCommand::Away(Some(msg.clone())));
+                self.away_status = Some(msg.clone());
+                self.auto_away_triggered = true;
+                self.add_server_message(ChatMessage::system(&format!("Auto-away: {}", msg)));
+            }
+        }
+
         // Request repaint for real-time updates
         ctx.request_repaint();
 
@@ -1281,10 +1343,21 @@ impl eframe::App for IrcApp {
                 ui.separator();
 
                 if self.connected {
-                    ui.label(RichText::new("●").color(Color32::GREEN));
+                    // Show yellow if away, green if active
+                    if self.away_status.is_some() {
+                        ui.label(RichText::new("●").color(Color32::from_rgb(255, 200, 0)));
+                    } else {
+                        ui.label(RichText::new("●").color(Color32::GREEN));
+                    }
                     ui.label(&self.my_nick);
                     ui.label("@");
                     ui.label(&self.server_host);
+
+                    // Show away status
+                    if let Some(away_msg) = &self.away_status {
+                        ui.separator();
+                        ui.label(RichText::new(format!("Away: {}", away_msg)).color(Color32::from_rgb(255, 200, 0)));
+                    }
                 } else if self.connecting {
                     ui.label(RichText::new("●").color(Color32::YELLOW));
                     ui.label("Connecting...");
@@ -1358,7 +1431,7 @@ impl eframe::App for IrcApp {
                                 } else {
                                     format!("#{}", self.join_channel)
                                 };
-                                self.send_command(IrcCommand::Join(channel));
+                                self.send_command(IrcCommand::Join(channel, None));
                                 self.join_channel.clear();
                             }
                         }

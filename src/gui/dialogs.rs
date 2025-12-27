@@ -289,6 +289,22 @@ impl IrcApp {
                     tray_response.on_hover_text("System tray support requires platform-specific setup");
                 }
 
+                ui.add_space(8.0);
+                ui.checkbox(&mut self.auto_away_enabled, "Auto-away when idle");
+                if self.auto_away_enabled {
+                    ui.horizontal(|ui| {
+                        ui.label("    After");
+                        let mut minutes = self.auto_away_minutes as i32;
+                        ui.add(egui::DragValue::new(&mut minutes).speed(1).range(1..=120));
+                        self.auto_away_minutes = minutes.max(1) as u32;
+                        ui.label("minutes");
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("    Message:");
+                        ui.add(TextEdit::singleline(&mut self.auto_away_message).desired_width(150.0));
+                    });
+                }
+
                 ui.separator();
                 ui.heading("About");
                 ui.separator();
@@ -487,7 +503,7 @@ impl IrcApp {
             self.channel_list_selected = None;
         }
         if let Some(channel) = join_channel {
-            self.send_command(IrcCommand::Join(channel));
+            self.send_command(IrcCommand::Join(channel, None));
             self.show_channel_list = false;
             self.channel_list_selected = None;
         }

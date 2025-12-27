@@ -12,12 +12,19 @@ impl IrcApp {
 
         match cmd.as_str() {
             "JOIN" | "J" => {
-                let channel = if args.starts_with('#') {
-                    args.to_string()
+                let join_parts: Vec<&str> = args.splitn(2, ' ').collect();
+                let channel_arg = join_parts.get(0).copied().unwrap_or("");
+                let key = join_parts.get(1).map(|k| k.to_string());
+                let channel = if channel_arg.starts_with('#') || channel_arg.starts_with('&') {
+                    channel_arg.to_string()
                 } else {
-                    format!("#{}", args)
+                    format!("#{}", channel_arg)
                 };
-                self.send_command(IrcCommand::Join(channel));
+                // Store key for use when channel is created
+                if let Some(ref k) = key {
+                    self.pending_channel_keys.insert(channel.to_lowercase(), k.clone());
+                }
+                self.send_command(IrcCommand::Join(channel, key));
             }
 
             "PART" | "LEAVE" => {
@@ -73,11 +80,23 @@ impl IrcApp {
                 if args.is_empty() {
                     // Clear away status
                     self.send_command(IrcCommand::Away(None));
+                    self.away_status = None;
+                    self.auto_away_triggered = false;
                     self.add_server_message(ChatMessage::system("You are no longer marked as away"));
                 } else {
-                    self.send_command(IrcCommand::Away(Some(args.to_string())));
-                    self.add_server_message(ChatMessage::system(&format!("You are now marked as away: {}", args)));
+                    let reason = args.to_string();
+                    self.send_command(IrcCommand::Away(Some(reason.clone())));
+                    self.away_status = Some(reason.clone());
+                    self.auto_away_triggered = false;
+                    self.add_server_message(ChatMessage::system(&format!("You are now marked as away: {}", reason)));
                 }
+            }
+
+            "BACK" => {
+                self.send_command(IrcCommand::Away(None));
+                self.away_status = None;
+                self.auto_away_triggered = false;
+                self.add_server_message(ChatMessage::system("You are no longer marked as away"));
             }
 
             "RAW" | "QUOTE" => {
@@ -454,8 +473,10 @@ impl IrcApp {
                 };
                 if let Some(ch) = channel {
                     if is_channel(&ch) {
+                        // Get the stored key for auto-rejoin if available
+                        let key = self.channels.get(&ch).and_then(|c| c.key.clone());
                         self.send_command(IrcCommand::Part(ch.clone(), Some("Cycling".to_string())));
-                        self.send_command(IrcCommand::Join(ch));
+                        self.send_command(IrcCommand::Join(ch, key));
                     }
                 }
             }
@@ -796,7 +817,8 @@ impl IrcApp {
                 "/server <host:port> - Connect to server",
                 "/disconnect         - Disconnect",
                 "/reconnect          - Reconnect",
-                "/away [message]     - Set/clear away",
+                "/away [message]     - Set away message",
+                "/back               - Clear away status",
             ]),
             ("=== Utility ===", vec![
                 "/clear              - Clear window",

@@ -37,6 +37,10 @@ pub struct Settings {
     pub ignore_list: Vec<String>,
     pub server_favorites: Vec<ServerFavorite>,
     pub auto_perform: String,
+    // Auto-away settings
+    pub auto_away_enabled: bool,
+    pub auto_away_minutes: u32,
+    pub auto_away_message: String,
 }
 
 impl Default for Settings {
@@ -58,6 +62,9 @@ impl Default for Settings {
             ignore_list: Vec::new(),
             server_favorites: Vec::new(),
             auto_perform: String::new(),
+            auto_away_enabled: false,
+            auto_away_minutes: 10,
+            auto_away_message: "Auto-away".to_string(),
         }
     }
 }
@@ -211,6 +218,7 @@ pub struct Channel {
     pub users: Vec<(String, UserMode)>,
     pub messages: Vec<ChatMessage>,
     pub unread: usize,
+    pub key: Option<String>,  // Channel key for auto-rejoin
 }
 
 impl Channel {
@@ -220,6 +228,7 @@ impl Channel {
             users: Vec::new(),
             messages: Vec::new(),
             unread: 0,
+            key: None,
         }
     }
 
