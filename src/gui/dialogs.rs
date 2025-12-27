@@ -220,139 +220,34 @@ impl IrcApp {
         egui::Window::new("Settings")
             .collapsible(false)
             .resizable(true)
-            .default_size([350.0, 450.0])
+            .default_size([380.0, 320.0])
             .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
             .show(ctx, |ui| {
-                ScrollArea::vertical()
-                    .auto_shrink([false; 2])
-                    .show(ui, |ui| {
-                ui.heading("Connection Defaults");
+                // Tab bar
+                ui.horizontal(|ui| {
+                    if ui.selectable_label(self.settings_tab == 0, "Connection").clicked() {
+                        self.settings_tab = 0;
+                    }
+                    if ui.selectable_label(self.settings_tab == 1, "Automation").clicked() {
+                        self.settings_tab = 1;
+                    }
+                    if ui.selectable_label(self.settings_tab == 2, "Behavior").clicked() {
+                        self.settings_tab = 2;
+                    }
+                    if ui.selectable_label(self.settings_tab == 3, "About").clicked() {
+                        self.settings_tab = 3;
+                    }
+                });
                 ui.separator();
 
-                ui.horizontal(|ui| {
-                    ui.label("Default Server:");
-                    ui.add(TextEdit::singleline(&mut self.server_host).desired_width(200.0));
-                });
-
-                ui.horizontal(|ui| {
-                    ui.label("Default Port:");
-                    ui.add(TextEdit::singleline(&mut self.server_port).desired_width(80.0));
-                });
-
-                ui.horizontal(|ui| {
-                    ui.checkbox(&mut self.use_tls, "Use TLS by default");
-                });
-
-                ui.separator();
-                ui.heading("Identity");
-                ui.separator();
-
-                ui.horizontal(|ui| {
-                    ui.label("Nickname:");
-                    ui.add(TextEdit::singleline(&mut self.nickname).desired_width(150.0));
-                });
-
-                ui.horizontal(|ui| {
-                    ui.label("Username:");
-                    ui.add(TextEdit::singleline(&mut self.username).desired_width(150.0));
-                });
-
-                ui.horizontal(|ui| {
-                    ui.label("Real name:");
-                    ui.add(TextEdit::singleline(&mut self.realname).desired_width(200.0));
-                });
-
-                ui.separator();
-                ui.heading("On Connect");
-                ui.separator();
-
-                ui.horizontal(|ui| {
-                    ui.label("Auto-join:");
-                    ui.add(
-                        TextEdit::singleline(&mut self.auto_join_channels)
-                            .desired_width(200.0)
-                            .hint_text("#chan1, #chan2")
-                    );
-                });
-
-                ui.checkbox(&mut self.set_invisible, "Set invisible (+i)");
-
-                ui.add_space(4.0);
-                ui.label("Auto-perform (one command per line):");
-                ui.add(
-                    TextEdit::multiline(&mut self.auto_perform)
-                        .desired_width(300.0)
-                        .desired_rows(3)
-                        .hint_text("/msg NickServ identify pass\n/join #secret key")
-                );
-
-                ui.separator();
-                ui.heading("Ignore List");
-                ui.separator();
-
-                // Display ignore list compactly
-                if self.ignore_list.is_empty() {
-                    ui.label("No users ignored. Use /ignore <nick|mask> to add.");
-                } else {
-                    let ignore_display = self.ignore_list.join(", ");
-                    ui.horizontal_wrapped(|ui| {
-                        ui.label("Ignored:");
-                        ui.label(RichText::new(&ignore_display).color(Color32::GRAY));
-                    });
-                    ui.label("Use /unignore <nick> to remove.");
+                // Tab content
+                match self.settings_tab {
+                    0 => self.settings_tab_connection(ui),
+                    1 => self.settings_tab_automation(ui),
+                    2 => self.settings_tab_behavior(ui),
+                    3 => self.settings_tab_about(ui),
+                    _ => {}
                 }
-
-                ui.separator();
-                ui.heading("Behavior");
-                ui.separator();
-
-                ui.checkbox(&mut self.auto_reconnect, "Auto-reconnect on disconnect");
-                ui.checkbox(&mut self.notifications_enabled, "Desktop notifications for highlights/PMs");
-
-                let tray_response = ui.checkbox(&mut self.minimize_to_tray, "Minimize to system tray");
-                if self.minimize_to_tray {
-                    tray_response.on_hover_text("System tray support requires platform-specific setup");
-                }
-
-                ui.add_space(8.0);
-                ui.checkbox(&mut self.auto_away_enabled, "Auto-away when idle");
-                if self.auto_away_enabled {
-                    ui.horizontal(|ui| {
-                        ui.label("    After");
-                        let mut minutes = self.auto_away_minutes as i32;
-                        ui.add(egui::DragValue::new(&mut minutes).speed(1).range(1..=120));
-                        self.auto_away_minutes = minutes.max(1) as u32;
-                        ui.label("minutes");
-                    });
-                    ui.horizontal(|ui| {
-                        ui.label("    Message:");
-                        ui.add(TextEdit::singleline(&mut self.auto_away_message).desired_width(150.0));
-                    });
-                }
-
-                ui.separator();
-                ui.heading("Logging");
-                ui.separator();
-
-                ui.checkbox(&mut self.logging_load_history, "Load chat history on join");
-                if self.logging_load_history {
-                    ui.horizontal(|ui| {
-                        ui.label("    Load last");
-                        let mut lines = self.logging_history_lines as i32;
-                        ui.add(egui::DragValue::new(&mut lines).speed(10).range(10..=1000));
-                        self.logging_history_lines = lines.max(10) as usize;
-                        ui.label("lines");
-                    });
-                }
-                ui.label("Logs are stored in ~/.config/fmirc/logs/");
-
-                ui.separator();
-                ui.heading("About");
-                ui.separator();
-                ui.label("fmIRC v0.0.1");
-                ui.label("A cross-platform IRC client");
-                ui.add_space(8.0);
-                }); // End ScrollArea
 
                 ui.separator();
                 if ui.button("Close").clicked() {
@@ -360,6 +255,152 @@ impl IrcApp {
                     self.show_settings = false;
                 }
             });
+    }
+
+    fn settings_tab_connection(&mut self, ui: &mut egui::Ui) {
+        ui.heading("Server Defaults");
+        ui.add_space(4.0);
+
+        egui::Grid::new("connection_grid")
+            .num_columns(2)
+            .spacing([10.0, 6.0])
+            .show(ui, |ui| {
+                ui.label("Server:");
+                ui.add(TextEdit::singleline(&mut self.server_host).desired_width(200.0));
+                ui.end_row();
+
+                ui.label("Port:");
+                ui.add(TextEdit::singleline(&mut self.server_port).desired_width(80.0));
+                ui.end_row();
+            });
+
+        ui.checkbox(&mut self.use_tls, "Use TLS by default");
+
+        ui.add_space(8.0);
+        ui.heading("Identity");
+        ui.add_space(4.0);
+
+        egui::Grid::new("identity_grid")
+            .num_columns(2)
+            .spacing([10.0, 6.0])
+            .show(ui, |ui| {
+                ui.label("Nickname:");
+                ui.add(TextEdit::singleline(&mut self.nickname).desired_width(150.0));
+                ui.end_row();
+
+                ui.label("Username:");
+                ui.add(TextEdit::singleline(&mut self.username).desired_width(150.0));
+                ui.end_row();
+
+                ui.label("Real name:");
+                ui.add(TextEdit::singleline(&mut self.realname).desired_width(200.0));
+                ui.end_row();
+            });
+    }
+
+    fn settings_tab_automation(&mut self, ui: &mut egui::Ui) {
+        ui.heading("On Connect");
+        ui.add_space(4.0);
+
+        ui.horizontal(|ui| {
+            ui.label("Auto-join:");
+            ui.add(
+                TextEdit::singleline(&mut self.auto_join_channels)
+                    .desired_width(200.0)
+                    .hint_text("#chan1, #chan2")
+            );
+        });
+
+        ui.checkbox(&mut self.set_invisible, "Set invisible (+i)");
+
+        ui.add_space(8.0);
+        ui.label("Auto-perform (one command per line):");
+        ui.add(
+            TextEdit::multiline(&mut self.auto_perform)
+                .desired_width(340.0)
+                .desired_rows(4)
+                .hint_text("/msg NickServ identify pass\n/join #secret key")
+        );
+
+        ui.add_space(8.0);
+        ui.heading("Ignore List");
+        ui.add_space(4.0);
+
+        if self.ignore_list.is_empty() {
+            ui.label(RichText::new("No users ignored").italics().color(Color32::GRAY));
+            ui.label("Use /ignore <nick|mask> to add.");
+        } else {
+            let ignore_display = self.ignore_list.join(", ");
+            ui.horizontal_wrapped(|ui| {
+                ui.label("Ignored:");
+                ui.label(RichText::new(&ignore_display).color(Color32::GRAY));
+            });
+            ui.label("Use /unignore <nick> to remove.");
+        }
+    }
+
+    fn settings_tab_behavior(&mut self, ui: &mut egui::Ui) {
+        ui.heading("Connection");
+        ui.add_space(4.0);
+
+        ui.checkbox(&mut self.auto_reconnect, "Auto-reconnect on disconnect");
+        ui.checkbox(&mut self.notifications_enabled, "Desktop notifications for highlights/PMs");
+
+        let tray_response = ui.checkbox(&mut self.minimize_to_tray, "Minimize to system tray");
+        if self.minimize_to_tray {
+            tray_response.on_hover_text("System tray support requires platform-specific setup");
+        }
+
+        ui.add_space(8.0);
+        ui.heading("Auto-Away");
+        ui.add_space(4.0);
+
+        ui.checkbox(&mut self.auto_away_enabled, "Auto-away when idle");
+        if self.auto_away_enabled {
+            ui.horizontal(|ui| {
+                ui.add_space(20.0);
+                ui.label("After");
+                let mut minutes = self.auto_away_minutes as i32;
+                ui.add(egui::DragValue::new(&mut minutes).speed(1).range(1..=120));
+                self.auto_away_minutes = minutes.max(1) as u32;
+                ui.label("minutes");
+            });
+            ui.horizontal(|ui| {
+                ui.add_space(20.0);
+                ui.label("Message:");
+                ui.add(TextEdit::singleline(&mut self.auto_away_message).desired_width(180.0));
+            });
+        }
+
+        ui.add_space(8.0);
+        ui.heading("Logging");
+        ui.add_space(4.0);
+
+        ui.checkbox(&mut self.logging_load_history, "Load chat history on join");
+        if self.logging_load_history {
+            ui.horizontal(|ui| {
+                ui.add_space(20.0);
+                ui.label("Load last");
+                let mut lines = self.logging_history_lines as i32;
+                ui.add(egui::DragValue::new(&mut lines).speed(10).range(10..=10000));
+                self.logging_history_lines = lines.max(10) as usize;
+                ui.label("lines");
+            });
+        }
+        ui.label(RichText::new("Logs: ~/.config/fmirc/logs/").small().color(Color32::GRAY));
+    }
+
+    fn settings_tab_about(&mut self, ui: &mut egui::Ui) {
+        ui.add_space(20.0);
+        ui.vertical_centered(|ui| {
+            ui.heading("fmIRC");
+            ui.label("Version 0.0.1");
+            ui.add_space(10.0);
+            ui.label("A cross-platform IRC client");
+            ui.label(RichText::new("Built with Rust + egui").small().color(Color32::GRAY));
+            ui.add_space(20.0);
+            ui.label(RichText::new("Windows ARM64 / x86 / Linux").small());
+        });
     }
 
     pub fn show_channel_list_window(&mut self, ctx: &egui::Context) {

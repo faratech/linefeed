@@ -126,6 +126,9 @@ pub struct IrcApp {
     pub show_channel_info: bool,
     pub channel_info_target: Option<String>,
 
+    // Settings dialog tab
+    pub settings_tab: usize,
+
     // Lag meter
     pub lag_ms: Option<u32>,
     pub ping_sent_time: Option<std::time::Instant>,
@@ -227,6 +230,9 @@ impl IrcApp {
             logging_history_lines: settings.logging_history_lines,
             show_channel_info: false,
             channel_info_target: None,
+
+            // Settings dialog tab
+            settings_tab: 0,
 
             // Lag meter
             lag_ms: None,
