@@ -828,4 +828,106 @@ impl IrcApp {
             self.channel_info_target = None;
         }
     }
+
+    /// Show the IRC color picker popup
+    pub fn show_color_picker_window(&mut self, ctx: &egui::Context) -> Option<String> {
+        let mut result: Option<String> = None;
+        let mut close = false;
+
+        // IRC color palette (mIRC standard colors)
+        let colors: [(u8, &str, Color32); 16] = [
+            (0, "White", Color32::WHITE),
+            (1, "Black", Color32::BLACK),
+            (2, "Blue", Color32::from_rgb(0, 0, 127)),
+            (3, "Green", Color32::from_rgb(0, 147, 0)),
+            (4, "Red", Color32::from_rgb(255, 0, 0)),
+            (5, "Brown", Color32::from_rgb(127, 0, 0)),
+            (6, "Purple", Color32::from_rgb(156, 0, 156)),
+            (7, "Orange", Color32::from_rgb(252, 127, 0)),
+            (8, "Yellow", Color32::from_rgb(255, 255, 0)),
+            (9, "Lt Green", Color32::from_rgb(0, 252, 0)),
+            (10, "Cyan", Color32::from_rgb(0, 147, 147)),
+            (11, "Lt Cyan", Color32::from_rgb(0, 255, 255)),
+            (12, "Lt Blue", Color32::from_rgb(0, 0, 252)),
+            (13, "Pink", Color32::from_rgb(255, 0, 255)),
+            (14, "Grey", Color32::from_rgb(127, 127, 127)),
+            (15, "Lt Grey", Color32::from_rgb(210, 210, 210)),
+        ];
+
+        egui::Window::new("IRC Colors")
+            .collapsible(false)
+            .resizable(false)
+            .default_width(220.0)
+            .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
+            .show(ctx, |ui| {
+                ui.label(if self.color_picker_fg {
+                    "Select foreground color:"
+                } else {
+                    "Select background color:"
+                });
+                ui.add_space(4.0);
+
+                // 4x4 color grid
+                egui::Grid::new("color_grid")
+                    .spacing([4.0, 4.0])
+                    .show(ui, |ui| {
+                        for (idx, (code, name, color)) in colors.iter().enumerate() {
+                            // Use contrasting border for visibility
+                            let border = if *code == 0 || *code == 15 {
+                                Color32::DARK_GRAY
+                            } else {
+                                Color32::TRANSPARENT
+                            };
+
+                            let btn = egui::Button::new("")
+                                .fill(*color)
+                                .stroke(egui::Stroke::new(1.0, border))
+                                .min_size(Vec2::new(40.0, 25.0));
+
+                            if ui.add(btn).on_hover_text(*name).clicked() {
+                                if self.color_picker_fg {
+                                    // First click - foreground color, now ask for background
+                                    result = Some(format!("\x03{:02}", code));
+                                    self.color_picker_fg = false;  // Switch to background selection
+                                } else {
+                                    // Second click - background color
+                                    result = Some(format!(",{:02}", code));
+                                    close = true;
+                                }
+                            }
+
+                            // 4 colors per row
+                            if (idx + 1) % 4 == 0 {
+                                ui.end_row();
+                            }
+                        }
+                    });
+
+                ui.add_space(8.0);
+                ui.separator();
+
+                ui.horizontal(|ui| {
+                    if !self.color_picker_fg {
+                        // Already selected foreground, show option to skip background
+                        if ui.button("No Background").clicked() {
+                            close = true;
+                        }
+                    }
+                    if ui.button("Cancel").clicked() {
+                        close = true;
+                    }
+                });
+
+                // Show formatting shortcuts help
+                ui.add_space(4.0);
+                ui.label(RichText::new("Shortcuts: Ctrl+B Bold, Ctrl+U Underline, Ctrl+I Italic").small().color(Color32::GRAY));
+            });
+
+        if close {
+            self.show_color_picker = false;
+            self.color_picker_fg = true;  // Reset for next time
+        }
+
+        result
+    }
 }

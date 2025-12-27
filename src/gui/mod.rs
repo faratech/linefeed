@@ -103,6 +103,9 @@ pub struct IrcApp {
     // Pending channel keys (for storing key when joining +k channels)
     pub pending_channel_keys: HashMap<String, String>,
 
+    // Pending invites (from_nick, channel)
+    pub pending_invites: Vec<(String, String)>,
+
     // Away status tracking
     pub away_status: Option<String>,
     pub last_activity: std::time::Instant,
@@ -149,6 +152,10 @@ pub struct IrcApp {
     pub lag_ms: Option<u32>,
     pub ping_sent_time: Option<std::time::Instant>,
     pub last_lag_check: std::time::Instant,
+
+    // Color picker state
+    pub show_color_picker: bool,
+    pub color_picker_fg: bool,  // true = selecting foreground, false = selecting background
 }
 
 impl Default for IrcApp {
@@ -231,6 +238,7 @@ impl IrcApp {
             show_save_favorite_dialog: false,
 
             pending_channel_keys: HashMap::new(),
+            pending_invites: Vec::new(),
 
             // Away status
             away_status: None,
@@ -271,6 +279,10 @@ impl IrcApp {
             lag_ms: None,
             ping_sent_time: None,
             last_lag_check: std::time::Instant::now(),
+
+            // Color picker
+            show_color_picker: false,
+            color_picker_fg: true,
         }
     }
 
@@ -733,6 +745,23 @@ impl IrcApp {
                     };
                     ch.messages.push(sys_msg);
                 }
+            }
+
+            IrcCommand::Invite(_target, channel) => {
+                let sender = msg.get_sender_nick().unwrap_or_else(|| "Someone".to_string());
+                // Store the invite
+                self.pending_invites.push((sender.clone(), channel.clone()));
+                // Show prominent message in server buffer
+                self.add_server_message(ChatMessage::system(&format!(
+                    "*** {} has invited you to {} - type /join {} to accept",
+                    sender, channel, channel
+                )));
+                // Send notification
+                self.send_notification(
+                    "Channel Invite",
+                    &format!("{} invited you to {}", sender, channel),
+                    false,
+                );
             }
 
             IrcCommand::Numeric(num, params) => {
@@ -1736,6 +1765,13 @@ impl eframe::App for IrcApp {
             self.show_channel_info_window(ctx);
         }
 
+        // Color picker dialog
+        if self.show_color_picker {
+            if let Some(color_code) = self.show_color_picker_window(ctx) {
+                self.input_text.push_str(&color_code);
+            }
+        }
+
         // Top panel - toolbar
         egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
             ui.horizontal(|ui| {
@@ -2086,9 +2122,14 @@ impl eframe::App for IrcApp {
 
                     if let Some(msgs) = messages {
                         for msg in msgs {
-                            // Use a frame for highlighted messages to show background
+                            // Check if message is from self
+                            let is_own_msg = !msg.is_system && msg.sender.eq_ignore_ascii_case(&self.my_nick);
+
+                            // Use a frame for highlighted or own messages
                             let frame = if msg.is_highlight {
                                 egui::Frame::NONE.fill(Color32::from_rgb(60, 40, 20))
+                            } else if is_own_msg {
+                                egui::Frame::NONE.fill(Color32::from_rgb(25, 35, 45))
                             } else {
                                 egui::Frame::NONE
                             };
@@ -2110,9 +2151,11 @@ impl eframe::App for IrcApp {
                                         // System messages with IRC color support
                                         render_irc_text(ui, &msg.content, Color32::GRAY);
                                     } else if msg.is_action {
-                                        // Action messages - highlighted actions use yellow
+                                        // Action messages - highlighted actions use yellow, own use cyan
                                         let action_color = if msg.is_highlight {
                                             Color32::YELLOW
+                                        } else if is_own_msg {
+                                            Color32::from_rgb(100, 180, 220)
                                         } else {
                                             Color32::from_rgb(150, 100, 200)
                                         };
@@ -2120,11 +2163,22 @@ impl eframe::App for IrcApp {
                                             .color(action_color));
                                         render_irc_text(ui, &msg.content, action_color);
                                     } else {
-                                        // Regular messages - highlighted messages use yellow text
-                                        ui.label(RichText::new(format!("<{}>", msg.sender))
-                                            .color(nick_color(&msg.sender)));
+                                        // Regular messages
+                                        // Own messages use cyan nick, others use computed color
+                                        let nick_style = if is_own_msg {
+                                            RichText::new(format!("<{}>", msg.sender))
+                                                .color(Color32::from_rgb(100, 200, 255))
+                                        } else {
+                                            RichText::new(format!("<{}>", msg.sender))
+                                                .color(nick_color(&msg.sender))
+                                        };
+                                        ui.label(nick_style);
+
+                                        // Text color: yellow for highlights, light gray for own, white for others
                                         let text_color = if msg.is_highlight {
                                             Color32::YELLOW
+                                        } else if is_own_msg {
+                                            Color32::from_rgb(200, 210, 220)
                                         } else {
                                             Color32::WHITE
                                         };
@@ -2141,12 +2195,41 @@ impl eframe::App for IrcApp {
             let mut history_up = false;
             let mut history_down = false;
             let mut tab_complete = false;
+            let mut insert_bold = false;
+            let mut insert_underline = false;
+            let mut insert_italic = false;
+            let mut insert_color = false;
+            let mut insert_reset = false;
             let input_before = self.input_text.clone();
+
             ui.horizontal(|ui| {
+                // Compact formatting buttons
+                if ui.small_button("B").on_hover_text("Bold (Ctrl+B)").clicked() {
+                    insert_bold = true;
+                }
+                if ui.small_button("U").on_hover_text("Underline (Ctrl+U)").clicked() {
+                    insert_underline = true;
+                }
+                if ui.small_button("I").on_hover_text("Italic (Ctrl+I)").clicked() {
+                    insert_italic = true;
+                }
+                if ui.small_button("C").on_hover_text("Color (Ctrl+K)").clicked() {
+                    insert_color = true;
+                }
+
+                // Show formatting indicator
+                let has_formatting = self.input_text.contains('\x02')
+                    || self.input_text.contains('\x1F')
+                    || self.input_text.contains('\x1D')
+                    || self.input_text.contains('\x03');
+                if has_formatting {
+                    ui.label(RichText::new("*").color(Color32::YELLOW).small());
+                }
+
                 let response = ui.add(
                     TextEdit::singleline(&mut self.input_text)
                         .hint_text("Type a message...")
-                        .desired_width(ui.available_width() - 60.0)
+                        .desired_width(ui.available_width() - 50.0)
                 );
 
                 if response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
@@ -2164,6 +2247,21 @@ impl eframe::App for IrcApp {
                     }
                     if ui.input(|i| i.key_pressed(egui::Key::Tab)) {
                         tab_complete = true;
+                    }
+
+                    // Formatting shortcuts (Ctrl+B/U/I/K/O)
+                    if ui.input(|i| i.modifiers.ctrl && i.key_pressed(egui::Key::B)) {
+                        insert_bold = true;
+                    }
+                    if ui.input(|i| i.modifiers.ctrl && i.key_pressed(egui::Key::U)) {
+                        insert_underline = true;
+                    }
+                    // Note: Ctrl+I may be captured by system, use button instead
+                    if ui.input(|i| i.modifiers.ctrl && i.key_pressed(egui::Key::K)) {
+                        insert_color = true;
+                    }
+                    if ui.input(|i| i.modifiers.ctrl && i.key_pressed(egui::Key::O)) {
+                        insert_reset = true;
                     }
                 }
 
@@ -2186,6 +2284,24 @@ impl eframe::App for IrcApp {
             } else if self.input_text != input_before {
                 // Reset tab completion if input changed (not by Tab)
                 self.reset_tab_completion();
+            }
+
+            // Handle formatting insertions
+            if insert_bold {
+                self.input_text.push('\x02');
+            }
+            if insert_underline {
+                self.input_text.push('\x1F');
+            }
+            if insert_italic {
+                self.input_text.push('\x1D');
+            }
+            if insert_color {
+                self.show_color_picker = true;
+                self.color_picker_fg = true;
+            }
+            if insert_reset {
+                self.input_text.push('\x0F');
             }
         });
     }

@@ -288,7 +288,17 @@ pub fn render_irc_text(ui: &mut egui::Ui, text: &str, default_color: Color32) {
                     );
                 } else {
                     // Render as regular text with formatting
-                    let mut rich_text = RichText::new(&segment).color(color);
+                    // For bold, brighten the color slightly to make it more visible
+                    let effective_color = if span.bold {
+                        let r = (color.r() as u16 + 40).min(255) as u8;
+                        let g = (color.g() as u16 + 40).min(255) as u8;
+                        let b = (color.b() as u16 + 40).min(255) as u8;
+                        Color32::from_rgb(r, g, b)
+                    } else {
+                        color
+                    };
+
+                    let mut rich_text = RichText::new(&segment).color(effective_color);
 
                     if span.bold {
                         rich_text = rich_text.strong();

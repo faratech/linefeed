@@ -166,6 +166,10 @@ impl IrcMessage {
                 params.get(1).cloned().unwrap_or_default(),
                 params.get(2).cloned(),
             ),
+            "INVITE" => IrcCommand::Invite(
+                params.get(0).cloned().unwrap_or_default(),  // target nick (us)
+                params.get(1).cloned().unwrap_or_default(),  // channel
+            ),
             "MODE" => IrcCommand::Mode(
                 params.get(0).cloned().unwrap_or_default(),
                 params.get(1).cloned(),
