@@ -125,6 +125,11 @@ pub struct IrcApp {
     // Channel info dialog
     pub show_channel_info: bool,
     pub channel_info_target: Option<String>,
+
+    // Lag meter
+    pub lag_ms: Option<u32>,
+    pub ping_sent_time: Option<std::time::Instant>,
+    pub last_lag_check: std::time::Instant,
 }
 
 impl Default for IrcApp {
@@ -222,6 +227,11 @@ impl IrcApp {
             logging_history_lines: settings.logging_history_lines,
             show_channel_info: false,
             channel_info_target: None,
+
+            // Lag meter
+            lag_ms: None,
+            ping_sent_time: None,
+            last_lag_check: std::time::Instant::now(),
         }
     }
 
@@ -312,6 +322,8 @@ impl IrcApp {
         self.last_disconnect_time = Some(std::time::Instant::now());
         self.cmd_tx = None;
         self.msg_rx = None;
+        self.lag_ms = None;
+        self.ping_sent_time = None;
     }
 
     /// Prepare for reconnection attempt
@@ -667,6 +679,14 @@ impl IrcApp {
                 // Handled automatically in client
             }
 
+            IrcCommand::Pong(_) => {
+                // Calculate lag from our ping
+                if let Some(sent_time) = self.ping_sent_time.take() {
+                    let elapsed = sent_time.elapsed();
+                    self.lag_ms = Some(elapsed.as_millis() as u32);
+                }
+            }
+
             _ => {
                 // Log unknown messages
                 let sys_msg = ChatMessage::system(&msg.raw);
@@ -725,6 +745,10 @@ impl IrcApp {
                         self.add_server_message(ChatMessage::system("Running auto-perform commands..."));
                     }
                 }
+
+                // Initial lag check
+                self.ping_sent_time = Some(std::time::Instant::now());
+                self.send_command(IrcCommand::Ping("LAG".to_string()));
             }
 
             RPL_TOPIC => {
@@ -1581,6 +1605,13 @@ impl eframe::App for IrcApp {
             }
         }
 
+        // Lag meter - send PING every 30 seconds when connected
+        if self.connected && self.last_lag_check.elapsed().as_secs() >= 30 {
+            self.last_lag_check = std::time::Instant::now();
+            self.ping_sent_time = Some(std::time::Instant::now());
+            self.send_command(IrcCommand::Ping("LAG".to_string()));
+        }
+
         // Request repaint for real-time updates
         ctx.request_repaint();
 
@@ -1620,6 +1651,18 @@ impl eframe::App for IrcApp {
                     ui.label(&self.my_nick);
                     ui.label("@");
                     ui.label(&self.server_host);
+
+                    // Show lag meter
+                    if let Some(lag) = self.lag_ms {
+                        let lag_color = if lag < 100 {
+                            Color32::GREEN
+                        } else if lag < 300 {
+                            Color32::YELLOW
+                        } else {
+                            Color32::from_rgb(255, 100, 100)
+                        };
+                        ui.label(RichText::new(format!("({}ms)", lag)).color(lag_color).small());
+                    }
 
                     // Show away status
                     if let Some(away_msg) = &self.away_status {
