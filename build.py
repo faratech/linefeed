@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""fmIRC Build Script - Async Python version"""
+"""Linefeed Build Script - Async Python version"""
 
 import argparse
 import asyncio
@@ -13,9 +13,9 @@ OUT_DIR = SCRIPT_DIR / "dist"
 
 # All build targets: (flag_name, display_name, cargo_target, src_binary, dst_binary)
 ALL_TARGETS = {
-    "linux": ("Linux (native)", None, "fmirc", "fmirc_linux"),
-    "arm64": ("Windows ARM64", "aarch64-pc-windows-gnullvm", "fmirc.exe", "fmirc_arm64.exe"),
-    "x86": ("Windows x86", "i686-pc-windows-gnullvm", "fmirc.exe", "fmirc_x86.exe"),
+    "linux": ("Linux (native)", None, "linefeed", "linefeed_linux"),
+    "arm64": ("Windows ARM64", "aarch64-pc-windows-gnullvm", "linefeed.exe", "linefeed_arm64.exe"),
+    "x86": ("Windows x86", "i686-pc-windows-gnullvm", "linefeed.exe", "linefeed_x86.exe"),
 }
 
 # Default targets when no flags specified
@@ -23,9 +23,9 @@ DEFAULT_TARGETS = ["arm64"]
 
 # UPX-compatible targets
 UPX_SUPPORTED = {
-    "fmirc_linux": True,
-    "fmirc_x86.exe": True,
-    "fmirc_arm64.exe": False,  # UPX doesn't support win64/arm64
+    "linefeed_linux": True,
+    "linefeed_x86.exe": True,
+    "linefeed_arm64.exe": False,  # UPX doesn't support win64/arm64
 }
 
 
@@ -103,7 +103,7 @@ async def compress_with_upx(filename: str) -> tuple[str, bool, int, int]:
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Build fmIRC for various platforms",
+        description="Build Linefeed for various platforms",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
@@ -138,7 +138,7 @@ Examples:
 async def main():
     args = parse_args()
 
-    print("=== fmIRC Build Script ===")
+    print("=== Linefeed Build Script ===")
 
     # Determine which targets to build
     if args.all:

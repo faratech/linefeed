@@ -16,7 +16,7 @@ impl LogManager {
     /// Create a new log manager
     pub fn new(enabled: bool) -> Self {
         let log_dir = dirs::config_dir()
-            .map(|p| p.join("fmirc").join("logs"))
+            .map(|p| p.join("linefeed").join("logs"))
             .unwrap_or_else(|| PathBuf::from("logs"));
 
         Self { log_dir, enabled }

@@ -732,25 +732,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "fmirc"
-version = "0.0.1"
-dependencies = [
- "base64",
- "dirs",
- "eframe",
- "egui",
- "libc 1.0.0-alpha.1",
- "native-tls",
- "serde",
- "serde_json",
- "tokio",
- "tokio-native-tls",
- "tracing",
- "tracing-subscriber",
- "windows",
-]
-
-[[package]]
 name = "foldhash"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1194,6 +1175,25 @@ dependencies = [
  "bitflags 2.10.0",
  "libc 0.2.178",
  "redox_syscall 0.6.0",
+]
+
+[[package]]
+name = "linefeed"
+version = "0.0.1"
+dependencies = [
+ "base64",
+ "dirs",
+ "eframe",
+ "egui",
+ "libc 1.0.0-alpha.1",
+ "native-tls",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-native-tls",
+ "tracing",
+ "tracing-subscriber",
+ "windows",
 ]
 
 [[package]]

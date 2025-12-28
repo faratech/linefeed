@@ -97,8 +97,8 @@ impl Default for Settings {
             use_tls: true,
             accept_invalid_certs: false,
             nickname: String::new(),
-            username: "fmirc".to_string(),
-            realname: "fmIRC".to_string(),
+            username: "linefeed".to_string(),
+            realname: "Linefeed".to_string(),
             password: String::new(),
             auto_join_channels: String::new(),
             set_invisible: true,
@@ -129,7 +129,7 @@ impl Default for Settings {
             reconnect_delay_secs: 5,
             max_reconnect_attempts: 10,
             // Custom messages
-            quit_message: "fmIRC".to_string(),
+            quit_message: "Linefeed".to_string(),
             part_message: String::new(),
             // Channel list
             list_min_users: 0,
@@ -139,7 +139,7 @@ impl Default for Settings {
 
 impl Settings {
     fn config_path() -> Option<PathBuf> {
-        dirs::config_dir().map(|p| p.join("fmirc").join("settings.json"))
+        dirs::config_dir().map(|p| p.join("linefeed").join("settings.json"))
     }
 
     pub fn load() -> Self {

@@ -123,7 +123,7 @@ fn ensure_single_instance() -> bool {
 
     unsafe {
         // Try to create a named mutex
-        let _mutex = CreateMutexW(None, true, w!("fmIRC_SingleInstance"));
+        let _mutex = CreateMutexW(None, true, w!("Linefeed_SingleInstance"));
 
         // If ERROR_ALREADY_EXISTS, another instance has the mutex
         if GetLastError().is_err() {
@@ -161,7 +161,7 @@ fn main() -> eframe::Result<()> {
         .with_target(false)
         .init();
 
-    tracing::info!("Starting fmIRC");
+    tracing::info!("Starting Linefeed");
 
     // Enable Efficiency Mode to reduce CPU/battery usage
     enable_efficiency_mode();
@@ -176,13 +176,13 @@ fn main() -> eframe::Result<()> {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1024.0, 768.0])
             .with_min_inner_size([640.0, 480.0])
-            .with_title("fmIRC")
+            .with_title("Linefeed")
             .with_icon(Arc::new(load_icon())),
         ..Default::default()
     };
 
     eframe::run_native(
-        "fmIRC",
+        "Linefeed",
         options,
         Box::new(|cc| {
             // Load emoji fonts for comprehensive Unicode support
@@ -192,7 +192,7 @@ fn main() -> eframe::Result<()> {
             style.spacing.item_spacing = egui::vec2(8.0, 4.0);
             cc.egui_ctx.set_style(style);
 
-            Ok(Box::new(FmIrcApp {
+            Ok(Box::new(LinefeedApp {
                 app: IrcApp::new(cc),
                 connection_thread: None,
             }))
@@ -200,12 +200,12 @@ fn main() -> eframe::Result<()> {
     )
 }
 
-struct FmIrcApp {
+struct LinefeedApp {
     app: IrcApp,
     connection_thread: Option<std::thread::JoinHandle<()>>,
 }
 
-impl eframe::App for FmIrcApp {
+impl eframe::App for LinefeedApp {
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         // Tray handling (Windows only)
         #[cfg(windows)]
@@ -271,7 +271,7 @@ impl eframe::App for FmIrcApp {
     }
 }
 
-impl FmIrcApp {
+impl LinefeedApp {
     fn start_connection(&mut self, ctx: egui::Context) {
         let config = self.app.get_server_config();
         tracing::info!("Connecting to {}:{}", config.host, config.port);

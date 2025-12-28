@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-fmIRC is a cross-platform IRC client written in Rust using egui/eframe for the GUI. It supports Windows (ARM64, x86) and Linux with TLS encryption via native-tls (SChannel on Windows, OpenSSL on Linux).
+Linefeed is a cross-platform IRC client written in Rust using egui/eframe for the GUI. It supports Windows (ARM64, x86) and Linux with TLS encryption via native-tls (SChannel on Windows, OpenSSL on Linux).
 
 ## Build Commands
 
@@ -37,7 +37,7 @@ Output: `./dist/` (build.py) or `./target/<profile>/` (cargo)
 
 - `build.py`: Async Python build script with parallel compilation
 - `tools/update-deps.py`: Updates Cargo.toml dependencies (`--check`, `--pin`, `--dry-run`)
-- `tools/gen-icon.py`: Converts `assets/fmirc.png` to `src/icon_data.rs`
+- `tools/gen-icon.py`: Converts `assets/linefeed.png` to `src/icon_data.rs`
 
 ## Cross-Compilation
 
@@ -70,9 +70,9 @@ src/
 - `IrcClient` (irc/client.rs): Async connection, TLS, SASL negotiation
 - `IrcCommand` (irc/message.rs): Enum for all IRC commands, implements Display for wire format
 - `IrcMessage` (irc/message.rs): Parsed message with IRCv3 tags, prefix, command
-- `Settings` (gui/types.rs): Persistent config at `~/.config/fmirc/settings.json`
+- `Settings` (gui/types.rs): Persistent config at `~/.config/linefeed/settings.json`
 - `Channel` (gui/types.rs): Channel state with sorted user list, messages, topic, modes, bans
-- `LogManager` (gui/logging.rs): Chat history at `~/.config/fmirc/logs/<network>/<channel>.log`
+- `LogManager` (gui/logging.rs): Chat history at `~/.config/linefeed/logs/<network>/<channel>.log`
 
 **Threading model:**
 1. Main thread runs egui event loop via `FmIrcApp::update()`

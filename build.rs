@@ -24,9 +24,9 @@ fn main() {
     };
 
     // Create resource script
-    let rc_path = Path::new(&out_dir).join("fmirc.rc");
+    let rc_path = Path::new(&out_dir).join("linefeed.rc");
     let rc_content = format!(
-        r#"1 ICON "{}/assets/fmirc.ico"
+        r#"1 ICON "{}/assets/linefeed.ico"
 1 VERSIONINFO
 FILEVERSION 0,0,1,0
 PRODUCTVERSION 0,0,1,0
@@ -35,8 +35,8 @@ BEGIN
     BEGIN
         BLOCK "040904E4"
         BEGIN
-            VALUE "ProductName", "fmIRC"
-            VALUE "FileDescription", "fmIRC"
+            VALUE "ProductName", "Linefeed"
+            VALUE "FileDescription", "Linefeed IRC Client"
             VALUE "FileVersion", "0.0.1"
             VALUE "ProductVersion", "0.0.1"
             VALUE "LegalCopyright", "Copyright 2025"
@@ -53,7 +53,7 @@ END
     std::fs::write(&rc_path, rc_content).unwrap();
 
     // Compile resource
-    let res_path = Path::new(&out_dir).join("fmirc.res");
+    let res_path = Path::new(&out_dir).join("linefeed.res");
     let status = Command::new(windres)
         .args([
             rc_path.to_str().unwrap(),
@@ -74,6 +74,6 @@ END
         }
     }
 
-    println!("cargo:rerun-if-changed=assets/fmirc.ico");
+    println!("cargo:rerun-if-changed=assets/linefeed.ico");
     println!("cargo:rerun-if-changed=build.rs");
 }

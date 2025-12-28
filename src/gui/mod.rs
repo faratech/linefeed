@@ -181,7 +181,7 @@ impl Default for IrcApp {
 impl IrcApp {
     fn with_settings(settings: Settings) -> Self {
         let nickname = if settings.nickname.is_empty() {
-            format!("fmIRC_{}", rand_suffix())
+            format!("Linefeed_{}", rand_suffix())
         } else {
             settings.nickname.clone()
         };
@@ -467,7 +467,7 @@ impl IrcApp {
             let body = body.to_string();
             std::thread::spawn(move || {
                 let _ = std::process::Command::new("notify-send")
-                    .args(["-a", "fmIRC", "-t", "5000", &title, &body])
+                    .args(["-a", "Linefeed", "-t", "5000", &title, &body])
                     .spawn();
             });
         }
@@ -1583,7 +1583,7 @@ impl IrcApp {
         // Build the reply based on the CTCP command
         let reply = match ctcp_cmd.as_str() {
             "VERSION" => {
-                Some(format!("\x01VERSION fmIRC v0.0.1 - Rust/egui cross-platform IRC client\x01"))
+                Some(format!("\x01VERSION Linefeed v0.0.1 - Rust/egui cross-platform IRC client\x01"))
             }
             "TIME" => {
                 // Get current local time
@@ -1622,7 +1622,7 @@ impl IrcApp {
                 Some(format!("\x01CLIENTINFO ACTION PING VERSION TIME CLIENTINFO SOURCE USERINFO\x01"))
             }
             "SOURCE" => {
-                Some(format!("\x01SOURCE https://github.com/user/fmirc\x01"))
+                Some(format!("\x01SOURCE https://github.com/user/linefeed\x01"))
             }
             "USERINFO" => {
                 Some(format!("\x01USERINFO {}\x01", self.realname))
@@ -1846,7 +1846,7 @@ impl eframe::App for IrcApp {
         // Top panel - toolbar
         egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
             ui.horizontal(|ui| {
-                ui.heading("fmIRC");
+                ui.heading("Linefeed");
                 ui.separator();
 
                 if self.connected {
@@ -1896,7 +1896,7 @@ impl eframe::App for IrcApp {
                         }
                     } else if self.connected {
                         if ui.button("Disconnect").clicked() {
-                            self.send_command(IrcCommand::Quit(Some("fmIRC".to_string())));
+                            self.send_command(IrcCommand::Quit(Some("Linefeed".to_string())));
                             self.connected = false;
                         }
                     }

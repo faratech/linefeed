@@ -41,7 +41,7 @@ static NID_HWND: AtomicPtr<std::ffi::c_void> = AtomicPtr::new(std::ptr::null_mut
 
 fn find_main_window() -> Option<HWND> {
     unsafe {
-        match FindWindowW(None, w!("fmIRC")) {
+        match FindWindowW(None, w!("Linefeed")) {
             Ok(hwnd) if !hwnd.is_invalid() => Some(hwnd),
             _ => None,
         }
@@ -96,7 +96,7 @@ pub fn activate_existing_instance() {
 
     unsafe {
         // Find the tray message window of the existing instance
-        if let Ok(hwnd) = FindWindowW(None, w!("fmIRC Tray")) {
+        if let Ok(hwnd) = FindWindowW(None, w!("Linefeed Tray")) {
             if !hwnd.is_invalid() {
                 // Send our custom show message
                 SendMessageW(hwnd, WM_SHOW_WINDOW, Some(WPARAM(0)), Some(LPARAM(0)));
@@ -175,7 +175,7 @@ unsafe fn show_context_menu(hwnd: HWND) {
         let menu = CreatePopupMenu().unwrap();
 
         // Add menu items
-        let show_text: Vec<u16> = "Show fmIRC\0".encode_utf16().collect();
+        let show_text: Vec<u16> = "Show Linefeed\0".encode_utf16().collect();
         let quit_text: Vec<u16> = "Quit\0".encode_utf16().collect();
 
         let _ = InsertMenuW(menu, 0, MF_BYPOSITION | MF_STRING, ID_SHOW as usize, PCWSTR(show_text.as_ptr()));
@@ -269,7 +269,7 @@ fn create_message_window() -> Option<HWND> {
         let instance = GetModuleHandleW(None).ok()?;
         let hinstance = HINSTANCE(instance.0);
 
-        let class_name = w!("fmIRC_TrayClass");
+        let class_name = w!("Linefeed_TrayClass");
 
         let wc = WNDCLASSEXW {
             cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
@@ -289,7 +289,7 @@ fn create_message_window() -> Option<HWND> {
         let hwnd = CreateWindowExW(
             WINDOW_EX_STYLE::default(),
             class_name,
-            w!("fmIRC Tray"),
+            w!("Linefeed Tray"),
             WS_OVERLAPPEDWINDOW,
             CW_USEDEFAULT,
             CW_USEDEFAULT,
@@ -335,7 +335,7 @@ pub fn create_tray_icon() -> bool {
         };
 
         // Set tooltip
-        let tip = "fmIRC";
+        let tip = "Linefeed";
         for (i, c) in tip.encode_utf16().enumerate() {
             if i < nid.szTip.len() - 1 {
                 nid.szTip[i] = c;

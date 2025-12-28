@@ -1,8 +1,8 @@
-# fmIRC Project Context
+# Linefeed Project Context
 
 ## Project Overview
 
-fmIRC is a cross-platform IRC client written in Rust. It utilizes **egui/eframe** for the graphical user interface and supports Windows (ARM64, x86) and Linux.
+Linefeed is a cross-platform IRC client written in Rust. It utilizes **egui/eframe** for the graphical user interface and supports Windows (ARM64, x86) and Linux.
 
 *   **Language**: Rust (Edition 2024)
 *   **GUI Framework**: `eframe` / `egui`
@@ -73,6 +73,6 @@ The application follows a threaded model separating the GUI (main thread) from t
     *   `Settings`: Persisted configuration (loaded/saved to JSON).
 
 3.  **Conventions**:
-    *   **Logging**: Chat logs are stored in `~/.config/fmirc/logs/` in irssi-compatible format.
-    *   **Settings**: Configuration is stored in `~/.config/fmirc/settings.json`.
+    *   **Logging**: Chat logs are stored in `~/.config/linefeed/logs/` in irssi-compatible format.
+    *   **Settings**: Configuration is stored in `~/.config/linefeed/settings.json`.
     *   **Style**: Rust standard formatting (`cargo fmt`) and strict linting (`clippy`).

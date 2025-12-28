@@ -120,7 +120,7 @@ impl IrcApp {
                 } else if !self.quit_message.is_empty() {
                     Some(self.quit_message.clone())
                 } else {
-                    Some("fmIRC".to_string())
+                    Some("Linefeed".to_string())
                 };
                 self.send_command(IrcCommand::Quit(reason));
                 self.connected = false;

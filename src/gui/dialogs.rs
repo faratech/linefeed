@@ -511,7 +511,7 @@ impl IrcApp {
                 ui.label("lines");
             });
         }
-        ui.label(RichText::new("Logs: ~/.config/fmirc/logs/").small().color(Color32::GRAY));
+        ui.label(RichText::new("Logs: ~/.config/linefeed/logs/").small().color(Color32::GRAY));
 
         ui.add_space(8.0);
         ui.heading("Custom Messages");
@@ -519,7 +519,7 @@ impl IrcApp {
 
         ui.horizontal(|ui| {
             ui.label("Quit:");
-            ui.add(TextEdit::singleline(&mut self.quit_message).desired_width(200.0).hint_text("fmIRC"));
+            ui.add(TextEdit::singleline(&mut self.quit_message).desired_width(200.0).hint_text("Linefeed"));
         });
         ui.horizontal(|ui| {
             ui.label("Part:");
@@ -542,7 +542,7 @@ impl IrcApp {
     fn settings_tab_about(&mut self, ui: &mut egui::Ui) {
         ui.add_space(20.0);
         ui.vertical_centered(|ui| {
-            ui.heading("fmIRC");
+            ui.heading("Linefeed");
             ui.label("Version 0.0.1");
             ui.add_space(10.0);
             ui.label("A cross-platform IRC client");
