@@ -50,8 +50,8 @@ pub enum IrcCommand {
     // Numeric replies (server responses)
     Numeric(u16, Vec<String>),
 
-    // CAP negotiation
-    Cap(String, Option<String>),
+    // CAP negotiation: (target, subcommand, params)
+    Cap(String, String, Option<String>),
 
     // SASL authentication
     Authenticate(String),
@@ -176,8 +176,9 @@ impl IrcMessage {
                 params.get(2).cloned(),
             ),
             "CAP" => IrcCommand::Cap(
-                params.get(0).cloned().unwrap_or_default(),
-                params.get(1).cloned(),
+                params.get(0).cloned().unwrap_or_default(),  // target (usually "*" or nick)
+                params.get(1).cloned().unwrap_or_default(),  // subcommand (LS, ACK, NAK, etc.)
+                params.get(2).cloned(),                       // params (capabilities list)
             ),
             "AUTHENTICATE" => IrcCommand::Authenticate(
                 params.get(0).cloned().unwrap_or_default(),
@@ -361,7 +362,8 @@ impl fmt::Display for IrcCommand {
                     write!(f, "TRACE")
                 }
             }
-            IrcCommand::Cap(sub, param) => {
+            IrcCommand::Cap(_target, sub, param) => {
+                // When sending CAP commands, we don't include target (server adds it)
                 if let Some(p) = param {
                     write!(f, "CAP {} :{}", sub, p)
                 } else {

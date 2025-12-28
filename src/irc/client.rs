@@ -322,8 +322,9 @@ impl IrcClient {
                 // Forward to GUI for display (non-blocking)
                 let _ = incoming_tx.try_send(msg.clone());
 
-                if let IrcCommand::Cap(subcmd, params) = &msg.command {
-                    if subcmd == "LS" || subcmd == "*" {
+                if let IrcCommand::Cap(_target, subcmd, params) = &msg.command {
+                    // CAP LS can be multi-line: "* LS" means more coming, "LS" is final
+                    if subcmd == "LS" {
                         if let Some(caps) = params {
                             // Check if sasl is in the capability list
                             let caps_lower = caps.to_lowercase();
@@ -331,10 +332,16 @@ impl IrcClient {
                                 sasl_available = true;
                             }
                         }
-                        // CAP LS can be multi-line, wait for one without * prefix
-                        if subcmd == "LS" {
-                            break;
+                        break;  // Got final LS response
+                    } else if subcmd == "*" {
+                        // Multi-line CAP LS - check params which contains "LS <caps>"
+                        if let Some(rest) = params {
+                            let rest_lower = rest.to_lowercase();
+                            if rest_lower.contains("sasl") {
+                                sasl_available = true;
+                            }
                         }
+                        // Don't break - wait for final LS
                     }
                 }
             }
@@ -372,7 +379,7 @@ impl IrcClient {
             if let Some(msg) = IrcMessage::parse(&trimmed) {
                 let _ = incoming_tx.try_send(msg.clone());
 
-                if let IrcCommand::Cap(subcmd, params) = &msg.command {
+                if let IrcCommand::Cap(_target, subcmd, params) = &msg.command {
                     if subcmd == "ACK" {
                         if let Some(caps) = params {
                             if caps.to_lowercase().contains("sasl") {
