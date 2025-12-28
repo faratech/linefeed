@@ -150,6 +150,9 @@ pub struct IrcApp {
     pub quit_message: String,
     pub part_message: String,
 
+    // Channel list
+    pub list_min_users: u32,
+
     // Channel info dialog
     pub show_channel_info: bool,
     pub channel_info_target: Option<String>,
@@ -290,6 +293,9 @@ impl IrcApp {
             quit_message: settings.quit_message,
             part_message: settings.part_message,
 
+            // Channel list
+            list_min_users: settings.list_min_users,
+
             show_channel_info: false,
             channel_info_target: None,
 
@@ -348,6 +354,8 @@ impl IrcApp {
             // Custom messages
             quit_message: self.quit_message.clone(),
             part_message: self.part_message.clone(),
+            // Channel list
+            list_min_users: self.list_min_users,
         }
     }
 
@@ -577,6 +585,8 @@ impl IrcApp {
                 } else {
                     target.clone()
                 };
+                tracing::debug!("PRIVMSG: target={:?} sender={:?} is_pm={} target_name={:?}",
+                    target, sender, is_pm, target_name);
 
                 // Send desktop notification for highlights and PMs
                 // Skip if we sent it ourselves

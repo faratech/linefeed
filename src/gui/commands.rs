@@ -304,7 +304,16 @@ impl IrcApp {
             }
 
             "LIST" => {
+                // Use configurable min users filter to avoid flooding on large networks
+                // Users can override with /list * or /list <filter>
                 if args.is_empty() {
+                    if self.list_min_users > 0 {
+                        self.send_command(IrcCommand::List(Some(format!(">{}", self.list_min_users))));
+                    } else {
+                        self.send_command(IrcCommand::List(None));
+                    }
+                } else if args == "*" {
+                    // Allow /list * to get all channels (use at your own risk)
                     self.send_command(IrcCommand::List(None));
                 } else {
                     self.send_command(IrcCommand::List(Some(args.to_string())));

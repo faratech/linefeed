@@ -68,6 +68,8 @@ pub struct Settings {
     // Custom messages
     pub quit_message: String,
     pub part_message: String,
+    // Channel list
+    pub list_min_users: u32,
 }
 
 impl Default for Settings {
@@ -112,6 +114,8 @@ impl Default for Settings {
             // Custom messages
             quit_message: "fmIRC".to_string(),
             part_message: String::new(),
+            // Channel list
+            list_min_users: 5,
         }
     }
 }

@@ -1,4 +1,4 @@
-#![windows_subsystem = "windows"]
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod irc;
 mod gui;
@@ -262,11 +262,10 @@ impl eframe::App for FmIrcApp {
         // Main UI update
         self.app.update(ctx, frame);
 
-        // Only repaint periodically for background tasks (lag meter, auto-away, connection checks)
-        // IRC messages trigger immediate repaint via IrcApp::update()
-        // User input triggers repaint automatically via egui
+        // Repaint frequently when connected to process incoming IRC messages quickly
+        // This prevents the message channel from filling up during high-traffic events (e.g., /list)
         if self.app.connected || self.app.connecting {
-            ctx.request_repaint_after(std::time::Duration::from_millis(1000));
+            ctx.request_repaint_after(std::time::Duration::from_millis(50));
         }
         // When disconnected and not connecting, no need to poll - egui handles UI events
     }
@@ -277,7 +276,7 @@ impl FmIrcApp {
         let config = self.app.get_server_config();
         tracing::info!("Connecting to {}:{}", config.host, config.port);
 
-        let (msg_tx, msg_rx) = mpsc::channel::<IrcMessage>(1000);
+        let (msg_tx, msg_rx) = mpsc::channel::<IrcMessage>(50000);
         let (cmd_tx, cmd_rx) = mpsc::channel::<IrcCommand>(100);
 
         self.app.msg_rx = Some(msg_rx);

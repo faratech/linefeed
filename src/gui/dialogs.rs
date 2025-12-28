@@ -525,6 +525,18 @@ impl IrcApp {
             ui.label("Part:");
             ui.add(TextEdit::singleline(&mut self.part_message).desired_width(200.0).hint_text("Leaving"));
         });
+
+        ui.add_space(8.0);
+        ui.heading("Channel List");
+        ui.add_space(4.0);
+
+        ui.horizontal(|ui| {
+            ui.label("Min users:");
+            let mut min_users = self.list_min_users as i32;
+            ui.add(egui::DragValue::new(&mut min_users).speed(1).range(0..=100));
+            self.list_min_users = min_users.max(0) as u32;
+        });
+        ui.label(RichText::new("Filter /list to channels with at least this many users (0 = all)").small().color(Color32::GRAY));
     }
 
     fn settings_tab_about(&mut self, ui: &mut egui::Ui) {
@@ -548,23 +560,23 @@ impl IrcApp {
             .resizable(true)
             .default_size([700.0, 450.0])
             .show(ctx, |ui| {
+                // Pre-filter the channel list once (for virtual scrolling we need indexed access)
+                let filter = self.channel_list_filter.to_lowercase();
+                let filtered: Vec<_> = if filter.is_empty() {
+                    self.channel_list.iter().collect()
+                } else {
+                    self.channel_list.iter()
+                        .filter(|e| e.name.to_lowercase().contains(&filter)
+                            || e.topic.to_lowercase().contains(&filter))
+                        .collect()
+                };
+
                 // Filter input and status
                 ui.horizontal(|ui| {
                     ui.label("Filter:");
                     ui.add(TextEdit::singleline(&mut self.channel_list_filter).desired_width(200.0));
                     ui.add_space(10.0);
-
-                    // Count filtered channels
-                    let filter = self.channel_list_filter.to_lowercase();
-                    let filtered_count = if filter.is_empty() {
-                        self.channel_list.len()
-                    } else {
-                        self.channel_list.iter()
-                            .filter(|e| e.name.to_lowercase().contains(&filter)
-                                || e.topic.to_lowercase().contains(&filter))
-                            .count()
-                    };
-                    ui.label(format!("{} of {} channels", filtered_count, self.channel_list.len()));
+                    ui.label(format!("{} of {} channels", filtered.len(), self.channel_list.len()));
 
                     if self.channel_list_loading {
                         ui.spinner();
@@ -600,53 +612,55 @@ impl IrcApp {
                 });
                 ui.separator();
 
-                // Scrollable channel list with proper column layout
+                // Virtual scrolling - only render visible rows
                 let current_selected = self.channel_list_selected.clone();
                 let mut new_selected = current_selected.clone();
+                let row_height = 20.0;
+                let total_rows = filtered.len();
 
                 ScrollArea::vertical()
                     .auto_shrink([false; 2])
                     .max_height(350.0)
-                    .show(ui, |ui| {
-                        let filter = self.channel_list_filter.to_lowercase();
+                    .show_rows(ui, row_height, total_rows, |ui, row_range| {
+                        for row_idx in row_range {
+                            let entry = &filtered[row_idx];
+                            let is_selected = current_selected.as_ref() == Some(&entry.name);
 
-                        // Use Grid for proper column alignment
-                        egui::Grid::new("channel_list_grid")
-                            .num_columns(3)
-                            .min_col_width(0.0)
-                            .spacing([8.0, 2.0])
-                            .striped(true)
-                            .show(ui, |ui| {
-                                for entry in &self.channel_list {
-                                    // Filter by channel name or topic
-                                    if !filter.is_empty()
-                                        && !entry.name.to_lowercase().contains(&filter)
-                                        && !entry.topic.to_lowercase().contains(&filter)
-                                    {
-                                        continue;
-                                    }
+                            // Alternate row background for readability
+                            let bg_color = if row_idx % 2 == 0 {
+                                Color32::TRANSPARENT
+                            } else {
+                                Color32::from_rgba_unmultiplied(255, 255, 255, 8)
+                            };
+                            let row_color = if is_selected {
+                                Color32::WHITE
+                            } else {
+                                Color32::from_rgb(180, 210, 255)
+                            };
 
-                                    let is_selected = current_selected.as_ref() == Some(&entry.name);
-                                    let row_color = if is_selected {
-                                        Color32::WHITE
-                                    } else {
-                                        Color32::from_rgb(180, 210, 255)
-                                    };
+                            // Draw row with background
+                            let (row_rect, _) = ui.allocate_exact_size(
+                                Vec2::new(ui.available_width(), row_height),
+                                egui::Sense::hover()
+                            );
+                            ui.painter().rect_filled(row_rect, 0.0, bg_color);
+
+                            // Put content in the row area
+                            ui.scope_builder(egui::UiBuilder::new().max_rect(row_rect), |ui| {
+                                ui.horizontal(|ui| {
+                                    ui.add_space(4.0);
 
                                     // Column 1: Channel name (clickable)
                                     let response = ui.add_sized(
-                                        [channel_width, 18.0],
+                                        [channel_width, row_height - 2.0],
                                         egui::Button::new(RichText::new(&entry.name).color(row_color))
                                             .selected(is_selected)
                                             .frame(false)
                                     );
 
-                                    // Single click to select
                                     if response.clicked() {
                                         new_selected = Some(entry.name.clone());
                                     }
-
-                                    // Double click to join
                                     if response.double_clicked() {
                                         join_channel = Some(entry.name.clone());
                                     }
@@ -676,11 +690,16 @@ impl IrcApp {
                                         }
                                     });
 
-                                    // Column 2: User count (right-aligned)
-                                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                        ui.set_min_width(users_width);
-                                        ui.label(RichText::new(format!("{}", entry.user_count)).color(Color32::LIGHT_GREEN));
-                                    });
+                                    // Column 2: User count
+                                    ui.allocate_ui_with_layout(
+                                        Vec2::new(users_width, row_height - 2.0),
+                                        egui::Layout::right_to_left(egui::Align::Center),
+                                        |ui| {
+                                            ui.label(RichText::new(format!("{}", entry.user_count)).color(Color32::LIGHT_GREEN));
+                                        }
+                                    );
+
+                                    ui.add_space(10.0);
 
                                     // Column 3: Topic (truncated)
                                     let topic_display = if entry.topic.len() > 70 {
@@ -689,13 +708,12 @@ impl IrcApp {
                                         entry.topic.clone()
                                     };
                                     ui.add_sized(
-                                        [topic_width, 18.0],
+                                        [topic_width, row_height - 2.0],
                                         egui::Label::new(RichText::new(&topic_display).color(Color32::GRAY))
                                     );
-
-                                    ui.end_row();
-                                }
+                                });
                             });
+                        }
                     });
 
                 // Update selection
@@ -711,7 +729,12 @@ impl IrcApp {
                     if ui.button("Refresh").clicked() {
                         self.channel_list.clear();
                         self.channel_list_selected = None;
-                        self.send_command(IrcCommand::List(None));
+                        // Use configurable min users filter
+                        if self.list_min_users > 0 {
+                            self.send_command(IrcCommand::List(Some(format!(">{}", self.list_min_users))));
+                        } else {
+                            self.send_command(IrcCommand::List(None));
+                        }
                     }
                     if ui.button("Close").clicked() {
                         close = true;
