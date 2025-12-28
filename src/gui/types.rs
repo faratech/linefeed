@@ -4,6 +4,23 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 use super::helpers::current_time_formatted;
 
+/// Sort column for channel list
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub enum ChannelListSort {
+    #[default]
+    Channel,
+    Users,
+    Topic,
+}
+
+/// Sort direction
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub enum SortDirection {
+    #[default]
+    Ascending,
+    Descending,
+}
+
 /// Server favorite for quick connect
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ServerFavorite {
@@ -115,7 +132,7 @@ impl Default for Settings {
             quit_message: "fmIRC".to_string(),
             part_message: String::new(),
             // Channel list
-            list_min_users: 5,
+            list_min_users: 0,
         }
     }
 }

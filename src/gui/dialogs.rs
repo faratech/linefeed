@@ -553,16 +553,19 @@ impl IrcApp {
     }
 
     pub fn show_channel_list_window(&mut self, ctx: &egui::Context) {
+        use super::formatting::strip_irc_formatting;
+        use super::types::{ChannelListSort, SortDirection};
+
         let mut close = false;
         let mut join_channel: Option<String> = None;
 
         egui::Window::new("Channel List")
-            .resizable(true)
-            .default_size([700.0, 450.0])
+            .resizable(false)
+            .fixed_size([600.0, 400.0])
             .show(ctx, |ui| {
-                // Pre-filter the channel list once (for virtual scrolling we need indexed access)
+                // Pre-filter and sort the channel list
                 let filter = self.channel_list_filter.to_lowercase();
-                let filtered: Vec<_> = if filter.is_empty() {
+                let mut filtered: Vec<_> = if filter.is_empty() {
                     self.channel_list.iter().collect()
                 } else {
                     self.channel_list.iter()
@@ -571,147 +574,190 @@ impl IrcApp {
                         .collect()
                 };
 
+                // Sort the filtered list
+                let sort_col = self.channel_list_sort;
+                let sort_dir = self.channel_list_sort_dir;
+                filtered.sort_by(|a, b| {
+                    let cmp = match sort_col {
+                        ChannelListSort::Channel => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
+                        ChannelListSort::Users => a.user_count.cmp(&b.user_count),
+                        ChannelListSort::Topic => a.topic.to_lowercase().cmp(&b.topic.to_lowercase()),
+                    };
+                    match sort_dir {
+                        SortDirection::Ascending => cmp,
+                        SortDirection::Descending => cmp.reverse(),
+                    }
+                });
+
                 // Filter input and status
                 ui.horizontal(|ui| {
                     ui.label("Filter:");
-                    ui.add(TextEdit::singleline(&mut self.channel_list_filter).desired_width(200.0));
-                    ui.add_space(10.0);
-                    ui.label(format!("{} of {} channels", filtered.len(), self.channel_list.len()));
+                    ui.add(TextEdit::singleline(&mut self.channel_list_filter).desired_width(150.0));
+                    ui.add_space(8.0);
+                    ui.label(format!("{}/{} channels", filtered.len(), self.channel_list.len()));
+                    if self.channel_list.is_empty() && !self.channel_list_loading {
+                        ui.label(RichText::new("(No channels found - server may be restricting /list)").color(Color32::GOLD).small());
+                    }
 
                     if self.channel_list_loading {
                         ui.spinner();
-                        ui.label("Loading...");
                     }
                 });
                 ui.separator();
 
-                // Column widths
-                let channel_width = 150.0;
-                let users_width = 60.0;
-                let topic_width = ui.available_width() - channel_width - users_width - 40.0;
+                // Fixed column widths
+                let channel_width = 130.0;
+                let users_width = 45.0;
+                let topic_width = 380.0;
 
-                // Table header
+                // Compute sort indicators
+                let current_sort = self.channel_list_sort;
+                let current_dir = self.channel_list_sort_dir;
+                let arrow = |col: ChannelListSort| -> &'static str {
+                    if current_sort == col {
+                        match current_dir {
+                            SortDirection::Ascending => " ^",
+                            SortDirection::Descending => " v",
+                        }
+                    } else {
+                        ""
+                    }
+                };
+
+                // Table header row
                 ui.horizontal(|ui| {
-                    ui.add_space(4.0);
-                    ui.allocate_ui_with_layout(
-                        Vec2::new(channel_width, 20.0),
-                        egui::Layout::left_to_right(egui::Align::Center),
-                        |ui| { ui.label(RichText::new("Channel").strong()); }
-                    );
-                    ui.allocate_ui_with_layout(
-                        Vec2::new(users_width, 20.0),
-                        egui::Layout::right_to_left(egui::Align::Center),
-                        |ui| { ui.label(RichText::new("Users").strong()); }
-                    );
-                    ui.add_space(10.0);
-                    ui.allocate_ui_with_layout(
-                        Vec2::new(topic_width, 20.0),
-                        egui::Layout::left_to_right(egui::Align::Center),
-                        |ui| { ui.label(RichText::new("Topic").strong()); }
-                    );
+                    // Channel header
+                    let chan_text = format!("Channel{}", arrow(ChannelListSort::Channel));
+                    if ui.add_sized([channel_width, 16.0], egui::Button::new(RichText::new(chan_text).strong().color(Color32::WHITE))).clicked() {
+                        if self.channel_list_sort == ChannelListSort::Channel {
+                            self.channel_list_sort_dir = match self.channel_list_sort_dir {
+                                SortDirection::Ascending => SortDirection::Descending,
+                                SortDirection::Descending => SortDirection::Ascending,
+                            };
+                        } else {
+                            self.channel_list_sort = ChannelListSort::Channel;
+                            self.channel_list_sort_dir = SortDirection::Ascending;
+                        }
+                    }
+
+                    // Users header
+                    let users_text = format!("#{}", arrow(ChannelListSort::Users));
+                    if ui.add_sized([users_width, 16.0], egui::Button::new(RichText::new(users_text).strong().color(Color32::WHITE))).clicked() {
+                        if self.channel_list_sort == ChannelListSort::Users {
+                            self.channel_list_sort_dir = match self.channel_list_sort_dir {
+                                SortDirection::Ascending => SortDirection::Descending,
+                                SortDirection::Descending => SortDirection::Ascending,
+                            };
+                        } else {
+                            self.channel_list_sort = ChannelListSort::Users;
+                            self.channel_list_sort_dir = SortDirection::Descending;
+                        }
+                    }
+
+                    // Topic header
+                    let topic_text = format!("Topic{}", arrow(ChannelListSort::Topic));
+                    if ui.add_sized([topic_width, 16.0], egui::Button::new(RichText::new(topic_text).strong().color(Color32::WHITE))).clicked() {
+                        if self.channel_list_sort == ChannelListSort::Topic {
+                            self.channel_list_sort_dir = match self.channel_list_sort_dir {
+                                SortDirection::Ascending => SortDirection::Descending,
+                                SortDirection::Descending => SortDirection::Ascending,
+                            };
+                        } else {
+                            self.channel_list_sort = ChannelListSort::Topic;
+                            self.channel_list_sort_dir = SortDirection::Ascending;
+                        }
+                    }
                 });
                 ui.separator();
 
                 // Virtual scrolling - only render visible rows
                 let current_selected = self.channel_list_selected.clone();
                 let mut new_selected = current_selected.clone();
-                let row_height = 20.0;
+                let row_height = 16.0;
                 let total_rows = filtered.len();
 
                 ScrollArea::vertical()
                     .auto_shrink([false; 2])
-                    .max_height(350.0)
+                    .max_height(280.0)
                     .show_rows(ui, row_height, total_rows, |ui, row_range| {
                         for row_idx in row_range {
                             let entry = &filtered[row_idx];
                             let is_selected = current_selected.as_ref() == Some(&entry.name);
 
-                            // Alternate row background for readability
-                            let bg_color = if row_idx % 2 == 0 {
+                            // Alternate row background
+                            let bg_color = if is_selected {
+                                Color32::from_rgb(60, 80, 120)
+                            } else if row_idx % 2 == 0 {
                                 Color32::TRANSPARENT
                             } else {
                                 Color32::from_rgba_unmultiplied(255, 255, 255, 8)
                             };
-                            let row_color = if is_selected {
+                            let text_color = if is_selected {
                                 Color32::WHITE
                             } else {
                                 Color32::from_rgb(180, 210, 255)
                             };
 
-                            // Draw row with background
-                            let (row_rect, _) = ui.allocate_exact_size(
-                                Vec2::new(ui.available_width(), row_height),
-                                egui::Sense::hover()
-                            );
-                            ui.painter().rect_filled(row_rect, 0.0, bg_color);
+                            ui.horizontal(|ui| {
+                                ui.set_height(row_height);
 
-                            // Put content in the row area
-                            ui.scope_builder(egui::UiBuilder::new().max_rect(row_rect), |ui| {
-                                ui.horizontal(|ui| {
-                                    ui.add_space(4.0);
+                                // Draw background
+                                let row_rect = ui.max_rect();
+                                ui.painter().rect_filled(row_rect, 0.0, bg_color);
 
-                                    // Column 1: Channel name (clickable)
-                                    let response = ui.add_sized(
-                                        [channel_width, row_height - 2.0],
-                                        egui::Button::new(RichText::new(&entry.name).color(row_color))
-                                            .selected(is_selected)
-                                            .frame(false)
-                                    );
+                                // Channel name (clickable)
+                                let response = ui.add_sized(
+                                    [channel_width, row_height],
+                                    egui::Button::new(RichText::new(&entry.name).color(text_color))
+                                        .frame(false)
+                                );
 
-                                    if response.clicked() {
-                                        new_selected = Some(entry.name.clone());
-                                    }
-                                    if response.double_clicked() {
-                                        join_channel = Some(entry.name.clone());
-                                    }
+                                if response.clicked() {
+                                    new_selected = Some(entry.name.clone());
+                                }
+                                if response.double_clicked() {
+                                    join_channel = Some(entry.name.clone());
+                                }
 
-                                    // Right-click context menu
-                                    let channel_name = entry.name.clone();
-                                    let channel_topic = entry.topic.clone();
-                                    let channel_users = entry.user_count;
-                                    response.context_menu(|ui| {
-                                        ui.label(RichText::new(&channel_name).strong());
-                                        ui.label(format!("{} users", channel_users));
-                                        if !channel_topic.is_empty() {
-                                            ui.separator();
-                                            ui.label(RichText::new("Topic:").small());
-                                            ui.add(egui::Label::new(
-                                                RichText::new(&channel_topic).small().color(Color32::GRAY)
-                                            ).wrap_mode(egui::TextWrapMode::Wrap));
-                                        }
+                                // Context menu
+                                let channel_name = entry.name.clone();
+                                let channel_topic = strip_irc_formatting(&entry.topic);
+                                let channel_users = entry.user_count;
+                                response.context_menu(|ui| {
+                                    ui.set_max_width(300.0);
+                                    ui.label(RichText::new(&channel_name).strong());
+                                    ui.label(format!("{} users", channel_users));
+                                    if !channel_topic.is_empty() {
                                         ui.separator();
-                                        if ui.button("Join Channel").clicked() {
-                                            join_channel = Some(channel_name.clone());
-                                            ui.close();
-                                        }
-                                        if ui.button("Copy Channel Name").clicked() {
-                                            ui.ctx().copy_text(channel_name.clone());
-                                            ui.close();
-                                        }
-                                    });
-
-                                    // Column 2: User count
-                                    ui.allocate_ui_with_layout(
-                                        Vec2::new(users_width, row_height - 2.0),
-                                        egui::Layout::right_to_left(egui::Align::Center),
-                                        |ui| {
-                                            ui.label(RichText::new(format!("{}", entry.user_count)).color(Color32::LIGHT_GREEN));
-                                        }
-                                    );
-
-                                    ui.add_space(10.0);
-
-                                    // Column 3: Topic (truncated)
-                                    let topic_display = if entry.topic.len() > 70 {
-                                        format!("{}...", entry.topic.chars().take(70).collect::<String>())
-                                    } else {
-                                        entry.topic.clone()
-                                    };
-                                    ui.add_sized(
-                                        [topic_width, row_height - 2.0],
-                                        egui::Label::new(RichText::new(&topic_display).color(Color32::GRAY))
-                                    );
+                                        ui.label(RichText::new("Topic:").small());
+                                        ui.add(egui::Label::new(
+                                            RichText::new(&channel_topic).small().color(Color32::GRAY)
+                                        ).wrap_mode(egui::TextWrapMode::Wrap));
+                                    }
+                                    ui.separator();
+                                    if ui.button("Join Channel").clicked() {
+                                        join_channel = Some(channel_name.clone());
+                                        ui.close();
+                                    }
+                                    if ui.button("Copy Channel Name").clicked() {
+                                        ui.ctx().copy_text(channel_name.clone());
+                                        ui.close();
+                                    }
                                 });
+
+                                // User count
+                                ui.add_sized(
+                                    [users_width, row_height],
+                                    egui::Label::new(RichText::new(format!("{}", entry.user_count)).color(Color32::LIGHT_GREEN))
+                                );
+
+                                // Topic (clipped, with IRC formatting stripped)
+                                let clean_topic = strip_irc_formatting(&entry.topic);
+                                ui.add_sized(
+                                    [topic_width, row_height],
+                                    egui::Label::new(RichText::new(&clean_topic).color(Color32::GRAY))
+                                        .truncate()
+                                );
                             });
                         }
                     });
@@ -726,12 +772,18 @@ impl IrcApp {
                             join_channel = Some(channel.clone());
                         }
                     }
+
+                    ui.label("Min:");
+                    let mut min_users = self.list_min_users as i32;
+                    ui.add(egui::DragValue::new(&mut min_users).range(0..=1000).speed(1));
+                    self.list_min_users = min_users.max(0) as u32;
+
                     if ui.button("Refresh").clicked() {
                         self.channel_list.clear();
                         self.channel_list_selected = None;
-                        // Use configurable min users filter
-                        if self.list_min_users > 0 {
-                            self.send_command(IrcCommand::List(Some(format!(">{}", self.list_min_users))));
+                        // >N means "more than N users", so for min 5, send >4
+                        if self.list_min_users >= 1 {
+                            self.send_command(IrcCommand::List(Some(format!(">{}", self.list_min_users.saturating_sub(1)))));
                         } else {
                             self.send_command(IrcCommand::List(None));
                         }
@@ -745,11 +797,13 @@ impl IrcApp {
         if close {
             self.show_channel_list = false;
             self.channel_list_selected = None;
+            self.save_settings();
         }
         if let Some(channel) = join_channel {
             self.send_command(IrcCommand::Join(channel, None));
             self.show_channel_list = false;
             self.channel_list_selected = None;
+            self.save_settings();
         }
     }
 

@@ -304,11 +304,17 @@ impl IrcApp {
             }
 
             "LIST" => {
+                // Prepare the channel list dialog
+                self.channel_list.clear();
+                self.channel_list_loading = true;
+                self.show_channel_list = true;
+
                 // Use configurable min users filter to avoid flooding on large networks
                 // Users can override with /list * or /list <filter>
                 if args.is_empty() {
-                    if self.list_min_users > 0 {
-                        self.send_command(IrcCommand::List(Some(format!(">{}", self.list_min_users))));
+                    // >N means "more than N users", so for min 5, send >4
+                    if self.list_min_users >= 1 {
+                        self.send_command(IrcCommand::List(Some(format!(">{}", self.list_min_users.saturating_sub(1)))));
                     } else {
                         self.send_command(IrcCommand::List(None));
                     }

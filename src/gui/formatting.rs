@@ -59,6 +59,36 @@ pub fn nick_color(nick: &str) -> Color32 {
     NICK_COLORS[(hash as usize) % NICK_COLORS.len()]
 }
 
+/// Strip IRC color codes and formatting from text, returning plain text
+pub fn strip_irc_formatting(input: &str) -> String {
+    let mut result = String::with_capacity(input.len());
+    let mut chars = input.chars().peekable();
+
+    while let Some(c) = chars.next() {
+        match c {
+            '\x02' | '\x1D' | '\x1F' | '\x16' | '\x0F' => {
+                // Bold, italic, underline, reverse, reset - skip
+            }
+            '\x03' => {
+                // Color code - skip digits
+                // Format: \x03[fg[,bg]] where fg and bg are 1-2 digits
+                while chars.peek().map_or(false, |c| c.is_ascii_digit()) {
+                    chars.next();
+                }
+                if chars.peek() == Some(&',') {
+                    chars.next();
+                    while chars.peek().map_or(false, |c| c.is_ascii_digit()) {
+                        chars.next();
+                    }
+                }
+            }
+            _ => result.push(c),
+        }
+    }
+
+    result
+}
+
 /// Parse IRC color codes and formatting from text
 fn parse_irc_colors(input: &str) -> Vec<TextSpan> {
     let mut spans = Vec::new();

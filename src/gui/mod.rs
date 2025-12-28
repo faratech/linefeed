@@ -14,7 +14,7 @@ use crate::irc::client::ServerConfig;
 use crate::irc::numerics::*;
 use helpers::{is_channel, mask_matches, format_timestamp, truncate_chars};
 use formatting::{render_irc_text, nick_color};
-pub use types::{ServerFavorite, Settings, ChatMessage, Channel, UserMode, ChannelListEntry, TabCompletion, BanEntry};
+pub use types::{ServerFavorite, Settings, ChatMessage, Channel, UserMode, ChannelListEntry, TabCompletion, BanEntry, ChannelListSort, SortDirection};
 pub struct IrcApp {
     // Connection state
     pub connected: bool,
@@ -61,6 +61,8 @@ pub struct IrcApp {
     pub show_channel_list: bool,
     pub channel_list_filter: String,
     pub channel_list_selected: Option<String>,
+    pub channel_list_sort: ChannelListSort,
+    pub channel_list_sort_dir: SortDirection,
 
     // Tab completion
     pub tab_completion: Option<TabCompletion>,
@@ -222,6 +224,8 @@ impl IrcApp {
             show_channel_list: false,
             channel_list_filter: String::new(),
             channel_list_selected: None,
+            channel_list_sort: ChannelListSort::Users,
+            channel_list_sort_dir: SortDirection::Descending,
 
             tab_completion: None,
 
@@ -1000,15 +1004,47 @@ impl IrcApp {
             }
 
             RPL_LIST => {
-                // params: [client, channel, visible_count, topic]
-                if let (Some(channel), Some(count_str)) = (params.get(1), params.get(2)) {
-                    let user_count = count_str.parse().unwrap_or(0);
-                    let topic = params.get(3).cloned().unwrap_or_default();
+                let mut channel = None;
+                let mut user_count = 0;
+                let mut topic = String::new();
+
+                for (i, p) in params.iter().enumerate() {
+                    // Channel name: first param starting with #, &, or just looks like a channel
+                    // Relaxed check: if it's not a number and channel is none, take it? No, unsafe.
+                    if (p.starts_with('#') || p.starts_with('&')) && channel.is_none() {
+                        channel = Some(p.clone());
+                        if let Some(last_p) = params.last() {
+                            if last_p != p && !last_p.chars().all(|c| c.is_ascii_digit()) {
+                                topic = last_p.clone();
+                            }
+                        }
+                    }
+                    
+                    // User count: any numeric param. Handle '1000' with commas.
+                    let clean_p = p.replace(',', "");
+                    if i > 0 && clean_p.chars().all(|c| c.is_ascii_digit() || c == '+') && !clean_p.is_empty() {
+                        if let Ok(cnt) = clean_p.trim_start_matches('+').parse::<usize>() {
+                            user_count = cnt;
+                        }
+                    }
+                }
+
+                if let Some(name) = channel {
                     self.channel_list.push(ChannelListEntry {
-                        name: channel.clone(),
+                        name,
                         user_count,
                         topic,
                     });
+                } else {
+                    // Fallback: if we have at least 3 params, assume standard format
+                    // [client, channel, count, topic]
+                    if params.len() >= 3 {
+                         self.channel_list.push(ChannelListEntry {
+                            name: params[1].clone(),
+                            user_count: params[2].replace(',', "").parse().unwrap_or(0),
+                            topic: params.get(3).cloned().unwrap_or_default(),
+                        });
+                    }
                 }
             }
 
