@@ -67,7 +67,7 @@ A lightweight, cross-platform IRC client written in Rust with a native GUI.
 
 ### Pre-built Binaries
 
-Download from the [Releases](https://github.com/yourusername/linefeed/releases) page:
+Download from the [Releases](https://github.com/faratech/linefeed/releases) page:
 - `linefeed_arm64.exe` - Windows ARM64
 - `linefeed_x86.exe` - Windows x86
 - `linefeed` - Linux x86_64
@@ -81,7 +81,7 @@ Download from the [Releases](https://github.com/yourusername/linefeed/releases) 
 **Quick build:**
 ```bash
 # Clone the repository
-git clone https://github.com/yourusername/linefeed.git
+git clone https://github.com/faratech/linefeed.git
 cd linefeed
 
 # Build for your platform
