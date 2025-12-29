@@ -254,6 +254,15 @@ impl ChatMessage {
             is_highlight: true,
         }
     }
+
+    /// Override timestamp with server-provided time (IRCv3 server-time)
+    /// If server_time is Some, use it; otherwise keep existing timestamp
+    pub fn with_server_time(mut self, server_time: Option<String>) -> Self {
+        if let Some(time) = server_time {
+            self.timestamp = time;
+        }
+        self
+    }
 }
 
 /// User mode in a channel (determines prefix and sort order)
@@ -299,6 +308,30 @@ pub struct BanEntry {
     pub set_time: u64,
 }
 
+/// A user in a channel with mode and away status
+#[derive(Debug, Clone)]
+pub struct ChannelUser {
+    pub nick: String,
+    pub mode: UserMode,
+    pub away: Option<String>,  // None = not away, Some(msg) = away with message
+    pub account: Option<String>,  // IRCv3 account name
+}
+
+impl ChannelUser {
+    pub fn new(nick: String, mode: UserMode) -> Self {
+        Self {
+            nick,
+            mode,
+            away: None,
+            account: None,
+        }
+    }
+
+    pub fn is_away(&self) -> bool {
+        self.away.is_some()
+    }
+}
+
 /// An IRC channel with users and messages
 #[derive(Debug, Clone)]
 pub struct Channel {
@@ -308,7 +341,7 @@ pub struct Channel {
     pub modes: String,  // Channel modes like "+nt"
     pub mode_params: Vec<String>,  // Mode parameters (limit, key, etc.)
     pub created: Option<u64>,  // Channel creation timestamp
-    pub users: Vec<(String, UserMode)>,
+    pub users: Vec<ChannelUser>,
     pub messages: Vec<ChatMessage>,
     pub unread: usize,
     pub key: Option<String>,  // Channel key for auto-rejoin
@@ -336,32 +369,63 @@ impl Channel {
 
     pub fn add_user(&mut self, nick: &str, mode: UserMode) {
         let clean_nick = nick.trim_start_matches(|c| c == '~' || c == '&' || c == '@' || c == '%' || c == '+');
-        if !self.users.iter().any(|(n, _)| n.eq_ignore_ascii_case(clean_nick)) {
-            self.users.push((clean_nick.to_string(), mode));
+        if !self.users.iter().any(|u| u.nick.eq_ignore_ascii_case(clean_nick)) {
+            self.users.push(ChannelUser::new(clean_nick.to_string(), mode));
             self.sort_users();
         }
     }
 
     pub fn remove_user(&mut self, nick: &str) {
-        self.users.retain(|(n, _)| !n.eq_ignore_ascii_case(nick));
+        self.users.retain(|u| !u.nick.eq_ignore_ascii_case(nick));
     }
 
     pub fn rename_user(&mut self, old_nick: &str, new_nick: &str) {
-        if let Some(pos) = self.users.iter().position(|(n, _)| n.eq_ignore_ascii_case(old_nick)) {
-            let mode = self.users[pos].1;
-            self.users[pos] = (new_nick.to_string(), mode);
+        if let Some(user) = self.users.iter_mut().find(|u| u.nick.eq_ignore_ascii_case(old_nick)) {
+            user.nick = new_nick.to_string();
             self.sort_users();
         }
     }
 
     pub fn has_user(&self, nick: &str) -> bool {
-        self.users.iter().any(|(n, _)| n.eq_ignore_ascii_case(nick))
+        self.users.iter().any(|u| u.nick.eq_ignore_ascii_case(nick))
+    }
+
+    pub fn get_user(&self, nick: &str) -> Option<&ChannelUser> {
+        self.users.iter().find(|u| u.nick.eq_ignore_ascii_case(nick))
+    }
+
+    pub fn get_user_mut(&mut self, nick: &str) -> Option<&mut ChannelUser> {
+        self.users.iter_mut().find(|u| u.nick.eq_ignore_ascii_case(nick))
     }
 
     fn sort_users(&mut self) {
-        self.users.sort_by(|(a_nick, a_mode), (b_nick, b_mode)| {
-            a_mode.cmp(b_mode).then_with(|| a_nick.to_lowercase().cmp(&b_nick.to_lowercase()))
+        self.users.sort_by(|a, b| {
+            a.mode.cmp(&b.mode).then_with(|| a.nick.to_lowercase().cmp(&b.nick.to_lowercase()))
         });
+    }
+
+    /// IRCv3 away-notify: update user's away status
+    pub fn set_user_away(&mut self, nick: &str, away_msg: Option<String>) {
+        if let Some(user) = self.get_user_mut(nick) {
+            user.away = away_msg;
+        }
+    }
+
+    /// IRCv3 account-notify: update user's logged-in account
+    pub fn set_user_account(&mut self, nick: &str, account: Option<String>) {
+        if let Some(user) = self.get_user_mut(nick) {
+            user.account = account;
+        }
+    }
+
+    /// Check if a user is away
+    pub fn is_user_away(&self, nick: &str) -> bool {
+        self.get_user(nick).map(|u| u.is_away()).unwrap_or(false)
+    }
+
+    /// Get count of away users
+    pub fn away_count(&self) -> usize {
+        self.users.iter().filter(|u| u.is_away()).count()
     }
 }
 

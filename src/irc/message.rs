@@ -10,7 +10,9 @@ pub enum IrcCommand {
     Away(Option<String>),
 
     // Channel
-    Join(String, Option<String>),  // (channel, optional key)
+    // When sending: (channel, optional key, None, None)
+    // When receiving with extended-join: (channel, None, account, realname)
+    Join(String, Option<String>, Option<String>, Option<String>),  // (channel, key, account, realname)
     Part(String, Option<String>),
     Topic(String, Option<String>),
     Names(Option<String>),
@@ -35,6 +37,18 @@ pub enum IrcCommand {
 
     // IRCv3 Monitor (friend list)
     Monitor(String, Option<String>),  // (subcommand: +/-/C/L/S, optional targets)
+
+    // IRCv3 account-notify: user logged in/out of account
+    Account(String),  // account name, or "*" if logged out
+
+    // IRCv3 away-notify: user away status changed (from prefix)
+    // Away(Option<String>) is reused - None means back, Some(msg) means away
+
+    // IRCv3 CHGHOST: user changed their host
+    Chghost(String, String),  // (new_user, new_host)
+
+    // IRCv3 batch: start/end of a batch
+    Batch(String, Option<String>, Option<String>),  // (+/-reference, type, params)
 
     // Server info
     Time(Option<String>),
@@ -146,10 +160,14 @@ impl IrcMessage {
                 params.get(0).cloned().unwrap_or_default(),
                 params.get(1).cloned().unwrap_or_default(),
             ),
-            "JOIN" => IrcCommand::Join(
-                params.get(0).cloned().unwrap_or_default(),
-                params.get(1).cloned(),
-            ),
+            "JOIN" => {
+                // Standard JOIN: channel only
+                // Extended-join (IRCv3): channel, account, realname
+                let channel = params.get(0).cloned().unwrap_or_default();
+                let account = params.get(1).cloned().filter(|a| a != "*");
+                let realname = params.get(2).cloned();
+                IrcCommand::Join(channel, None, account, realname)
+            }
             "PART" => IrcCommand::Part(
                 params.get(0).cloned().unwrap_or_default(),
                 params.get(1).cloned(),
@@ -183,6 +201,21 @@ impl IrcMessage {
             "AUTHENTICATE" => IrcCommand::Authenticate(
                 params.get(0).cloned().unwrap_or_default(),
             ),
+            // IRCv3 account-notify
+            "ACCOUNT" => IrcCommand::Account(
+                params.get(0).cloned().unwrap_or_else(|| "*".to_string()),
+            ),
+            // IRCv3 chghost
+            "CHGHOST" => IrcCommand::Chghost(
+                params.get(0).cloned().unwrap_or_default(),
+                params.get(1).cloned().unwrap_or_default(),
+            ),
+            // IRCv3 batch
+            "BATCH" => IrcCommand::Batch(
+                params.get(0).cloned().unwrap_or_default(),
+                params.get(1).cloned(),
+                params.get(2).cloned(),
+            ),
             _ => {
                 // Try to parse as numeric
                 if let Ok(num) = cmd.parse::<u16>() {
@@ -201,7 +234,6 @@ impl IrcMessage {
     }
 
     /// Get a specific IRCv3 tag value
-    #[allow(dead_code)]
     pub fn get_tag(&self, key: &str) -> Option<String> {
         self.tags.as_ref().and_then(|tags| {
             for part in tags.split(';') {
@@ -215,6 +247,37 @@ impl IrcMessage {
             }
             None
         })
+    }
+
+    /// Get server-time from tags (IRCv3 server-time)
+    /// Returns formatted time string if present
+    pub fn get_server_time(&self) -> Option<String> {
+        self.get_tag("time").and_then(|iso| {
+            // Parse ISO 8601 format: 2025-12-28T19:30:00.000Z
+            // Extract just the time portion for display
+            if let Some(t_pos) = iso.find('T') {
+                let time_part = &iso[t_pos + 1..];
+                // Remove milliseconds and Z suffix
+                let time_clean = time_part
+                    .split('.')
+                    .next()
+                    .unwrap_or(time_part)
+                    .trim_end_matches('Z');
+                Some(time_clean.to_string())
+            } else {
+                None
+            }
+        })
+    }
+
+    /// Get account name from tags (IRCv3 account tag)
+    pub fn get_account(&self) -> Option<String> {
+        self.get_tag("account")
+    }
+
+    /// Get batch reference from tags (IRCv3 batch)
+    pub fn get_batch(&self) -> Option<String> {
+        self.get_tag("batch")
     }
 }
 
@@ -240,7 +303,8 @@ impl fmt::Display for IrcCommand {
                     write!(f, "AWAY")
                 }
             }
-            IrcCommand::Join(channel, key) => {
+            IrcCommand::Join(channel, key, _account, _realname) => {
+                // When sending, only channel and optional key are used
                 if let Some(k) = key {
                     write!(f, "JOIN {} {}", channel, k)
                 } else {
@@ -371,6 +435,15 @@ impl fmt::Display for IrcCommand {
                 }
             }
             IrcCommand::Authenticate(data) => write!(f, "AUTHENTICATE {}", data),
+            IrcCommand::Account(account) => write!(f, "ACCOUNT {}", account),
+            IrcCommand::Chghost(user, host) => write!(f, "CHGHOST {} {}", user, host),
+            IrcCommand::Batch(reference, batch_type, params) => {
+                match (batch_type, params) {
+                    (Some(t), Some(p)) => write!(f, "BATCH {} {} {}", reference, t, p),
+                    (Some(t), None) => write!(f, "BATCH {} {}", reference, t),
+                    _ => write!(f, "BATCH {}", reference),
+                }
+            }
             IrcCommand::Numeric(num, params) => {
                 write!(f, "{:03} {}", num, params.join(" "))
             }

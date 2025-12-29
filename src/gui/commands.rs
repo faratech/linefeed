@@ -24,7 +24,7 @@ impl IrcApp {
                 if let Some(ref k) = key {
                     self.pending_channel_keys.insert(channel.to_lowercase(), k.clone());
                 }
-                self.send_command(IrcCommand::Join(channel, key));
+                self.send_command(IrcCommand::Join(channel, key, None, None));
             }
 
             "PART" | "LEAVE" => {
@@ -132,12 +132,18 @@ impl IrcApp {
                     self.send_command(IrcCommand::Away(None));
                     self.away_status = None;
                     self.auto_away_triggered = false;
+                    // Update our own status in all channels
+                    let my_nick = self.my_nick.clone();
+                    self.update_user_away_status(&my_nick, None);
                     self.add_server_message(ChatMessage::system("You are no longer marked as away"));
                 } else {
                     let reason = args.to_string();
                     self.send_command(IrcCommand::Away(Some(reason.clone())));
                     self.away_status = Some(reason.clone());
                     self.auto_away_triggered = false;
+                    // Update our own status in all channels
+                    let my_nick = self.my_nick.clone();
+                    self.update_user_away_status(&my_nick, Some(reason.clone()));
                     self.add_server_message(ChatMessage::system(&format!("You are now marked as away: {}", reason)));
                 }
             }
@@ -146,6 +152,9 @@ impl IrcApp {
                 self.send_command(IrcCommand::Away(None));
                 self.away_status = None;
                 self.auto_away_triggered = false;
+                // Update our own status in all channels
+                let my_nick = self.my_nick.clone();
+                self.update_user_away_status(&my_nick, None);
                 self.add_server_message(ChatMessage::system("You are no longer marked as away"));
             }
 
@@ -632,7 +641,7 @@ impl IrcApp {
                         // Get the stored key for auto-rejoin if available
                         let key = self.channels.get(&ch).and_then(|c| c.key.clone());
                         self.send_command(IrcCommand::Part(ch.clone(), Some("Cycling".to_string())));
-                        self.send_command(IrcCommand::Join(ch, key));
+                        self.send_command(IrcCommand::Join(ch, key, None, None));
                     }
                 }
             }

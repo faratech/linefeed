@@ -800,7 +800,7 @@ impl IrcApp {
             self.save_settings();
         }
         if let Some(channel) = join_channel {
-            self.send_command(IrcCommand::Join(channel, None));
+            self.send_command(IrcCommand::Join(channel, None, None, None));
             self.show_channel_list = false;
             self.channel_list_selected = None;
             self.save_settings();
@@ -922,9 +922,13 @@ impl IrcApp {
                             .max_height(150.0)
                             .show(ui, |ui| {
                                 ui.horizontal_wrapped(|ui| {
-                                    for (nick, mode) in &ch.users {
-                                        let prefix = mode.prefix();
-                                        let display = format!("{}{}", prefix, nick);
+                                    for user in &ch.users {
+                                        let prefix = user.mode.prefix();
+                                        let display = if user.is_away() {
+                                            format!("{}{} (away)", prefix, user.nick)
+                                        } else {
+                                            format!("{}{}", prefix, user.nick)
+                                        };
                                         ui.label(&display);
                                     }
                                 });

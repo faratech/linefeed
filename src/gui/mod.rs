@@ -14,7 +14,7 @@ use crate::irc::client::ServerConfig;
 use crate::irc::numerics::*;
 use helpers::{is_channel, mask_matches, format_timestamp, truncate_chars};
 use formatting::{render_irc_text, nick_color};
-pub use types::{ServerFavorite, Settings, ChatMessage, Channel, UserMode, ChannelListEntry, TabCompletion, BanEntry, ChannelListSort, SortDirection};
+pub use types::{ServerFavorite, Settings, ChatMessage, Channel, ChannelUser, UserMode, ChannelListEntry, TabCompletion, BanEntry, ChannelListSort, SortDirection};
 pub struct IrcApp {
     // Connection state
     pub connected: bool,
@@ -583,6 +583,9 @@ impl IrcApp {
                 // Check if the message mentions our nick (case-insensitive word boundary check)
                 let is_highlight = self.check_nick_mention(content);
 
+                // Get server-time from IRCv3 tags if available
+                let server_time = msg.get_server_time();
+
                 let fmt = &self.timestamp_format;
                 let chat_msg = if is_action {
                     let action_text = content
@@ -591,13 +594,17 @@ impl IrcApp {
                         .unwrap_or(content);
                     if is_highlight {
                         ChatMessage::action_highlighted_fmt(&sender, action_text, fmt)
+                            .with_server_time(server_time)
                     } else {
                         ChatMessage::action_fmt(&sender, action_text, fmt)
+                            .with_server_time(server_time)
                     }
                 } else if is_highlight {
                     ChatMessage::highlighted_fmt(&sender, content, fmt)
+                        .with_server_time(server_time)
                 } else {
                     ChatMessage::new_fmt(&sender, content, fmt)
+                        .with_server_time(server_time)
                 };
 
                 // Determine target channel/query
@@ -696,7 +703,7 @@ impl IrcApp {
                 }
             }
 
-            IrcCommand::Join(channel, _key) => {
+            IrcCommand::Join(channel, _key, account, realname) => {
                 let sender = msg.get_sender_nick().unwrap_or_default();
                 if sender.eq_ignore_ascii_case(&self.my_nick) {
                     // We joined a channel
@@ -729,7 +736,21 @@ impl IrcApp {
                     self.add_message_to_channel(channel, sys_msg);
                 } else {
                     if !self.hide_join_part {
-                        let sys_msg = ChatMessage::system(&format!("{} has joined {}", sender, channel));
+                        // Include account info if available (IRCv3 extended-join)
+                        let sys_msg = match (account, realname) {
+                            (Some(acct), Some(real)) => ChatMessage::system(
+                                &format!("{} ({}) [{}] has joined {}", sender, real, acct, channel)
+                            ),
+                            (Some(acct), None) => ChatMessage::system(
+                                &format!("{} [{}] has joined {}", sender, acct, channel)
+                            ),
+                            (None, Some(real)) => ChatMessage::system(
+                                &format!("{} ({}) has joined {}", sender, real, channel)
+                            ),
+                            (None, None) => ChatMessage::system(
+                                &format!("{} has joined {}", sender, channel)
+                            ),
+                        };
                         self.add_message_to_channel(channel, sys_msg);
                     }
                     if let Some(ch) = self.channels.get_mut(channel) {
@@ -842,6 +863,84 @@ impl IrcApp {
                 }
             }
 
+            // IRCv3 away-notify: user changed away status
+            IrcCommand::Away(away_msg) => {
+                let sender = msg.get_sender_nick().unwrap_or_default();
+                // Update away status for user in ALL channels they're in
+                self.update_user_away_status(&sender, away_msg.clone());
+
+                // Show message once (in first shared channel)
+                if !self.hide_join_part {
+                    let sys_msg = if let Some(away_text) = away_msg {
+                        ChatMessage::system(&format!("{} is now away: {}", sender, away_text))
+                    } else {
+                        ChatMessage::system(&format!("{} is back", sender))
+                    };
+                    // Find first channel where user is present and show message there
+                    for (_, channel) in self.channels.iter_mut() {
+                        if channel.has_user(&sender) {
+                            channel.messages.push(sys_msg);
+                            break;
+                        }
+                    }
+                }
+            }
+
+            // IRCv3 account-notify: user logged in/out of account
+            IrcCommand::Account(account) => {
+                let sender = msg.get_sender_nick().unwrap_or_default();
+                // Update account for user in all channels they're in
+                for (_, channel) in self.channels.iter_mut() {
+                    if channel.has_user(&sender) {
+                        channel.set_user_account(&sender, if account == "*" { None } else { Some(account.clone()) });
+                    }
+                }
+                // Optionally show message (only if not hiding join/part)
+                if !self.hide_join_part {
+                    let sys_msg = if account == "*" {
+                        ChatMessage::system(&format!("{} has logged out", sender))
+                    } else {
+                        ChatMessage::system(&format!("{} has logged in as {}", sender, account))
+                    };
+                    // Show in channels where user is present
+                    for (_, channel) in self.channels.iter_mut() {
+                        if channel.has_user(&sender) {
+                            channel.messages.push(sys_msg.clone());
+                            break; // Only show once
+                        }
+                    }
+                }
+            }
+
+            // IRCv3 chghost: user changed their username/hostname
+            IrcCommand::Chghost(new_user, new_host) => {
+                let sender = msg.get_sender_nick().unwrap_or_default();
+                // Update host for user in all channels (informational, we don't track hosts)
+                if !self.hide_join_part {
+                    let sys_msg = ChatMessage::system(&format!(
+                        "{} changed host to {}@{}", sender, new_user, new_host
+                    ));
+                    for (_, channel) in self.channels.iter_mut() {
+                        if channel.has_user(&sender) {
+                            channel.messages.push(sys_msg.clone());
+                            break; // Only show once
+                        }
+                    }
+                }
+            }
+
+            // IRCv3 batch: grouped messages (we just log start/end for now)
+            IrcCommand::Batch(reference, batch_type, _params) => {
+                if reference.starts_with('+') {
+                    // Batch start
+                    tracing::debug!("Batch started: {} type={:?}", reference, batch_type);
+                } else if reference.starts_with('-') {
+                    // Batch end
+                    tracing::debug!("Batch ended: {}", reference);
+                }
+                // Messages within batches have @batch=reference tag, handled normally
+            }
+
             _ => {
                 // Log unknown messages
                 let sys_msg = ChatMessage::system(&msg.raw);
@@ -882,7 +981,7 @@ impl IrcApp {
                             } else {
                                 format!("#{}", chan)
                             };
-                            self.send_command(IrcCommand::Join(channel.clone(), None));
+                            self.send_command(IrcCommand::Join(channel.clone(), None, None, None));
                             self.add_server_message(ChatMessage::system(&format!("Auto-joining {}", channel)));
                         }
                     }
@@ -975,6 +1074,12 @@ impl IrcApp {
             }
 
             RPL_ENDOFNAMES => {
+                // After getting the user list, send WHO to get away status
+                if let Some(channel) = params.get(1) {
+                    if is_channel(channel) {
+                        self.send_command(IrcCommand::Who(channel.clone()));
+                    }
+                }
             }
 
             RPL_BANLIST => {
@@ -1248,19 +1353,24 @@ impl IrcApp {
             // WHO responses
             RPL_WHOREPLY => {
                 // <channel> <user> <host> <server> <nick> <H|G>[*][@|+] :<hopcount> <realname>
-                if let (Some(channel), Some(user), Some(host), Some(_server), Some(nick), Some(flags)) =
+                if let (Some(channel), Some(_user), Some(_host), Some(_server), Some(nick), Some(flags)) =
                     (params.get(1), params.get(2), params.get(3), params.get(4), params.get(5), params.get(6))
                 {
-                    let realname = params.get(7).cloned().unwrap_or_default();
-                    let away = if flags.starts_with('G') { " (away)" } else { "" };
-                    self.add_message_to_current(ChatMessage::system(
-                        &format!("[WHO] {} {}@{} {} {}{}", nick, user, host, channel, realname, away)
-                    ));
+                    // Update away status based on H (Here) or G (Gone/away) flag
+                    let is_away = flags.starts_with('G');
+                    if let Some(ch) = self.channels.get_mut(channel) {
+                        if is_away {
+                            // Mark user as away (we don't have the away message from WHO)
+                            ch.set_user_away(nick, Some("Away".to_string()));
+                        } else {
+                            ch.set_user_away(nick, None);
+                        }
+                    }
                 }
             }
 
             RPL_ENDOFWHO => {
-                self.add_message_to_current(ChatMessage::system("[WHO] End of WHO list"));
+                // Silently handled - WHO is automatically sent to get away status
             }
 
             // Error numerics
@@ -1440,6 +1550,13 @@ impl IrcApp {
         }
     }
 
+    /// Update a user's away status in all channels they're in
+    pub fn update_user_away_status(&mut self, nick: &str, away_msg: Option<String>) {
+        for (_, channel) in self.channels.iter_mut() {
+            channel.set_user_away(nick, away_msg.clone());
+        }
+    }
+
     /// Add a message to the current window (channel or server buffer)
     fn add_message_to_current(&mut self, msg: ChatMessage) {
         if let Some(channel_name) = &self.current_channel.clone() {
@@ -1478,6 +1595,17 @@ impl IrcApp {
         if input.starts_with('/') {
             self.process_command(&input);
         } else if let Some(channel) = &self.current_channel.clone() {
+            // Auto-back: clear away status when user sends a message
+            if self.away_status.is_some() {
+                self.send_command(IrcCommand::Away(None));
+                self.away_status = None;
+                self.auto_away_triggered = false;
+                // Update our own status in all channels
+                let my_nick = self.my_nick.clone();
+                self.update_user_away_status(&my_nick, None);
+                self.add_server_message(ChatMessage::system("You are no longer marked as away (auto-back)"));
+            }
+
             // Send message to current channel
             let msg = ChatMessage::new_fmt(&self.my_nick, &input, &self.timestamp_format);
             self.add_message_to_channel(channel, msg);
@@ -1526,11 +1654,11 @@ impl IrcApp {
         if let Some(channel_name) = &self.current_channel {
             if let Some(channel) = self.channels.get(channel_name) {
                 let prefix_lower = prefix.to_lowercase();
-                let mut matches: Vec<_> = channel
+                let mut matches: Vec<String> = channel
                     .users
                     .iter()
-                    .filter(|(nick, _)| nick.to_lowercase().starts_with(&prefix_lower))
-                    .map(|(nick, _)| nick.clone())
+                    .filter(|user| user.nick.to_lowercase().starts_with(&prefix_lower))
+                    .map(|user| user.nick.clone())
                     .collect();
                 matches.sort_by(|a, b| a.to_lowercase().cmp(&b.to_lowercase()));
                 return matches;
@@ -1984,7 +2112,7 @@ impl eframe::App for IrcApp {
                                 } else {
                                     format!("#{}", self.join_channel)
                                 };
-                                self.send_command(IrcCommand::Join(channel, None));
+                                self.send_command(IrcCommand::Join(channel, None, None, None));
                                 self.join_channel.clear();
                             }
                         }
@@ -2092,19 +2220,28 @@ impl eframe::App for IrcApp {
                     .default_width(140.0)
                     .show(ctx, |ui| {
                         if let Some(channel) = self.channels.get(&chan_for_context) {
-                            ui.heading(format!("Users ({})", channel.users.len()));
+                            // Show user count with away count if any
+                            let away_count = channel.away_count();
+                            if away_count > 0 {
+                                ui.heading(format!("Users ({}, {} away)", channel.users.len(), away_count));
+                            } else {
+                                ui.heading(format!("Users ({})", channel.users.len()));
+                            }
                             ui.separator();
                             // Get selected user for this render
                             let current_selected = self.selected_user.clone();
                             let mut new_selected: Option<String> = current_selected.clone();
 
                             ScrollArea::vertical().show(ui, |ui| {
-                                for (nick, mode) in &channel.users {
+                                for user in &channel.users {
+                                    let nick = &user.nick;
+                                    let mode = &user.mode;
                                     let prefix = mode.prefix();
                                     let is_selected = current_selected.as_ref() == Some(nick);
+                                    let is_away = user.is_away();
 
-                                    // Color based on mode
-                                    let color = match mode {
+                                    // Color based on mode, dimmed if away
+                                    let base_color = match mode {
                                         UserMode::Owner => Color32::from_rgb(255, 100, 100),
                                         UserMode::Admin => Color32::from_rgb(255, 150, 100),
                                         UserMode::Op => Color32::from_rgb(100, 200, 100),
@@ -2113,8 +2250,33 @@ impl eframe::App for IrcApp {
                                         UserMode::Normal => Color32::WHITE,
                                     };
 
-                                    let text = RichText::new(format!("{}{}", prefix, nick)).color(color);
+                                    // Dim color for away users (reduce to ~50% brightness)
+                                    let color = if is_away {
+                                        Color32::from_rgb(
+                                            base_color.r() / 2,
+                                            base_color.g() / 2,
+                                            base_color.b() / 2,
+                                        )
+                                    } else {
+                                        base_color
+                                    };
+
+                                    // Add (away) indicator for away users
+                                    let display_text = if is_away {
+                                        format!("{}{} (away)", prefix, nick)
+                                    } else {
+                                        format!("{}{}", prefix, nick)
+                                    };
+
+                                    let text = RichText::new(display_text).color(color);
                                     let response = ui.selectable_label(is_selected, text);
+
+                                    // Show away message on hover
+                                    if is_away {
+                                        if let Some(away_msg) = &user.away {
+                                            response.clone().on_hover_text(format!("Away: {}", away_msg));
+                                        }
+                                    }
 
                                     // Single click to select
                                     if response.clicked() {
