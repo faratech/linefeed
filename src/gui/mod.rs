@@ -170,6 +170,9 @@ pub struct IrcApp {
     // Color picker state
     pub show_color_picker: bool,
     pub color_picker_fg: bool,  // true = selecting foreground, false = selecting background
+
+    // CPU optimization state
+    pub had_messages_this_frame: bool,
 }
 
 impl Default for IrcApp {
@@ -314,6 +317,9 @@ impl IrcApp {
             // Color picker
             show_color_picker: false,
             color_picker_fg: true,
+
+            // CPU optimization
+            had_messages_this_frame: false,
         }
     }
 
@@ -442,6 +448,22 @@ impl IrcApp {
             self.reconnect_attempts,
             delay
         )));
+    }
+
+    /// Minimal update when window is minimized - drains messages without rendering UI
+    /// This prevents the message buffer from filling up while keeping CPU usage near zero
+    pub fn update_minimal(&mut self) {
+        // Drain all pending messages to prevent buffer overflow
+        let messages: Vec<_> = if let Some(rx) = &mut self.msg_rx {
+            std::iter::from_fn(|| rx.try_recv().ok()).collect()
+        } else {
+            Vec::new()
+        };
+
+        // Process messages so notifications, state updates, etc. still work
+        for msg in messages {
+            self.handle_incoming_message(msg);
+        }
     }
 
     /// Send a desktop notification
@@ -1740,18 +1762,30 @@ impl IrcApp {
 
 impl eframe::App for IrcApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // Process incoming messages
+        // Reset frame state
+        self.had_messages_this_frame = false;
+
+        // Process incoming messages with batch limiting for UI responsiveness
+        const MAX_MESSAGES_PER_FRAME: usize = 100;
+
         let messages: Vec<_> = if let Some(rx) = &mut self.msg_rx {
-            std::iter::from_fn(|| rx.try_recv().ok()).collect()
+            std::iter::from_fn(|| rx.try_recv().ok())
+                .take(MAX_MESSAGES_PER_FRAME + 1) // Take one extra to detect if more pending
+                .collect()
         } else {
             Vec::new()
         };
-        let had_messages = !messages.is_empty();
+
+        // Check if we hit the batch limit (got more than MAX_MESSAGES_PER_FRAME)
+        let has_more = messages.len() > MAX_MESSAGES_PER_FRAME;
+
+        self.had_messages_this_frame = !messages.is_empty();
         for msg in messages {
             self.handle_incoming_message(msg);
         }
-        // Only request immediate repaint if we received messages
-        if had_messages {
+
+        // If we hit the batch limit, request immediate repaint to process remaining
+        if has_more {
             ctx.request_repaint();
         }
 

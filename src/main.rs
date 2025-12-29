@@ -239,6 +239,7 @@ fn main() -> eframe::Result<()> {
             Ok(Box::new(LinefeedApp {
                 app: IrcApp::new(cc),
                 connection_thread: None,
+                last_message_time: std::time::Instant::now(),
             }))
         }),
     )
@@ -247,6 +248,8 @@ fn main() -> eframe::Result<()> {
 struct LinefeedApp {
     app: IrcApp,
     connection_thread: Option<std::thread::JoinHandle<()>>,
+    /// Track when we last received messages (for adaptive repaint intervals)
+    last_message_time: std::time::Instant,
 }
 
 impl eframe::App for LinefeedApp {
@@ -266,18 +269,39 @@ impl eframe::App for LinefeedApp {
             }
 
             // When hidden to system tray, skip all UI work
+            // But check if user restored via taskbar (not our tray menu)
             if systray::is_window_hidden() {
-                return;
+                let minimized = ctx.input(|i| i.viewport().minimized.unwrap_or(true));
+                if !minimized {
+                    // User restored via taskbar, clear our flag
+                    systray::clear_hidden();
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+                } else {
+                    // Still hidden, skip work
+                    return;
+                }
             }
 
             // Intercept X button when minimize_to_tray is enabled (only when visible)
             if self.app.minimize_to_tray && systray::is_active() {
                 if ctx.input(|i| i.viewport().close_requested()) {
                     ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                    // Tell egui we're minimized so it stops rendering
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
                     systray::hide_window();
                     return;
                 }
             }
+        }
+
+        // Check if window is minimized (cross-platform, including Linux)
+        let is_minimized = ctx.input(|i| i.viewport().minimized.unwrap_or(false));
+        if is_minimized {
+            // Process messages to prevent buffer overflow, but skip rendering
+            self.app.update_minimal();
+            // Use slow repaint interval when minimized
+            ctx.request_repaint_after(std::time::Duration::from_millis(1000));
+            return;
         }
 
         // Check if connection thread has finished (connection lost)
@@ -306,10 +330,31 @@ impl eframe::App for LinefeedApp {
         // Main UI update
         self.app.update(ctx, frame);
 
-        // Repaint frequently when connected to process incoming IRC messages quickly
-        // This prevents the message channel from filling up during high-traffic events (e.g., /list)
+        // Track when we last received messages for adaptive repaint intervals
+        if self.app.had_messages_this_frame {
+            self.last_message_time = std::time::Instant::now();
+        }
+
+        // Adaptive repaint interval based on activity level
         if self.app.connected || self.app.connecting {
-            ctx.request_repaint_after(std::time::Duration::from_millis(50));
+            let interval = if self.app.channel_list_loading {
+                // High-traffic mode during /list - fast polling for UI responsiveness
+                std::time::Duration::from_millis(16)
+            } else {
+                // Check how long since last message activity
+                let idle_time = self.last_message_time.elapsed();
+                if idle_time < std::time::Duration::from_secs(2) {
+                    // Recent activity - responsive mode
+                    std::time::Duration::from_millis(100)
+                } else if idle_time < std::time::Duration::from_secs(30) {
+                    // Moderate idle - reduced polling
+                    std::time::Duration::from_millis(250)
+                } else {
+                    // Long idle - minimal polling
+                    std::time::Duration::from_millis(500)
+                }
+            };
+            ctx.request_repaint_after(interval);
         }
         // When disconnected and not connecting, no need to poll - egui handles UI events
     }
