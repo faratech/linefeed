@@ -7,6 +7,9 @@ mod icon_data;
 #[cfg(windows)]
 mod systray;
 
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use eframe::egui;
 use tokio::sync::mpsc;
 use std::sync::Arc;
@@ -232,6 +235,11 @@ fn main() -> eframe::Result<()> {
             // Load emoji fonts for comprehensive Unicode support
             setup_fonts(&cc.egui_ctx);
 
+            // Reduce texture memory by discarding image data after GPU upload
+            cc.egui_ctx.options_mut(|opts| {
+                opts.reduce_texture_memory = true;
+            });
+
             let mut style = (*cc.egui_ctx.style()).clone();
             style.spacing.item_spacing = egui::vec2(8.0, 4.0);
             cc.egui_ctx.set_style(style);
@@ -365,7 +373,7 @@ impl LinefeedApp {
         let config = self.app.get_server_config();
         tracing::info!("Connecting to {}:{}", config.host, config.port);
 
-        let (msg_tx, msg_rx) = mpsc::channel::<IrcMessage>(50000);
+        let (msg_tx, msg_rx) = mpsc::channel::<IrcMessage>(1000);
         let (cmd_tx, cmd_rx) = mpsc::channel::<IrcCommand>(100);
 
         self.app.msg_rx = Some(msg_rx);

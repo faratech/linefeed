@@ -1,7 +1,7 @@
 //! Chat logging manager for persistent message history
 
 use std::fs::{self, File, OpenOptions};
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::PathBuf;
 use super::types::ChatMessage;
 use super::helpers::days_to_ymd;
@@ -66,7 +66,7 @@ impl LogManager {
         }
     }
 
-    /// Load recent history from a log file
+    /// Load recent history from a log file (reads from end to avoid loading entire file)
     pub fn load_history(&self, network: &str, channel: &str, max_lines: usize) -> Vec<ChatMessage> {
         if !self.enabled || max_lines == 0 {
             return Vec::new();
@@ -74,21 +74,34 @@ impl LogManager {
 
         let path = self.log_path(network, channel);
 
-        let file = match File::open(&path) {
+        let mut file = match File::open(&path) {
             Ok(f) => f,
             Err(_) => return Vec::new(), // File doesn't exist yet
         };
 
-        let reader = BufReader::new(file);
-        let lines: Vec<String> = reader.lines().filter_map(|l| l.ok()).collect();
+        // Get file size
+        let file_size = match file.seek(SeekFrom::End(0)) {
+            Ok(size) => size,
+            Err(_) => return Vec::new(),
+        };
 
-        // Take the last N lines
-        let start = lines.len().saturating_sub(max_lines);
+        // For small files, just read the whole thing
+        if file_size < 65536 {
+            if file.seek(SeekFrom::Start(0)).is_err() {
+                return Vec::new();
+            }
+            let reader = BufReader::new(file);
+            let lines: Vec<String> = reader.lines().filter_map(|l| l.ok()).collect();
+            let start = lines.len().saturating_sub(max_lines);
+            return lines[start..]
+                .iter()
+                .filter_map(|line| parse_log_line(line))
+                .collect();
+        }
 
-        lines[start..]
-            .iter()
-            .filter_map(|line| parse_log_line(line))
-            .collect()
+        // For larger files, read backwards in chunks to find the last N lines
+        let lines = read_last_n_lines(&mut file, file_size, max_lines);
+        lines.iter().filter_map(|line| parse_log_line(line)).collect()
     }
 
     /// Write a session marker (log opened/closed)
@@ -199,6 +212,58 @@ fn parse_log_line(line: &str) -> Option<ChatMessage> {
     } else {
         None
     }
+}
+
+/// Read the last N lines from a file by reading backwards in chunks
+fn read_last_n_lines(file: &mut File, file_size: u64, max_lines: usize) -> Vec<String> {
+    const CHUNK_SIZE: u64 = 8192;
+    let mut lines = Vec::new();
+    let mut remaining_bytes = Vec::new();
+    let mut pos = file_size;
+
+    // Read backwards in chunks
+    while pos > 0 && lines.len() < max_lines + 1 {
+        let chunk_start = pos.saturating_sub(CHUNK_SIZE);
+        let chunk_len = (pos - chunk_start) as usize;
+
+        if file.seek(SeekFrom::Start(chunk_start)).is_err() {
+            break;
+        }
+
+        let mut chunk = vec![0u8; chunk_len];
+        if file.read_exact(&mut chunk).is_err() {
+            break;
+        }
+
+        // Prepend to remaining bytes
+        chunk.extend(remaining_bytes);
+        remaining_bytes = chunk;
+
+        // Count newlines from the end
+        let mut newline_count = 0;
+        for &b in remaining_bytes.iter().rev() {
+            if b == b'\n' {
+                newline_count += 1;
+                if newline_count > max_lines {
+                    break;
+                }
+            }
+        }
+
+        // Convert to string and split into lines
+        if let Ok(text) = String::from_utf8(remaining_bytes.clone()) {
+            lines = text.lines().map(|s| s.to_string()).collect();
+            if lines.len() > max_lines {
+                break;
+            }
+        }
+
+        pos = chunk_start;
+    }
+
+    // Return only the last max_lines
+    let start = lines.len().saturating_sub(max_lines);
+    lines[start..].to_vec()
 }
 
 /// Get current date/time as a string for session markers
