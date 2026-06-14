@@ -17,5 +17,9 @@ Thumbs.db
 # Rust-specific
 **/*.rs.bk
 
+# Python (build.py / tools)
+__pycache__/
+*.pyc
+
 # Debug files
 *.pdb

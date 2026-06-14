@@ -57,6 +57,30 @@ async def check_deps():
         sys.exit(1)
 
 
+async def run_audit():
+    """Run `cargo audit` to flag known security advisories (non-fatal)."""
+    print("[security] Auditing dependencies (cargo audit)...")
+    if not shutil.which("cargo-audit"):
+        print("    cargo-audit not installed; skipping "
+              "(install with: cargo install cargo-audit)")
+        print()
+        return
+
+    # cargo audit exits non-zero when advisories are found.
+    success, output = await run_cmd(["cargo", "audit"])
+    for line in output.splitlines():
+        if line.strip():
+            print(f"    {line}")
+    if success:
+        print("    OK: no known vulnerabilities.")
+    else:
+        # Warn but don't block the build: a freshly-disclosed advisory may not
+        # have a fixed release yet, and you may still need to ship.
+        print("    WARNING: advisories found above. "
+              "Try `cargo update`, then `cargo audit fix` if needed.")
+    print()
+
+
 async def build_target(name: str, target: str | None, src_name: str, dst_name: str) -> bool:
     """Build a single target"""
     print(f"  Building {name}...")
@@ -112,6 +136,7 @@ Examples:
   python3 build.py --arm64 --x86  # Build ARM64 and x86
   python3 build.py --linux      # Build Linux only
   python3 build.py --no-upx     # Skip UPX compression
+  python3 build.py --no-audit   # Skip the cargo audit security check
   python3 build.py --jobs 8     # Use 8 parallel jobs
 """,
     )
@@ -131,6 +156,8 @@ Examples:
                         help="Skip UPX compression")
     parser.add_argument("--skip-deps", action="store_true",
                         help="Skip dependency check")
+    parser.add_argument("--no-audit", action="store_true",
+                        help="Skip the cargo audit security check")
 
     return parser.parse_args()
 
@@ -185,6 +212,10 @@ async def main():
     if not args.skip_deps:
         await check_deps()
         print()
+
+    # Security audit (non-fatal: warns on advisories, never blocks the build)
+    if not args.no_audit:
+        await run_audit()
 
     # Create output directory
     OUT_DIR.mkdir(exist_ok=True)

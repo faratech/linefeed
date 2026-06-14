@@ -1,0 +1,27 @@
+# Dependabot configuration.
+# Works alongside GitHub's Dependabot *security* alerts (already enabled) to also
+# open scheduled *version-update* PRs, keeping transitive crates (e.g. openssl)
+# current so newly-disclosed advisories are picked up automatically.
+version: 2
+updates:
+  - package-ecosystem: "cargo"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 10
+    commit-message:
+      prefix: "deps"
+    groups:
+      # Batch routine patch/minor bumps into a single PR to cut noise.
+      cargo-minor-patch:
+        update-types:
+          - "minor"
+          - "patch"
+
+  # Keep the GitHub Actions used in workflows up to date too.
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    commit-message:
+      prefix: "ci"
