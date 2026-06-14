@@ -248,6 +248,7 @@ fn main() -> eframe::Result<()> {
                 app: IrcApp::new(cc),
                 connection_thread: None,
                 last_message_time: std::time::Instant::now(),
+                window_size_ok: false,
             }))
         }),
     )
@@ -258,6 +259,9 @@ struct LinefeedApp {
     connection_thread: Option<std::thread::JoinHandle<()>>,
     /// Track when we last received messages (for adaptive repaint intervals)
     last_message_time: std::time::Instant,
+    /// Set once the window has been confirmed at a sane size; guards the
+    /// startup tiny-window self-heal (see `ui`).
+    window_size_ok: bool,
 }
 
 impl eframe::App for LinefeedApp {
@@ -314,6 +318,23 @@ impl eframe::App for LinefeedApp {
             // small without the cost of full-rate rendering.
             ctx.request_repaint_after(std::time::Duration::from_millis(250));
             return;
+        }
+
+        // Self-heal a degenerately small startup window. eframe restores the window
+        // size saved last session, but the minimize-to-tray flow can persist a tiny
+        // (minimized) size, and the restore has no lower-bound clamp, so the app can
+        // reopen as a tiny box. Only a bad restore can put a *visible* window below
+        // our 640x480 minimum (winit enforces that min on user resizes), so if we see
+        // a sub-minimum window, snap it back to the default. screen_rect * zoom_factor
+        // yields logical pixels, matching min_inner_size regardless of DPI/zoom.
+        if !self.window_size_ok {
+            let logical = ctx.screen_rect().size() * ctx.zoom_factor();
+            if logical.x >= 640.0 && logical.y >= 480.0 {
+                self.window_size_ok = true;
+            } else {
+                ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(1024.0, 768.0)));
+                ctx.request_repaint_after(std::time::Duration::from_millis(50));
+            }
         }
 
         // Check if connection thread has finished (connection lost)
