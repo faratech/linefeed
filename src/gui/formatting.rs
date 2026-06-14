@@ -75,10 +75,16 @@ pub fn strip_irc_formatting(input: &str) -> String {
                 while chars.peek().map_or(false, |c| c.is_ascii_digit()) {
                     chars.next();
                 }
+                // Only treat the comma as a fg/bg separator when a digit follows it,
+                // so a literal comma after a color code is preserved.
                 if chars.peek() == Some(&',') {
-                    chars.next();
-                    while chars.peek().map_or(false, |c| c.is_ascii_digit()) {
-                        chars.next();
+                    let mut lookahead = chars.clone();
+                    lookahead.next(); // skip the comma in the lookahead copy
+                    if lookahead.peek().map_or(false, |c| c.is_ascii_digit()) {
+                        chars.next(); // consume the comma for real
+                        while chars.peek().map_or(false, |c| c.is_ascii_digit()) {
+                            chars.next();
+                        }
                     }
                 }
             }
@@ -139,23 +145,29 @@ fn parse_irc_colors(input: &str) -> Vec<TextSpan> {
                     bg_color = None;
                 }
 
-                // Check for background color (comma followed by 1-2 digits)
+                // Check for background color (comma followed by 1-2 digits). Only
+                // consume the comma when a digit actually follows, so a literal
+                // comma after a color code is preserved as text.
                 if chars.peek() == Some(&',') {
-                    chars.next(); // consume comma
-                    let mut bg_str = String::new();
-                    while bg_str.len() < 2 {
-                        if let Some(&next) = chars.peek() {
-                            if next.is_ascii_digit() {
-                                bg_str.push(chars.next().unwrap());
+                    let mut lookahead = chars.clone();
+                    lookahead.next(); // skip the comma in the lookahead copy
+                    if lookahead.peek().map_or(false, |c| c.is_ascii_digit()) {
+                        chars.next(); // consume the comma for real
+                        let mut bg_str = String::new();
+                        while bg_str.len() < 2 {
+                            if let Some(&next) = chars.peek() {
+                                if next.is_ascii_digit() {
+                                    bg_str.push(chars.next().unwrap());
+                                } else {
+                                    break;
+                                }
                             } else {
                                 break;
                             }
-                        } else {
-                            break;
                         }
-                    }
-                    if let Ok(bg) = bg_str.parse::<usize>() {
-                        bg_color = Some(IRC_COLORS[bg % 16]);
+                        if let Ok(bg) = bg_str.parse::<usize>() {
+                            bg_color = Some(IRC_COLORS[bg % 16]);
+                        }
                     }
                 }
             }

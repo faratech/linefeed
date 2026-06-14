@@ -240,9 +240,9 @@ fn main() -> eframe::Result<()> {
                 opts.reduce_texture_memory = true;
             });
 
-            let mut style = (*cc.egui_ctx.style()).clone();
+            let mut style = (*cc.egui_ctx.global_style()).clone();
             style.spacing.item_spacing = egui::vec2(8.0, 4.0);
-            cc.egui_ctx.set_style(style);
+            cc.egui_ctx.set_global_style(style);
 
             Ok(Box::new(LinefeedApp {
                 app: IrcApp::new(cc),
@@ -261,7 +261,9 @@ struct LinefeedApp {
 }
 
 impl eframe::App for LinefeedApp {
-    fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+    fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
+        let ctx = ui.ctx().clone();
+        let ctx = &ctx;
         // Tray handling (Windows only)
         #[cfg(windows)]
         {
@@ -305,10 +307,12 @@ impl eframe::App for LinefeedApp {
         // Check if window is minimized (cross-platform, including Linux)
         let is_minimized = ctx.input(|i| i.viewport().minimized.unwrap_or(false));
         if is_minimized {
-            // Process messages to prevent buffer overflow, but skip rendering
+            // Process messages to prevent buffer overflow, but skip rendering.
             self.app.update_minimal();
-            // Use slow repaint interval when minimized
-            ctx.request_repaint_after(std::time::Duration::from_millis(1000));
+            // Drain reasonably often while minimized: update_minimal() empties the
+            // channel each call, so polling ~4x/second keeps the message-loss window
+            // small without the cost of full-rate rendering.
+            ctx.request_repaint_after(std::time::Duration::from_millis(250));
             return;
         }
 
@@ -317,10 +321,19 @@ impl eframe::App for LinefeedApp {
             if handle.is_finished() {
                 self.connection_thread = None;
                 if self.app.connected {
-                    // Connection was lost unexpectedly
+                    // Connection was lost unexpectedly after registering.
                     self.app.mark_connection_lost();
                     self.app.add_server_message(ChatMessage::system("Connection lost"));
                     tracing::warn!("Connection lost, will attempt reconnect");
+                } else if self.app.connecting {
+                    // The connection thread exited before we ever registered: the
+                    // initial connect failed. Clear `connecting` and mark the
+                    // connection lost so the reconnect/backoff path and the connect
+                    // UI can engage instead of being stuck "connecting" forever.
+                    self.app.connecting = false;
+                    self.app.mark_connection_lost();
+                    self.app.add_server_message(ChatMessage::system("Connection failed"));
+                    tracing::warn!("Initial connection failed, will attempt reconnect");
                 }
             }
         }
@@ -336,7 +349,7 @@ impl eframe::App for LinefeedApp {
         }
 
         // Main UI update
-        self.app.update(ctx, frame);
+        self.app.ui(ui, frame);
 
         // Track when we last received messages for adaptive repaint intervals
         if self.app.had_messages_this_frame {
@@ -366,6 +379,12 @@ impl eframe::App for LinefeedApp {
         }
         // When disconnected and not connecting, no need to poll - egui handles UI events
     }
+
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        // Remove the tray icon and free its HICON on shutdown (no-op elsewhere).
+        #[cfg(windows)]
+        systray::destroy_tray_icon();
+    }
 }
 
 impl LinefeedApp {
@@ -380,10 +399,28 @@ impl LinefeedApp {
         self.app.cmd_tx = Some(cmd_tx);
 
         self.connection_thread = Some(std::thread::spawn(move || {
-            let rt = tokio::runtime::Builder::new_current_thread()
+            let rt = match tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
-                .unwrap();
+            {
+                Ok(rt) => rt,
+                Err(e) => {
+                    // Surface the failure instead of panicking the worker thread.
+                    // The thread then finishes, and update() resolves the stuck
+                    // "connecting" state (and triggers reconnect) on the next frame.
+                    tracing::error!("Failed to build tokio runtime: {}", e);
+                    let _ = msg_tx.blocking_send(IrcMessage {
+                        tags: None,
+                        prefix: None,
+                        command: IrcCommand::Notice(
+                            "*".to_string(),
+                            format!("Failed to start connection runtime: {}", e),
+                        ),
+                        raw: String::new(),
+                    });
+                    return;
+                }
+            };
 
             rt.block_on(async {
                 let mut client = IrcClient::new(config.clone());

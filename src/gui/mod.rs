@@ -428,6 +428,13 @@ impl IrcApp {
 
     /// Mark connection as lost (called on disconnect)
     pub fn mark_connection_lost(&mut self) {
+        // Drain any still-buffered incoming messages before dropping the receiver,
+        // so the last lines the server sent before the disconnect are not lost.
+        if let Some(mut rx) = self.msg_rx.take() {
+            while let Ok(msg) = rx.try_recv() {
+                self.handle_incoming_message(msg);
+            }
+        }
         self.connected = false;
         self.connection_lost = true;
         self.last_disconnect_time = Some(std::time::Instant::now());
@@ -530,6 +537,16 @@ impl IrcApp {
         self.auto_perform = fav.auto_perform.clone();
         self.sasl_username = fav.sasl_username.clone();
         self.sasl_password = fav.sasl_password.clone();
+        // Restore the previously-dropped connection details. username/realname are
+        // only applied when non-empty so loading an older favorite (serde default)
+        // doesn't wipe the current values.
+        if !fav.username.is_empty() {
+            self.username = fav.username.clone();
+        }
+        if !fav.realname.is_empty() {
+            self.realname = fav.realname.clone();
+        }
+        self.accept_invalid_certs = fav.accept_invalid_certs;
     }
 
 }
@@ -652,8 +669,10 @@ impl IrcApp {
                     return;
                 }
 
-                // Check for CTCP reply (starts and ends with \x01)
-                if content.starts_with('\x01') && content.ends_with('\x01') {
+                // Check for CTCP reply (starts and ends with \x01).
+                // Require >= 2 bytes so the opening and closing \x01 are distinct;
+                // a lone "\x01" would otherwise slice as content[1..0] and panic.
+                if content.len() >= 2 && content.starts_with('\x01') && content.ends_with('\x01') {
                     let ctcp_content = &content[1..content.len()-1];
                     let parts: Vec<&str> = ctcp_content.splitn(2, ' ').collect();
                     let ctcp_cmd = parts[0];
@@ -785,11 +804,12 @@ impl IrcApp {
                 let reason_str = reason.as_deref().unwrap_or("Quit");
 
                 // Remove user from all channels, optionally show quit message
+                let max = self.max_scrollback;
                 for (_, channel) in self.channels.iter_mut() {
                     if channel.has_user(&sender) {
                         if !self.hide_join_part {
                             let sys_msg = ChatMessage::system(&format!("{} has quit ({})", sender, reason_str));
-                            channel.messages.push(sys_msg);
+                            channel.push_trimmed(sys_msg, max);
                         }
                         channel.remove_user(&sender);
                     }
@@ -805,15 +825,17 @@ impl IrcApp {
                 let sys_msg = ChatMessage::system(&format!(
                     "{} is now known as {}", old_nick, new_nick
                 ));
+                let max = self.max_scrollback;
                 for (_, channel) in self.channels.iter_mut() {
                     if channel.has_user(&old_nick) {
-                        channel.messages.push(sys_msg.clone());
+                        channel.push_trimmed(sys_msg.clone(), max);
                         channel.rename_user(&old_nick, new_nick);
                     }
                 }
             }
 
             IrcCommand::Topic(channel, topic) => {
+                let max = self.max_scrollback;
                 if let Some(ch) = self.channels.get_mut(channel) {
                     ch.topic = topic.clone();
                     let sender = msg.get_sender_nick();
@@ -826,13 +848,18 @@ impl IrcApp {
                             "Topic: {}", topic.as_deref().unwrap_or("")
                         ))
                     };
-                    ch.messages.push(sys_msg);
+                    ch.push_trimmed(sys_msg, max);
                 }
             }
 
             IrcCommand::Invite(_target, channel) => {
                 let sender = msg.get_sender_nick().unwrap_or_else(|| "Someone".to_string());
-                // Store the invite
+                // Store the invite, bounding the queue so unsolicited INVITE spam
+                // cannot grow it without limit (drop the oldest when full).
+                const MAX_PENDING_INVITES: usize = 64;
+                if self.pending_invites.len() >= MAX_PENDING_INVITES {
+                    self.pending_invites.remove(0);
+                }
                 self.pending_invites.push((sender.clone(), channel.clone()));
                 // Show prominent message in server buffer
                 self.add_server_message(ChatMessage::system(&format!(
@@ -877,9 +904,10 @@ impl IrcApp {
                         ChatMessage::system(&format!("{} is back", sender))
                     };
                     // Find first channel where user is present and show message there
+                    let max = self.max_scrollback;
                     for (_, channel) in self.channels.iter_mut() {
                         if channel.has_user(&sender) {
-                            channel.messages.push(sys_msg);
+                            channel.push_trimmed(sys_msg, max);
                             break;
                         }
                     }
@@ -903,9 +931,10 @@ impl IrcApp {
                         ChatMessage::system(&format!("{} has logged in as {}", sender, account))
                     };
                     // Show in channels where user is present
+                    let max = self.max_scrollback;
                     for (_, channel) in self.channels.iter_mut() {
                         if channel.has_user(&sender) {
-                            channel.messages.push(sys_msg.clone());
+                            channel.push_trimmed(sys_msg.clone(), max);
                             break; // Only show once
                         }
                     }
@@ -920,9 +949,10 @@ impl IrcApp {
                     let sys_msg = ChatMessage::system(&format!(
                         "{} changed host to {}@{}", sender, new_user, new_host
                     ));
+                    let max = self.max_scrollback;
                     for (_, channel) in self.channels.iter_mut() {
                         if channel.has_user(&sender) {
-                            channel.messages.push(sys_msg.clone());
+                            channel.push_trimmed(sys_msg.clone(), max);
                             break; // Only show once
                         }
                     }
@@ -1131,6 +1161,13 @@ impl IrcApp {
             }
 
             RPL_LIST => {
+                // Bound the in-memory channel list so an enormous (or malicious)
+                // LIST reply cannot grow it without limit.
+                const MAX_LIST_ENTRIES: usize = 50_000;
+                if self.channel_list.len() >= MAX_LIST_ENTRIES {
+                    return;
+                }
+
                 let mut channel = None;
                 let mut user_count = 0;
                 let mut topic = String::new();
@@ -1503,6 +1540,18 @@ impl IrcApp {
     fn add_message_to_channel(&mut self, channel: &str, msg: ChatMessage) {
         let is_new = !self.channels.contains_key(channel);
         if is_new {
+            // Cap auto-created query (non-channel) windows so a flood of messages
+            // from many distinct senders cannot grow `channels` without bound.
+            // Real channels you joined are exempt; over the cap we fall back to the
+            // server buffer instead of opening a new window.
+            if !is_channel(channel) {
+                const MAX_QUERY_WINDOWS: usize = 200;
+                let query_count = self.channels.keys().filter(|k| !is_channel(k)).count();
+                if query_count >= MAX_QUERY_WINDOWS {
+                    self.add_server_message(msg);
+                    return;
+                }
+            }
             let mut new_channel = Channel::new();
             // Load chat history for new query windows (non-channels)
             if self.logging_load_history && !is_channel(channel) {
@@ -1568,7 +1617,11 @@ impl IrcApp {
 
     pub fn send_command(&mut self, cmd: IrcCommand) {
         if let Some(tx) = &self.cmd_tx {
-            let _ = tx.try_send(cmd);
+            if let Err(e) = tx.try_send(cmd) {
+                // Surface rather than silently drop: a burst (e.g. /amsg to many
+                // channels) can momentarily fill the bounded outgoing channel.
+                tracing::warn!("Outgoing command dropped: {}", e);
+            }
         }
     }
 
@@ -1595,6 +1648,15 @@ impl IrcApp {
         if input.starts_with('/') {
             self.process_command(&input);
         } else if let Some(channel) = &self.current_channel.clone() {
+            // Don't echo a message we can't actually send: without a live
+            // connection the command channel is gone and the line would be lost.
+            if !self.connected || self.cmd_tx.is_none() {
+                self.add_message_to_current(ChatMessage::system(
+                    "Not connected - message not sent"
+                ));
+                return;
+            }
+
             // Auto-back: clear away status when user sends a message
             if self.away_status.is_some() {
                 self.send_command(IrcCommand::Away(None));
@@ -1714,8 +1776,10 @@ impl IrcApp {
     /// Handle CTCP request and send reply if applicable
     /// Returns true if the message was a CTCP request that was handled
     fn handle_ctcp_request(&mut self, sender: &str, content: &str) -> bool {
-        // CTCP messages start and end with \x01
-        if !content.starts_with('\x01') || !content.ends_with('\x01') {
+        // CTCP messages start and end with \x01. Require >= 2 bytes so the opening
+        // and closing delimiters are distinct; a lone "\x01" (first byte == last
+        // byte) would otherwise slice as content[1..0] and panic.
+        if content.len() < 2 || !content.starts_with('\x01') || !content.ends_with('\x01') {
             return false;
         }
 
@@ -1889,7 +1953,9 @@ impl IrcApp {
 }
 
 impl eframe::App for IrcApp {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    fn ui(&mut self, root_ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        let ctx = root_ui.ctx().clone();
+        let ctx = &ctx;
         // Reset frame state
         self.had_messages_this_frame = false;
 
@@ -2006,7 +2072,7 @@ impl eframe::App for IrcApp {
         }
 
         // Top panel - toolbar
-        egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
+        egui::Panel::top("toolbar").show_inside(root_ui, |ui| {
             ui.horizontal(|ui| {
                 ui.heading("Linefeed");
                 ui.separator();
@@ -2067,10 +2133,10 @@ impl eframe::App for IrcApp {
         });
 
         // Left panel - channel list
-        egui::SidePanel::left("channels")
+        egui::Panel::left("channels")
             .resizable(true)
-            .default_width(150.0)
-            .show(ctx, |ui| {
+            .default_size(150.0)
+            .show_inside(root_ui, |ui| {
                 ui.heading("Channels");
                 ui.separator();
 
@@ -2215,10 +2281,10 @@ impl eframe::App for IrcApp {
         if let Some(channel_name) = &self.current_channel {
             if is_channel(&channel_name) {
                 let chan_for_context = channel_name.clone();
-                egui::SidePanel::right("users")
+                egui::Panel::right("users")
                     .resizable(true)
-                    .default_width(140.0)
-                    .show(ctx, |ui| {
+                    .default_size(140.0)
+                    .show_inside(root_ui, |ui| {
                         if let Some(channel) = self.channels.get(&chan_for_context) {
                             // Show user count with away count if any
                             let away_count = channel.away_count();
@@ -2347,7 +2413,7 @@ impl eframe::App for IrcApp {
         }
 
         // Central panel - chat area
-        egui::CentralPanel::default().show(ctx, |ui| {
+        egui::CentralPanel::default().show_inside(root_ui, |ui| {
             // Channel header with modes and topic
             if let Some(channel_name) = &self.current_channel {
                 if let Some(channel) = self.channels.get(channel_name) {

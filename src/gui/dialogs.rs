@@ -215,6 +215,9 @@ impl IrcApp {
                                 auto_perform: self.auto_perform.clone(),
                                 sasl_username: self.sasl_username.clone(),
                                 sasl_password: self.sasl_password.clone(),
+                                username: self.username.clone(),
+                                realname: self.realname.clone(),
+                                accept_invalid_certs: self.accept_invalid_certs,
                             };
                             self.server_favorites.push(new_fav);
                             self.selected_favorite = Some(self.server_favorites.len() - 1);
@@ -533,7 +536,9 @@ impl IrcApp {
         ui.horizontal(|ui| {
             ui.label("Min users:");
             let mut min_users = self.list_min_users as i32;
-            ui.add(egui::DragValue::new(&mut min_users).speed(1).range(0..=100));
+            // Range must match the Channel List window's DragValue (0..=1000) so the
+            // shared list_min_users value is never silently clamped when switching UIs.
+            ui.add(egui::DragValue::new(&mut min_users).speed(1).range(0..=1000));
             self.list_min_users = min_users.max(0) as u32;
         });
         ui.label(RichText::new("Filter /list to channels with at least this many users (0 = all)").small().color(Color32::GRAY));

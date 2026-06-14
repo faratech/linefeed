@@ -5,15 +5,30 @@ pub fn is_channel(name: &str) -> bool {
     name.starts_with('#') || name.starts_with('&')
 }
 
-/// Convert a nick or mask to a proper ban mask
-/// If already contains !, @, or *, returns as-is
-/// Otherwise, converts "nick" to "nick!*@*"
+/// Convert a nick or partial mask into a complete `nick!user@host` ban mask.
+/// A full mask (a '!' followed later by an '@') is returned unchanged; partial
+/// forms like "nick", "nick@host", or "nick!user" are completed with `*`
+/// wildcards so the result is always a valid mask.
 pub fn nick_to_mask(arg: &str) -> String {
-    if arg.contains('!') || arg.contains('@') || arg.contains('*') {
-        arg.to_string()
-    } else {
-        format!("{}!*@*", arg)
+    fn or_star(s: &str) -> &str {
+        if s.is_empty() { "*" } else { s }
     }
+    // Already a full nick!user@host mask? Pass it through.
+    if let Some(bang) = arg.find('!') {
+        if arg[bang + 1..].contains('@') {
+            return arg.to_string();
+        }
+    }
+    // Split off an optional host, then an optional user, defaulting the rest to '*'.
+    let (nick_user, host) = match arg.split_once('@') {
+        Some((lhs, rhs)) => (lhs, rhs),
+        None => (arg, "*"),
+    };
+    let (nick, user) = match nick_user.split_once('!') {
+        Some((n, u)) => (n, u),
+        None => (nick_user, "*"),
+    };
+    format!("{}!{}@{}", or_star(nick), or_star(user), or_star(host))
 }
 
 /// Get current local time formatted according to preference
@@ -28,8 +43,16 @@ pub fn current_time_formatted(format: &str) -> String {
             .as_secs();
         let t = secs as libc::time_t;
         let mut tm: libc::tm = unsafe { std::mem::zeroed() };
-        unsafe { libc::localtime_r(&t, &mut tm) };
-        ((tm.tm_mon + 1) as u64, tm.tm_mday as u64, tm.tm_hour as u64, tm.tm_min as u64, tm.tm_sec as u64)
+        let res = unsafe { libc::localtime_r(&t, &mut tm) };
+        if res.is_null() {
+            // localtime_r failed; fall back to a UTC decomposition rather than
+            // formatting the zeroed tm (which would render as 1900/epoch garbage).
+            let days = secs / 86400;
+            let (_, m, d) = days_to_ymd(days);
+            (m as u64, d as u64, (secs % 86400) / 3600, (secs % 3600) / 60, secs % 60)
+        } else {
+            ((tm.tm_mon + 1) as u64, tm.tm_mday as u64, tm.tm_hour as u64, tm.tm_min as u64, tm.tm_sec as u64)
+        }
     };
 
     #[cfg(windows)]
@@ -120,45 +143,70 @@ pub fn truncate_chars(s: &str, max_chars: usize) -> String {
     }
 }
 
-/// Simple wildcard mask matching for ignore list
-/// Supports * (any chars) and ? (single char)
+/// Simple wildcard mask matching for ignore list.
+/// Supports `*` (any run of chars) and `?` (single char). Iterative two-pointer
+/// matcher with backtracking on the last `*` — no per-position allocation or
+/// recursion (the previous version cloned the remaining text and recursed at
+/// every position, which was quadratic/super-linear on adversarial input).
 pub fn mask_matches(pattern: &str, text: &str) -> bool {
-    let mut pattern_chars = pattern.chars().peekable();
-    let mut text_chars = text.chars().peekable();
+    let p: Vec<char> = pattern.chars().collect();
+    let t: Vec<char> = text.chars().collect();
+    let (mut pi, mut ti) = (0usize, 0usize);
+    let mut star: Option<usize> = None; // pattern index just after the last '*'
+    let mut star_ti = 0usize;           // text index when that '*' was taken
 
-    while let Some(p) = pattern_chars.next() {
-        match p {
-            '*' => {
-                // Skip consecutive wildcards
-                while pattern_chars.peek() == Some(&'*') {
-                    pattern_chars.next();
-                }
-                // If * is at end, match rest
-                if pattern_chars.peek().is_none() {
-                    return true;
-                }
-                // Try matching rest of pattern from each position
-                let remaining_pattern: String = pattern_chars.collect();
-                while text_chars.peek().is_some() {
-                    let remaining_text: String = text_chars.clone().collect();
-                    if mask_matches(&remaining_pattern, &remaining_text) {
-                        return true;
-                    }
-                    text_chars.next();
-                }
-                return mask_matches(&remaining_pattern, "");
-            }
-            '?' => {
-                if text_chars.next().is_none() {
-                    return false;
-                }
-            }
-            c => {
-                if text_chars.next() != Some(c) {
-                    return false;
-                }
-            }
+    while ti < t.len() {
+        if pi < p.len() && (p[pi] == '?' || p[pi] == t[ti]) {
+            pi += 1;
+            ti += 1;
+        } else if pi < p.len() && p[pi] == '*' {
+            star = Some(pi);
+            star_ti = ti;
+            pi += 1;
+        } else if let Some(s) = star {
+            // Backtrack: let the last '*' absorb one more text char.
+            pi = s + 1;
+            star_ti += 1;
+            ti = star_ti;
+        } else {
+            return false;
         }
     }
-    text_chars.peek().is_none()
+
+    // Any pattern remainder must be all '*' to match the now-exhausted text.
+    while pi < p.len() && p[pi] == '*' {
+        pi += 1;
+    }
+    pi == p.len()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn nick_to_mask_completes_partials() {
+        assert_eq!(nick_to_mask("nick"), "nick!*@*");
+        assert_eq!(nick_to_mask("nick!user@host"), "nick!user@host");
+        assert_eq!(nick_to_mask("nick@host"), "nick!*@host");
+        assert_eq!(nick_to_mask("nick!user"), "nick!user@*");
+        assert_eq!(nick_to_mask("*!*@*"), "*!*@*");
+        assert_eq!(nick_to_mask("*@host"), "*!*@host");
+    }
+
+    #[test]
+    fn mask_matches_globs() {
+        assert!(mask_matches("*", "anything"));
+        assert!(mask_matches("a*c", "abc"));
+        assert!(mask_matches("a*c", "ac"));
+        assert!(mask_matches("a?c", "abc"));
+        assert!(!mask_matches("a?c", "ac"));
+        assert!(mask_matches("nick!*@*", "nick!user@host"));
+        assert!(!mask_matches("nick!*@*", "other!user@host"));
+        assert!(mask_matches("*@*.example.com", "n!u@host.example.com"));
+        assert!(!mask_matches("abc", "abcd"));
+        assert!(mask_matches("", ""));
+        assert!(!mask_matches("", "x"));
+        assert!(mask_matches("**a", "a"));
+    }
 }

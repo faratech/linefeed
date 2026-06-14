@@ -64,8 +64,11 @@ pub enum IrcCommand {
     // Numeric replies (server responses)
     Numeric(u16, Vec<String>),
 
-    // CAP negotiation: (target, subcommand, params)
-    Cap(String, String, Option<String>),
+    // CAP negotiation: (target, subcommand, remaining params)
+    // For a multiline `CAP * LS * :caps` the remaining params are ["*", "caps"];
+    // for the final `CAP * LS :caps` they are ["caps"]. The trailing capability
+    // list is always the last element.
+    Cap(String, String, Vec<String>),
 
     // SASL authentication
     Authenticate(String),
@@ -196,7 +199,7 @@ impl IrcMessage {
             "CAP" => IrcCommand::Cap(
                 params.get(0).cloned().unwrap_or_default(),  // target (usually "*" or nick)
                 params.get(1).cloned().unwrap_or_default(),  // subcommand (LS, ACK, NAK, etc.)
-                params.get(2).cloned(),                       // params (capabilities list)
+                params.get(2..).map(|s| s.to_vec()).unwrap_or_default(),  // [continuation marker +] cap list
             ),
             "AUTHENTICATE" => IrcCommand::Authenticate(
                 params.get(0).cloned().unwrap_or_default(),
@@ -239,7 +242,7 @@ impl IrcMessage {
             for part in tags.split(';') {
                 if let Some((k, v)) = part.split_once('=') {
                     if k == key {
-                        return Some(v.to_string());
+                        return Some(unescape_tag_value(v));
                     }
                 } else if part == key {
                     return Some(String::new());
@@ -279,6 +282,34 @@ impl IrcMessage {
     pub fn get_batch(&self) -> Option<String> {
         self.get_tag("batch")
     }
+}
+
+/// Unescape an IRCv3 message-tag value per the spec
+/// (https://ircv3.net/specs/extensions/message-tags#escaping-values):
+/// `\:` -> `;`, `\s` -> space, `\r` -> CR, `\n` -> LF, `\\` -> `\`.
+/// A lone trailing backslash and unrecognized escapes drop the backslash.
+fn unescape_tag_value(value: &str) -> String {
+    if !value.contains('\\') {
+        return value.to_string();
+    }
+    let mut out = String::with_capacity(value.len());
+    let mut chars = value.chars();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            match chars.next() {
+                Some(':') => out.push(';'),
+                Some('s') => out.push(' '),
+                Some('r') => out.push('\r'),
+                Some('n') => out.push('\n'),
+                Some('\\') => out.push('\\'),
+                Some(other) => out.push(other),
+                None => {}
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
 }
 
 impl fmt::Display for IrcCommand {
@@ -426,12 +457,12 @@ impl fmt::Display for IrcCommand {
                     write!(f, "TRACE")
                 }
             }
-            IrcCommand::Cap(_target, sub, param) => {
+            IrcCommand::Cap(_target, sub, params) => {
                 // When sending CAP commands, we don't include target (server adds it)
-                if let Some(p) = param {
-                    write!(f, "CAP {} :{}", sub, p)
-                } else {
+                if params.is_empty() {
                     write!(f, "CAP {}", sub)
+                } else {
+                    write!(f, "CAP {} :{}", sub, params.join(" "))
                 }
             }
             IrcCommand::Authenticate(data) => write!(f, "AUTHENTICATE {}", data),
@@ -448,6 +479,53 @@ impl fmt::Display for IrcCommand {
                 write!(f, "{:03} {}", num, params.join(" "))
             }
             IrcCommand::Raw(raw) => write!(f, "{}", raw),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cap_ls_multiline_carries_continuation_marker_and_caps() {
+        // Continuation line: rest = ["*", caps]
+        let m = IrcMessage::parse(":srv CAP * LS * :multi-prefix sasl=PLAIN").unwrap();
+        match m.command {
+            IrcCommand::Cap(target, sub, rest) => {
+                assert_eq!(target, "*");
+                assert_eq!(sub, "LS");
+                assert_eq!(rest, vec!["*".to_string(), "multi-prefix sasl=PLAIN".to_string()]);
+            }
+            other => panic!("expected Cap, got {:?}", other),
+        }
+        // Final line: rest = [caps]
+        let m = IrcMessage::parse(":srv CAP * LS :away-notify").unwrap();
+        if let IrcCommand::Cap(_, sub, rest) = m.command {
+            assert_eq!(sub, "LS");
+            assert_eq!(rest, vec!["away-notify".to_string()]);
+        } else {
+            panic!("expected Cap");
+        }
+    }
+
+    #[test]
+    fn tag_values_are_unescaped() {
+        // wire: k1=a\sb -> "a b"; k2=x\:y -> "x;y"; k3 (no value) -> ""
+        let m = IrcMessage::parse("@k1=a\\sb;k2=x\\:y;k3 PRIVMSG #c :hi").unwrap();
+        assert_eq!(m.get_tag("k1").as_deref(), Some("a b"));
+        assert_eq!(m.get_tag("k2").as_deref(), Some("x;y"));
+        assert_eq!(m.get_tag("k3").as_deref(), Some(""));
+        assert_eq!(m.get_tag("missing"), None);
+    }
+
+    #[test]
+    fn lone_ctcp_byte_notice_parses() {
+        let m = IrcMessage::parse(":x NOTICE me :\u{0001}").unwrap();
+        if let IrcCommand::Notice(_, content) = m.command {
+            assert_eq!(content, "\u{0001}");
+        } else {
+            panic!("expected Notice");
         }
     }
 }

@@ -5,18 +5,89 @@ use base64::prelude::*;
 
 use super::message::{IrcCommand, IrcMessage};
 
+/// Maximum bytes we will buffer for a single line from the server. Classic IRC
+/// lines are 512 bytes; IRCv3 message tags and long CAP LS lists raise this, so
+/// we allow generous headroom. A server that never sends a newline cannot grow
+/// our read buffer past this bound.
+const MAX_LINE_LEN: usize = 16 * 1024;
+
+/// Read bytes up to and including the next `\n` into `buf`, enforcing an upper
+/// bound so a newline-less flood cannot exhaust memory. Returns the number of
+/// bytes buffered (0 only at EOF with nothing pending). If `max` is reached
+/// before a newline, returns `InvalidData` so the caller drops the connection.
+async fn read_until_lf_bounded<R: tokio::io::AsyncBufRead + Unpin>(
+    reader: &mut R,
+    buf: &mut Vec<u8>,
+    max: usize,
+) -> std::io::Result<usize> {
+    buf.clear();
+    loop {
+        let available = reader.fill_buf().await?;
+        if available.is_empty() {
+            return Ok(buf.len()); // EOF (buf may hold a partial, newline-less line)
+        }
+        if let Some(i) = available.iter().position(|&b| b == b'\n') {
+            buf.extend_from_slice(&available[..=i]);
+            reader.consume(i + 1);
+            return Ok(buf.len());
+        }
+        let n = available.len();
+        buf.extend_from_slice(available);
+        reader.consume(n);
+        if buf.len() > max {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "IRC line exceeded maximum length",
+            ));
+        }
+    }
+}
+
 /// Read a line from the reader, handling non-UTF8 data gracefully
 async fn read_line_lossy<R: tokio::io::AsyncBufRead + Unpin>(
     reader: &mut R,
     buf: &mut Vec<u8>,
 ) -> std::io::Result<usize> {
-    buf.clear();
-    reader.read_until(b'\n', buf).await
+    read_until_lf_bounded(reader, buf, MAX_LINE_LEN).await
 }
 
 /// Convert bytes to string with lossy UTF-8 conversion
 fn bytes_to_string_lossy(buf: &[u8]) -> String {
     String::from_utf8_lossy(buf).trim().to_string()
+}
+
+/// Read the next protocol message during the registration handshake: parse it,
+/// forward a copy to the GUI, and transparently answer server PINGs (which can
+/// arrive mid-handshake, before the writer task that normally handles them
+/// exists). Loops until it has a non-PING message to return, or errors if the
+/// connection closes.
+async fn read_handshake_msg<W, R>(
+    writer: &mut W,
+    reader: &mut R,
+    buf: &mut Vec<u8>,
+    incoming_tx: &mpsc::Sender<IrcMessage>,
+) -> Result<IrcMessage, Box<dyn std::error::Error + Send + Sync>>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+    R: tokio::io::AsyncBufRead + Unpin,
+{
+    loop {
+        if read_line_lossy(reader, buf).await? == 0 {
+            return Err("Connection closed during registration".into());
+        }
+        let trimmed = bytes_to_string_lossy(buf);
+        tracing::debug!("< {}", trimmed);
+        if let Some(msg) = IrcMessage::parse(&trimmed) {
+            let _ = incoming_tx.try_send(msg.clone());
+            if let IrcCommand::Ping(token) = &msg.command {
+                let pong = format!("PONG :{}\r\n", token);
+                writer.write_all(pong.as_bytes()).await?;
+                writer.flush().await?;
+                continue;
+            }
+            return Ok(msg);
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -319,54 +390,46 @@ impl IrcClient {
         let mut available_caps = String::new();
 
         loop {
-            if read_line_lossy(reader, &mut buf).await? == 0 {
-                return Err("Connection closed during CAP negotiation".into());
-            }
-            let trimmed = bytes_to_string_lossy(&buf);
-            tracing::debug!("< {}", trimmed);
+            let msg = read_handshake_msg(writer, reader, &mut buf, incoming_tx).await?;
 
-            if let Some(msg) = IrcMessage::parse(&trimmed) {
-                let _ = incoming_tx.try_send(msg.clone());
-
-                if let IrcCommand::Cap(_target, subcmd, params) = &msg.command {
-                    if subcmd == "LS" {
-                        if let Some(caps) = params {
-                            available_caps.push_str(caps);
-                            available_caps.push(' ');
-                        }
-                        break;  // Got final LS response
-                    } else if subcmd == "*" {
-                        // Multi-line CAP LS - params contains "LS <caps>"
-                        if let Some(rest) = params {
-                            // Extract caps after "LS " if present
-                            let caps_part = if rest.starts_with("LS ") {
-                                &rest[3..]
-                            } else {
-                                rest.as_str()
-                            };
-                            available_caps.push_str(caps_part);
-                            available_caps.push(' ');
-                        }
-                        // Don't break - wait for final LS
+            if let IrcCommand::Cap(_target, subcmd, rest) = &msg.command {
+                if subcmd == "LS" {
+                    // Multiline form `CAP * LS * :caps` -> rest = ["*", caps];
+                    // final form `CAP * LS :caps`       -> rest = [caps].
+                    let (is_more, caps) = match rest.first().map(String::as_str) {
+                        Some("*") => (true, rest.get(1)),
+                        _ => (false, rest.first()),
+                    };
+                    if let Some(c) = caps {
+                        available_caps.push_str(c);
+                        available_caps.push(' ');
+                    }
+                    if !is_more {
+                        break; // got the final LS line
                     }
                 }
             }
         }
 
-        let available_lower = available_caps.to_lowercase();
+        // Match capabilities by whitespace-delimited token (stripping any `=value`
+        // suffix) so e.g. "sasl" does not spuriously match "no-sasl".
+        let available_tokens: std::collections::HashSet<String> = available_caps
+            .split_whitespace()
+            .map(|t| t.split('=').next().unwrap_or(t).to_ascii_lowercase())
+            .collect();
         tracing::info!("Server capabilities: {}", available_caps.trim());
 
         // Step 3: Build list of capabilities to request
         let mut caps_to_request: Vec<&str> = Vec::new();
 
         for cap in DESIRED_CAPS {
-            if available_lower.contains(*cap) {
+            if available_tokens.contains(*cap) {
                 caps_to_request.push(cap);
             }
         }
 
         // Add SASL if available and we want it
-        let sasl_available = available_lower.contains("sasl");
+        let sasl_available = available_tokens.contains("sasl");
         if want_sasl && sasl_available {
             caps_to_request.push("sasl");
         }
@@ -394,39 +457,35 @@ impl IrcClient {
         // Step 5: Wait for CAP ACK/NAK
         let mut acked_caps = String::new();
         loop {
-            if read_line_lossy(reader, &mut buf).await? == 0 {
-                return Err("Connection closed during CAP negotiation".into());
-            }
-            let trimmed = bytes_to_string_lossy(&buf);
-            tracing::debug!("< {}", trimmed);
+            let msg = read_handshake_msg(writer, reader, &mut buf, incoming_tx).await?;
 
-            if let Some(msg) = IrcMessage::parse(&trimmed) {
-                let _ = incoming_tx.try_send(msg.clone());
-
-                if let IrcCommand::Cap(_target, subcmd, params) = &msg.command {
-                    if subcmd == "ACK" {
-                        if let Some(caps) = params {
-                            acked_caps = caps.clone();
-                        }
-                        break;
-                    } else if subcmd == "NAK" {
-                        let _ = incoming_tx.try_send(IrcMessage {
-                            tags: None,
-                            prefix: None,
-                            command: IrcCommand::Notice("*".to_string(), "Server rejected some capabilities".to_string()),
-                            raw: String::new(),
-                        });
-                        break;
+            if let IrcCommand::Cap(_target, subcmd, rest) = &msg.command {
+                if subcmd == "ACK" {
+                    // The trailing element is the acked cap list (after any "*" marker).
+                    if let Some(caps) = rest.last() {
+                        acked_caps = caps.clone();
                     }
+                    break;
+                } else if subcmd == "NAK" {
+                    let _ = incoming_tx.try_send(IrcMessage {
+                        tags: None,
+                        prefix: None,
+                        command: IrcCommand::Notice("*".to_string(), "Server rejected some capabilities".to_string()),
+                        raw: String::new(),
+                    });
+                    break;
                 }
             }
         }
 
-        let acked_lower = acked_caps.to_lowercase();
+        let acked_tokens: std::collections::HashSet<String> = acked_caps
+            .split_whitespace()
+            .map(|t| t.split('=').next().unwrap_or(t).to_ascii_lowercase())
+            .collect();
         tracing::info!("Enabled capabilities: {}", acked_caps);
 
         // Step 6: If SASL was ACKed and we want it, do SASL authentication
-        if want_sasl && acked_lower.contains("sasl") {
+        if want_sasl && acked_tokens.contains("sasl") {
             self.do_sasl_auth_inner(writer, reader, incoming_tx).await?;
         } else if want_sasl && !sasl_available {
             let _ = incoming_tx.try_send(IrcMessage {
@@ -439,7 +498,7 @@ impl IrcClient {
 
         // Report enabled capabilities
         let enabled: Vec<&str> = DESIRED_CAPS.iter()
-            .filter(|cap| acked_lower.contains(*cap))
+            .filter(|cap| acked_tokens.contains(**cap))
             .copied()
             .collect();
         if !enabled.is_empty() {
@@ -491,65 +550,69 @@ impl IrcClient {
 
         // Wait for AUTHENTICATE +
         loop {
-            if read_line_lossy(reader, &mut buf).await? == 0 {
-                return Err("Connection closed during SASL".into());
-            }
-            let trimmed = bytes_to_string_lossy(&buf);
-            tracing::debug!("< {}", trimmed);
-
-            if let Some(msg) = IrcMessage::parse(&trimmed) {
-                let _ = incoming_tx.try_send(msg.clone());
-
-                if let IrcCommand::Authenticate(data) = &msg.command {
-                    if data == "+" {
-                        break;
-                    }
+            let msg = read_handshake_msg(writer, reader, &mut buf, incoming_tx).await?;
+            if let IrcCommand::Authenticate(data) = &msg.command {
+                if data == "+" {
+                    break;
                 }
             }
         }
 
-        // Send credentials (base64 of \0username\0password)
+        // Send credentials (base64 of \0username\0password), split into <=400-byte
+        // AUTHENTICATE lines per the SASL-over-IRC spec. A payload whose length is an
+        // exact multiple of 400 is terminated with an empty `AUTHENTICATE +`.
         let credentials = format!("\0{}\0{}", sasl_user, sasl_pass);
         let encoded = BASE64_STANDARD.encode(credentials.as_bytes());
-        let auth_creds = format!("AUTHENTICATE {}\r\n", encoded);
         tracing::debug!("> AUTHENTICATE <credentials>");
-        writer.write_all(auth_creds.as_bytes()).await?;
+        let bytes = encoded.as_bytes();
+        if bytes.is_empty() {
+            writer.write_all(b"AUTHENTICATE +\r\n").await?;
+        } else {
+            let mut pos = 0;
+            loop {
+                let end = (pos + 400).min(bytes.len());
+                let chunk = &bytes[pos..end];
+                writer.write_all(b"AUTHENTICATE ").await?;
+                writer.write_all(chunk).await?;
+                writer.write_all(b"\r\n").await?;
+                pos = end;
+                if chunk.len() < 400 {
+                    break;
+                }
+                if pos == bytes.len() {
+                    writer.write_all(b"AUTHENTICATE +\r\n").await?;
+                    break;
+                }
+            }
+        }
         writer.flush().await?;
 
-        // Wait for 903 (success) or 904 (failure)
+        // Wait for 903 (success) or 904/905/906 (failure)
         loop {
-            if read_line_lossy(reader, &mut buf).await? == 0 {
-                return Err("Connection closed during SASL".into());
-            }
-            let trimmed = bytes_to_string_lossy(&buf);
-            tracing::debug!("< {}", trimmed);
+            let msg = read_handshake_msg(writer, reader, &mut buf, incoming_tx).await?;
 
-            if let Some(msg) = IrcMessage::parse(&trimmed) {
-                let _ = incoming_tx.try_send(msg.clone());
-
-                if let IrcCommand::Numeric(num, _params) = &msg.command {
-                    match *num {
-                        903 => {
-                            let _ = incoming_tx.try_send(IrcMessage {
-                                tags: None,
-                                prefix: None,
-                                command: IrcCommand::Notice("*".to_string(), "SASL authentication successful!".to_string()),
-                                raw: String::new(),
-                            });
-                            return Ok(());
-                        }
-                        904 | 905 | 906 => {
-                            let _ = incoming_tx.try_send(IrcMessage {
-                                tags: None,
-                                prefix: None,
-                                command: IrcCommand::Notice("*".to_string(), "SASL authentication failed!".to_string()),
-                                raw: String::new(),
-                            });
-                            return Ok(());
-                        }
-                        900 => continue,  // RPL_LOGGEDIN
-                        _ => {}
+            if let IrcCommand::Numeric(num, _params) = &msg.command {
+                match *num {
+                    903 => {
+                        let _ = incoming_tx.try_send(IrcMessage {
+                            tags: None,
+                            prefix: None,
+                            command: IrcCommand::Notice("*".to_string(), "SASL authentication successful!".to_string()),
+                            raw: String::new(),
+                        });
+                        return Ok(());
                     }
+                    904 | 905 | 906 => {
+                        let _ = incoming_tx.try_send(IrcMessage {
+                            tags: None,
+                            prefix: None,
+                            command: IrcCommand::Notice("*".to_string(), "SASL authentication failed!".to_string()),
+                            raw: String::new(),
+                        });
+                        return Ok(());
+                    }
+                    900 => continue,  // RPL_LOGGEDIN
+                    _ => {}
                 }
             }
         }
@@ -562,9 +625,9 @@ impl IrcClient {
     ) {
         let mut buf = Vec::with_capacity(2048);
         loop {
-            buf.clear();
-            // Read bytes until newline to handle non-UTF8 encodings (common on older IRC networks)
-            match reader.read_until(b'\n', &mut buf).await {
+            // Read bytes until newline to handle non-UTF8 encodings (common on older
+            // IRC networks); bounded so a newline-less flood cannot exhaust memory.
+            match read_until_lf_bounded(&mut reader, &mut buf, MAX_LINE_LEN).await {
                 Ok(0) => {
                     tracing::info!("Connection closed by server (EOF)");
                     let _ = incoming_tx.try_send(IrcMessage {
@@ -577,6 +640,18 @@ impl IrcClient {
                 }
                 Ok(n) => {
                     tracing::trace!("Read {} bytes", n);
+                    if !buf.ends_with(b"\n") {
+                        // EOF reached mid-line: the trailing fragment is an incomplete
+                        // message, so discard it rather than parsing a truncated line.
+                        tracing::info!("Connection closed by server (partial line discarded)");
+                        let _ = incoming_tx.try_send(IrcMessage {
+                            tags: None,
+                            prefix: None,
+                            command: IrcCommand::Notice("*".to_string(), "Connection closed by server".to_string()),
+                            raw: String::new(),
+                        });
+                        break;
+                    }
                     // Convert to UTF-8 lossily (replaces invalid sequences with replacement char)
                     let line = String::from_utf8_lossy(&buf);
                     let trimmed = line.trim();
@@ -590,9 +665,12 @@ impl IrcClient {
                                     let _ = tx.try_send(pong);
                                 }
                             }
-                            // Use try_send to never block the read loop
-                            if incoming_tx.try_send(msg).is_err() {
-                                tracing::warn!("Message buffer full, dropping message");
+                            // Awaiting send applies backpressure (and naturally throttles
+                            // our socket reads) instead of silently dropping messages when
+                            // the GUI is briefly behind.
+                            if incoming_tx.send(msg).await.is_err() {
+                                tracing::warn!("GUI receiver dropped; stopping read loop");
+                                break;
                             }
                         }
                     }

@@ -38,6 +38,8 @@ static TRAY_ICON_ADDED: AtomicBool = AtomicBool::new(false);
 
 // Store NID fields we need for cleanup (avoiding Send issues with raw pointers)
 static NID_HWND: AtomicPtr<std::ffi::c_void> = AtomicPtr::new(std::ptr::null_mut());
+// Handle of the icon we created, so we can DestroyIcon it on teardown.
+static TRAY_HICON: AtomicPtr<std::ffi::c_void> = AtomicPtr::new(std::ptr::null_mut());
 
 fn find_main_window() -> Option<HWND> {
     unsafe {
@@ -172,7 +174,12 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
 
 unsafe fn show_context_menu(hwnd: HWND) {
     unsafe {
-        let menu = CreatePopupMenu().unwrap();
+        // Don't unwrap inside this extern "system" callback path: a panic would
+        // unwind across the FFI boundary (UB). Bail out gracefully on failure.
+        let menu = match CreatePopupMenu() {
+            Ok(m) => m,
+            Err(_) => return,
+        };
 
         // Add menu items
         let show_text: Vec<u16> = "Show Linefeed\0".encode_utf16().collect();
@@ -322,6 +329,10 @@ pub fn create_tray_icon() -> bool {
 
     // Create the icon - if it fails, use a default
     let hicon = create_icon();
+    if let Some(icon) = hicon {
+        // Remember the handle so destroy_tray_icon can free it (HICON is Copy).
+        TRAY_HICON.store(icon.0 as *mut _, Ordering::SeqCst);
+    }
 
     unsafe {
         let mut nid = NOTIFYICONDATAW {
@@ -334,13 +345,17 @@ pub fn create_tray_icon() -> bool {
             ..Default::default()
         };
 
-        // Set tooltip
+        // Set tooltip. Copy the array out by value first: NOTIFYICONDATAW is
+        // packed on some targets (e.g. i686), so taking a reference to the
+        // szTip field directly is unaligned (E0793).
+        let mut sztip = nid.szTip;
         let tip = "Linefeed";
         for (i, c) in tip.encode_utf16().enumerate() {
-            if i < nid.szTip.len() - 1 {
-                nid.szTip[i] = c;
+            if i < sztip.len() - 1 {
+                sztip[i] = c;
             }
         }
+        nid.szTip = sztip;
 
         if Shell_NotifyIconW(NIM_ADD, &nid).as_bool() {
             TRAY_ICON_ADDED.store(true, Ordering::SeqCst);
@@ -382,6 +397,15 @@ pub fn destroy_tray_icon() {
             }
         }
         TRAY_ICON_ADDED.store(false, Ordering::SeqCst);
+    }
+
+    // Free the icon resource we created, after it has been removed from the tray.
+    let icon_ptr = TRAY_HICON.swap(std::ptr::null_mut(), Ordering::SeqCst);
+    if !icon_ptr.is_null() {
+        unsafe {
+            use windows::Win32::UI::WindowsAndMessaging::{DestroyIcon, HICON};
+            let _ = DestroyIcon(HICON(icon_ptr as *mut _));
+        }
     }
 
     let hwnd_ptr = MSG_HWND.swap(std::ptr::null_mut(), Ordering::SeqCst);

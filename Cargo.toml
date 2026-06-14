@@ -7,31 +7,31 @@ license = "MIT"
 
 [dependencies]
 # GUI (no default_fonts - we load custom fonts)
-egui = "0.33.3"
+egui = "0.34.3"
 
 # Async runtime (minimal features for lower memory)
-tokio = { version = "1.48.0", features = ["rt", "net", "io-util", "sync", "time", "macros"] }
+tokio = { version = "1.52.3", features = ["rt", "net", "io-util", "sync", "time", "macros"] }
 
 # TLS (uses OS native: SChannel on Windows, OpenSSL on Linux)
 tokio-native-tls = "0.3.1"
-native-tls = "0.2.14"  # for TlsConnector::builder()
+native-tls = "0.2.18"  # for TlsConnector::builder()
 
 # Utilities
 serde = { version = "1.0.228", features = ["derive"] }
-serde_json = "1.0.148"
+serde_json = "1.0.150"
 tracing = "0.1.44"
-tracing-subscriber = { version = "0.3.22", default-features = false, features = ["fmt", "std"] }
+tracing-subscriber = { version = "0.3.23", default-features = false, features = ["fmt", "std"] }
 dirs = "6.0.0"
 base64 = "0.22.1"  # For SASL authentication
-mimalloc = { version = "0.1.48", default-features = false }  # Lower memory allocator
+mimalloc = { version = "0.1.52", default-features = false }  # Lower memory allocator
 
 # Platform-specific: eframe with x11/wayland only on Linux
 [target.'cfg(target_os = "linux")'.dependencies]
-eframe = { version = "0.33.3", default-features = false, features = ["glow", "persistence", "x11", "wayland"] }
-libc = "1.0.0-alpha.1"
+eframe = { version = "0.34.3", default-features = false, features = ["glow", "persistence", "x11", "wayland"] }
+libc = "0.2"
 
 [target.'cfg(not(target_os = "linux"))'.dependencies]
-eframe = { version = "0.33.3", default-features = false, features = ["glow", "persistence"] }
+eframe = { version = "0.34.3", default-features = false, features = ["glow", "persistence"] }
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.62.2", features = [

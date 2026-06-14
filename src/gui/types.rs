@@ -37,6 +37,13 @@ pub struct ServerFavorite {
     pub sasl_username: String,
     #[serde(default)]
     pub sasl_password: String,
+    // Connection details that were previously dropped when saving a favorite
+    #[serde(default)]
+    pub username: String,
+    #[serde(default)]
+    pub realname: String,
+    #[serde(default)]
+    pub accept_invalid_certs: bool,
 }
 
 /// Persistent settings
@@ -369,6 +376,11 @@ impl Channel {
 
     pub fn add_user(&mut self, nick: &str, mode: UserMode) {
         let clean_nick = nick.trim_start_matches(|c| c == '~' || c == '&' || c == '@' || c == '%' || c == '+');
+        // Ignore tokens that are only mode prefixes (e.g. a stray "@"): they would
+        // otherwise insert a blank-nick, unremovable user into the list.
+        if clean_nick.is_empty() {
+            return;
+        }
         if !self.users.iter().any(|u| u.nick.eq_ignore_ascii_case(clean_nick)) {
             self.users.push(ChannelUser::new(clean_nick.to_string(), mode));
             self.sort_users();
@@ -380,9 +392,30 @@ impl Channel {
     }
 
     pub fn rename_user(&mut self, old_nick: &str, new_nick: &str) {
+        // If the target nick already exists as a different user, drop the old entry
+        // rather than creating a duplicate (can happen with out-of-order NICK/JOIN).
+        // A pure case change of the same nick still falls through to the rename.
+        if !old_nick.eq_ignore_ascii_case(new_nick)
+            && self.users.iter().any(|u| u.nick.eq_ignore_ascii_case(new_nick))
+        {
+            self.users.retain(|u| !u.nick.eq_ignore_ascii_case(old_nick));
+            self.sort_users();
+            return;
+        }
         if let Some(user) = self.users.iter_mut().find(|u| u.nick.eq_ignore_ascii_case(old_nick)) {
             user.nick = new_nick.to_string();
             self.sort_users();
+        }
+    }
+
+    /// Append a message, trimming the scrollback to at most `max` messages.
+    /// Used by callers that push directly to `messages` (e.g. Quit/Nick loops
+    /// over all channels) so they respect the same cap as add_message_to_channel.
+    pub fn push_trimmed(&mut self, msg: ChatMessage, max: usize) {
+        self.messages.push(msg);
+        if max > 0 && self.messages.len() > max {
+            let excess = self.messages.len() - max;
+            self.messages.drain(0..excess);
         }
     }
 

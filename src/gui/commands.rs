@@ -28,18 +28,29 @@ impl IrcApp {
             }
 
             "PART" | "LEAVE" => {
-                let channel = if args.is_empty() {
-                    self.current_channel.clone()
+                // Forms: "/part", "/part #chan", "/part #chan reason", "/part reason".
+                // Split off a leading channel token; otherwise treat args as a reason
+                // for the current channel (so the channel field never contains spaces).
+                let (channel, inline_reason) = if args.is_empty() {
+                    (self.current_channel.clone(), None)
                 } else {
-                    Some(args.to_string())
+                    let mut it = args.splitn(2, ' ');
+                    let first = it.next().unwrap_or("");
+                    if is_channel(first) {
+                        (Some(first.to_string()), it.next().map(|r| r.to_string()))
+                    } else {
+                        (self.current_channel.clone(), Some(args.to_string()))
+                    }
                 };
                 if let Some(ch) = channel {
-                    // Use custom part message if set and no explicit message given
-                    let reason = if !self.part_message.is_empty() {
-                        Some(self.part_message.clone())
-                    } else {
-                        None
-                    };
+                    // Inline reason wins, else the configured part message (if any).
+                    let reason = inline_reason.or_else(|| {
+                        if self.part_message.is_empty() {
+                            None
+                        } else {
+                            Some(self.part_message.clone())
+                        }
+                    });
                     self.send_command(IrcCommand::Part(ch, reason));
                 }
             }
@@ -50,6 +61,8 @@ impl IrcApp {
                     self.send_command(IrcCommand::Privmsg(target.to_string(), message.to_string()));
                     let chat_msg = ChatMessage::new(&self.my_nick, message);
                     self.add_message_to_channel(target, chat_msg);
+                } else {
+                    self.add_message_to_current(ChatMessage::system("Usage: /msg <target> <message>"));
                 }
             }
 
@@ -79,7 +92,9 @@ impl IrcApp {
             }
 
             "ME" => {
-                if let Some(channel) = &self.current_channel.clone() {
+                if args.is_empty() {
+                    self.add_message_to_current(ChatMessage::system("Usage: /me <action>"));
+                } else if let Some(channel) = &self.current_channel.clone() {
                     let action = format!("\x01ACTION {}\x01", args);
                     self.send_command(IrcCommand::Privmsg(channel.clone(), action));
                     let msg = ChatMessage::action(&self.my_nick, args);
@@ -100,7 +115,13 @@ impl IrcApp {
             }
 
             "NICK" => {
-                self.send_command(IrcCommand::Nick(args.to_string()));
+                // NICK takes a single token; reject empty and ignore trailing words.
+                let new_nick = args.split_whitespace().next().unwrap_or("");
+                if new_nick.is_empty() {
+                    self.add_message_to_current(ChatMessage::system("Usage: /nick <newnick>"));
+                } else {
+                    self.send_command(IrcCommand::Nick(new_nick.to_string()));
+                }
             }
 
             "TOPIC" => {
@@ -270,6 +291,12 @@ impl IrcApp {
                 ));
             }
 
+            // Catch the cases the guarded PING arm above rejects (empty target, or a
+            // channel-like target) instead of falling through to "Unknown command".
+            "PING" => {
+                self.add_message_to_current(ChatMessage::system("Usage: /ping <nick>"));
+            }
+
             "CLEAR" => {
                 if let Some(channel) = &self.current_channel {
                     if let Some(ch) = self.channels.get_mut(channel) {
@@ -339,17 +366,14 @@ impl IrcApp {
 
             "KICK" | "K" => {
                 let parts: Vec<&str> = args.splitn(2, ' ').collect();
-                if let Some(nick) = parts.get(0) {
-                    if !nick.is_empty() {
-                        if let Some(channel) = &self.current_channel.clone() {
-                            if is_channel(channel) {
-                                let reason = parts.get(1).map(|s| s.to_string());
-                                self.send_command(IrcCommand::Kick(channel.clone(), nick.to_string(), reason));
-                            }
-                        }
-                    }
-                } else {
+                let nick = parts.get(0).copied().unwrap_or("");
+                if nick.is_empty() {
                     self.add_message_to_current(ChatMessage::system("Usage: /kick <nick> [reason]"));
+                } else if let Some(channel) = &self.current_channel.clone() {
+                    if is_channel(channel) {
+                        let reason = parts.get(1).map(|s| s.to_string());
+                        self.send_command(IrcCommand::Kick(channel.clone(), nick.to_string(), reason));
+                    }
                 }
             }
 
@@ -385,20 +409,17 @@ impl IrcApp {
 
             "KICKBAN" | "KB" => {
                 let parts: Vec<&str> = args.splitn(2, ' ').collect();
-                if let Some(nick) = parts.get(0) {
-                    if !nick.is_empty() {
-                        if let Some(channel) = &self.current_channel.clone() {
-                            if is_channel(channel) {
-                                // Ban first, then kick
-                                let mask = format!("{}!*@*", nick);
-                                self.send_command(IrcCommand::Mode(channel.clone(), Some("+b".to_string()), Some(mask)));
-                                let reason = parts.get(1).map(|s| s.to_string());
-                                self.send_command(IrcCommand::Kick(channel.clone(), nick.to_string(), reason));
-                            }
-                        }
-                    }
-                } else {
+                let nick = parts.get(0).copied().unwrap_or("");
+                if nick.is_empty() {
                     self.add_message_to_current(ChatMessage::system("Usage: /kickban <nick> [reason]"));
+                } else if let Some(channel) = &self.current_channel.clone() {
+                    if is_channel(channel) {
+                        // Ban first, then kick
+                        let mask = format!("{}!*@*", nick);
+                        self.send_command(IrcCommand::Mode(channel.clone(), Some("+b".to_string()), Some(mask)));
+                        let reason = parts.get(1).map(|s| s.to_string());
+                        self.send_command(IrcCommand::Kick(channel.clone(), nick.to_string(), reason));
+                    }
                 }
             }
 
@@ -617,16 +638,15 @@ impl IrcApp {
 
             "INVITE" => {
                 let parts: Vec<&str> = args.splitn(2, ' ').collect();
-                if let Some(nick) = parts.get(0) {
-                    let channel = parts.get(1).map(|s| s.to_string())
-                        .or_else(|| self.current_channel.clone())
-                        .unwrap_or_default();
-                    if !nick.is_empty() && !channel.is_empty() {
-                        self.send_command(IrcCommand::Invite(nick.to_string(), channel.clone()));
-                        self.add_message_to_current(ChatMessage::system(&format!("Inviting {} to {}", nick, channel)));
-                    }
-                } else {
+                let nick = parts.get(0).copied().unwrap_or("");
+                let channel = parts.get(1).map(|s| s.to_string())
+                    .or_else(|| self.current_channel.clone())
+                    .unwrap_or_default();
+                if nick.is_empty() || channel.is_empty() {
                     self.add_message_to_current(ChatMessage::system("Usage: /invite <nick> [#channel]"));
+                } else {
+                    self.send_command(IrcCommand::Invite(nick.to_string(), channel.clone()));
+                    self.add_message_to_current(ChatMessage::system(&format!("Inviting {} to {}", nick, channel)));
                 }
             }
 

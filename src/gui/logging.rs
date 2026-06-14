@@ -10,6 +10,9 @@ use super::helpers::days_to_ymd;
 pub struct LogManager {
     log_dir: PathBuf,
     enabled: bool,
+    /// Cache of open append writers, keyed by file path, so we don't re-open the
+    /// file (and re-create its directory) on every logged line.
+    writers: std::cell::RefCell<std::collections::HashMap<PathBuf, std::io::BufWriter<File>>>,
 }
 
 impl LogManager {
@@ -19,7 +22,39 @@ impl LogManager {
             .map(|p| p.join("linefeed").join("logs"))
             .unwrap_or_else(|| PathBuf::from("logs"));
 
-        Self { log_dir, enabled }
+        Self {
+            log_dir,
+            enabled,
+            writers: std::cell::RefCell::new(std::collections::HashMap::new()),
+        }
+    }
+
+    /// Get-or-open a buffered append writer for `path`, run `f` on it, then flush.
+    /// Keeping the handle open removes the per-message `create_dir_all` + open +
+    /// close syscalls from the hot path (called for every incoming message).
+    fn with_writer<F: FnOnce(&mut std::io::BufWriter<File>)>(&self, path: PathBuf, f: F) {
+        use std::collections::hash_map::Entry;
+        let mut writers = self.writers.borrow_mut();
+        let writer = match writers.entry(path.clone()) {
+            Entry::Occupied(e) => e.into_mut(),
+            Entry::Vacant(v) => {
+                if let Some(parent) = path.parent() {
+                    if let Err(e) = fs::create_dir_all(parent) {
+                        tracing::error!("Failed to create log directory: {}", e);
+                        return;
+                    }
+                }
+                match OpenOptions::new().create(true).append(true).open(&path) {
+                    Ok(file) => v.insert(std::io::BufWriter::new(file)),
+                    Err(e) => {
+                        tracing::error!("Failed to open log file {:?}: {}", path, e);
+                        return;
+                    }
+                }
+            }
+        };
+        f(writer);
+        let _ = writer.flush();
     }
 
     /// Get the log file path for a channel/query
@@ -37,33 +72,13 @@ impl LogManager {
         }
 
         let path = self.log_path(network, channel);
-
-        // Ensure directory exists
-        if let Some(parent) = path.parent() {
-            if let Err(e) = fs::create_dir_all(parent) {
-                tracing::error!("Failed to create log directory: {}", e);
-                return;
-            }
-        }
-
-        // Open file in append mode
-        let mut file = match OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)
-        {
-            Ok(f) => f,
-            Err(e) => {
-                tracing::error!("Failed to open log file {:?}: {}", path, e);
-                return;
-            }
-        };
-
         // Format message (irssi-style)
         let line = format_log_line(msg);
-        if let Err(e) = writeln!(file, "{}", line) {
-            tracing::error!("Failed to write to log: {}", e);
-        }
+        self.with_writer(path, |w| {
+            if let Err(e) = writeln!(w, "{}", line) {
+                tracing::error!("Failed to write to log: {}", e);
+            }
+        });
     }
 
     /// Load recent history from a log file (reads from end to avoid loading entire file)
@@ -111,30 +126,35 @@ impl LogManager {
         }
 
         let path = self.log_path(network, channel);
-
-        if let Some(parent) = path.parent() {
-            let _ = fs::create_dir_all(parent);
-        }
-
-        if let Ok(mut file) = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)
-        {
-            let now = current_datetime_string();
-            let _ = writeln!(file, "--- Log opened {}", now);
-        }
+        let now = current_datetime_string();
+        self.with_writer(path, |w| {
+            let _ = writeln!(w, "--- Log opened {}", now);
+        });
     }
 }
 
 /// Sanitize a string for use as a filename
 fn sanitize_filename(name: &str) -> String {
-    name.chars()
+    let mapped: String = name
+        .chars()
         .map(|c| match c {
-            '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' => '_',
+            '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' | '\0' => '_',
             _ => c,
         })
-        .collect()
+        .collect();
+    let trimmed = mapped.trim();
+    // Neutralize path-significant components so a network/channel name like ".."
+    // or "." (or all dots) cannot escape the logs directory via path traversal.
+    if trimmed.is_empty() || trimmed.chars().all(|c| c == '.') {
+        return "_".to_string();
+    }
+    // Strip leading dots to avoid hidden files / ".." remnants.
+    let cleaned = trimmed.trim_start_matches('.');
+    if cleaned.is_empty() {
+        "_".to_string()
+    } else {
+        cleaned.to_string()
+    }
 }
 
 /// Format a ChatMessage as a log line
@@ -151,6 +171,21 @@ fn format_log_line(msg: &ChatMessage) -> String {
     }
 }
 
+/// Split a log line into (timestamp, rest-of-line), tolerating a timestamp that
+/// contains a space (the "full" MM-DD HH:MM format). The timestamp is either a
+/// single time token (contains ':') or a "MM-DD HH:MM" pair whose first token is
+/// a date (no ':' but a '-'). Returns None if there is no separating space.
+fn split_timestamp(line: &str) -> Option<(String, &str)> {
+    let (first, after) = line.split_once(' ')?;
+    if !first.contains(':') && first.contains('-') {
+        // Date token; the next whitespace-separated token is the time.
+        let (second, rest) = after.split_once(' ')?;
+        Some((format!("{} {}", first, second), rest.trim_start()))
+    } else {
+        Some((first.to_string(), after))
+    }
+}
+
 /// Parse a log line back into a ChatMessage
 fn parse_log_line(line: &str) -> Option<ChatMessage> {
     // Skip session markers
@@ -158,14 +193,11 @@ fn parse_log_line(line: &str) -> Option<ChatMessage> {
         return None;
     }
 
-    // Parse format: "HH:MM <nick> message" or "HH:MM * nick action" or "HH:MM -!- system"
-    let parts: Vec<&str> = line.splitn(2, ' ').collect();
-    if parts.len() < 2 {
-        return None;
-    }
-
-    let timestamp = format!("[{}]", parts[0]);
-    let rest = parts[1];
+    // Parse format: "HH:MM <nick> message" / "HH:MM * nick action" / "HH:MM -!- system".
+    // The timestamp may itself contain a space when the "full" (MM-DD HH:MM) format
+    // is used, so detect a leading date token rather than blindly splitting once.
+    let (ts_inner, rest) = split_timestamp(line)?;
+    let timestamp = format!("[{}]", ts_inner);
 
     if rest.starts_with("-!- ") {
         // System message
@@ -217,12 +249,13 @@ fn parse_log_line(line: &str) -> Option<ChatMessage> {
 /// Read the last N lines from a file by reading backwards in chunks
 fn read_last_n_lines(file: &mut File, file_size: u64, max_lines: usize) -> Vec<String> {
     const CHUNK_SIZE: u64 = 8192;
-    let mut lines = Vec::new();
-    let mut remaining_bytes = Vec::new();
+    let mut remaining_bytes: Vec<u8> = Vec::new();
     let mut pos = file_size;
+    let mut newline_count = 0usize;
 
-    // Read backwards in chunks
-    while pos > 0 && lines.len() < max_lines + 1 {
+    // Read backwards in chunks until we've accumulated more than `max_lines` line
+    // breaks (so the last `max_lines` complete lines are guaranteed present).
+    while pos > 0 && newline_count <= max_lines {
         let chunk_start = pos.saturating_sub(CHUNK_SIZE);
         let chunk_len = (pos - chunk_start) as usize;
 
@@ -235,35 +268,20 @@ fn read_last_n_lines(file: &mut File, file_size: u64, max_lines: usize) -> Vec<S
             break;
         }
 
-        // Prepend to remaining bytes
-        chunk.extend(remaining_bytes);
+        newline_count += chunk.iter().filter(|&&b| b == b'\n').count();
+
+        // Prepend this chunk to what we have so far.
+        chunk.extend_from_slice(&remaining_bytes);
         remaining_bytes = chunk;
-
-        // Count newlines from the end
-        let mut newline_count = 0;
-        for &b in remaining_bytes.iter().rev() {
-            if b == b'\n' {
-                newline_count += 1;
-                if newline_count > max_lines {
-                    break;
-                }
-            }
-        }
-
-        // Convert to string and split into lines
-        if let Ok(text) = String::from_utf8(remaining_bytes.clone()) {
-            lines = text.lines().map(|s| s.to_string()).collect();
-            if lines.len() > max_lines {
-                break;
-            }
-        }
 
         pos = chunk_start;
     }
 
-    // Return only the last max_lines
+    // Decode once (not per chunk), then return only the last `max_lines` lines.
+    let text = String::from_utf8_lossy(&remaining_bytes);
+    let lines: Vec<&str> = text.lines().collect();
     let start = lines.len().saturating_sub(max_lines);
-    lines[start..].to_vec()
+    lines[start..].iter().map(|s| s.to_string()).collect()
 }
 
 /// Get current date/time as a string for session markers
@@ -289,4 +307,71 @@ fn current_datetime_string() -> String {
 
     format!("{} {} {:2} {:02}:{:02}:{:02} {}",
             weekday_name, month_name, day, hours, minutes, seconds, year)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::gui::types::ChatMessage;
+
+    fn msg(ts: &str, sender: &str, content: &str, system: bool, action: bool) -> ChatMessage {
+        ChatMessage {
+            timestamp: ts.to_string(),
+            sender: sender.to_string(),
+            content: content.to_string(),
+            is_action: action,
+            is_system: system,
+            is_highlight: false,
+        }
+    }
+
+    fn round_trip(m: &ChatMessage) -> ChatMessage {
+        parse_log_line(&format_log_line(m)).expect("log line should round-trip")
+    }
+
+    #[test]
+    fn full_format_with_space_round_trips() {
+        // Regression: the "full" timestamp [MM-DD HH:MM] contains a space, which
+        // previously broke parsing and silently dropped all loaded history.
+        let p = round_trip(&msg("[06-14 09:30]", "alice", "hello world", false, false));
+        assert_eq!(p.timestamp, "[06-14 09:30]");
+        assert_eq!(p.sender, "alice");
+        assert_eq!(p.content, "hello world");
+        assert!(!p.is_system && !p.is_action);
+    }
+
+    #[test]
+    fn short_and_long_formats_round_trip() {
+        let p = round_trip(&msg("[09:30]", "bob", "hi there", false, false));
+        assert_eq!(p.timestamp, "[09:30]");
+        assert_eq!(p.sender, "bob");
+        assert_eq!(p.content, "hi there");
+
+        let p = round_trip(&msg("[09:30:15]", "bob", "hi", false, false));
+        assert_eq!(p.timestamp, "[09:30:15]");
+    }
+
+    #[test]
+    fn system_and_action_round_trip() {
+        let p = round_trip(&msg("[06-14 09:30]", "*", "x has joined", true, false));
+        assert!(p.is_system);
+        assert_eq!(p.content, "x has joined");
+
+        let p = round_trip(&msg("[06-14 09:30]", "carol", "waves around", false, true));
+        assert!(p.is_action);
+        assert_eq!(p.sender, "carol");
+        assert_eq!(p.content, "waves around");
+    }
+
+    #[test]
+    fn sanitize_filename_blocks_traversal() {
+        assert_eq!(sanitize_filename(".."), "_");
+        assert_eq!(sanitize_filename("."), "_");
+        assert_eq!(sanitize_filename("..."), "_");
+        assert_eq!(sanitize_filename("a/b"), "a_b");
+        // '/' maps to '_' and the leading dots are stripped -> safe single component.
+        assert_eq!(sanitize_filename("../etc"), "_etc");
+        assert_eq!(sanitize_filename("normal"), "normal");
+        assert_eq!(sanitize_filename("#channel"), "#channel");
+    }
 }
