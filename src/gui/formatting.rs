@@ -4,42 +4,42 @@ use egui::{Color32, RichText};
 
 /// IRC color codes (mIRC standard)
 const IRC_COLORS: [Color32; 16] = [
-    Color32::WHITE,                      // 0: White
-    Color32::BLACK,                      // 1: Black
-    Color32::from_rgb(0, 0, 127),        // 2: Blue (navy)
-    Color32::from_rgb(0, 147, 0),        // 3: Green
-    Color32::from_rgb(255, 0, 0),        // 4: Red
-    Color32::from_rgb(127, 0, 0),        // 5: Brown (maroon)
-    Color32::from_rgb(156, 0, 156),      // 6: Purple
-    Color32::from_rgb(252, 127, 0),      // 7: Orange
-    Color32::from_rgb(255, 255, 0),      // 8: Yellow
-    Color32::from_rgb(0, 252, 0),        // 9: Light Green
-    Color32::from_rgb(0, 147, 147),      // 10: Cyan (teal)
-    Color32::from_rgb(0, 255, 255),      // 11: Light Cyan
-    Color32::from_rgb(0, 0, 252),        // 12: Light Blue
-    Color32::from_rgb(255, 0, 255),      // 13: Pink
-    Color32::from_rgb(127, 127, 127),    // 14: Grey
-    Color32::from_rgb(210, 210, 210),    // 15: Light Grey
+    Color32::WHITE,                   // 0: White
+    Color32::BLACK,                   // 1: Black
+    Color32::from_rgb(0, 0, 127),     // 2: Blue (navy)
+    Color32::from_rgb(0, 147, 0),     // 3: Green
+    Color32::from_rgb(255, 0, 0),     // 4: Red
+    Color32::from_rgb(127, 0, 0),     // 5: Brown (maroon)
+    Color32::from_rgb(156, 0, 156),   // 6: Purple
+    Color32::from_rgb(252, 127, 0),   // 7: Orange
+    Color32::from_rgb(255, 255, 0),   // 8: Yellow
+    Color32::from_rgb(0, 252, 0),     // 9: Light Green
+    Color32::from_rgb(0, 147, 147),   // 10: Cyan (teal)
+    Color32::from_rgb(0, 255, 255),   // 11: Light Cyan
+    Color32::from_rgb(0, 0, 252),     // 12: Light Blue
+    Color32::from_rgb(255, 0, 255),   // 13: Pink
+    Color32::from_rgb(127, 127, 127), // 14: Grey
+    Color32::from_rgb(210, 210, 210), // 15: Light Grey
 ];
 
 /// Curated palette of distinct, readable colors for nick coloring
 const NICK_COLORS: [Color32; 16] = [
-    Color32::from_rgb(255, 100, 100),  // Light red
-    Color32::from_rgb(100, 255, 100),  // Light green
-    Color32::from_rgb(100, 200, 255),  // Light blue
-    Color32::from_rgb(255, 200, 100),  // Orange/gold
-    Color32::from_rgb(255, 100, 255),  // Pink/magenta
-    Color32::from_rgb(100, 255, 255),  // Cyan
-    Color32::from_rgb(255, 255, 100),  // Yellow
-    Color32::from_rgb(200, 150, 255),  // Light purple
-    Color32::from_rgb(255, 150, 150),  // Salmon
-    Color32::from_rgb(150, 255, 200),  // Mint
-    Color32::from_rgb(150, 200, 255),  // Sky blue
-    Color32::from_rgb(255, 200, 150),  // Peach
-    Color32::from_rgb(200, 255, 150),  // Lime
-    Color32::from_rgb(255, 150, 200),  // Rose
-    Color32::from_rgb(150, 255, 255),  // Aqua
-    Color32::from_rgb(255, 220, 180),  // Tan
+    Color32::from_rgb(255, 100, 100), // Light red
+    Color32::from_rgb(100, 255, 100), // Light green
+    Color32::from_rgb(100, 200, 255), // Light blue
+    Color32::from_rgb(255, 200, 100), // Orange/gold
+    Color32::from_rgb(255, 100, 255), // Pink/magenta
+    Color32::from_rgb(100, 255, 255), // Cyan
+    Color32::from_rgb(255, 255, 100), // Yellow
+    Color32::from_rgb(200, 150, 255), // Light purple
+    Color32::from_rgb(255, 150, 150), // Salmon
+    Color32::from_rgb(150, 255, 200), // Mint
+    Color32::from_rgb(150, 200, 255), // Sky blue
+    Color32::from_rgb(255, 200, 150), // Peach
+    Color32::from_rgb(200, 255, 150), // Lime
+    Color32::from_rgb(255, 150, 200), // Rose
+    Color32::from_rgb(150, 255, 255), // Aqua
+    Color32::from_rgb(255, 220, 180), // Tan
 ];
 
 /// A span of text with optional formatting
@@ -51,11 +51,14 @@ struct TextSpan {
     bold: bool,
     underline: bool,
     italic: bool,
+    reverse: bool,
 }
 
 /// Get a consistent color for a nick based on hash
 pub fn nick_color(nick: &str) -> Color32 {
-    let hash: u32 = nick.bytes().fold(0, |acc, b| acc.wrapping_add(b as u32).wrapping_mul(31));
+    let hash: u32 = nick
+        .bytes()
+        .fold(0, |acc, b| acc.wrapping_add(b as u32).wrapping_mul(31));
     NICK_COLORS[(hash as usize) % NICK_COLORS.len()]
 }
 
@@ -72,7 +75,7 @@ pub fn strip_irc_formatting(input: &str) -> String {
             '\x03' => {
                 // Color code - skip digits
                 // Format: \x03[fg[,bg]] where fg and bg are 1-2 digits
-                while chars.peek().map_or(false, |c| c.is_ascii_digit()) {
+                while chars.peek().is_some_and(|c| c.is_ascii_digit()) {
                     chars.next();
                 }
                 // Only treat the comma as a fg/bg separator when a digit follows it,
@@ -80,9 +83,9 @@ pub fn strip_irc_formatting(input: &str) -> String {
                 if chars.peek() == Some(&',') {
                     let mut lookahead = chars.clone();
                     lookahead.next(); // skip the comma in the lookahead copy
-                    if lookahead.peek().map_or(false, |c| c.is_ascii_digit()) {
+                    if lookahead.peek().is_some_and(|c| c.is_ascii_digit()) {
                         chars.next(); // consume the comma for real
-                        while chars.peek().map_or(false, |c| c.is_ascii_digit()) {
+                        while chars.peek().is_some_and(|c| c.is_ascii_digit()) {
                             chars.next();
                         }
                     }
@@ -104,6 +107,7 @@ fn parse_irc_colors(input: &str) -> Vec<TextSpan> {
     let mut bold = false;
     let mut underline = false;
     let mut italic = false;
+    let mut reverse = false;
 
     let mut chars = input.chars().peekable();
 
@@ -119,6 +123,7 @@ fn parse_irc_colors(input: &str) -> Vec<TextSpan> {
                         bold,
                         underline,
                         italic,
+                        reverse,
                     });
                     current_text.clear();
                 }
@@ -151,7 +156,7 @@ fn parse_irc_colors(input: &str) -> Vec<TextSpan> {
                 if chars.peek() == Some(&',') {
                     let mut lookahead = chars.clone();
                     lookahead.next(); // skip the comma in the lookahead copy
-                    if lookahead.peek().map_or(false, |c| c.is_ascii_digit()) {
+                    if lookahead.peek().is_some_and(|c| c.is_ascii_digit()) {
                         chars.next(); // consume the comma for real
                         let mut bg_str = String::new();
                         while bg_str.len() < 2 {
@@ -181,6 +186,7 @@ fn parse_irc_colors(input: &str) -> Vec<TextSpan> {
                         bold,
                         underline,
                         italic,
+                        reverse,
                     });
                     current_text.clear();
                 }
@@ -196,13 +202,14 @@ fn parse_irc_colors(input: &str) -> Vec<TextSpan> {
                         bold,
                         underline,
                         italic,
+                        reverse,
                     });
                     current_text.clear();
                 }
                 underline = !underline;
             }
-            '\x1D' | '\x16' => {
-                // Italic toggle (\x1D is proper italic, \x16 is reverse/italic)
+            '\x1D' => {
+                // Italic toggle
                 if !current_text.is_empty() {
                     spans.push(TextSpan {
                         text: current_text.clone(),
@@ -211,10 +218,27 @@ fn parse_irc_colors(input: &str) -> Vec<TextSpan> {
                         bold,
                         underline,
                         italic,
+                        reverse,
                     });
                     current_text.clear();
                 }
                 italic = !italic;
+            }
+            '\x16' => {
+                // Reverse-video toggle
+                if !current_text.is_empty() {
+                    spans.push(TextSpan {
+                        text: current_text.clone(),
+                        fg_color,
+                        bg_color,
+                        bold,
+                        underline,
+                        italic,
+                        reverse,
+                    });
+                    current_text.clear();
+                }
+                reverse = !reverse;
             }
             '\x0F' => {
                 // Reset all formatting
@@ -226,6 +250,7 @@ fn parse_irc_colors(input: &str) -> Vec<TextSpan> {
                         bold,
                         underline,
                         italic,
+                        reverse,
                     });
                     current_text.clear();
                 }
@@ -234,6 +259,7 @@ fn parse_irc_colors(input: &str) -> Vec<TextSpan> {
                 bold = false;
                 underline = false;
                 italic = false;
+                reverse = false;
             }
             _ => {
                 current_text.push(c);
@@ -250,6 +276,7 @@ fn parse_irc_colors(input: &str) -> Vec<TextSpan> {
             bold,
             underline,
             italic,
+            reverse,
         });
     }
 
@@ -267,10 +294,10 @@ fn split_urls(text: &str) -> Vec<(String, bool)> {
         let mut earliest_url: Option<(usize, &str)> = None;
 
         for prefix in &url_starts {
-            if let Some(pos) = remaining.find(prefix) {
-                if earliest_url.is_none() || pos < earliest_url.unwrap().0 {
-                    earliest_url = Some((pos, prefix));
-                }
+            if let Some(pos) = remaining.find(prefix)
+                && (earliest_url.is_none() || pos < earliest_url.unwrap().0)
+            {
+                earliest_url = Some((pos, prefix));
             }
         }
 
@@ -285,7 +312,14 @@ fn split_urls(text: &str) -> Vec<(String, bool)> {
                 let url_start = pos;
                 let after_url = &remaining[url_start..];
                 let url_end = after_url
-                    .find(|c: char| c.is_whitespace() || c == '>' || c == ')' || c == ']' || c == '"' || c == '\'')
+                    .find(|c: char| {
+                        c.is_whitespace()
+                            || c == '>'
+                            || c == ')'
+                            || c == ']'
+                            || c == '"'
+                            || c == '\''
+                    })
                     .unwrap_or(after_url.len());
 
                 let url = &after_url[..url_end];
@@ -311,7 +345,13 @@ pub fn render_irc_text(ui: &mut egui::Ui, text: &str, default_color: Color32) {
     ui.horizontal_wrapped(|ui| {
         ui.spacing_mut().item_spacing.x = 0.0;
         for span in spans {
-            let color = span.fg_color.unwrap_or(default_color);
+            let mut color = span.fg_color.unwrap_or(default_color);
+            let mut bg_color = span.bg_color;
+            if span.reverse {
+                let old_color = color;
+                color = bg_color.unwrap_or(Color32::BLACK);
+                bg_color = Some(old_color);
+            }
 
             // Split the span text into URL and non-URL parts
             let segments = split_urls(&span.text);
@@ -325,8 +365,10 @@ pub fn render_irc_text(ui: &mut egui::Ui, text: &str, default_color: Color32) {
                         segment.clone()
                     };
                     ui.hyperlink_to(
-                        RichText::new(&segment).color(Color32::from_rgb(100, 150, 255)).underline(),
-                        &url
+                        RichText::new(&segment)
+                            .color(Color32::from_rgb(100, 150, 255))
+                            .underline(),
+                        &url,
                     );
                 } else {
                     // Render as regular text with formatting
@@ -352,7 +394,7 @@ pub fn render_irc_text(ui: &mut egui::Ui, text: &str, default_color: Color32) {
                         rich_text = rich_text.italics();
                     }
 
-                    if let Some(bg) = span.bg_color {
+                    if let Some(bg) = bg_color {
                         rich_text = rich_text.background_color(bg);
                     }
 
@@ -361,4 +403,19 @@ pub fn render_irc_text(ui: &mut egui::Ui, text: &str, default_color: Color32) {
             }
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reverse_control_is_not_italic() {
+        let spans = parse_irc_colors("\x16rev\x16 plain");
+        assert_eq!(spans[0].text, "rev");
+        assert!(spans[0].reverse);
+        assert!(!spans[0].italic);
+        assert_eq!(spans[1].text, " plain");
+        assert!(!spans[1].reverse);
+    }
 }

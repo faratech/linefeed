@@ -1,8 +1,8 @@
 //! Core types for the IRC GUI
 
-use std::path::PathBuf;
-use serde::{Deserialize, Serialize};
 use super::helpers::current_time_formatted;
+use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
 
 /// Sort column for channel list
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
@@ -24,14 +24,14 @@ pub enum SortDirection {
 /// Server favorite for quick connect
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ServerFavorite {
-    pub name: String,           // Display name (e.g., "Libera Chat")
-    pub host: String,           // Server host
-    pub port: String,           // Server port
-    pub use_tls: bool,          // Use TLS
-    pub password: String,       // Server password (if any)
-    pub nickname: String,       // Nick to use (empty = use default)
-    pub auto_join: String,      // Channels to auto-join (comma-separated)
-    pub auto_perform: String,   // Commands to run on connect (newline-separated)
+    pub name: String,         // Display name (e.g., "Libera Chat")
+    pub host: String,         // Server host
+    pub port: String,         // Server port
+    pub use_tls: bool,        // Use TLS
+    pub password: String,     // Server password (if any)
+    pub nickname: String,     // Nick to use (empty = use default)
+    pub auto_join: String,    // Channels to auto-join (comma-separated)
+    pub auto_perform: String, // Commands to run on connect (newline-separated)
     // SASL authentication
     #[serde(default)]
     pub sasl_username: String,
@@ -78,14 +78,14 @@ pub struct Settings {
     pub logging_load_history: bool,
     pub logging_history_lines: usize,
     // Display
-    pub timestamp_format: String,  // "short" = HH:MM, "long" = HH:MM:SS, "full" = MM-DD HH:MM
+    pub timestamp_format: String, // "short" = HH:MM, "long" = HH:MM:SS, "full" = MM-DD HH:MM
     pub hide_join_part: bool,
     pub font_size: f32,
     pub max_scrollback: usize,
     // Privacy
     pub ctcp_replies_enabled: bool,
     // Highlights
-    pub highlight_words: String,  // comma-separated
+    pub highlight_words: String, // comma-separated
     // Connection
     pub reconnect_delay_secs: u32,
     pub max_reconnect_attempts: u32,
@@ -150,15 +150,13 @@ impl Settings {
     }
 
     pub fn load() -> Self {
-        if let Some(path) = Self::config_path() {
-            if path.exists() {
-                if let Ok(data) = std::fs::read_to_string(&path) {
-                    if let Ok(settings) = serde_json::from_str(&data) {
-                        tracing::info!("Loaded settings from {:?}", path);
-                        return settings;
-                    }
-                }
-            }
+        if let Some(path) = Self::config_path()
+            && path.exists()
+            && let Ok(data) = std::fs::read_to_string(&path)
+            && let Ok(settings) = serde_json::from_str(&data)
+        {
+            tracing::info!("Loaded settings from {:?}", path);
+            return settings;
         }
         tracing::info!("Using default settings");
         Self::default()
@@ -195,10 +193,6 @@ pub struct ChatMessage {
 }
 
 impl ChatMessage {
-    pub fn new(sender: &str, content: &str) -> Self {
-        Self::new_fmt(sender, content, "short")
-    }
-
     pub fn new_fmt(sender: &str, content: &str, format: &str) -> Self {
         Self {
             timestamp: current_time_formatted(format),
@@ -223,10 +217,6 @@ impl ChatMessage {
             is_system: true,
             is_highlight: false,
         }
-    }
-
-    pub fn action(sender: &str, content: &str) -> Self {
-        Self::action_fmt(sender, content, "short")
     }
 
     pub fn action_fmt(sender: &str, content: &str, format: &str) -> Self {
@@ -275,11 +265,11 @@ impl ChatMessage {
 /// User mode in a channel (determines prefix and sort order)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum UserMode {
-    Owner,    // ~
-    Admin,    // &
-    Op,       // @
-    HalfOp,   // %
-    Voice,    // +
+    Owner,  // ~
+    Admin,  // &
+    Op,     // @
+    HalfOp, // %
+    Voice,  // +
     Normal,
 }
 
@@ -307,6 +297,30 @@ impl UserMode {
     }
 }
 
+/// Server-advertised IRC support that affects routing and user prefixes.
+#[derive(Debug, Clone)]
+pub struct NetworkSupport {
+    pub channel_types: String,
+    pub user_prefixes: String,
+}
+
+impl Default for NetworkSupport {
+    fn default() -> Self {
+        Self {
+            channel_types: "#&+!".to_string(),
+            user_prefixes: "~&@%+".to_string(),
+        }
+    }
+}
+
+impl NetworkSupport {
+    pub fn is_channel(&self, name: &str) -> bool {
+        name.chars()
+            .next()
+            .is_some_and(|c| self.channel_types.contains(c))
+    }
+}
+
 /// Ban list entry
 #[derive(Debug, Clone)]
 pub struct BanEntry {
@@ -320,8 +334,8 @@ pub struct BanEntry {
 pub struct ChannelUser {
     pub nick: String,
     pub mode: UserMode,
-    pub away: Option<String>,  // None = not away, Some(msg) = away with message
-    pub account: Option<String>,  // IRCv3 account name
+    pub away: Option<String>, // None = not away, Some(msg) = away with message
+    pub account: Option<String>, // IRCv3 account name
 }
 
 impl ChannelUser {
@@ -345,13 +359,13 @@ pub struct Channel {
     pub topic: Option<String>,
     pub topic_set_by: Option<String>,
     pub topic_set_time: Option<u64>,
-    pub modes: String,  // Channel modes like "+nt"
-    pub mode_params: Vec<String>,  // Mode parameters (limit, key, etc.)
-    pub created: Option<u64>,  // Channel creation timestamp
+    pub modes: String,            // Channel modes like "+nt"
+    pub mode_params: Vec<String>, // Mode parameters (limit, key, etc.)
+    pub created: Option<u64>,     // Channel creation timestamp
     pub users: Vec<ChannelUser>,
     pub messages: Vec<ChatMessage>,
     pub unread: usize,
-    pub key: Option<String>,  // Channel key for auto-rejoin
+    pub key: Option<String>, // Channel key for auto-rejoin
     pub bans: Vec<BanEntry>,
     pub ban_list_complete: bool,
 }
@@ -375,15 +389,48 @@ impl Channel {
     }
 
     pub fn add_user(&mut self, nick: &str, mode: UserMode) {
-        let clean_nick = nick.trim_start_matches(|c| c == '~' || c == '&' || c == '@' || c == '%' || c == '+');
+        self.add_user_with_prefixes(nick, mode, "~&@%+");
+    }
+
+    pub fn add_user_with_prefixes(&mut self, nick: &str, mode: UserMode, prefixes: &str) {
+        let clean_nick = nick.trim_start_matches(|c| prefixes.contains(c));
         // Ignore tokens that are only mode prefixes (e.g. a stray "@"): they would
         // otherwise insert a blank-nick, unremovable user into the list.
         if clean_nick.is_empty() {
             return;
         }
-        if !self.users.iter().any(|u| u.nick.eq_ignore_ascii_case(clean_nick)) {
-            self.users.push(ChannelUser::new(clean_nick.to_string(), mode));
+        if !self
+            .users
+            .iter()
+            .any(|u| u.nick.eq_ignore_ascii_case(clean_nick))
+        {
+            self.users
+                .push(ChannelUser::new(clean_nick.to_string(), mode));
             self.sort_users();
+        }
+    }
+
+    pub fn set_user_mode(&mut self, nick: &str, mode: UserMode) {
+        if let Some(user) = self.get_user_mut(nick) {
+            user.mode = mode;
+            self.sort_users();
+        }
+    }
+
+    pub fn apply_channel_mode_flag(&mut self, sign: char, mode: char) {
+        if sign == '+' {
+            if !self.modes.contains(mode) {
+                if self.modes.starts_with('+') {
+                    self.modes.push(mode);
+                } else {
+                    self.modes = format!("+{}", mode);
+                }
+            }
+        } else if sign == '-' {
+            self.modes.retain(|c| c != mode);
+            if self.modes == "+" {
+                self.modes.clear();
+            }
         }
     }
 
@@ -396,13 +443,21 @@ impl Channel {
         // rather than creating a duplicate (can happen with out-of-order NICK/JOIN).
         // A pure case change of the same nick still falls through to the rename.
         if !old_nick.eq_ignore_ascii_case(new_nick)
-            && self.users.iter().any(|u| u.nick.eq_ignore_ascii_case(new_nick))
+            && self
+                .users
+                .iter()
+                .any(|u| u.nick.eq_ignore_ascii_case(new_nick))
         {
-            self.users.retain(|u| !u.nick.eq_ignore_ascii_case(old_nick));
+            self.users
+                .retain(|u| !u.nick.eq_ignore_ascii_case(old_nick));
             self.sort_users();
             return;
         }
-        if let Some(user) = self.users.iter_mut().find(|u| u.nick.eq_ignore_ascii_case(old_nick)) {
+        if let Some(user) = self
+            .users
+            .iter_mut()
+            .find(|u| u.nick.eq_ignore_ascii_case(old_nick))
+        {
             user.nick = new_nick.to_string();
             self.sort_users();
         }
@@ -424,16 +479,22 @@ impl Channel {
     }
 
     pub fn get_user(&self, nick: &str) -> Option<&ChannelUser> {
-        self.users.iter().find(|u| u.nick.eq_ignore_ascii_case(nick))
+        self.users
+            .iter()
+            .find(|u| u.nick.eq_ignore_ascii_case(nick))
     }
 
     pub fn get_user_mut(&mut self, nick: &str) -> Option<&mut ChannelUser> {
-        self.users.iter_mut().find(|u| u.nick.eq_ignore_ascii_case(nick))
+        self.users
+            .iter_mut()
+            .find(|u| u.nick.eq_ignore_ascii_case(nick))
     }
 
     fn sort_users(&mut self) {
         self.users.sort_by(|a, b| {
-            a.mode.cmp(&b.mode).then_with(|| a.nick.to_lowercase().cmp(&b.nick.to_lowercase()))
+            a.mode
+                .cmp(&b.mode)
+                .then_with(|| a.nick.to_lowercase().cmp(&b.nick.to_lowercase()))
         });
     }
 

@@ -3,29 +3,26 @@
 
 use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
 
-use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, POINT, WPARAM};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Shell::{
-    Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE,
-    NOTIFYICONDATAW,
+    NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NOTIFYICONDATAW, Shell_NotifyIconW,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreatePopupMenu, CreateWindowExW, DefWindowProcW,
+    CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, CreatePopupMenu, CreateWindowExW, DefWindowProcW,
     DestroyMenu, DestroyWindow, DispatchMessageW, FindWindowW, GetCursorPos, GetMessageW,
-    InsertMenuW, PostMessageW, PostQuitMessage, RegisterClassExW, SetForegroundWindow,
-    SetMenuDefaultItem, ShowWindow, TrackPopupMenu, TranslateMessage,
-    CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT,
-    MF_BYPOSITION, MF_SEPARATOR, MF_STRING, MSG, SW_HIDE, SW_RESTORE, SW_SHOW,
-    TPM_BOTTOMALIGN, TPM_LEFTALIGN, TPM_RIGHTBUTTON, WINDOW_EX_STYLE,
-    WM_COMMAND, WM_DESTROY, WM_LBUTTONDBLCLK, WM_RBUTTONUP, WM_USER, WNDCLASSEXW,
+    InsertMenuW, MF_BYPOSITION, MF_SEPARATOR, MF_STRING, MSG, PostMessageW, PostQuitMessage,
+    RegisterClassExW, SW_HIDE, SW_RESTORE, SW_SHOW, SetForegroundWindow, SetMenuDefaultItem,
+    ShowWindow, TPM_BOTTOMALIGN, TPM_LEFTALIGN, TPM_RIGHTBUTTON, TrackPopupMenu, TranslateMessage,
+    WINDOW_EX_STYLE, WM_COMMAND, WM_DESTROY, WM_LBUTTONDBLCLK, WM_RBUTTONUP, WM_USER, WNDCLASSEXW,
     WS_OVERLAPPEDWINDOW,
 };
+use windows::core::{PCWSTR, w};
 
 use crate::icon_data;
 
 const WM_TRAYICON: u32 = WM_USER + 1;
-const WM_SHOW_WINDOW: u32 = WM_USER + 2;  // Custom message to show window
+const WM_SHOW_WINDOW: u32 = WM_USER + 2; // Custom message to show window
 const ID_SHOW: u16 = 1;
 const ID_QUIT: u16 = 2;
 
@@ -114,7 +111,9 @@ pub fn should_exit() -> bool {
 
 /// Flash the taskbar to alert the user of a notification
 pub fn flash_window() {
-    use windows::Win32::UI::WindowsAndMessaging::{FlashWindowEx, FLASHWINFO, FLASHW_ALL, FLASHW_TIMERNOFG};
+    use windows::Win32::UI::WindowsAndMessaging::{
+        FLASHW_ALL, FLASHW_TIMERNOFG, FLASHWINFO, FlashWindowEx,
+    };
 
     if let Some(hwnd) = find_main_window() {
         unsafe {
@@ -131,7 +130,12 @@ pub fn flash_window() {
     }
 }
 
-unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+unsafe extern "system" fn wnd_proc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
     match msg {
         WM_TRAYICON => {
             let event = lparam.0 as u32;
@@ -185,9 +189,21 @@ unsafe fn show_context_menu(hwnd: HWND) {
         let show_text: Vec<u16> = "Show Linefeed\0".encode_utf16().collect();
         let quit_text: Vec<u16> = "Quit\0".encode_utf16().collect();
 
-        let _ = InsertMenuW(menu, 0, MF_BYPOSITION | MF_STRING, ID_SHOW as usize, PCWSTR(show_text.as_ptr()));
+        let _ = InsertMenuW(
+            menu,
+            0,
+            MF_BYPOSITION | MF_STRING,
+            ID_SHOW as usize,
+            PCWSTR(show_text.as_ptr()),
+        );
         let _ = InsertMenuW(menu, 1, MF_BYPOSITION | MF_SEPARATOR, 0, PCWSTR::null());
-        let _ = InsertMenuW(menu, 2, MF_BYPOSITION | MF_STRING, ID_QUIT as usize, PCWSTR(quit_text.as_ptr()));
+        let _ = InsertMenuW(
+            menu,
+            2,
+            MF_BYPOSITION | MF_STRING,
+            ID_QUIT as usize,
+            PCWSTR(quit_text.as_ptr()),
+        );
 
         // Make "Show" the default (bold) - third param: 1 = by position
         let _ = SetMenuDefaultItem(menu, 0, 1);
@@ -371,13 +387,11 @@ pub fn create_tray_icon() -> bool {
 
 pub fn setup_event_handler() {
     // Start message pump thread for tray events
-    std::thread::spawn(|| {
-        unsafe {
-            let mut msg = MSG::default();
-            while GetMessageW(&mut msg, None, 0, 0).as_bool() {
-                let _ = TranslateMessage(&msg);
-                DispatchMessageW(&msg);
-            }
+    std::thread::spawn(|| unsafe {
+        let mut msg = MSG::default();
+        while GetMessageW(&mut msg, None, 0, 0).as_bool() {
+            let _ = TranslateMessage(&msg);
+            DispatchMessageW(&msg);
         }
     });
 }

@@ -118,6 +118,10 @@ def is_newer(latest: str, current: str) -> bool:
         return False
 
 
+def is_prerelease(version: str) -> bool:
+    return "-" in version
+
+
 def update_cargo_toml(updates: dict[str, str], dry_run: bool = False) -> None:
     """Update Cargo.toml with new versions."""
     content = CARGO_TOML.read_text()
@@ -151,6 +155,7 @@ def main():
     parser.add_argument("--dry-run", "-n", action="store_true", help="Show what would be updated without making changes")
     parser.add_argument("--check", "-c", action="store_true", help="Only check for outdated deps, don't update")
     parser.add_argument("--pin", "-p", action="store_true", help="Pin all deps to exact latest versions (e.g., 0.33 -> 0.33.3)")
+    parser.add_argument("--allow-prerelease", action="store_true", help="Allow prerelease versions from cargo search")
     args = parser.parse_args()
 
     print("Checking for outdated dependencies...\n")
@@ -170,6 +175,9 @@ def main():
         latest = get_latest_version(name)
         if latest is None:
             print("not found on crates.io")
+            continue
+        if is_prerelease(latest) and not args.allow_prerelease:
+            print(f"{current} (latest {latest} is prerelease; skipped)")
             continue
 
         if is_newer(latest, current):

@@ -13,16 +13,27 @@ use crate::irc::client::ServerConfig;
 use crate::irc::numerics::*;
 use crate::irc::{IrcCommand, IrcMessage};
 use formatting::{nick_color, render_irc_text};
-use helpers::{format_timestamp, is_channel, mask_matches, truncate_chars};
+use helpers::{format_timestamp, mask_matches, truncate_chars};
 pub use types::{
-    BanEntry, Channel, ChannelListEntry, ChannelListSort, ChatMessage, ServerFavorite,
-    Settings, SortDirection, TabCompletion, UserMode,
+    BanEntry, Channel, ChannelListEntry, ChannelListSort, ChatMessage, NetworkSupport,
+    ServerFavorite, Settings, SortDirection, TabCompletion, UserMode,
 };
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConnectionIntent {
+    None,
+    ManualDisconnect,
+    ReconnectAfterClose,
+}
+
+const IRC_MAX_LINE_BYTES: usize = 510;
+
 pub struct IrcApp {
     // Connection state
     pub connected: bool,
     pub connecting: bool,
     pub my_nick: String,
+    pub connection_intent: ConnectionIntent,
 
     // Server config
     pub server_host: String,
@@ -143,6 +154,9 @@ pub struct IrcApp {
     // Highlights
     pub highlight_words: String,
 
+    // Server-advertised protocol support
+    pub network_support: NetworkSupport,
+
     // Cached lowercase versions for efficient comparison (updated when source changes)
     my_nick_lower: String,
     ignore_list_lower: Vec<String>,
@@ -177,6 +191,8 @@ pub struct IrcApp {
 
     // CPU optimization state
     pub had_messages_this_frame: bool,
+
+    nick_retry_attempts: u8,
 }
 
 impl Default for IrcApp {
@@ -198,6 +214,7 @@ impl IrcApp {
             connected: false,
             connecting: false,
             my_nick: nickname.clone(),
+            connection_intent: ConnectionIntent::None,
 
             server_host: settings.server_host,
             server_port: settings.server_port,
@@ -303,6 +320,7 @@ impl IrcApp {
 
             // Highlights
             highlight_words: settings.highlight_words.clone(),
+            network_support: NetworkSupport::default(),
 
             // Reconnect settings
             reconnect_delay_secs: settings.reconnect_delay_secs,
@@ -332,6 +350,7 @@ impl IrcApp {
 
             // CPU optimization
             had_messages_this_frame: false,
+            nick_retry_attempts: 0,
         }
     }
 
@@ -391,12 +410,11 @@ impl IrcApp {
                 return true;
             }
             // Check for wildcard mask match (e.g., *!*@*.spammer.net)
-            if pattern.contains('!') || pattern.contains('@') || pattern.contains('*') {
-                if let Some(full_prefix) = prefix {
-                    if mask_matches(pattern_lower, &full_prefix.to_lowercase()) {
-                        return true;
-                    }
-                }
+            if (pattern.contains('!') || pattern.contains('@') || pattern.contains('*'))
+                && let Some(full_prefix) = prefix
+                && mask_matches(pattern_lower, &full_prefix.to_lowercase())
+            {
+                return true;
             }
         }
         false
@@ -500,14 +518,26 @@ impl IrcApp {
             return;
         }
 
-        // Use notify-send on Linux (usually pre-installed)
-        #[cfg(unix)]
+        // Use notify-send on Linux/BSD (usually pre-installed on Linux desktops)
+        #[cfg(all(unix, not(target_os = "macos")))]
         {
             let title = title.to_string();
             let body = body.to_string();
             std::thread::spawn(move || {
                 let _ = std::process::Command::new("notify-send")
                     .args(["-a", "Linefeed", "-t", "5000", &title, &body])
+                    .spawn();
+            });
+        }
+
+        #[cfg(target_os = "macos")]
+        {
+            let title = title.replace('"', "\\\"");
+            let body = body.replace('"', "\\\"");
+            std::thread::spawn(move || {
+                let script = format!("display notification \"{}\" with title \"{}\"", body, title);
+                let _ = std::process::Command::new("osascript")
+                    .args(["-e", &script])
                     .spawn();
             });
         }
@@ -542,6 +572,59 @@ impl IrcApp {
         self.my_nick_lower = self.my_nick.to_lowercase();
     }
 
+    pub fn is_channel_name(&self, name: &str) -> bool {
+        self.network_support.is_channel(name)
+    }
+
+    pub fn normalize_channel_name(&self, name: &str) -> String {
+        if self.is_channel_name(name) {
+            name.to_string()
+        } else {
+            format!("#{}", name)
+        }
+    }
+
+    fn reset_connection_support(&mut self) {
+        self.network_support = NetworkSupport::default();
+        self.nick_retry_attempts = 0;
+    }
+
+    pub fn request_manual_disconnect(&mut self, reason: Option<String>) {
+        self.connection_intent = ConnectionIntent::ManualDisconnect;
+        if self.cmd_tx.is_some() {
+            let _ = self.send_command(IrcCommand::Quit(reason));
+        }
+        self.connected = false;
+        self.connecting = false;
+        self.connection_lost = false;
+        self.cmd_tx = None;
+        self.lag_ms = None;
+        self.ping_sent_time = None;
+    }
+
+    pub fn request_reconnect_after_close(&mut self, reason: &str) {
+        if self.cmd_tx.is_some() {
+            self.connection_intent = ConnectionIntent::ReconnectAfterClose;
+            let _ = self.send_command(IrcCommand::Quit(Some(reason.to_string())));
+            self.connected = false;
+            self.connecting = false;
+            self.connection_lost = false;
+            self.cmd_tx = None;
+        } else {
+            self.connection_intent = ConnectionIntent::None;
+            self.connected = false;
+            self.connecting = true;
+            self.connection_lost = false;
+        }
+        self.lag_ms = None;
+        self.ping_sent_time = None;
+    }
+
+    fn fail_registration(&mut self, message: String) {
+        self.add_server_message(ChatMessage::system_fmt(&message, &self.timestamp_format));
+        self.request_manual_disconnect(Some("Registration failed".to_string()));
+    }
+
     fn reset_session_state(&mut self) {
         self.channels.clear();
         self.current_channel = None;
@@ -554,6 +637,7 @@ impl IrcApp {
         self.channel_list_loading = false;
         self.away_status = None;
         self.auto_away_triggered = false;
+        self.reset_connection_support();
     }
 
     /// Load a server favorite into the connection form
@@ -673,7 +757,7 @@ impl IrcApp {
                 let is_pm = !target.starts_with('#')
                     && !target.starts_with('&')
                     && target.eq_ignore_ascii_case(&self.my_nick);
-                let target_name = if is_channel(&target) {
+                let target_name = if self.is_channel_name(target) {
                     target.clone()
                 } else if is_pm {
                     // Private message to us - use sender as channel
@@ -696,14 +780,14 @@ impl IrcApp {
                     // PMs always notify (force=true)
                     self.send_notification(
                         &format!("PM from {}", sender),
-                        &truncate_chars(&content, 50),
+                        &truncate_chars(content, 50),
                         true,
                     );
                 } else if is_highlight && !is_from_self {
                     // Highlights only notify when not focused
                     self.send_notification(
                         &format!("{} mentioned you in {}", sender, target_name),
-                        &truncate_chars(&content, 50),
+                        &truncate_chars(content, 50),
                         false,
                     );
                 }
@@ -941,6 +1025,13 @@ impl IrcApp {
                 );
             }
 
+            IrcCommand::Mode(target, mode, params) => {
+                let sender = msg
+                    .get_sender_nick()
+                    .unwrap_or_else(|| "Server".to_string());
+                self.handle_mode_message(&sender, target, mode.as_deref(), params);
+            }
+
             IrcCommand::Numeric(num, params) => {
                 self.handle_numeric(*num, params);
             }
@@ -1056,13 +1147,119 @@ impl IrcApp {
         self.scroll_to_bottom = true;
     }
 
+    fn apply_isupport_tokens(&mut self, params: &[String]) {
+        for token in params.iter().skip(1) {
+            if token.starts_with(':') {
+                break;
+            }
+            if let Some(value) = token.strip_prefix("CHANTYPES=") {
+                if !value.is_empty() {
+                    self.network_support.channel_types = value.to_string();
+                }
+            } else if let Some(value) = token.strip_prefix("PREFIX=")
+                && let Some((_, prefixes)) = value.rsplit_once(')')
+                && !prefixes.is_empty()
+            {
+                self.network_support.user_prefixes = prefixes.to_string();
+            }
+        }
+    }
+
+    fn handle_mode_message(
+        &mut self,
+        sender: &str,
+        target: &str,
+        mode: Option<&str>,
+        params: &[String],
+    ) {
+        let Some(mode) = mode else {
+            return;
+        };
+        let is_channel = self.is_channel_name(target);
+        let mut param_idx = 0usize;
+        let mut sign = '+';
+        let max = self.max_scrollback;
+        let timestamp_format = self.timestamp_format.clone();
+
+        if is_channel {
+            if let Some(channel) = self.channels.get_mut(target) {
+                for c in mode.chars() {
+                    match c {
+                        '+' | '-' => sign = c,
+                        'q' | 'a' | 'o' | 'h' | 'v' => {
+                            if let Some(nick) = params.get(param_idx) {
+                                param_idx += 1;
+                                let new_mode = if sign == '+' {
+                                    match c {
+                                        'q' => UserMode::Owner,
+                                        'a' => UserMode::Admin,
+                                        'o' => UserMode::Op,
+                                        'h' => UserMode::HalfOp,
+                                        'v' => UserMode::Voice,
+                                        _ => UserMode::Normal,
+                                    }
+                                } else {
+                                    UserMode::Normal
+                                };
+                                channel.set_user_mode(nick, new_mode);
+                            }
+                        }
+                        'b' | 'e' | 'I' => {
+                            // List modes carry a parameter but are tracked through
+                            // their numeric list replies, not as persistent channel modes.
+                            if params.get(param_idx).is_some() {
+                                param_idx += 1;
+                            }
+                        }
+                        other => {
+                            if sign == '+' && matches!(other, 'k' | 'l') {
+                                if params.get(param_idx).is_some() {
+                                    param_idx += 1;
+                                }
+                            } else if sign == '-' && other == 'k' && params.get(param_idx).is_some()
+                            {
+                                param_idx += 1;
+                            }
+                            channel.apply_channel_mode_flag(sign, other);
+                        }
+                    }
+                }
+                channel.mode_params = params.to_vec();
+                let rendered = if params.is_empty() {
+                    mode.to_string()
+                } else {
+                    format!("{} {}", mode, params.join(" "))
+                };
+                channel.push_trimmed(
+                    ChatMessage::system_fmt(
+                        &format!("{} set mode {}", sender, rendered),
+                        &timestamp_format,
+                    ),
+                    max,
+                );
+            }
+        } else if target.eq_ignore_ascii_case(&self.my_nick) {
+            let rendered = if params.is_empty() {
+                mode.to_string()
+            } else {
+                format!("{} {}", mode, params.join(" "))
+            };
+            self.add_server_message(ChatMessage::system_fmt(
+                &format!("{} set user mode {}", sender, rendered),
+                &self.timestamp_format,
+            ));
+        }
+    }
+
     fn handle_numeric(&mut self, num: u16, params: &[String]) {
         match num {
             RPL_WELCOME => {
                 self.connected = true;
                 self.connecting = false;
                 self.reset_reconnect_state(); // Reset reconnect attempts on successful connection
-                if let Some(nick) = params.get(0) {
+                self.connection_intent = ConnectionIntent::None;
+                self.nick_retry_attempts = 0;
+                if let Some(nick) = params.first() {
                     self.set_my_nick(nick.clone());
                 }
                 let msg = params
@@ -1076,7 +1273,7 @@ impl IrcApp {
                     self.send_command(IrcCommand::Mode(
                         self.my_nick.clone(),
                         Some("+i".to_string()),
-                        None,
+                        Vec::new(),
                     ));
                     self.add_server_message(ChatMessage::system(
                         "Setting user mode +i (invisible)",
@@ -1089,11 +1286,7 @@ impl IrcApp {
                     for chan in auto_join.split(',') {
                         let chan = chan.trim();
                         if !chan.is_empty() {
-                            let channel = if is_channel(chan) {
-                                chan.to_string()
-                            } else {
-                                format!("#{}", chan)
-                            };
+                            let channel = self.normalize_channel_name(chan);
                             self.send_command(IrcCommand::Join(channel.clone(), None, None, None));
                             self.add_server_message(ChatMessage::system(&format!(
                                 "Auto-joining {}",
@@ -1124,23 +1317,27 @@ impl IrcApp {
                 self.send_command(IrcCommand::Ping("LAG".to_string()));
             }
 
+            RPL_ISUPPORT => {
+                self.apply_isupport_tokens(params);
+            }
+
             RPL_TOPIC => {
-                if let (Some(channel), Some(topic)) = (params.get(1), params.get(2)) {
-                    if let Some(ch) = self.channels.get_mut(channel) {
-                        ch.topic = Some(topic.clone());
-                        ch.messages
-                            .push(ChatMessage::system(&format!("Topic: {}", topic)));
-                    }
+                if let (Some(channel), Some(topic)) = (params.get(1), params.get(2))
+                    && let Some(ch) = self.channels.get_mut(channel)
+                {
+                    ch.topic = Some(topic.clone());
+                    ch.messages
+                        .push(ChatMessage::system(&format!("Topic: {}", topic)));
                 }
             }
 
             RPL_CHANNELMODEIS => {
                 // Format: 324 <nick> <channel> <modes> [<mode params>...]
-                if let (Some(channel), Some(modes)) = (params.get(1), params.get(2)) {
-                    if let Some(ch) = self.channels.get_mut(channel) {
-                        ch.modes = modes.clone();
-                        ch.mode_params = params[3..].to_vec();
-                    }
+                if let (Some(channel), Some(modes)) = (params.get(1), params.get(2))
+                    && let Some(ch) = self.channels.get_mut(channel)
+                {
+                    ch.modes = modes.clone();
+                    ch.mode_params = params[3..].to_vec();
                 }
             }
 
@@ -1178,18 +1375,25 @@ impl IrcApp {
             }
 
             RPL_NAMREPLY => {
-                if let Some(channel) = params.get(2) {
-                    if let Some(names) = params.get(3) {
-                        if let Some(ch) = self.channels.get_mut(channel) {
-                            for name in names.split_whitespace() {
-                                // Parse mode prefix
-                                let mode = name
-                                    .chars()
-                                    .next()
-                                    .and_then(UserMode::from_prefix)
-                                    .unwrap_or(UserMode::Normal);
-                                ch.add_user(name, mode);
-                            }
+                if let Some(channel) = params.get(2)
+                    && let Some(names) = params.get(3)
+                {
+                    let prefixes = self.network_support.user_prefixes.clone();
+                    if let Some(ch) = self.channels.get_mut(channel) {
+                        for name in names.split_whitespace() {
+                            // Parse mode prefix
+                            let mode = name
+                                .chars()
+                                .next()
+                                .and_then(|c| {
+                                    if prefixes.contains(c) {
+                                        UserMode::from_prefix(c)
+                                    } else {
+                                        None
+                                    }
+                                })
+                                .unwrap_or(UserMode::Normal);
+                            ch.add_user_with_prefixes(name, mode, &prefixes);
                         }
                     }
                 }
@@ -1197,10 +1401,10 @@ impl IrcApp {
 
             RPL_ENDOFNAMES => {
                 // After getting the user list, send WHO to get away status
-                if let Some(channel) = params.get(1) {
-                    if is_channel(channel) {
-                        self.send_command(IrcCommand::Who(channel.clone()));
-                    }
+                if let Some(channel) = params.get(1)
+                    && self.is_channel_name(channel)
+                {
+                    self.send_command(IrcCommand::Who(channel.clone()));
                 }
             }
 
@@ -1222,10 +1426,10 @@ impl IrcApp {
 
             RPL_ENDOFBANLIST => {
                 // Format: 368 <nick> <channel> :End of channel ban list
-                if let Some(channel) = params.get(1) {
-                    if let Some(ch) = self.channels.get_mut(channel) {
-                        ch.ban_list_complete = true;
-                    }
+                if let Some(channel) = params.get(1)
+                    && let Some(ch) = self.channels.get_mut(channel)
+                {
+                    ch.ban_list_complete = true;
                 }
             }
 
@@ -1236,6 +1440,15 @@ impl IrcApp {
             }
 
             ERR_NICKNAMEINUSE => {
+                if !self.connected && self.nick_retry_attempts >= 3 {
+                    let text = params
+                        .last()
+                        .cloned()
+                        .unwrap_or_else(|| "Nickname is already in use".to_string());
+                    self.fail_registration(format!("Registration failed: {}", text));
+                    return;
+                }
+                self.nick_retry_attempts = self.nick_retry_attempts.saturating_add(1);
                 let new_nick = format!("{}_", self.my_nick);
                 self.set_my_nick(new_nick.clone());
                 if let Some(tx) = &self.cmd_tx {
@@ -1244,6 +1457,22 @@ impl IrcApp {
                 self.add_server_message(ChatMessage::system(
                     "Nickname in use, trying alternative...",
                 ));
+            }
+
+            ERR_NONICKNAMEGIVEN | ERR_ERRONEUSNICKNAME | ERR_NICKCOLLISION | ERR_PASSWDMISMATCH
+            | ERR_YOUREBANNEDCREEP => {
+                let text = params
+                    .last()
+                    .cloned()
+                    .unwrap_or_else(|| format!("registration error {}", num));
+                if !self.connected {
+                    self.fail_registration(format!("Registration failed: {}", text));
+                } else {
+                    self.add_server_message(ChatMessage::system_fmt(
+                        &format!("[{}] {}", num, text),
+                        &self.timestamp_format,
+                    ));
+                }
             }
 
             RPL_LISTSTART => {
@@ -1270,10 +1499,11 @@ impl IrcApp {
                     // Relaxed check: if it's not a number and channel is none, take it? No, unsafe.
                     if (p.starts_with('#') || p.starts_with('&')) && channel.is_none() {
                         channel = Some(p.clone());
-                        if let Some(last_p) = params.last() {
-                            if last_p != p && !last_p.chars().all(|c| c.is_ascii_digit()) {
-                                topic = last_p.clone();
-                            }
+                        if let Some(last_p) = params.last()
+                            && last_p != p
+                            && !last_p.chars().all(|c| c.is_ascii_digit())
+                        {
+                            topic = last_p.clone();
                         }
                     }
 
@@ -1282,10 +1512,9 @@ impl IrcApp {
                     if i > 0
                         && clean_p.chars().all(|c| c.is_ascii_digit() || c == '+')
                         && !clean_p.is_empty()
+                        && let Ok(cnt) = clean_p.trim_start_matches('+').parse::<usize>()
                     {
-                        if let Ok(cnt) = clean_p.trim_start_matches('+').parse::<usize>() {
-                            user_count = cnt;
-                        }
+                        user_count = cnt;
                     }
                 }
 
@@ -1687,9 +1916,13 @@ impl IrcApp {
             // from many distinct senders cannot grow `channels` without bound.
             // Real channels you joined are exempt; over the cap we fall back to the
             // server buffer instead of opening a new window.
-            if !is_channel(channel) {
+            if !self.is_channel_name(channel) {
                 const MAX_QUERY_WINDOWS: usize = 200;
-                let query_count = self.channels.keys().filter(|k| !is_channel(k)).count();
+                let query_count = self
+                    .channels
+                    .keys()
+                    .filter(|k| !self.is_channel_name(k))
+                    .count();
                 if query_count >= MAX_QUERY_WINDOWS {
                     self.add_server_message(msg);
                     return;
@@ -1697,7 +1930,7 @@ impl IrcApp {
             }
             let mut new_channel = Channel::new();
             // Load chat history for new query windows (non-channels)
-            if self.logging_load_history && !is_channel(channel) {
+            if self.logging_load_history && !self.is_channel_name(channel) {
                 let history = self.log_manager.load_history(
                     &self.server_host,
                     channel,
@@ -1761,11 +1994,109 @@ impl IrcApp {
         }
     }
 
-    pub fn send_command(&mut self, cmd: IrcCommand) {
+    fn command_fits_irc_line(cmd: &IrcCommand) -> bool {
+        format!("{}", cmd).as_bytes().len() <= IRC_MAX_LINE_BYTES
+    }
+
+    fn split_irc_text_payload(
+        command: &str,
+        target: &str,
+        text: &str,
+        wrapper_prefix: &str,
+        wrapper_suffix: &str,
+    ) -> Option<Vec<String>> {
+        let overhead =
+            format!("{} {} :", command, target).len() + wrapper_prefix.len() + wrapper_suffix.len();
+        if overhead >= IRC_MAX_LINE_BYTES {
+            return None;
+        }
+        let max_payload_bytes = IRC_MAX_LINE_BYTES - overhead;
+        if text.len() <= max_payload_bytes {
+            return Some(vec![format!(
+                "{}{}{}",
+                wrapper_prefix, text, wrapper_suffix
+            )]);
+        }
+
+        let mut chunks = Vec::new();
+        let mut remaining = text;
+        while !remaining.is_empty() {
+            let mut end = remaining.len().min(max_payload_bytes);
+            while end > 0 && !remaining.is_char_boundary(end) {
+                end -= 1;
+            }
+            if end == 0 {
+                return None;
+            }
+            chunks.push(format!(
+                "{}{}{}",
+                wrapper_prefix,
+                &remaining[..end],
+                wrapper_suffix
+            ));
+            remaining = &remaining[end..];
+        }
+        Some(chunks)
+    }
+
+    pub fn send_privmsg_text(&mut self, target: &str, text: &str) -> bool {
+        let Some(chunks) = Self::split_irc_text_payload("PRIVMSG", target, text, "", "") else {
+            self.add_message_to_current(ChatMessage::system_fmt(
+                "Message not sent - target name leaves no room for text",
+                &self.timestamp_format,
+            ));
+            return false;
+        };
+        chunks
+            .into_iter()
+            .all(|chunk| self.send_command(IrcCommand::Privmsg(target.to_string(), chunk)))
+    }
+
+    pub fn send_notice_text(&mut self, target: &str, text: &str) -> bool {
+        let Some(chunks) = Self::split_irc_text_payload("NOTICE", target, text, "", "") else {
+            self.add_message_to_current(ChatMessage::system_fmt(
+                "Notice not sent - target name leaves no room for text",
+                &self.timestamp_format,
+            ));
+            return false;
+        };
+        chunks
+            .into_iter()
+            .all(|chunk| self.send_command(IrcCommand::Notice(target.to_string(), chunk)))
+    }
+
+    pub fn send_action_text(&mut self, target: &str, text: &str) -> bool {
+        let Some(chunks) =
+            Self::split_irc_text_payload("PRIVMSG", target, text, "\x01ACTION ", "\x01")
+        else {
+            self.add_message_to_current(ChatMessage::system_fmt(
+                "Action not sent - target name leaves no room for text",
+                &self.timestamp_format,
+            ));
+            return false;
+        };
+        chunks
+            .into_iter()
+            .all(|chunk| self.send_command(IrcCommand::Privmsg(target.to_string(), chunk)))
+    }
+
+    pub fn send_command(&mut self, cmd: IrcCommand) -> bool {
+        if !Self::command_fits_irc_line(&cmd) {
+            tracing::warn!("Outgoing command not sent (line too long): {:?}", cmd);
+            self.add_message_to_current(ChatMessage::system_fmt(
+                "Command not sent - IRC line is too long",
+                &self.timestamp_format,
+            ));
+            return false;
+        }
         if let Some(tx) = &self.cmd_tx {
             if let Err(e) = tx.send(cmd) {
                 tracing::warn!("Outgoing command not sent (disconnected): {:?}", e);
+                return false;
             }
+            true
+        } else {
+            false
         }
     }
 
@@ -1803,7 +2134,7 @@ impl IrcApp {
 
             // Auto-back: clear away status when user sends a message
             if self.away_status.is_some() {
-                self.send_command(IrcCommand::Away(None));
+                let _ = self.send_command(IrcCommand::Away(None));
                 self.away_status = None;
                 self.auto_away_triggered = false;
                 // Update our own status in all channels
@@ -1815,9 +2146,15 @@ impl IrcApp {
             }
 
             // Send message to current channel
-            let msg = ChatMessage::new_fmt(&self.my_nick, &input, &self.timestamp_format);
-            self.add_message_to_channel(channel, msg);
-            self.send_command(IrcCommand::Privmsg(channel.clone(), input));
+            if self.send_privmsg_text(channel, &input) {
+                let msg = ChatMessage::new_fmt(&self.my_nick, &input, &self.timestamp_format);
+                self.add_message_to_channel(channel, msg);
+            } else {
+                self.add_message_to_current(ChatMessage::system_fmt(
+                    "Message not sent",
+                    &self.timestamp_format,
+                ));
+            }
         }
     }
 
@@ -1842,35 +2179,32 @@ impl IrcApp {
     }
 
     fn history_down(&mut self) {
-        match self.history_index {
-            Some(i) => {
-                if i + 1 < self.command_history.len() {
-                    self.history_index = Some(i + 1);
-                    self.input_text = self.command_history[i + 1].clone();
-                } else {
-                    // Past end of history - restore temp
-                    self.history_index = None;
-                    self.input_text = self.history_temp.clone();
-                    self.history_temp.clear();
-                }
+        if let Some(i) = self.history_index {
+            if i + 1 < self.command_history.len() {
+                self.history_index = Some(i + 1);
+                self.input_text = self.command_history[i + 1].clone();
+            } else {
+                // Past end of history - restore temp
+                self.history_index = None;
+                self.input_text = self.history_temp.clone();
+                self.history_temp.clear();
             }
-            None => {} // Not browsing, do nothing
         }
     }
 
     fn find_nick_completions(&self, prefix: &str) -> Vec<String> {
-        if let Some(channel_name) = &self.current_channel {
-            if let Some(channel) = self.channels.get(channel_name) {
-                let prefix_lower = prefix.to_lowercase();
-                let mut matches: Vec<String> = channel
-                    .users
-                    .iter()
-                    .filter(|user| user.nick.to_lowercase().starts_with(&prefix_lower))
-                    .map(|user| user.nick.clone())
-                    .collect();
-                matches.sort_by(|a, b| a.to_lowercase().cmp(&b.to_lowercase()));
-                return matches;
-            }
+        if let Some(channel_name) = &self.current_channel
+            && let Some(channel) = self.channels.get(channel_name)
+        {
+            let prefix_lower = prefix.to_lowercase();
+            let mut matches: Vec<String> = channel
+                .users
+                .iter()
+                .filter(|user| user.nick.to_lowercase().starts_with(&prefix_lower))
+                .map(|user| user.nick.clone())
+                .collect();
+            matches.sort_by_key(|a| a.to_lowercase());
+            return matches;
         }
         Vec::new()
     }
@@ -1942,9 +2276,9 @@ impl IrcApp {
 
         // Build the reply based on the CTCP command
         let reply = match ctcp_cmd.as_str() {
-            "VERSION" => Some(format!(
-                "\x01VERSION Linefeed v0.0.1 - Rust/egui cross-platform IRC client\x01"
-            )),
+            "VERSION" => Some(
+                "\x01VERSION Linefeed v0.0.1 - Rust/egui cross-platform IRC client\x01".to_string(),
+            ),
             "TIME" => {
                 // Get current local time
                 use std::time::{SystemTime, UNIX_EPOCH};
@@ -1984,10 +2318,11 @@ impl IrcApp {
                 // Echo back the ping argument
                 Some(format!("\x01PING {}\x01", ctcp_args))
             }
-            "CLIENTINFO" => Some(format!(
+            "CLIENTINFO" => Some(
                 "\x01CLIENTINFO ACTION PING VERSION TIME CLIENTINFO SOURCE USERINFO\x01"
-            )),
-            "SOURCE" => Some(format!("\x01SOURCE https://github.com/user/linefeed\x01")),
+                    .to_string(),
+            ),
+            "SOURCE" => Some("\x01SOURCE https://github.com/user/linefeed\x01".to_string()),
             "USERINFO" => Some(format!("\x01USERINFO {}\x01", self.realname)),
             _ => None,
         };
@@ -2055,7 +2390,7 @@ impl IrcApp {
             // Build ordered list: Server (0), then channels sorted alphabetically
             let mut tabs: Vec<Option<String>> = vec![None]; // Server buffer is index 0 (Alt+1)
             let mut channel_names: Vec<_> = self.channels.keys().cloned().collect();
-            channel_names.sort_by(|a, b| a.to_lowercase().cmp(&b.to_lowercase()));
+            channel_names.sort_by_key(|a| a.to_lowercase());
             for name in channel_names {
                 tabs.push(Some(name));
             }
@@ -2077,37 +2412,36 @@ impl IrcApp {
                 .iter()
                 .enumerate()
                 {
-                    if i.key_pressed(*key) {
-                        if idx < tabs.len() {
-                            self.current_channel = tabs[idx].clone();
-                            self.selected_user = None;
-                            // Clear unread for the switched-to channel
-                            if let Some(ref channel_name) = self.current_channel {
-                                if let Some(ch) = self.channels.get_mut(channel_name) {
-                                    ch.unread = 0;
-                                }
-                            } else {
-                                self.server_unread = 0;
+                    if i.key_pressed(*key) && idx < tabs.len() {
+                        self.current_channel = tabs[idx].clone();
+                        self.selected_user = None;
+                        // Clear unread for the switched-to channel
+                        if let Some(ref channel_name) = self.current_channel {
+                            if let Some(ch) = self.channels.get_mut(channel_name) {
+                                ch.unread = 0;
                             }
+                        } else {
+                            self.server_unread = 0;
                         }
                     }
                 }
             }
 
             // Ctrl+W to close current tab
-            if i.modifiers.ctrl && i.key_pressed(egui::Key::W) {
-                if let Some(channel_name) = self.current_channel.clone() {
-                    if is_channel(&channel_name) {
-                        // Part the channel
-                        self.send_command(IrcCommand::Part(channel_name, None));
-                    } else {
-                        // Close query window
-                        self.channels.remove(&channel_name);
-                        self.current_channel = self.channels.keys().next().cloned();
-                    }
+            if i.modifiers.ctrl
+                && i.key_pressed(egui::Key::W)
+                && let Some(channel_name) = self.current_channel.clone()
+            {
+                if self.is_channel_name(&channel_name) {
+                    // Part the channel
+                    self.send_command(IrcCommand::Part(channel_name, None));
+                } else {
+                    // Close query window
+                    self.channels.remove(&channel_name);
+                    self.current_channel = self.channels.keys().next().cloned();
                 }
-                // If on server buffer, do nothing (can't close it)
             }
+            // If on server buffer, do nothing (can't close it)
         });
     }
 }
@@ -2144,21 +2478,21 @@ impl eframe::App for IrcApp {
         }
 
         // Execute pending auto-perform commands (one per frame to avoid flooding)
-        if let Some(ref mut commands) = self.pending_auto_perform.take() {
-            if let Some(cmd) = commands.first().cloned() {
-                // Process command (add / prefix if not present)
-                let cmd = if cmd.starts_with('/') {
-                    cmd
-                } else {
-                    format!("/{}", cmd)
-                };
-                self.process_command(&cmd);
+        if let Some(ref mut commands) = self.pending_auto_perform.take()
+            && let Some(cmd) = commands.first().cloned()
+        {
+            // Process command (add / prefix if not present)
+            let cmd = if cmd.starts_with('/') {
+                cmd
+            } else {
+                format!("/{}", cmd)
+            };
+            self.process_command(&cmd);
 
-                // Put remaining commands back
-                let remaining: Vec<_> = commands.iter().skip(1).cloned().collect();
-                if !remaining.is_empty() {
-                    self.pending_auto_perform = Some(remaining);
-                }
+            // Put remaining commands back
+            let remaining: Vec<_> = commands.iter().skip(1).cloned().collect();
+            if !remaining.is_empty() {
+                self.pending_auto_perform = Some(remaining);
             }
         }
 
@@ -2226,10 +2560,10 @@ impl eframe::App for IrcApp {
         }
 
         // Color picker dialog
-        if self.show_color_picker {
-            if let Some(color_code) = self.show_color_picker_window(ctx) {
-                self.input_text.push_str(&color_code);
-            }
+        if self.show_color_picker
+            && let Some(color_code) = self.show_color_picker_window(ctx)
+        {
+            self.input_text.push_str(&color_code);
         }
 
         // Top panel - toolbar
@@ -2290,11 +2624,9 @@ impl eframe::App for IrcApp {
                         if ui.button("Connect").clicked() {
                             self.show_connect_dialog = true;
                         }
-                    } else if self.connected {
-                        if ui.button("Disconnect").clicked() {
-                            self.send_command(IrcCommand::Quit(Some("Linefeed".to_string())));
-                            self.connected = false;
-                        }
+                    } else if self.connected && ui.button("Disconnect").clicked() {
+                        self.send_command(IrcCommand::Quit(Some("Linefeed".to_string())));
+                        self.connected = false;
                     }
                 });
             });
@@ -2339,18 +2671,14 @@ impl eframe::App for IrcApp {
                                 .hint_text("#channel")
                                 .desired_width(100.0),
                         );
-                        if (response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)))
-                            || ui.button("+").clicked()
+                        if ((response.lost_focus()
+                            && ui.input(|i| i.key_pressed(egui::Key::Enter)))
+                            || ui.button("+").clicked())
+                            && !self.join_channel.is_empty()
                         {
-                            if !self.join_channel.is_empty() {
-                                let channel = if self.join_channel.starts_with('#') {
-                                    self.join_channel.clone()
-                                } else {
-                                    format!("#{}", self.join_channel)
-                                };
-                                self.send_command(IrcCommand::Join(channel, None, None, None));
-                                self.join_channel.clear();
-                            }
+                            let channel = self.normalize_channel_name(&self.join_channel);
+                            self.send_command(IrcCommand::Join(channel, None, None, None));
+                            self.join_channel.clear();
                         }
                     });
                     ui.separator();
@@ -2368,8 +2696,7 @@ impl eframe::App for IrcApp {
                             .get(&channel_name)
                             .map(|c| c.unread)
                             .unwrap_or(0);
-                        let is_pm =
-                            !channel_name.starts_with('#') && !channel_name.starts_with('&');
+                        let is_pm = !self.is_channel_name(&channel_name);
 
                         let label = if unread > 0 {
                             format!("{} ({})", channel_name, unread)
@@ -2407,24 +2734,28 @@ impl eframe::App for IrcApp {
                         }
 
                         // Double-click to open channel info
-                        if response.double_clicked() && is_channel(&channel_name) {
+                        if response.double_clicked() && self.is_channel_name(&channel_name) {
                             self.channel_info_target = Some(channel_name.clone());
                             self.show_channel_info = true;
                             // Request fresh mode info
-                            self.send_command(IrcCommand::Mode(channel_name.clone(), None, None));
+                            self.send_command(IrcCommand::Mode(
+                                channel_name.clone(),
+                                None,
+                                Vec::new(),
+                            ));
                         }
 
                         // Context menu for channels
                         let chan_for_menu = channel_name.clone();
                         response.context_menu(|ui| {
-                            if is_channel(&chan_for_menu) {
+                            if self.is_channel_name(&chan_for_menu) {
                                 if ui.button("Channel Info").clicked() {
                                     self.channel_info_target = Some(chan_for_menu.clone());
                                     self.show_channel_info = true;
                                     self.send_command(IrcCommand::Mode(
                                         chan_for_menu.clone(),
                                         None,
-                                        None,
+                                        Vec::new(),
                                     ));
                                     ui.close();
                                 }
@@ -2461,128 +2792,124 @@ impl eframe::App for IrcApp {
         let mut op_nick: Option<(String, String)> = None; // (channel, nick)
         let mut voice_nick: Option<(String, String)> = None;
         let mut kick_nick: Option<(String, String)> = None;
-        if let Some(channel_name) = &self.current_channel {
-            if is_channel(&channel_name) {
-                let chan_for_context = channel_name.clone();
-                egui::Panel::right("users")
-                    .resizable(true)
-                    .default_size(140.0)
-                    .show_inside(root_ui, |ui| {
-                        if let Some(channel) = self.channels.get(&chan_for_context) {
-                            // Show user count with away count if any
-                            let away_count = channel.away_count();
-                            if away_count > 0 {
-                                ui.heading(format!(
-                                    "Users ({}, {} away)",
-                                    channel.users.len(),
-                                    away_count
-                                ));
-                            } else {
-                                ui.heading(format!("Users ({})", channel.users.len()));
-                            }
-                            ui.separator();
-                            // Get selected user for this render
-                            let current_selected = self.selected_user.clone();
-                            let mut new_selected: Option<String> = current_selected.clone();
-
-                            ScrollArea::vertical().show(ui, |ui| {
-                    for user in &channel.users {
-                        let nick = &user.nick;
-                        let mode = &user.mode;
-                        let prefix = mode.prefix();
-                        let is_selected = current_selected.as_ref() == Some(nick);
-                        let is_away = channel.is_user_away(nick);
-
-                                    // Color based on mode, dimmed if away
-                                    let base_color = match mode {
-                                        UserMode::Owner => Color32::from_rgb(255, 100, 100),
-                                        UserMode::Admin => Color32::from_rgb(255, 150, 100),
-                                        UserMode::Op => Color32::from_rgb(100, 200, 100),
-                                        UserMode::HalfOp => Color32::from_rgb(100, 200, 200),
-                                        UserMode::Voice => Color32::from_rgb(200, 200, 100),
-                                        UserMode::Normal => Color32::WHITE,
-                                    };
-
-                                    // Dim color for away users (reduce to ~50% brightness)
-                                    let color = if is_away {
-                                        Color32::from_rgb(
-                                            base_color.r() / 2,
-                                            base_color.g() / 2,
-                                            base_color.b() / 2,
-                                        )
-                                    } else {
-                                        base_color
-                                    };
-
-                                    // Add (away) indicator for away users
-                                    let display_text = if is_away {
-                                        format!("{}{} (away)", prefix, nick)
-                                    } else {
-                                        format!("{}{}", prefix, nick)
-                                    };
-
-                                    let text = RichText::new(display_text).color(color);
-                                    let response = ui.selectable_label(is_selected, text);
-
-                                    // Show away message on hover
-                                    if is_away {
-                                        if let Some(user) = channel.get_user(nick) {
-                                            if let Some(away_msg) = &user.away {
-                                                response
-                                                    .clone()
-                                                    .on_hover_text(format!("Away: {}", away_msg));
-                                            }
-                                        }
-                                    }
-
-                                    // Single click to select
-                                    if response.clicked() {
-                                        new_selected = Some(nick.clone());
-                                    }
-
-                                    // Double click to open PM
-                                    if response.double_clicked() {
-                                        pm_to_open = Some(nick.clone());
-                                    }
-
-                                    // Context menu for user
-                                    let nick_clone = nick.clone();
-                                    let chan_clone = chan_for_context.clone();
-                                    response.context_menu(|ui| {
-                                        if ui.button("Private Message").clicked() {
-                                            pm_to_open = Some(nick_clone.clone());
-                                            ui.close();
-                                        }
-                                        if ui.button("WHOIS").clicked() {
-                                            whois_nick = Some(nick_clone.clone());
-                                            ui.close();
-                                        }
-                                        ui.separator();
-                                        if ui.button("Op (+o)").clicked() {
-                                            op_nick =
-                                                Some((chan_clone.clone(), nick_clone.clone()));
-                                            ui.close();
-                                        }
-                                        if ui.button("Voice (+v)").clicked() {
-                                            voice_nick =
-                                                Some((chan_clone.clone(), nick_clone.clone()));
-                                            ui.close();
-                                        }
-                                        ui.separator();
-                                        if ui.button("Kick").clicked() {
-                                            kick_nick =
-                                                Some((chan_clone.clone(), nick_clone.clone()));
-                                            ui.close();
-                                        }
-                                    });
-                                }
-                            });
-
-                            // Update selected user
-                            self.selected_user = new_selected;
+        if let Some(channel_name) = &self.current_channel
+            && self.is_channel_name(channel_name)
+        {
+            let chan_for_context = channel_name.clone();
+            egui::Panel::right("users")
+                .resizable(true)
+                .default_size(140.0)
+                .show_inside(root_ui, |ui| {
+                    if let Some(channel) = self.channels.get(&chan_for_context) {
+                        // Show user count with away count if any
+                        let away_count = channel.away_count();
+                        if away_count > 0 {
+                            ui.heading(format!(
+                                "Users ({}, {} away)",
+                                channel.users.len(),
+                                away_count
+                            ));
+                        } else {
+                            ui.heading(format!("Users ({})", channel.users.len()));
                         }
-                    });
-            }
+                        ui.separator();
+                        // Get selected user for this render
+                        let current_selected = self.selected_user.clone();
+                        let mut new_selected: Option<String> = current_selected.clone();
+
+                        ScrollArea::vertical().show(ui, |ui| {
+                            for user in &channel.users {
+                                let nick = &user.nick;
+                                let mode = &user.mode;
+                                let prefix = mode.prefix();
+                                let is_selected = current_selected.as_ref() == Some(nick);
+                                let is_away = channel.is_user_away(nick);
+
+                                // Color based on mode, dimmed if away
+                                let base_color = match mode {
+                                    UserMode::Owner => Color32::from_rgb(255, 100, 100),
+                                    UserMode::Admin => Color32::from_rgb(255, 150, 100),
+                                    UserMode::Op => Color32::from_rgb(100, 200, 100),
+                                    UserMode::HalfOp => Color32::from_rgb(100, 200, 200),
+                                    UserMode::Voice => Color32::from_rgb(200, 200, 100),
+                                    UserMode::Normal => Color32::WHITE,
+                                };
+
+                                // Dim color for away users (reduce to ~50% brightness)
+                                let color = if is_away {
+                                    Color32::from_rgb(
+                                        base_color.r() / 2,
+                                        base_color.g() / 2,
+                                        base_color.b() / 2,
+                                    )
+                                } else {
+                                    base_color
+                                };
+
+                                // Add (away) indicator for away users
+                                let display_text = if is_away {
+                                    format!("{}{} (away)", prefix, nick)
+                                } else {
+                                    format!("{}{}", prefix, nick)
+                                };
+
+                                let text = RichText::new(display_text).color(color);
+                                let response = ui.selectable_label(is_selected, text);
+
+                                // Show away message on hover
+                                if is_away
+                                    && let Some(user) = channel.get_user(nick)
+                                    && let Some(away_msg) = &user.away
+                                {
+                                    response
+                                        .clone()
+                                        .on_hover_text(format!("Away: {}", away_msg));
+                                }
+
+                                // Single click to select
+                                if response.clicked() {
+                                    new_selected = Some(nick.clone());
+                                }
+
+                                // Double click to open PM
+                                if response.double_clicked() {
+                                    pm_to_open = Some(nick.clone());
+                                }
+
+                                // Context menu for user
+                                let nick_clone = nick.clone();
+                                let chan_clone = chan_for_context.clone();
+                                response.context_menu(|ui| {
+                                    if ui.button("Private Message").clicked() {
+                                        pm_to_open = Some(nick_clone.clone());
+                                        ui.close();
+                                    }
+                                    if ui.button("WHOIS").clicked() {
+                                        whois_nick = Some(nick_clone.clone());
+                                        ui.close();
+                                    }
+                                    ui.separator();
+                                    if ui.button("Op (+o)").clicked() {
+                                        op_nick = Some((chan_clone.clone(), nick_clone.clone()));
+                                        ui.close();
+                                    }
+                                    if ui.button("Voice (+v)").clicked() {
+                                        voice_nick = Some((chan_clone.clone(), nick_clone.clone()));
+                                        ui.close();
+                                    }
+                                    ui.separator();
+                                    if ui.button("Kick").clicked() {
+                                        kick_nick = Some((chan_clone.clone(), nick_clone.clone()));
+                                        ui.close();
+                                    }
+                                });
+                            }
+                        });
+
+                        // Update selected user
+                        self.selected_user = new_selected;
+                    }
+                });
         }
 
         // Handle user list actions
@@ -2600,14 +2927,14 @@ impl eframe::App for IrcApp {
             self.send_command(IrcCommand::Mode(
                 channel,
                 Some("+o".to_string()),
-                Some(nick),
+                vec![nick],
             ));
         }
         if let Some((channel, nick)) = voice_nick {
             self.send_command(IrcCommand::Mode(
                 channel,
                 Some("+v".to_string()),
-                Some(nick),
+                vec![nick],
             ));
         }
         if let Some((channel, nick)) = kick_nick {
@@ -2617,32 +2944,32 @@ impl eframe::App for IrcApp {
         // Central panel - chat area
         egui::CentralPanel::default().show_inside(root_ui, |ui| {
             // Channel header with modes and topic
-            if let Some(channel_name) = &self.current_channel {
-                if let Some(channel) = self.channels.get(channel_name) {
-                    // Show channel name and modes for channels
-                    if is_channel(channel_name) && !channel.modes.is_empty() {
-                        ui.horizontal(|ui| {
-                            ui.label(RichText::new(channel_name).strong());
-                            ui.label(
-                                RichText::new(format!("[{}]", channel.modes))
-                                    .color(Color32::from_rgb(150, 150, 150)),
-                            );
-                            ui.label(
-                                RichText::new(format!("({} users)", channel.users.len()))
-                                    .small()
-                                    .color(Color32::GRAY),
-                            );
-                        });
-                    }
-                    if let Some(topic) = &channel.topic {
-                        ui.horizontal(|ui| {
-                            ui.label(RichText::new("Topic:").strong());
-                            render_irc_text(ui, topic, Color32::WHITE);
-                        });
-                    }
-                    if is_channel(channel_name) || channel.topic.is_some() {
-                        ui.separator();
-                    }
+            if let Some(channel_name) = &self.current_channel
+                && let Some(channel) = self.channels.get(channel_name)
+            {
+                // Show channel name and modes for channels
+                if self.is_channel_name(channel_name) && !channel.modes.is_empty() {
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new(channel_name).strong());
+                        ui.label(
+                            RichText::new(format!("[{}]", channel.modes))
+                                .color(Color32::from_rgb(150, 150, 150)),
+                        );
+                        ui.label(
+                            RichText::new(format!("({} users)", channel.users.len()))
+                                .small()
+                                .color(Color32::GRAY),
+                        );
+                    });
+                }
+                if let Some(topic) = &channel.topic {
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new("Topic:").strong());
+                        render_irc_text(ui, topic, Color32::WHITE);
+                    });
+                }
+                if self.is_channel_name(channel_name) || channel.topic.is_some() {
+                    ui.separator();
                 }
             }
 
@@ -2864,5 +3191,73 @@ impl eframe::App for IrcApp {
                 self.input_text.push('\x0F');
             }
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_app() -> IrcApp {
+        IrcApp::with_settings(Settings::default())
+    }
+
+    #[test]
+    fn isupport_updates_channel_types() {
+        let mut app = test_app();
+        app.handle_numeric(
+            RPL_ISUPPORT,
+            &[
+                "nick".to_string(),
+                "CHANTYPES=#&+!".to_string(),
+                "PREFIX=(qaohv)~&@%+".to_string(),
+                "are supported".to_string(),
+            ],
+        );
+        assert!(app.is_channel_name("+ops"));
+        assert!(app.is_channel_name("!safe"));
+        assert!(!app.is_channel_name("nick"));
+    }
+
+    #[test]
+    fn fatal_registration_error_clears_connecting() {
+        let mut app = test_app();
+        app.connecting = true;
+        app.handle_numeric(
+            ERR_PASSWDMISMATCH,
+            &["nick".to_string(), "Password incorrect".to_string()],
+        );
+        assert!(!app.connecting);
+        assert!(!app.connected);
+        assert_eq!(app.connection_intent, ConnectionIntent::ManualDisconnect);
+        assert!(
+            app.server_messages
+                .last()
+                .is_some_and(|m| m.content.contains("Registration failed"))
+        );
+    }
+
+    #[test]
+    fn incoming_mode_updates_user_mode() {
+        let mut app = test_app();
+        let mut channel = Channel::new();
+        channel.add_user("alice", UserMode::Normal);
+        app.channels.insert("#chan".to_string(), channel);
+
+        app.handle_mode_message("oper", "#chan", Some("+o"), &["alice".to_string()]);
+
+        let alice = app.channels["#chan"].get_user("alice").unwrap();
+        assert_eq!(alice.mode, UserMode::Op);
+    }
+
+    #[test]
+    fn split_irc_text_payload_preserves_utf8_boundaries() {
+        let text = "é".repeat(400);
+        let chunks = IrcApp::split_irc_text_payload("PRIVMSG", "#chan", &text, "", "").unwrap();
+        assert!(chunks.len() > 1);
+        for chunk in chunks {
+            assert!(format!("PRIVMSG #chan :{}", chunk).len() <= IRC_MAX_LINE_BYTES);
+            assert!(chunk.is_char_boundary(chunk.len()));
+        }
     }
 }

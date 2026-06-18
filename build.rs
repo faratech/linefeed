@@ -1,6 +1,14 @@
-use std::process::Command;
-use std::path::Path;
 use std::env;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+
+fn llvm_mingw_tool(tool: &str) -> String {
+    if let Ok(home) = env::var("LLVM_MINGW_HOME") {
+        let path = PathBuf::from(home).join("bin").join(tool);
+        return path.to_string_lossy().into_owned();
+    }
+    tool.to_string()
+}
 
 fn main() {
     // Only compile resources when targeting Windows
@@ -14,13 +22,13 @@ fn main() {
 
     // Determine the windres tool based on target
     let windres = if target.contains("aarch64") && target.contains("gnullvm") {
-        "/root/toolchains/llvm-mingw/bin/aarch64-w64-mingw32-windres"
+        llvm_mingw_tool("aarch64-w64-mingw32-windres")
     } else if target.contains("i686") && target.contains("gnullvm") {
-        "/root/toolchains/llvm-mingw/bin/i686-w64-mingw32-windres"
+        llvm_mingw_tool("i686-w64-mingw32-windres")
     } else if target.contains("x86_64") && target.contains("gnullvm") {
-        "/root/toolchains/llvm-mingw/bin/x86_64-w64-mingw32-windres"
+        llvm_mingw_tool("x86_64-w64-mingw32-windres")
     } else {
-        "windres"
+        "windres".to_string()
     };
 
     // Create resource script
@@ -54,11 +62,13 @@ END
 
     // Compile resource
     let res_path = Path::new(&out_dir).join("linefeed.res");
-    let status = Command::new(windres)
+    let status = Command::new(&windres)
         .args([
             rc_path.to_str().unwrap(),
-            "-O", "coff",
-            "-o", res_path.to_str().unwrap(),
+            "-O",
+            "coff",
+            "-o",
+            res_path.to_str().unwrap(),
         ])
         .status();
 

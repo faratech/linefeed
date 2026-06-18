@@ -1,6 +1,6 @@
 //! IRC numeric reply codes (RFC 1459, RFC 2812, and common extensions)
 
-#![allow(dead_code)]  // Some constants are defined for completeness but not yet used
+#![allow(dead_code)] // Some constants are defined for completeness but not yet used
 
 // Connection/Welcome replies
 pub const RPL_WELCOME: u16 = 1;
@@ -15,26 +15,26 @@ pub const RPL_UNAWAY: u16 = 305;
 pub const RPL_NOWAWAY: u16 = 306;
 
 // WHOIS responses
-pub const RPL_WHOISCERTFP: u16 = 276;   // IRCv3: TLS certificate fingerprint
-pub const RPL_WHOISREGNICK: u16 = 307;  // Registered nick
+pub const RPL_WHOISCERTFP: u16 = 276; // IRCv3: TLS certificate fingerprint
+pub const RPL_WHOISREGNICK: u16 = 307; // Registered nick
 pub const RPL_WHOISUSER: u16 = 311;
 pub const RPL_WHOISSERVER: u16 = 312;
 pub const RPL_WHOISOPERATOR: u16 = 313;
 pub const RPL_WHOISIDLE: u16 = 317;
 pub const RPL_ENDOFWHOIS: u16 = 318;
 pub const RPL_WHOISCHANNELS: u16 = 319;
-pub const RPL_WHOISSPECIAL: u16 = 320;  // Non-standard: special user info/title
+pub const RPL_WHOISSPECIAL: u16 = 320; // Non-standard: special user info/title
 pub const RPL_WHOISACCOUNT: u16 = 330;
-pub const RPL_WHOISBOT: u16 = 335;      // User is a bot
+pub const RPL_WHOISBOT: u16 = 335; // User is a bot
 pub const RPL_WHOISACTUALLY: u16 = 338;
-pub const RPL_WHOISMARKS: u16 = 339;      // User marks/flags (network-specific)
-pub const RPL_WHOISHOST: u16 = 378;     // Actual host (shown to opers)
-pub const RPL_WHOISMODES: u16 = 379;    // User modes
-pub const RPL_WHOISSECURE: u16 = 671;   // TLS connection
+pub const RPL_WHOISMARKS: u16 = 339; // User marks/flags (network-specific)
+pub const RPL_WHOISHOST: u16 = 378; // Actual host (shown to opers)
+pub const RPL_WHOISMODES: u16 = 379; // User modes
+pub const RPL_WHOISSECURE: u16 = 671; // TLS connection
 
 // WHO responses
 pub const RPL_WHOREPLY: u16 = 352;
-pub const RPL_WHOSPCRPL: u16 = 354;     // IRCv3: Extended WHO (WHOX) reply
+pub const RPL_WHOSPCRPL: u16 = 354; // IRCv3: Extended WHO (WHOX) reply
 pub const RPL_ENDOFWHO: u16 = 315;
 
 // Channel list

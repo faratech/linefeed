@@ -16,6 +16,7 @@ use std::sync::Arc;
 use std::sync::OnceLock;
 use tokio::sync::mpsc;
 
+use gui::ConnectionIntent;
 use gui::{ChatMessage, IrcApp};
 use irc::{IrcClient, IrcCommand, IrcMessage};
 
@@ -292,6 +293,8 @@ impl eframe::App for LinefeedApp {
             // When hidden to system tray, skip all UI work
             // But check if user restored via taskbar (not our tray menu)
             if systray::is_window_hidden() {
+                self.app.update_minimal();
+                self.process_connection_lifecycle(ctx);
                 let minimized = ctx.input(|i| i.viewport().minimized.unwrap_or(true));
                 if !minimized {
                     // User restored via taskbar, clear our flag
@@ -299,6 +302,7 @@ impl eframe::App for LinefeedApp {
                     ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
                 } else {
                     // Still hidden, skip work
+                    ctx.request_repaint_after(std::time::Duration::from_millis(250));
                     return;
                 }
             }
@@ -320,6 +324,7 @@ impl eframe::App for LinefeedApp {
         if is_minimized {
             // Process messages to prevent buffer overflow, but skip rendering.
             self.app.update_minimal();
+            self.process_connection_lifecycle(ctx);
             // Drain reasonably often while minimized: update_minimal() empties the
             // channel each call, so polling ~4x/second keeps the message-loss window
             // small without the cost of full-rate rendering.
@@ -343,39 +348,7 @@ impl eframe::App for LinefeedApp {
             }
         }
 
-        // Check if connection thread has finished (connection lost)
-        if let Some(ref handle) = self.connection_thread {
-            if handle.is_finished() {
-                self.connection_thread = None;
-                if self.app.connected {
-                    // Connection was lost unexpectedly after registering.
-                    self.app.mark_connection_lost();
-                    self.app
-                        .add_server_message(ChatMessage::system("Connection lost"));
-                    tracing::warn!("Connection lost, will attempt reconnect");
-                } else if self.app.connecting {
-                    // The connection thread exited before we ever registered: the
-                    // initial connect failed. Clear `connecting` and mark the
-                    // connection lost so the reconnect/backoff path and the connect
-                    // UI can engage instead of being stuck "connecting" forever.
-                    self.app.connecting = false;
-                    self.app.mark_connection_lost();
-                    self.app
-                        .add_server_message(ChatMessage::system("Connection failed"));
-                    tracing::warn!("Initial connection failed, will attempt reconnect");
-                }
-            }
-        }
-
-        // Start connection if requested
-        if self.app.connecting && self.connection_thread.is_none() {
-            self.start_connection(ctx.clone());
-        }
-
-        // Auto-reconnect if enabled and connection was lost
-        if self.app.should_reconnect() {
-            self.app.start_reconnect();
-        }
+        self.process_connection_lifecycle(ctx);
 
         // Main UI update
         self.app.ui(ui, frame);
@@ -417,6 +390,56 @@ impl eframe::App for LinefeedApp {
 }
 
 impl LinefeedApp {
+    fn process_connection_lifecycle(&mut self, ctx: &egui::Context) {
+        if self
+            .connection_thread
+            .as_ref()
+            .is_some_and(|handle| handle.is_finished())
+        {
+            self.connection_thread = None;
+            match self.app.connection_intent {
+                ConnectionIntent::ReconnectAfterClose => {
+                    self.app.connection_intent = ConnectionIntent::None;
+                    self.app.connecting = true;
+                    self.app.connected = false;
+                    self.app
+                        .add_server_message(ChatMessage::system("Previous connection closed"));
+                }
+                ConnectionIntent::ManualDisconnect => {
+                    self.app.connection_intent = ConnectionIntent::None;
+                    self.app.connecting = false;
+                    self.app.connected = false;
+                }
+                ConnectionIntent::None => {
+                    if self.app.connected {
+                        // Connection was lost unexpectedly after registering.
+                        self.app.mark_connection_lost();
+                        self.app
+                            .add_server_message(ChatMessage::system("Connection lost"));
+                        tracing::warn!("Connection lost, will attempt reconnect");
+                    } else if self.app.connecting {
+                        // The connection thread exited before we ever registered.
+                        self.app.connecting = false;
+                        self.app.mark_connection_lost();
+                        self.app
+                            .add_server_message(ChatMessage::system("Connection failed"));
+                        tracing::warn!("Initial connection failed, will attempt reconnect");
+                    }
+                }
+            }
+        }
+
+        // Auto-reconnect if enabled and connection was lost.
+        if self.app.should_reconnect() {
+            self.app.start_reconnect();
+        }
+
+        // Start connection if requested.
+        if self.app.connecting && self.connection_thread.is_none() {
+            self.start_connection(ctx.clone());
+        }
+    }
+
     fn start_connection(&mut self, ctx: egui::Context) {
         let config = self.app.get_server_config();
         tracing::info!("Connecting to {}:{}", config.host, config.port);

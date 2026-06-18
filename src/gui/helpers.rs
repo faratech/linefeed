@@ -1,8 +1,11 @@
 //! Helper utilities for the GUI module
 
-/// Check if a name is an IRC channel (starts with # or &)
+/// Check if a name is an IRC channel using the common default CHANTYPES.
+/// Runtime code should prefer `IrcApp::is_channel_name` after RPL_ISUPPORT.
 pub fn is_channel(name: &str) -> bool {
-    name.starts_with('#') || name.starts_with('&')
+    name.chars()
+        .next()
+        .is_some_and(|c| matches!(c, '#' | '&' | '+' | '!'))
 }
 
 /// Convert a nick or partial mask into a complete `nick!user@host` ban mask.
@@ -14,10 +17,10 @@ pub fn nick_to_mask(arg: &str) -> String {
         if s.is_empty() { "*" } else { s }
     }
     // Already a full nick!user@host mask? Pass it through.
-    if let Some(bang) = arg.find('!') {
-        if arg[bang + 1..].contains('@') {
-            return arg.to_string();
-        }
+    if let Some(bang) = arg.find('!')
+        && arg[bang + 1..].contains('@')
+    {
+        return arg.to_string();
     }
     // Split off an optional host, then an optional user, defaulting the rest to '*'.
     let (nick_user, host) = match arg.split_once('@') {
@@ -49,9 +52,21 @@ pub fn current_time_formatted(format: &str) -> String {
             // formatting the zeroed tm (which would render as 1900/epoch garbage).
             let days = secs / 86400;
             let (_, m, d) = days_to_ymd(days);
-            (m as u64, d as u64, (secs % 86400) / 3600, (secs % 3600) / 60, secs % 60)
+            (
+                m as u64,
+                d as u64,
+                (secs % 86400) / 3600,
+                (secs % 3600) / 60,
+                secs % 60,
+            )
         } else {
-            ((tm.tm_mon + 1) as u64, tm.tm_mday as u64, tm.tm_hour as u64, tm.tm_min as u64, tm.tm_sec as u64)
+            (
+                (tm.tm_mon + 1) as u64,
+                tm.tm_mday as u64,
+                tm.tm_hour as u64,
+                tm.tm_min as u64,
+                tm.tm_sec as u64,
+            )
         }
     };
 
@@ -60,8 +75,14 @@ pub fn current_time_formatted(format: &str) -> String {
         use std::mem::MaybeUninit;
         #[repr(C)]
         struct SYSTEMTIME {
-            year: u16, month: u16, day_of_week: u16, day: u16,
-            hour: u16, minute: u16, second: u16, milliseconds: u16,
+            year: u16,
+            month: u16,
+            day_of_week: u16,
+            day: u16,
+            hour: u16,
+            minute: u16,
+            second: u16,
+            milliseconds: u16,
         }
         unsafe extern "system" {
             fn GetLocalTime(lpSystemTime: *mut SYSTEMTIME);
@@ -70,7 +91,13 @@ pub fn current_time_formatted(format: &str) -> String {
         unsafe {
             GetLocalTime(st.as_mut_ptr());
             let st = st.assume_init();
-            (st.month as u64, st.day as u64, st.hour as u64, st.minute as u64, st.second as u64)
+            (
+                st.month as u64,
+                st.day as u64,
+                st.hour as u64,
+                st.minute as u64,
+                st.second as u64,
+            )
         }
     };
 
@@ -109,12 +136,24 @@ pub fn format_timestamp(ts: u64) -> String {
 
     let (year, month, day) = days_to_ymd(days);
     let month_name = match month {
-        1 => "Jan", 2 => "Feb", 3 => "Mar", 4 => "Apr",
-        5 => "May", 6 => "Jun", 7 => "Jul", 8 => "Aug",
-        9 => "Sep", 10 => "Oct", 11 => "Nov", 12 => "Dec",
+        1 => "Jan",
+        2 => "Feb",
+        3 => "Mar",
+        4 => "Apr",
+        5 => "May",
+        6 => "Jun",
+        7 => "Jul",
+        8 => "Aug",
+        9 => "Sep",
+        10 => "Oct",
+        11 => "Nov",
+        12 => "Dec",
         _ => "???",
     };
-    format!("{} {}, {} {:02}:{:02} UTC", month_name, day, year, hours, minutes)
+    format!(
+        "{} {}, {} {:02}:{:02} UTC",
+        month_name, day, year, hours, minutes
+    )
 }
 
 /// Convert days since Unix epoch (1970-01-01) to (year, month, day)
@@ -153,7 +192,7 @@ pub fn mask_matches(pattern: &str, text: &str) -> bool {
     let t: Vec<char> = text.chars().collect();
     let (mut pi, mut ti) = (0usize, 0usize);
     let mut star: Option<usize> = None; // pattern index just after the last '*'
-    let mut star_ti = 0usize;           // text index when that '*' was taken
+    let mut star_ti = 0usize; // text index when that '*' was taken
 
     while ti < t.len() {
         if pi < p.len() && (p[pi] == '?' || p[pi] == t[ti]) {
@@ -208,5 +247,14 @@ mod tests {
         assert!(mask_matches("", ""));
         assert!(!mask_matches("", "x"));
         assert!(mask_matches("**a", "a"));
+    }
+
+    #[test]
+    fn default_channel_detection_includes_common_prefixes() {
+        assert!(is_channel("#chan"));
+        assert!(is_channel("&local"));
+        assert!(is_channel("+modeless"));
+        assert!(is_channel("!safe"));
+        assert!(!is_channel("nick"));
     }
 }

@@ -12,13 +12,13 @@ pub enum IrcCommand {
     // Channel
     // When sending: (channel, optional key, None, None)
     // When receiving with extended-join: (channel, None, account, realname)
-    Join(String, Option<String>, Option<String>, Option<String>),  // (channel, key, account, realname)
+    Join(String, Option<String>, Option<String>, Option<String>), // (channel, key, account, realname)
     Part(String, Option<String>),
     Topic(String, Option<String>),
     Names(Option<String>),
     List(Option<String>),
-    Kick(String, String, Option<String>),  // channel, nick, reason
-    Invite(String, String),                 // nick, channel
+    Kick(String, String, Option<String>), // channel, nick, reason
+    Invite(String, String),               // nick, channel
 
     // Messaging
     Privmsg(String, String),
@@ -31,31 +31,31 @@ pub enum IrcCommand {
     Who(String),
     Whois(String),
     Whowas(String),
-    Mode(String, Option<String>, Option<String>),
-    Userhost(String),   // space-separated nicks
-    Ison(String),       // space-separated nicks
+    Mode(String, Option<String>, Vec<String>),
+    Userhost(String), // space-separated nicks
+    Ison(String),     // space-separated nicks
 
     // IRCv3 Monitor (friend list)
-    Monitor(String, Option<String>),  // (subcommand: +/-/C/L/S, optional targets)
+    Monitor(String, Option<String>), // (subcommand: +/-/C/L/S, optional targets)
 
     // IRCv3 account-notify: user logged in/out of account
-    Account(String),  // account name, or "*" if logged out
+    Account(String), // account name, or "*" if logged out
 
     // IRCv3 away-notify: user away status changed (from prefix)
     // Away(Option<String>) is reused - None means back, Some(msg) means away
 
     // IRCv3 CHGHOST: user changed their host
-    Chghost(String, String),  // (new_user, new_host)
+    Chghost(String, String), // (new_user, new_host)
 
     // IRCv3 batch: start/end of a batch
-    Batch(String, Option<String>, Option<String>),  // (+/-reference, type, params)
+    Batch(String, Option<String>, Option<String>), // (+/-reference, type, params)
 
     // Server info
     Time(Option<String>),
     Motd(Option<String>),
     Admin(Option<String>),
     Info(Option<String>),
-    Version(Option<String>),  // Server VERSION (not CTCP)
+    Version(Option<String>), // Server VERSION (not CTCP)
     Lusers,
     Links(Option<String>),
     Stats(String),
@@ -133,9 +133,9 @@ impl IrcMessage {
         let mut remaining = s;
 
         while !remaining.is_empty() {
-            if remaining.starts_with(':') {
+            if let Some(stripped) = remaining.strip_prefix(':') {
                 // Trailing parameter (rest of the line)
-                params.push(remaining[1..].to_string());
+                params.push(stripped.to_string());
                 break;
             }
 
@@ -153,69 +153,67 @@ impl IrcMessage {
 
     fn parse_command(cmd: &str, params: Vec<String>) -> IrcCommand {
         match cmd {
-            "PING" => IrcCommand::Ping(params.get(0).cloned().unwrap_or_default()),
-            "PONG" => IrcCommand::Pong(params.get(0).cloned().unwrap_or_default()),
+            "PING" => IrcCommand::Ping(params.first().cloned().unwrap_or_default()),
+            "PONG" => IrcCommand::Pong(params.first().cloned().unwrap_or_default()),
             "PRIVMSG" => IrcCommand::Privmsg(
-                params.get(0).cloned().unwrap_or_default(),
+                params.first().cloned().unwrap_or_default(),
                 params.get(1).cloned().unwrap_or_default(),
             ),
             "NOTICE" => IrcCommand::Notice(
-                params.get(0).cloned().unwrap_or_default(),
+                params.first().cloned().unwrap_or_default(),
                 params.get(1).cloned().unwrap_or_default(),
             ),
             "JOIN" => {
                 // Standard JOIN: channel only
                 // Extended-join (IRCv3): channel, account, realname
-                let channel = params.get(0).cloned().unwrap_or_default();
+                let channel = params.first().cloned().unwrap_or_default();
                 let account = params.get(1).cloned().filter(|a| a != "*");
                 let realname = params.get(2).cloned();
                 IrcCommand::Join(channel, None, account, realname)
             }
             "PART" => IrcCommand::Part(
-                params.get(0).cloned().unwrap_or_default(),
+                params.first().cloned().unwrap_or_default(),
                 params.get(1).cloned(),
             ),
-            "QUIT" => IrcCommand::Quit(params.get(0).cloned()),
-            "AWAY" => IrcCommand::Away(params.get(0).cloned()),
-            "NICK" => IrcCommand::Nick(params.get(0).cloned().unwrap_or_default()),
+            "QUIT" => IrcCommand::Quit(params.first().cloned()),
+            "AWAY" => IrcCommand::Away(params.first().cloned()),
+            "NICK" => IrcCommand::Nick(params.first().cloned().unwrap_or_default()),
             "TOPIC" => IrcCommand::Topic(
-                params.get(0).cloned().unwrap_or_default(),
+                params.first().cloned().unwrap_or_default(),
                 params.get(1).cloned(),
             ),
             "KICK" => IrcCommand::Kick(
-                params.get(0).cloned().unwrap_or_default(),
+                params.first().cloned().unwrap_or_default(),
                 params.get(1).cloned().unwrap_or_default(),
                 params.get(2).cloned(),
             ),
             "INVITE" => IrcCommand::Invite(
-                params.get(0).cloned().unwrap_or_default(),  // target nick (us)
+                params.first().cloned().unwrap_or_default(), // target nick (us)
                 params.get(1).cloned().unwrap_or_default(),  // channel
             ),
             "MODE" => IrcCommand::Mode(
-                params.get(0).cloned().unwrap_or_default(),
+                params.first().cloned().unwrap_or_default(),
                 params.get(1).cloned(),
-                params.get(2).cloned(),
+                params.get(2..).map(|s| s.to_vec()).unwrap_or_default(),
             ),
             "CAP" => IrcCommand::Cap(
-                params.get(0).cloned().unwrap_or_default(),  // target (usually "*" or nick)
+                params.first().cloned().unwrap_or_default(), // target (usually "*" or nick)
                 params.get(1).cloned().unwrap_or_default(),  // subcommand (LS, ACK, NAK, etc.)
-                params.get(2..).map(|s| s.to_vec()).unwrap_or_default(),  // [continuation marker +] cap list
+                params.get(2..).map(|s| s.to_vec()).unwrap_or_default(), // [continuation marker +] cap list
             ),
-            "AUTHENTICATE" => IrcCommand::Authenticate(
-                params.get(0).cloned().unwrap_or_default(),
-            ),
+            "AUTHENTICATE" => IrcCommand::Authenticate(params.first().cloned().unwrap_or_default()),
             // IRCv3 account-notify
-            "ACCOUNT" => IrcCommand::Account(
-                params.get(0).cloned().unwrap_or_else(|| "*".to_string()),
-            ),
+            "ACCOUNT" => {
+                IrcCommand::Account(params.first().cloned().unwrap_or_else(|| "*".to_string()))
+            }
             // IRCv3 chghost
             "CHGHOST" => IrcCommand::Chghost(
-                params.get(0).cloned().unwrap_or_default(),
+                params.first().cloned().unwrap_or_default(),
                 params.get(1).cloned().unwrap_or_default(),
             ),
             // IRCv3 batch
             "BATCH" => IrcCommand::Batch(
-                params.get(0).cloned().unwrap_or_default(),
+                params.first().cloned().unwrap_or_default(),
                 params.get(1).cloned(),
                 params.get(2).cloned(),
             ),
@@ -231,9 +229,9 @@ impl IrcMessage {
     }
 
     pub fn get_sender_nick(&self) -> Option<String> {
-        self.prefix.as_ref().map(|p| {
-            p.split('!').next().unwrap_or(p).to_string()
-        })
+        self.prefix
+            .as_ref()
+            .map(|p| p.split('!').next().unwrap_or(p).to_string())
     }
 
     /// Get a specific IRCv3 tag value
@@ -362,12 +360,12 @@ impl fmt::Display for IrcCommand {
             }
             IrcCommand::Who(mask) => write!(f, "WHO {}", mask),
             IrcCommand::Whois(nick) => write!(f, "WHOIS {}", nick),
-            IrcCommand::Mode(target, mode, param) => {
+            IrcCommand::Mode(target, mode, params) => {
                 if let Some(m) = mode {
-                    if let Some(p) = param {
-                        write!(f, "MODE {} {} {}", target, m, p)
-                    } else {
+                    if params.is_empty() {
                         write!(f, "MODE {} {}", target, m)
+                    } else {
+                        write!(f, "MODE {} {} {}", target, m, params.join(" "))
                     }
                 } else {
                     write!(f, "MODE {}", target)
@@ -468,13 +466,11 @@ impl fmt::Display for IrcCommand {
             IrcCommand::Authenticate(data) => write!(f, "AUTHENTICATE {}", data),
             IrcCommand::Account(account) => write!(f, "ACCOUNT {}", account),
             IrcCommand::Chghost(user, host) => write!(f, "CHGHOST {} {}", user, host),
-            IrcCommand::Batch(reference, batch_type, params) => {
-                match (batch_type, params) {
-                    (Some(t), Some(p)) => write!(f, "BATCH {} {} {}", reference, t, p),
-                    (Some(t), None) => write!(f, "BATCH {} {}", reference, t),
-                    _ => write!(f, "BATCH {}", reference),
-                }
-            }
+            IrcCommand::Batch(reference, batch_type, params) => match (batch_type, params) {
+                (Some(t), Some(p)) => write!(f, "BATCH {} {} {}", reference, t, p),
+                (Some(t), None) => write!(f, "BATCH {} {}", reference, t),
+                _ => write!(f, "BATCH {}", reference),
+            },
             IrcCommand::Numeric(num, params) => {
                 write!(f, "{:03} {}", num, params.join(" "))
             }
@@ -495,7 +491,10 @@ mod tests {
             IrcCommand::Cap(target, sub, rest) => {
                 assert_eq!(target, "*");
                 assert_eq!(sub, "LS");
-                assert_eq!(rest, vec!["*".to_string(), "multi-prefix sasl=PLAIN".to_string()]);
+                assert_eq!(
+                    rest,
+                    vec!["*".to_string(), "multi-prefix sasl=PLAIN".to_string()]
+                );
             }
             other => panic!("expected Cap, got {:?}", other),
         }
@@ -526,6 +525,23 @@ mod tests {
             assert_eq!(content, "\u{0001}");
         } else {
             panic!("expected Notice");
+        }
+    }
+
+    #[test]
+    fn mode_preserves_all_parameters() {
+        let m = IrcMessage::parse(":oper MODE #chan +kl key 50").unwrap();
+        match m.command {
+            IrcCommand::Mode(target, mode, params) => {
+                assert_eq!(target, "#chan");
+                assert_eq!(mode.as_deref(), Some("+kl"));
+                assert_eq!(params, vec!["key".to_string(), "50".to_string()]);
+                assert_eq!(
+                    IrcCommand::Mode(target, mode, params).to_string(),
+                    "MODE #chan +kl key 50"
+                );
+            }
+            other => panic!("expected Mode, got {:?}", other),
         }
     }
 }

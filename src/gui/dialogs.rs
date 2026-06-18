@@ -63,6 +63,7 @@ impl IrcApp {
                                 .max_height(120.0)
                                 .show(ui, |ui| {
                                     let mut clicked_idx = None;
+                                    let mut connect_idx = None;
                                     for (idx, fav) in self.server_favorites.iter().enumerate() {
                                         let is_selected = self.selected_favorite == Some(idx);
                                         let text = format!("{} ({}:{})", fav.name, fav.host, fav.port);
@@ -73,45 +74,49 @@ impl IrcApp {
                                         if response.double_clicked() {
                                             // Load and connect on double-click
                                             clicked_idx = Some(idx);
+                                            connect_idx = Some(idx);
                                         }
                                     }
                                     if let Some(idx) = clicked_idx {
                                         self.selected_favorite = Some(idx);
                                     }
+                                    if let Some(idx) = connect_idx
+                                        && let Some(fav) = self.server_favorites.get(idx).cloned() {
+                                            self.load_favorite(&fav);
+                                            self.save_settings();
+                                            self.show_connect_dialog = false;
+                                            self.connecting = true;
+                                            self.set_my_nick(self.nickname.clone());
+                                        }
                                 });
 
                             ui.horizontal(|ui| {
                                 // Load button
                                 let has_selection = self.selected_favorite.is_some();
-                                if ui.add_enabled(has_selection, egui::Button::new("Load")).clicked() {
-                                    if let Some(idx) = self.selected_favorite {
-                                        if let Some(fav) = self.server_favorites.get(idx).cloned() {
+                                if ui.add_enabled(has_selection, egui::Button::new("Load")).clicked()
+                                    && let Some(idx) = self.selected_favorite
+                                        && let Some(fav) = self.server_favorites.get(idx).cloned() {
                                             self.load_favorite(&fav);
                                         }
-                                    }
-                                }
 
                                 // Delete button
-                                if ui.add_enabled(has_selection, egui::Button::new("Delete")).clicked() {
-                                    if let Some(idx) = self.selected_favorite {
+                                if ui.add_enabled(has_selection, egui::Button::new("Delete")).clicked()
+                                    && let Some(idx) = self.selected_favorite {
                                         self.server_favorites.remove(idx);
                                         self.selected_favorite = None;
                                         self.save_settings();
                                     }
-                                }
 
                                 // Connect button
-                                if ui.add_enabled(has_selection, egui::Button::new("Connect")).clicked() {
-                                    if let Some(idx) = self.selected_favorite {
-                                                if let Some(fav) = self.server_favorites.get(idx).cloned() {
+                                if ui.add_enabled(has_selection, egui::Button::new("Connect")).clicked()
+                                    && let Some(idx) = self.selected_favorite
+                                                && let Some(fav) = self.server_favorites.get(idx).cloned() {
                                                     self.load_favorite(&fav);
                                                     self.save_settings();
                                                     self.show_connect_dialog = false;
                                                     self.connecting = true;
                                                     self.set_my_nick(self.nickname.clone());
                                                 }
-                                            }
-                                        }
                             });
                         }
                     });
@@ -892,10 +897,10 @@ impl IrcApp {
 
                 ui.separator();
                 ui.horizontal(|ui| {
-                    if ui.button("Join").clicked() {
-                        if let Some(channel) = &self.channel_list_selected {
-                            join_channel = Some(channel.clone());
-                        }
+                    if ui.button("Join").clicked()
+                        && let Some(channel) = &self.channel_list_selected
+                    {
+                        join_channel = Some(channel.clone());
                     }
 
                     ui.label("Min:");
@@ -910,6 +915,7 @@ impl IrcApp {
                     if ui.button("Refresh").clicked() {
                         self.channel_list.clear();
                         self.channel_list_selected = None;
+                        self.channel_list_loading = true;
                         // >N means "more than N users", so for min 5, send >4
                         if self.list_min_users >= 1 {
                             self.send_command(IrcCommand::List(Some(format!(
@@ -1004,7 +1010,7 @@ impl IrcApp {
                         if let Some(setter) = &ch.topic_set_by {
                             let time_str = ch
                                 .topic_set_time
-                                .map(|ts| format_timestamp(ts))
+                                .map(format_timestamp)
                                 .unwrap_or_else(|| "Unknown".to_string());
                             ui.label(
                                 RichText::new(format!("Set by {} on {}", setter, time_str))
@@ -1028,7 +1034,7 @@ impl IrcApp {
                                     self.send_command(IrcCommand::Mode(
                                         channel_name.clone(),
                                         Some("+b".to_string()),
-                                        None,
+                                        Vec::new(),
                                     ));
                                 }
                             }
@@ -1078,7 +1084,7 @@ impl IrcApp {
                 ui.horizontal(|ui| {
                     if ui.button("Refresh").clicked() {
                         // Request fresh channel info
-                        self.send_command(IrcCommand::Mode(channel_name.clone(), None, None));
+                        self.send_command(IrcCommand::Mode(channel_name.clone(), None, Vec::new()));
                         // Clear and re-request ban list
                         if let Some(ch) = self.channels.get_mut(&channel_name) {
                             ch.bans.clear();

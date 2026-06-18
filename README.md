@@ -75,8 +75,9 @@ Download from the [Releases](https://github.com/faratech/linefeed/releases) page
 ### Building from Source
 
 **Requirements:**
-- Rust 1.70+
-- Python 3.8+ (for build script)
+- Rust 1.92+
+- Python 3.10+ (for build script)
+- llvm-mingw on `PATH` or `LLVM_MINGW_HOME` set when building Windows targets from Linux
 
 **Quick build:**
 ```bash
@@ -93,6 +94,10 @@ python3 build.py --arm64    # Windows ARM64
 python3 build.py --x86      # Windows x86
 python3 build.py --all      # All platforms
 ```
+
+Windows cross-builds look for `aarch64-w64-mingw32-*` and
+`i686-w64-mingw32-*` tools on `PATH`. If they are not already on `PATH`, set
+`LLVM_MINGW_HOME` to the llvm-mingw installation directory.
 
 Output binaries are in `./dist/` (build script) or `./target/release/` (cargo).
 

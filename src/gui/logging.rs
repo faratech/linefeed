@@ -1,10 +1,10 @@
 //! Chat logging manager for persistent message history
 
+use super::helpers::days_to_ymd;
+use super::types::ChatMessage;
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::PathBuf;
-use super::types::ChatMessage;
-use super::helpers::days_to_ymd;
 
 /// Manages chat logging to disk
 pub struct LogManager {
@@ -38,11 +38,11 @@ impl LogManager {
         let writer = match writers.entry(path.clone()) {
             Entry::Occupied(e) => e.into_mut(),
             Entry::Vacant(v) => {
-                if let Some(parent) = path.parent() {
-                    if let Err(e) = fs::create_dir_all(parent) {
-                        tracing::error!("Failed to create log directory: {}", e);
-                        return;
-                    }
+                if let Some(parent) = path.parent()
+                    && let Err(e) = fs::create_dir_all(parent)
+                {
+                    tracing::error!("Failed to create log directory: {}", e);
+                    return;
                 }
                 match OpenOptions::new().create(true).append(true).open(&path) {
                     Ok(file) => v.insert(std::io::BufWriter::new(file)),
@@ -62,7 +62,9 @@ impl LogManager {
         // Sanitize network and channel names for filesystem
         let safe_network = sanitize_filename(network);
         let safe_channel = sanitize_filename(channel);
-        self.log_dir.join(&safe_network).join(format!("{}.log", safe_channel))
+        self.log_dir
+            .join(&safe_network)
+            .join(format!("{}.log", safe_channel))
     }
 
     /// Log a message to disk
@@ -106,7 +108,7 @@ impl LogManager {
                 return Vec::new();
             }
             let reader = BufReader::new(file);
-            let lines: Vec<String> = reader.lines().filter_map(|l| l.ok()).collect();
+            let lines: Vec<String> = reader.lines().map_while(Result::ok).collect();
             let start = lines.len().saturating_sub(max_lines);
             return lines[start..]
                 .iter()
@@ -116,7 +118,10 @@ impl LogManager {
 
         // For larger files, read backwards in chunks to find the last N lines
         let lines = read_last_n_lines(&mut file, file_size, max_lines);
-        lines.iter().filter_map(|line| parse_log_line(line)).collect()
+        lines
+            .iter()
+            .filter_map(|line| parse_log_line(line))
+            .collect()
     }
 
     /// Write a session marker (log opened/closed)
@@ -199,19 +204,18 @@ fn parse_log_line(line: &str) -> Option<ChatMessage> {
     let (ts_inner, rest) = split_timestamp(line)?;
     let timestamp = format!("[{}]", ts_inner);
 
-    if rest.starts_with("-!- ") {
+    if let Some(system_rest) = rest.strip_prefix("-!- ") {
         // System message
         Some(ChatMessage {
             timestamp,
             sender: "*".to_string(),
-            content: rest[4..].to_string(),
+            content: system_rest.to_string(),
             is_action: false,
             is_system: true,
             is_highlight: false,
         })
-    } else if rest.starts_with("* ") {
+    } else if let Some(action_rest) = rest.strip_prefix("* ") {
         // Action message: "* nick does something"
-        let action_rest = &rest[2..];
         let action_parts: Vec<&str> = action_rest.splitn(2, ' ').collect();
         if action_parts.len() >= 2 {
             Some(ChatMessage {
@@ -229,7 +233,7 @@ fn parse_log_line(line: &str) -> Option<ChatMessage> {
         // Regular message: "<nick> message"
         if let Some(end) = rest.find('>') {
             let nick = &rest[1..end];
-            let content = rest[end+1..].trim_start();
+            let content = rest[end + 1..].trim_start();
             Some(ChatMessage {
                 timestamp,
                 sender: nick.to_string(),
@@ -302,11 +306,14 @@ fn current_datetime_string() -> String {
     let (year, month, day) = days_to_ymd(days);
     let weekday = ((days + 4) % 7) as usize; // Jan 1, 1970 was Thursday (4)
     let weekday_name = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"][weekday];
-    let month_name = ["", "Jan", "Feb", "Mar", "Apr", "May", "Jun",
-                      "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"][month as usize];
+    let month_name = [
+        "", "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ][month as usize];
 
-    format!("{} {} {:2} {:02}:{:02}:{:02} {}",
-            weekday_name, month_name, day, hours, minutes, seconds, year)
+    format!(
+        "{} {} {:2} {:02}:{:02}:{:02} {}",
+        weekday_name, month_name, day, hours, minutes, seconds, year
+    )
 }
 
 #[cfg(test)]

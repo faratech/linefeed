@@ -29,6 +29,22 @@ UPX_SUPPORTED = {
 }
 
 
+def configure_llvm_mingw_path() -> None:
+    """Prepend llvm-mingw's bin directory when explicitly configured or locally present."""
+    home = os.environ.get("LLVM_MINGW_HOME")
+    if not home:
+        candidate = Path("/root/toolchains/llvm-mingw")
+        if candidate.exists():
+            home = str(candidate)
+
+    if home:
+        bin_dir = str(Path(home) / "bin")
+        path_parts = os.environ.get("PATH", "").split(os.pathsep)
+        if bin_dir not in path_parts:
+            os.environ["PATH"] = os.pathsep.join([bin_dir, *path_parts])
+        os.environ.setdefault("LLVM_MINGW_HOME", home)
+
+
 async def run_cmd(cmd: list[str], desc: str = "") -> tuple[bool, str]:
     """Run a command asynchronously and return (success, output)"""
     if desc:
@@ -46,10 +62,10 @@ async def run_cmd(cmd: list[str], desc: str = "") -> tuple[bool, str]:
 
 
 async def check_deps():
-    """Check and update dependencies"""
+    """Check dependencies without mutating Cargo.toml/Cargo.lock."""
     print("[0/2] Checking dependencies...")
     success, output = await run_cmd(
-        ["python3", "tools/update-deps.py", "--pin"],
+        ["python3", "tools/update-deps.py", "--check"],
     )
     print(output)
     if not success:
@@ -81,11 +97,23 @@ async def run_audit():
     print()
 
 
+async def update_deps():
+    """Explicit maintenance path for dependency updates."""
+    print("[deps] Updating dependencies...")
+    success, output = await run_cmd(
+        ["python3", "tools/update-deps.py", "--pin"],
+    )
+    print(output)
+    if not success:
+        print("ERROR: Dependency update failed")
+        sys.exit(1)
+
+
 async def build_target(name: str, target: str | None, src_name: str, dst_name: str) -> bool:
     """Build a single target"""
     print(f"  Building {name}...")
 
-    cmd = ["cargo", "build", "--profile", "dist"]
+    cmd = ["cargo", "build", "--locked", "--profile", "dist"]
     if target:
         cmd.extend(["--target", target])
 
@@ -135,6 +163,7 @@ Examples:
   python3 build.py --all        # Build all platforms
   python3 build.py --arm64 --x86  # Build ARM64 and x86
   python3 build.py --linux      # Build Linux only
+  python3 build.py --update-deps # Update Cargo.toml dependency pins first
   python3 build.py --no-upx     # Skip UPX compression
   python3 build.py --no-audit   # Skip the cargo audit security check
   python3 build.py --jobs 8     # Use 8 parallel jobs
@@ -156,6 +185,8 @@ Examples:
                         help="Skip UPX compression")
     parser.add_argument("--skip-deps", action="store_true",
                         help="Skip dependency check")
+    parser.add_argument("--update-deps", action="store_true",
+                        help="Update Cargo.toml dependency pins before building")
     parser.add_argument("--no-audit", action="store_true",
                         help="Skip the cargo audit security check")
 
@@ -166,6 +197,7 @@ async def main():
     args = parse_args()
 
     print("=== Linefeed Build Script ===")
+    configure_llvm_mingw_path()
 
     # Determine which targets to build
     if args.all:
@@ -207,6 +239,10 @@ async def main():
         print("UPX compression: unavailable (upx not found)")
 
     print()
+
+    if args.update_deps:
+        await update_deps()
+        print()
 
     # Check dependencies
     if not args.skip_deps:

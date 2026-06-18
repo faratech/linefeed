@@ -3,4 +3,4 @@ pub mod message;
 pub mod numerics;
 
 pub use client::IrcClient;
-pub use message::{IrcMessage, IrcCommand};
+pub use message::{IrcCommand, IrcMessage};

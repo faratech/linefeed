@@ -1,19 +1,19 @@
 [target.aarch64-pc-windows-gnullvm]
-linker = "/root/toolchains/llvm-mingw/bin/aarch64-w64-mingw32-gcc"
-ar = "/root/toolchains/llvm-mingw/bin/aarch64-w64-mingw32-llvm-ar"
+linker = "aarch64-w64-mingw32-gcc"
+ar = "aarch64-w64-mingw32-llvm-ar"
 rustflags = ["-C", "target-feature=+crt-static"]
 
 [target.aarch64-pc-windows-gnullvm.env]
-CC_aarch64_pc_windows_gnullvm = "/root/toolchains/llvm-mingw/bin/aarch64-w64-mingw32-gcc"
-CXX_aarch64_pc_windows_gnullvm = "/root/toolchains/llvm-mingw/bin/aarch64-w64-mingw32-g++"
-AR_aarch64_pc_windows_gnullvm = "/root/toolchains/llvm-mingw/bin/aarch64-w64-mingw32-llvm-ar"
+CC_aarch64_pc_windows_gnullvm = "aarch64-w64-mingw32-gcc"
+CXX_aarch64_pc_windows_gnullvm = "aarch64-w64-mingw32-g++"
+AR_aarch64_pc_windows_gnullvm = "aarch64-w64-mingw32-llvm-ar"
 
 [target.i686-pc-windows-gnullvm]
-linker = "/root/toolchains/llvm-mingw/bin/i686-w64-mingw32-gcc"
-ar = "/root/toolchains/llvm-mingw/bin/i686-w64-mingw32-llvm-ar"
+linker = "i686-w64-mingw32-gcc"
+ar = "i686-w64-mingw32-llvm-ar"
 rustflags = ["-C", "target-feature=+crt-static"]
 
 [target.i686-pc-windows-gnullvm.env]
-CC_i686_pc_windows_gnullvm = "/root/toolchains/llvm-mingw/bin/i686-w64-mingw32-gcc"
-CXX_i686_pc_windows_gnullvm = "/root/toolchains/llvm-mingw/bin/i686-w64-mingw32-g++"
-AR_i686_pc_windows_gnullvm = "/root/toolchains/llvm-mingw/bin/i686-w64-mingw32-llvm-ar"
+CC_i686_pc_windows_gnullvm = "i686-w64-mingw32-gcc"
+CXX_i686_pc_windows_gnullvm = "i686-w64-mingw32-g++"
+AR_i686_pc_windows_gnullvm = "i686-w64-mingw32-llvm-ar"
