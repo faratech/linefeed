@@ -7,8 +7,8 @@ Linefeed is a cross-platform IRC client written in Rust. It utilizes **egui/efra
 *   **Language**: Rust (Edition 2024)
 *   **GUI Framework**: `eframe` / `egui`
 *   **Async Runtime**: `tokio`
-*   **Networking**: TLS via `native-tls` (SChannel on Windows, OpenSSL on Linux), SASL PLAIN authentication.
-*   **Platform Support**: Linux, Windows (ARM64, x86-64).
+*   **Networking**: TLS via `native-tls` (SChannel on Windows, OpenSSL on Linux), IRCv3 CAP negotiation, SASL PLAIN authentication with timeout/error fallback.
+*   **Platform Support**: Linux, Windows (ARM64, x86).
 
 ## Building and Running
 
@@ -16,10 +16,15 @@ Linefeed is a cross-platform IRC client written in Rust. It utilizes **egui/efra
 The project includes a wrapper script `build.py` for managing builds and cross-compilation.
 
 ```bash
-python3 build.py              # Build for host (or default target)
+python3 build.py              # Build Windows ARM64 (default)
 python3 build.py --linux      # Build for Linux
-python3 build.py --all        # Build for all targets + UPX compression
+python3 build.py --arm64 --x86  # Build Windows ARM64 and x86
+python3 build.py --all        # Build all targets + UPX compression where supported
+python3 build.py --update-deps # Explicitly update dependency pins
 ```
+
+The build script checks dependencies with `tools/update-deps.py --check` and
+builds with `cargo build --locked --profile dist`.
 
 ### Cargo Commands
 Standard cargo commands work for development.
@@ -37,7 +42,20 @@ cargo build --profile dist
 ```
 
 ### Cross-Compilation
-Windows cross-compilation from Linux requires the **llvm-mingw** toolchain (configured in `.cargo/config.toml`).
+Windows cross-compilation from Linux requires the **llvm-mingw** toolchain.
+The `.cargo/config.toml` expects `aarch64-w64-mingw32-*` and
+`i686-w64-mingw32-*` tools on `PATH`; alternatively set `LLVM_MINGW_HOME` to
+the llvm-mingw installation directory.
+
+### Verification
+
+```bash
+cargo check --locked
+cargo test --locked
+cargo clippy --all-targets -- -D warnings
+python3 tools/update-deps.py --check
+python3 -m py_compile build.py tools/update-deps.py
+```
 
 ## Codebase Architecture
 
@@ -47,15 +65,15 @@ The application follows a threaded model separating the GUI (main thread) from t
 
 *   **`src/main.rs`**: Application entry point. Defines `FmIrcApp`, manages the connection thread, and handles the system tray (Windows).
 *   **`src/gui/`**: specific GUI logic and state management.
-    *   **`mod.rs`**: Contains `IrcApp` (the primary UI state), routes incoming messages, and handles numerics.
+    *   **`mod.rs`**: Contains `IrcApp` (the primary UI state), routes incoming messages, handles numerics, tracks connection intent, and applies server ISUPPORT/MODE state.
     *   **`commands.rs`**: Implementation of all slash commands (e.g., `/join`, `/msg`, `/ns`).
     *   **`dialogs.rs`**: Code for modal windows (Settings, Channel List, Channel Info).
-    *   **`formatting.rs`**: IRC color parsing (mIRC codes) and text rendering.
+    *   **`formatting.rs`**: IRC formatting parsing, including mIRC colors and reverse video, plus text rendering.
     *   **`types.rs`**: Core data structures (`Settings`, `Channel`, `ChatMessage`).
     *   **`logging.rs`**: `LogManager` for handling persistent chat history (irssi format).
 *   **`src/irc/`**: IRC protocol implementation.
-    *   **`client.rs`**: `IrcClient` struct. Handles async TCP/TLS connections, SASL, and PING/PONG.
-    *   **`message.rs`**: `IrcMessage` parser, `IrcCommand` enum, and IRCv3 tag handling.
+    *   **`client.rs`**: `IrcClient` struct. Handles async TCP/TLS connections, CAP/SASL handshakes, and PING/PONG.
+    *   **`message.rs`**: `IrcMessage` parser, `IrcCommand` enum, IRCv3 tag handling, and wire-format rendering.
     *   **`numerics.rs`**: Constants for IRC numeric replies.
 *   **`tools/`**: Helper scripts (`gen-icon.py` for assets, `update-deps.py` for dependency management).
 
@@ -73,6 +91,6 @@ The application follows a threaded model separating the GUI (main thread) from t
     *   `Settings`: Persisted configuration (loaded/saved to JSON).
 
 3.  **Conventions**:
-    *   **Logging**: Chat logs are stored in `~/.config/linefeed/logs/` in irssi-compatible format.
-    *   **Settings**: Configuration is stored in `~/.config/linefeed/settings.json`.
+    *   **Logging**: Chat logs are stored in `~/.config/linefeed/logs/` on Linux and `%APPDATA%\linefeed\logs\` on Windows in irssi-compatible format.
+    *   **Settings**: Configuration is stored in `~/.config/linefeed/settings.json` on Linux and `%APPDATA%\linefeed\settings.json` on Windows.
     *   **Style**: Rust standard formatting (`cargo fmt`) and strict linting (`clippy`).

@@ -7,11 +7,13 @@ A lightweight, cross-platform IRC client written in Rust with a native GUI.
 ### Core
 - **Cross-platform**: Windows (ARM64, x86) and Linux
 - **TLS encryption**: Native TLS via SChannel (Windows) or OpenSSL (Linux)
-- **SASL authentication**: PLAIN mechanism for secure login
+- **SASL authentication**: PLAIN mechanism with timeout/error fallback
 - **Modern UI**: Clean interface built with egui/eframe
 
 ### Connection
+- IRCv3 CAP negotiation with timeout fallback
 - Auto-reconnect with exponential backoff
+- Safe reconnect and server switching without racing the old connection
 - Server favorites with quick-connect
 - Server password support
 - Accept invalid TLS certificates (optional)
@@ -19,15 +21,17 @@ A lightweight, cross-platform IRC client written in Rust with a native GUI.
 ### Channels
 - Multiple channel support with tabbed interface
 - Channel modes display (+nt, +k, etc.)
+- Server-aware channel/user prefix handling via ISUPPORT
 - Topic viewing and editing
 - Ban list management
 - Channel info dialog with creation date
-- User list with mode indicators (@, +)
+- User list with mode indicators (@, +, and server-provided prefixes)
 
 ### Messaging
 - Private messages (queries)
 - CTCP support (VERSION, TIME, PING, FINGER, CLIENTINFO)
-- mIRC color code rendering
+- IRC formatting rendering, including mIRC colors and reverse video
+- Outbound message splitting at IRC line-length limits
 - Nick highlighting with customizable words
 - Action messages (/me)
 - Notices
@@ -38,7 +42,7 @@ A lightweight, cross-platform IRC client written in Rust with a native GUI.
 - Configurable timestamps
 - Hide join/part/quit messages (optional)
 - Scrollback limit to manage memory
-- Desktop notifications
+- Desktop notifications on supported platforms
 - Lag meter
 
 ### Privacy & Security
@@ -89,9 +93,11 @@ cd linefeed
 cargo build --release
 
 # Or use the build script for optimized binaries
+python3 build.py            # Windows ARM64 default
 python3 build.py --linux    # Linux
 python3 build.py --arm64    # Windows ARM64
 python3 build.py --x86      # Windows x86
+python3 build.py --arm64 --x86
 python3 build.py --all      # All platforms
 ```
 
@@ -99,7 +105,23 @@ Windows cross-builds look for `aarch64-w64-mingw32-*` and
 `i686-w64-mingw32-*` tools on `PATH`. If they are not already on `PATH`, set
 `LLVM_MINGW_HOME` to the llvm-mingw installation directory.
 
-Output binaries are in `./dist/` (build script) or `./target/release/` (cargo).
+The build script runs `tools/update-deps.py --check` before building, uses
+`cargo build --locked --profile dist`, and optionally compresses supported
+outputs with UPX. Use `python3 build.py --update-deps` only when intentionally
+updating dependency pins.
+
+Output binaries are in `./dist/` when using `build.py`. Direct Cargo outputs
+are in `./target/<profile>/` for native builds and
+`./target/<target>/<profile>/` for cross-builds.
+
+**Verification:**
+```bash
+cargo check --locked
+cargo test --locked
+cargo clippy --all-targets -- -D warnings
+python3 tools/update-deps.py --check
+python3 -m py_compile build.py tools/update-deps.py
+```
 
 ## Commands
 
@@ -114,14 +136,14 @@ Output binaries are in `./dist/` (build script) or `./target/release/` (cargo).
 ### Channels
 | Command | Description |
 |---------|-------------|
-| `/join <#channel> [key]` | Join a channel (alias: `/j`) |
+| `/join <channel> [key]` | Join a channel (alias: `/j`) |
 | `/part [#channel] [message]` | Leave channel (alias: `/leave`) |
 | `/cycle` | Part and rejoin current channel (alias: `/hop`, `/rejoin`) |
 | `/topic [text]` | View or set channel topic |
 | `/names [#channel]` | List users in channel |
 | `/list [pattern]` | List channels matching pattern |
 | `/invite <nick>` | Invite user to current channel |
-| `/knock <#channel>` | Request invite to channel |
+| `/knock <channel>` | Request invite to channel |
 
 ### Messaging
 | Command | Description |
