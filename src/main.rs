@@ -1,8 +1,8 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-mod irc;
 mod gui;
 mod icon_data;
+mod irc;
 
 #[cfg(windows)]
 mod systray;
@@ -11,11 +11,16 @@ mod systray;
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 use eframe::egui;
-use tokio::sync::mpsc;
 use std::sync::Arc;
+#[cfg(windows)]
+use std::sync::OnceLock;
+use tokio::sync::mpsc;
 
+use gui::{ChatMessage, IrcApp};
 use irc::{IrcClient, IrcCommand, IrcMessage};
-use gui::{IrcApp, ChatMessage};
+
+#[cfg(windows)]
+static SINGLE_INSTANCE_MUTEX: OnceLock<isize> = OnceLock::new();
 
 fn load_icon() -> egui::IconData {
     egui::IconData {
@@ -33,9 +38,9 @@ fn setup_fonts(ctx: &egui::Context) {
     // These contain characters like ▄ █ ▓ ▒ ░ ─ │ etc.
     let symbol_font_paths: &[&str] = if cfg!(windows) {
         &[
-            "C:\\Windows\\Fonts\\seguisym.ttf",   // Segoe UI Symbol (best coverage)
-            "C:\\Windows\\Fonts\\consola.ttf",    // Consolas (good monospace coverage)
-            "C:\\Windows\\Fonts\\segoeui.ttf",    // Segoe UI
+            "C:\\Windows\\Fonts\\seguisym.ttf", // Segoe UI Symbol (best coverage)
+            "C:\\Windows\\Fonts\\consola.ttf",  // Consolas (good monospace coverage)
+            "C:\\Windows\\Fonts\\segoeui.ttf",  // Segoe UI
         ]
     } else if cfg!(target_os = "macos") {
         &[
@@ -61,10 +66,7 @@ fn setup_fonts(ctx: &egui::Context) {
             );
 
             // Add as fallback for all font families
-            for family in [
-                egui::FontFamily::Proportional,
-                egui::FontFamily::Monospace,
-            ] {
+            for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
                 if let Some(fonts_for_family) = fonts.families.get_mut(&family) {
                     fonts_for_family.push("symbols".to_owned());
                 }
@@ -78,7 +80,7 @@ fn setup_fonts(ctx: &egui::Context) {
     // Emoji fonts (separate from symbol fonts)
     let emoji_font_paths: &[&str] = if cfg!(windows) {
         &[
-            "C:\\Windows\\Fonts\\seguiemj.ttf",  // Segoe UI Emoji
+            "C:\\Windows\\Fonts\\seguiemj.ttf", // Segoe UI Emoji
         ]
     } else if cfg!(target_os = "macos") {
         &[
@@ -102,10 +104,7 @@ fn setup_fonts(ctx: &egui::Context) {
             );
 
             // Add emoji font as fallback for all font families
-            for family in [
-                egui::FontFamily::Proportional,
-                egui::FontFamily::Monospace,
-            ] {
+            for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
                 if let Some(fonts_for_family) = fonts.families.get_mut(&family) {
                     fonts_for_family.push("emoji".to_owned());
                 }
@@ -124,10 +123,9 @@ fn setup_fonts(ctx: &egui::Context) {
 #[cfg(windows)]
 fn enable_efficiency_mode() {
     use windows::Win32::System::Threading::{
-        GetCurrentProcess, SetPriorityClass, SetProcessInformation,
-        ProcessPowerThrottling, IDLE_PRIORITY_CLASS,
-        PROCESS_POWER_THROTTLING_STATE, PROCESS_POWER_THROTTLING_EXECUTION_SPEED,
-        PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION,
+        GetCurrentProcess, IDLE_PRIORITY_CLASS, PROCESS_POWER_THROTTLING_EXECUTION_SPEED,
+        PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION, PROCESS_POWER_THROTTLING_STATE,
+        ProcessPowerThrottling, SetPriorityClass, SetProcessInformation,
     };
 
     unsafe {
@@ -164,13 +162,23 @@ fn enable_efficiency_mode() {
 /// Returns true if this is the only instance, false if another exists
 #[cfg(windows)]
 fn ensure_single_instance() -> bool {
-    use windows::core::w;
     use windows::Win32::Foundation::GetLastError;
     use windows::Win32::System::Threading::CreateMutexW;
+    use windows::core::w;
 
     unsafe {
+        if SINGLE_INSTANCE_MUTEX.get().is_some() {
+            return true;
+        }
+
         // Try to create a named mutex
-        let _mutex = CreateMutexW(None, true, w!("Linefeed_SingleInstance"));
+        let mutex = match CreateMutexW(None, true, w!("Linefeed_SingleInstance")) {
+            Ok(handle) => handle,
+            Err(err) => {
+                tracing::warn!("Failed to create single-instance mutex: {err}");
+                return true;
+            }
+        };
 
         // If ERROR_ALREADY_EXISTS, another instance has the mutex
         if GetLastError().is_err() {
@@ -180,8 +188,7 @@ fn ensure_single_instance() -> bool {
         }
 
         // We got the mutex, we're the only instance
-        // Note: We intentionally don't close the mutex handle - it stays open
-        // for the lifetime of the process to prevent other instances
+        let _ = SINGLE_INSTANCE_MUTEX.set(mutex.0 as isize);
         true
     }
 }
@@ -325,10 +332,9 @@ impl eframe::App for LinefeedApp {
         // (minimized) size, and the restore has no lower-bound clamp, so the app can
         // reopen as a tiny box. Only a bad restore can put a *visible* window below
         // our 640x480 minimum (winit enforces that min on user resizes), so if we see
-        // a sub-minimum window, snap it back to the default. screen_rect * zoom_factor
-        // yields logical pixels, matching min_inner_size regardless of DPI/zoom.
+        // a sub-minimum content rect, snap it back to the default size.
         if !self.window_size_ok {
-            let logical = ctx.screen_rect().size() * ctx.zoom_factor();
+            let logical = ctx.content_rect().size();
             if logical.x >= 640.0 && logical.y >= 480.0 {
                 self.window_size_ok = true;
             } else {
@@ -344,7 +350,8 @@ impl eframe::App for LinefeedApp {
                 if self.app.connected {
                     // Connection was lost unexpectedly after registering.
                     self.app.mark_connection_lost();
-                    self.app.add_server_message(ChatMessage::system("Connection lost"));
+                    self.app
+                        .add_server_message(ChatMessage::system("Connection lost"));
                     tracing::warn!("Connection lost, will attempt reconnect");
                 } else if self.app.connecting {
                     // The connection thread exited before we ever registered: the
@@ -353,7 +360,8 @@ impl eframe::App for LinefeedApp {
                     // UI can engage instead of being stuck "connecting" forever.
                     self.app.connecting = false;
                     self.app.mark_connection_lost();
-                    self.app.add_server_message(ChatMessage::system("Connection failed"));
+                    self.app
+                        .add_server_message(ChatMessage::system("Connection failed"));
                     tracing::warn!("Initial connection failed, will attempt reconnect");
                 }
             }
@@ -414,7 +422,7 @@ impl LinefeedApp {
         tracing::info!("Connecting to {}:{}", config.host, config.port);
 
         let (msg_tx, msg_rx) = mpsc::channel::<IrcMessage>(1000);
-        let (cmd_tx, cmd_rx) = mpsc::channel::<IrcCommand>(100);
+        let (cmd_tx, cmd_rx) = mpsc::unbounded_channel::<IrcCommand>();
 
         self.app.msg_rx = Some(msg_rx);
         self.app.cmd_tx = Some(cmd_tx);
@@ -449,15 +457,17 @@ impl LinefeedApp {
                     Ok(_) => tracing::info!("Connection closed"),
                     Err(e) => {
                         tracing::error!("Connection error: {}", e);
-                        let _ = msg_tx.send(IrcMessage {
-                            tags: None,
-                            prefix: None,
-                            command: IrcCommand::Notice(
-                                "*".to_string(),
-                                format!("Connection error: {}", e),
-                            ),
-                            raw: String::new(),
-                        }).await;
+                        let _ = msg_tx
+                            .send(IrcMessage {
+                                tags: None,
+                                prefix: None,
+                                command: IrcCommand::Notice(
+                                    "*".to_string(),
+                                    format!("Connection error: {}", e),
+                                ),
+                                raw: String::new(),
+                            })
+                            .await;
                     }
                 }
                 ctx.request_repaint();

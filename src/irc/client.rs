@@ -1,7 +1,7 @@
+use base64::prelude::*;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
-use base64::prelude::*;
 
 use super::message::{IrcCommand, IrcMessage};
 
@@ -135,7 +135,7 @@ impl IrcClient {
     pub async fn connect(
         &mut self,
         incoming_tx: mpsc::Sender<IrcMessage>,
-        outgoing_rx: mpsc::Receiver<IrcCommand>,
+        outgoing_rx: mpsc::UnboundedReceiver<IrcCommand>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let addr = format!("{}:{}", self.config.host, self.config.port);
         tracing::info!("Connecting to {} (TLS: {})", addr, self.config.use_tls);
@@ -174,12 +174,17 @@ impl IrcClient {
             let _ = incoming_tx.try_send(IrcMessage {
                 tags: None,
                 prefix: None,
-                command: IrcCommand::Notice("*".to_string(), "Starting TLS handshake...".to_string()),
+                command: IrcCommand::Notice(
+                    "*".to_string(),
+                    "Starting TLS handshake...".to_string(),
+                ),
                 raw: String::new(),
             });
-            self.handle_tls_connection(stream, incoming_tx, outgoing_rx).await
+            self.handle_tls_connection(stream, incoming_tx, outgoing_rx)
+                .await
         } else {
-            self.handle_plain_connection(stream, incoming_tx, outgoing_rx).await
+            self.handle_plain_connection(stream, incoming_tx, outgoing_rx)
+                .await
         }
     }
 
@@ -187,7 +192,7 @@ impl IrcClient {
         &mut self,
         stream: TcpStream,
         incoming_tx: mpsc::Sender<IrcMessage>,
-        outgoing_rx: mpsc::Receiver<IrcCommand>,
+        outgoing_rx: mpsc::UnboundedReceiver<IrcCommand>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         // Set up native TLS
         let mut tls_builder = native_tls::TlsConnector::builder();
@@ -198,7 +203,8 @@ impl IrcClient {
             tls_builder.danger_accept_invalid_hostnames(true);
         }
 
-        let tls_connector = tls_builder.build()
+        let tls_connector = tls_builder
+            .build()
             .map_err(|e| format!("Failed to create TLS connector: {}", e))?;
 
         let connector = tokio_native_tls::TlsConnector::from(tls_connector);
@@ -208,7 +214,10 @@ impl IrcClient {
         let tls_stream = match connector.connect(&self.config.host, stream).await {
             Ok(s) => s,
             Err(e) => {
-                let msg = format!("TLS handshake failed: {}. Try disabling TLS or enabling 'Accept invalid certs'", e);
+                let msg = format!(
+                    "TLS handshake failed: {}. Try disabling TLS or enabling 'Accept invalid certs'",
+                    e
+                );
                 tracing::error!("{}", msg);
                 return Err(msg.into());
             }
@@ -222,14 +231,15 @@ impl IrcClient {
             raw: String::new(),
         });
 
-        self.run_connection(tls_stream, incoming_tx, outgoing_rx).await
+        self.run_connection(tls_stream, incoming_tx, outgoing_rx)
+            .await
     }
 
     async fn handle_plain_connection(
         &mut self,
         stream: TcpStream,
         incoming_tx: mpsc::Sender<IrcMessage>,
-        outgoing_rx: mpsc::Receiver<IrcCommand>,
+        outgoing_rx: mpsc::UnboundedReceiver<IrcCommand>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         self.run_connection(stream, incoming_tx, outgoing_rx).await
     }
@@ -239,7 +249,7 @@ impl IrcClient {
         &mut self,
         stream: S,
         incoming_tx: mpsc::Sender<IrcMessage>,
-        mut outgoing_rx: mpsc::Receiver<IrcCommand>,
+        mut outgoing_rx: mpsc::UnboundedReceiver<IrcCommand>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
     where
         S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
@@ -248,7 +258,8 @@ impl IrcClient {
         let mut reader = BufReader::new(reader);
 
         // Send registration (may include SASL handshake)
-        self.send_registration(&mut writer, &mut reader, &incoming_tx).await?;
+        self.send_registration(&mut writer, &mut reader, &incoming_tx)
+            .await?;
 
         // Create channel for sending
         let (send_tx, mut send_rx) = mpsc::channel::<String>(100);
@@ -256,7 +267,7 @@ impl IrcClient {
 
         // Spawn writer task
         let writer_handle = tokio::spawn(async move {
-            use tokio::time::{timeout, Duration};
+            use tokio::time::{Duration, timeout};
             loop {
                 tokio::select! {
                     Some(cmd) = outgoing_rx.recv() => {
@@ -341,7 +352,10 @@ impl IrcClient {
         let _ = incoming_tx.try_send(IrcMessage {
             tags: None,
             prefix: None,
-            command: IrcCommand::Notice("*".to_string(), "Registration sent, waiting for response...".to_string()),
+            command: IrcCommand::Notice(
+                "*".to_string(),
+                "Registration sent, waiting for response...".to_string(),
+            ),
             raw: String::new(),
         });
 
@@ -364,18 +378,21 @@ impl IrcClient {
 
         // IRCv3 capabilities we want to request
         const DESIRED_CAPS: &[&str] = &[
-            "away-notify",      // Get notified when users go away/back
-            "account-notify",   // Get notified when users log in/out
-            "extended-join",    // Get account and realname on JOIN
-            "server-time",      // Timestamps from server (for bouncers)
-            "batch",            // Grouped messages
-            "chghost",          // Host change notifications
+            "away-notify",    // Get notified when users go away/back
+            "account-notify", // Get notified when users log in/out
+            "extended-join",  // Get account and realname on JOIN
+            "server-time",    // Timestamps from server (for bouncers)
+            "batch",          // Grouped messages
+            "chghost",        // Host change notifications
         ];
 
         let _ = incoming_tx.try_send(IrcMessage {
             tags: None,
             prefix: None,
-            command: IrcCommand::Notice("*".to_string(), "Negotiating IRCv3 capabilities...".to_string()),
+            command: IrcCommand::Notice(
+                "*".to_string(),
+                "Negotiating IRCv3 capabilities...".to_string(),
+            ),
             raw: String::new(),
         });
 
@@ -438,7 +455,10 @@ impl IrcClient {
             let _ = incoming_tx.try_send(IrcMessage {
                 tags: None,
                 prefix: None,
-                command: IrcCommand::Notice("*".to_string(), "No IRCv3 capabilities available".to_string()),
+                command: IrcCommand::Notice(
+                    "*".to_string(),
+                    "No IRCv3 capabilities available".to_string(),
+                ),
                 raw: String::new(),
             });
             let cap_end = "CAP END\r\n";
@@ -456,24 +476,48 @@ impl IrcClient {
 
         // Step 5: Wait for CAP ACK/NAK
         let mut acked_caps = String::new();
+        let mut rejected_caps = Vec::new();
         loop {
             let msg = read_handshake_msg(writer, reader, &mut buf, incoming_tx).await?;
 
             if let IrcCommand::Cap(_target, subcmd, rest) = &msg.command {
-                if subcmd == "ACK" {
-                    // The trailing element is the acked cap list (after any "*" marker).
-                    if let Some(caps) = rest.last() {
-                        acked_caps = caps.clone();
+                let more = rest.first().is_some_and(|token| token == "*");
+                match subcmd.as_str() {
+                    "ACK" => {
+                        // The trailing element is the acked cap list (after any "*" marker).
+                        if let Some(caps) = rest.last() {
+                            if !acked_caps.is_empty() {
+                                acked_caps.push(' ');
+                            }
+                            acked_caps.push_str(caps);
+                        }
+                        if !more {
+                            break;
+                        }
                     }
-                    break;
-                } else if subcmd == "NAK" {
-                    let _ = incoming_tx.try_send(IrcMessage {
-                        tags: None,
-                        prefix: None,
-                        command: IrcCommand::Notice("*".to_string(), "Server rejected some capabilities".to_string()),
-                        raw: String::new(),
-                    });
-                    break;
+                    "NAK" => {
+                        // The trailing element is the rejected cap list (after any "*" marker).
+                        if let Some(caps) = rest.last() {
+                            rejected_caps.push(caps.clone());
+                        }
+                        if !more {
+                            let mut message = "Server rejected some capabilities".to_string();
+                            if !rejected_caps.is_empty() {
+                                message = format!(
+                                    "Server rejected capabilities: {}",
+                                    rejected_caps.join(" ")
+                                );
+                            }
+                            let _ = incoming_tx.try_send(IrcMessage {
+                                tags: None,
+                                prefix: None,
+                                command: IrcCommand::Notice("*".to_string(), message),
+                                raw: String::new(),
+                            });
+                            break;
+                        }
+                    }
+                    _ => {}
                 }
             }
         }
@@ -491,13 +535,17 @@ impl IrcClient {
             let _ = incoming_tx.try_send(IrcMessage {
                 tags: None,
                 prefix: None,
-                command: IrcCommand::Notice("*".to_string(), "Server does not support SASL".to_string()),
+                command: IrcCommand::Notice(
+                    "*".to_string(),
+                    "Server does not support SASL".to_string(),
+                ),
                 raw: String::new(),
             });
         }
 
         // Report enabled capabilities
-        let enabled: Vec<&str> = DESIRED_CAPS.iter()
+        let enabled: Vec<&str> = DESIRED_CAPS
+            .iter()
             .filter(|cap| acked_tokens.contains(**cap))
             .copied()
             .collect();
@@ -505,7 +553,10 @@ impl IrcClient {
             let _ = incoming_tx.try_send(IrcMessage {
                 tags: None,
                 prefix: None,
-                command: IrcCommand::Notice("*".to_string(), format!("IRCv3: {}", enabled.join(", "))),
+                command: IrcCommand::Notice(
+                    "*".to_string(),
+                    format!("IRCv3: {}", enabled.join(", ")),
+                ),
                 raw: String::new(),
             });
         }
@@ -538,7 +589,10 @@ impl IrcClient {
         let _ = incoming_tx.try_send(IrcMessage {
             tags: None,
             prefix: None,
-            command: IrcCommand::Notice("*".to_string(), "Starting SASL authentication...".to_string()),
+            command: IrcCommand::Notice(
+                "*".to_string(),
+                "Starting SASL authentication...".to_string(),
+            ),
             raw: String::new(),
         });
 
@@ -597,7 +651,10 @@ impl IrcClient {
                         let _ = incoming_tx.try_send(IrcMessage {
                             tags: None,
                             prefix: None,
-                            command: IrcCommand::Notice("*".to_string(), "SASL authentication successful!".to_string()),
+                            command: IrcCommand::Notice(
+                                "*".to_string(),
+                                "SASL authentication successful!".to_string(),
+                            ),
                             raw: String::new(),
                         });
                         return Ok(());
@@ -606,12 +663,15 @@ impl IrcClient {
                         let _ = incoming_tx.try_send(IrcMessage {
                             tags: None,
                             prefix: None,
-                            command: IrcCommand::Notice("*".to_string(), "SASL authentication failed!".to_string()),
+                            command: IrcCommand::Notice(
+                                "*".to_string(),
+                                "SASL authentication failed!".to_string(),
+                            ),
                             raw: String::new(),
                         });
                         return Ok(());
                     }
-                    900 => continue,  // RPL_LOGGEDIN
+                    900 => continue, // RPL_LOGGEDIN
                     _ => {}
                 }
             }
@@ -633,7 +693,10 @@ impl IrcClient {
                     let _ = incoming_tx.try_send(IrcMessage {
                         tags: None,
                         prefix: None,
-                        command: IrcCommand::Notice("*".to_string(), "Connection closed by server".to_string()),
+                        command: IrcCommand::Notice(
+                            "*".to_string(),
+                            "Connection closed by server".to_string(),
+                        ),
                         raw: String::new(),
                     });
                     break;
@@ -647,7 +710,10 @@ impl IrcClient {
                         let _ = incoming_tx.try_send(IrcMessage {
                             tags: None,
                             prefix: None,
-                            command: IrcCommand::Notice("*".to_string(), "Connection closed by server".to_string()),
+                            command: IrcCommand::Notice(
+                                "*".to_string(),
+                                "Connection closed by server".to_string(),
+                            ),
                             raw: String::new(),
                         });
                         break;
@@ -681,7 +747,10 @@ impl IrcClient {
                     let _ = incoming_tx.try_send(IrcMessage {
                         tags: None,
                         prefix: None,
-                        command: IrcCommand::Notice("*".to_string(), format!("[v3] Read error: {}", err_msg)),
+                        command: IrcCommand::Notice(
+                            "*".to_string(),
+                            format!("[v3] Read error: {}", err_msg),
+                        ),
                         raw: String::new(),
                     });
                     break;

@@ -1,9 +1,9 @@
 //! Dialog windows for connect, settings, and channel list
 
-use egui::{Color32, RichText, ScrollArea, TextEdit, Vec2};
-use crate::irc::IrcCommand;
-use super::{IrcApp, ServerFavorite};
 use super::helpers::format_timestamp;
+use super::{IrcApp, ServerFavorite};
+use crate::irc::IrcCommand;
+use egui::{Color32, RichText, ScrollArea, TextEdit, Vec2};
 
 /// Popular IRC network presets (alphabetical)
 const NETWORK_PRESETS: &[(&str, &str, &str, bool)] = &[
@@ -103,15 +103,15 @@ impl IrcApp {
                                 // Connect button
                                 if ui.add_enabled(has_selection, egui::Button::new("Connect")).clicked() {
                                     if let Some(idx) = self.selected_favorite {
-                                        if let Some(fav) = self.server_favorites.get(idx).cloned() {
-                                            self.load_favorite(&fav);
-                                            self.save_settings();
-                                            self.show_connect_dialog = false;
-                                            self.connecting = true;
-                                            self.my_nick = self.nickname.clone();
+                                                if let Some(fav) = self.server_favorites.get(idx).cloned() {
+                                                    self.load_favorite(&fav);
+                                                    self.save_settings();
+                                                    self.show_connect_dialog = false;
+                                                    self.connecting = true;
+                                                    self.set_my_nick(self.nickname.clone());
+                                                }
+                                            }
                                         }
-                                    }
-                                }
                             });
                         }
                     });
@@ -248,7 +248,7 @@ impl IrcApp {
                         self.save_settings();
                         self.show_connect_dialog = false;
                         self.connecting = true;
-                        self.my_nick = self.nickname.clone();
+                        self.set_my_nick(self.nickname.clone());
                     }
                     if ui.button("Cancel").clicked() {
                         self.show_connect_dialog = false;
@@ -266,19 +266,34 @@ impl IrcApp {
             .show(ctx, |ui| {
                 // Tab bar
                 ui.horizontal(|ui| {
-                    if ui.selectable_label(self.settings_tab == 0, "Connection").clicked() {
+                    if ui
+                        .selectable_label(self.settings_tab == 0, "Connection")
+                        .clicked()
+                    {
                         self.settings_tab = 0;
                     }
-                    if ui.selectable_label(self.settings_tab == 1, "Display").clicked() {
+                    if ui
+                        .selectable_label(self.settings_tab == 1, "Display")
+                        .clicked()
+                    {
                         self.settings_tab = 1;
                     }
-                    if ui.selectable_label(self.settings_tab == 2, "Automation").clicked() {
+                    if ui
+                        .selectable_label(self.settings_tab == 2, "Automation")
+                        .clicked()
+                    {
                         self.settings_tab = 2;
                     }
-                    if ui.selectable_label(self.settings_tab == 3, "Behavior").clicked() {
+                    if ui
+                        .selectable_label(self.settings_tab == 3, "Behavior")
+                        .clicked()
+                    {
                         self.settings_tab = 3;
                     }
-                    if ui.selectable_label(self.settings_tab == 4, "About").clicked() {
+                    if ui
+                        .selectable_label(self.settings_tab == 4, "About")
+                        .clicked()
+                    {
                         self.settings_tab = 4;
                     }
                 });
@@ -359,7 +374,11 @@ impl IrcApp {
                 .show_ui(ui, |ui| {
                     ui.selectable_value(&mut self.timestamp_format, "short".to_string(), "HH:MM");
                     ui.selectable_value(&mut self.timestamp_format, "long".to_string(), "HH:MM:SS");
-                    ui.selectable_value(&mut self.timestamp_format, "full".to_string(), "MM-DD HH:MM");
+                    ui.selectable_value(
+                        &mut self.timestamp_format,
+                        "full".to_string(),
+                        "MM-DD HH:MM",
+                    );
                 });
         });
 
@@ -372,7 +391,11 @@ impl IrcApp {
         ui.horizontal(|ui| {
             ui.label("Max scrollback:");
             let mut lines = self.max_scrollback as i32;
-            ui.add(egui::DragValue::new(&mut lines).speed(100).range(100..=10000));
+            ui.add(
+                egui::DragValue::new(&mut lines)
+                    .speed(100)
+                    .range(100..=10000),
+            );
             self.max_scrollback = lines.max(100) as usize;
             ui.label("lines");
         });
@@ -383,10 +406,18 @@ impl IrcApp {
 
         ui.horizontal(|ui| {
             ui.label("Size:");
-            ui.add(egui::DragValue::new(&mut self.font_size).speed(0.5).range(10.0..=24.0));
+            ui.add(
+                egui::DragValue::new(&mut self.font_size)
+                    .speed(0.5)
+                    .range(10.0..=24.0),
+            );
             ui.label("px");
         });
-        ui.label(RichText::new("Restart required for font changes").small().color(Color32::GRAY));
+        ui.label(
+            RichText::new("Restart required for font changes")
+                .small()
+                .color(Color32::GRAY),
+        );
 
         ui.add_space(8.0);
         ui.heading("Highlights");
@@ -396,9 +427,13 @@ impl IrcApp {
         ui.add(
             TextEdit::singleline(&mut self.highlight_words)
                 .desired_width(300.0)
-                .hint_text("urgent, alert, your-other-nick")
+                .hint_text("urgent, alert, your-other-nick"),
         );
-        ui.label(RichText::new("Your nick is always highlighted").small().color(Color32::GRAY));
+        ui.label(
+            RichText::new("Your nick is always highlighted")
+                .small()
+                .color(Color32::GRAY),
+        );
     }
 
     fn settings_tab_automation(&mut self, ui: &mut egui::Ui) {
@@ -410,7 +445,7 @@ impl IrcApp {
             ui.add(
                 TextEdit::singleline(&mut self.auto_join_channels)
                     .desired_width(200.0)
-                    .hint_text("#chan1, #chan2")
+                    .hint_text("#chan1, #chan2"),
             );
         });
 
@@ -422,7 +457,7 @@ impl IrcApp {
             TextEdit::multiline(&mut self.auto_perform)
                 .desired_width(340.0)
                 .desired_rows(4)
-                .hint_text("/msg NickServ identify pass\n/join #secret key")
+                .hint_text("/msg NickServ identify pass\n/join #secret key"),
         );
 
         ui.add_space(8.0);
@@ -430,7 +465,11 @@ impl IrcApp {
         ui.add_space(4.0);
 
         if self.ignore_list.is_empty() {
-            ui.label(RichText::new("No users ignored").italics().color(Color32::GRAY));
+            ui.label(
+                RichText::new("No users ignored")
+                    .italics()
+                    .color(Color32::GRAY),
+            );
             ui.label("Use /ignore <nick|mask> to add.");
         } else {
             let ignore_display = self.ignore_list.join(", ");
@@ -465,7 +504,10 @@ impl IrcApp {
             });
         }
 
-        ui.checkbox(&mut self.notifications_enabled, "Desktop notifications for highlights/PMs");
+        ui.checkbox(
+            &mut self.notifications_enabled,
+            "Desktop notifications for highlights/PMs",
+        );
 
         let tray_response = ui.checkbox(&mut self.minimize_to_tray, "Minimize to system tray");
         if self.minimize_to_tray {
@@ -476,7 +518,10 @@ impl IrcApp {
         ui.heading("Privacy");
         ui.add_space(4.0);
 
-        ui.checkbox(&mut self.ctcp_replies_enabled, "Reply to CTCP requests (VERSION, TIME, etc.)");
+        ui.checkbox(
+            &mut self.ctcp_replies_enabled,
+            "Reply to CTCP requests (VERSION, TIME, etc.)",
+        );
 
         ui.add_space(8.0);
         ui.heading("Auto-Away");
@@ -514,7 +559,11 @@ impl IrcApp {
                 ui.label("lines");
             });
         }
-        ui.label(RichText::new("Logs: ~/.config/linefeed/logs/").small().color(Color32::GRAY));
+        ui.label(
+            RichText::new("Logs: ~/.config/linefeed/logs/")
+                .small()
+                .color(Color32::GRAY),
+        );
 
         ui.add_space(8.0);
         ui.heading("Custom Messages");
@@ -522,11 +571,19 @@ impl IrcApp {
 
         ui.horizontal(|ui| {
             ui.label("Quit:");
-            ui.add(TextEdit::singleline(&mut self.quit_message).desired_width(200.0).hint_text("Linefeed"));
+            ui.add(
+                TextEdit::singleline(&mut self.quit_message)
+                    .desired_width(200.0)
+                    .hint_text("Linefeed"),
+            );
         });
         ui.horizontal(|ui| {
             ui.label("Part:");
-            ui.add(TextEdit::singleline(&mut self.part_message).desired_width(200.0).hint_text("Leaving"));
+            ui.add(
+                TextEdit::singleline(&mut self.part_message)
+                    .desired_width(200.0)
+                    .hint_text("Leaving"),
+            );
         });
 
         ui.add_space(8.0);
@@ -538,10 +595,18 @@ impl IrcApp {
             let mut min_users = self.list_min_users as i32;
             // Range must match the Channel List window's DragValue (0..=1000) so the
             // shared list_min_users value is never silently clamped when switching UIs.
-            ui.add(egui::DragValue::new(&mut min_users).speed(1).range(0..=1000));
+            ui.add(
+                egui::DragValue::new(&mut min_users)
+                    .speed(1)
+                    .range(0..=1000),
+            );
             self.list_min_users = min_users.max(0) as u32;
         });
-        ui.label(RichText::new("Filter /list to channels with at least this many users (0 = all)").small().color(Color32::GRAY));
+        ui.label(
+            RichText::new("Filter /list to channels with at least this many users (0 = all)")
+                .small()
+                .color(Color32::GRAY),
+        );
     }
 
     fn settings_tab_about(&mut self, ui: &mut egui::Ui) {
@@ -551,7 +616,11 @@ impl IrcApp {
             ui.label("Version 0.0.1");
             ui.add_space(10.0);
             ui.label("A cross-platform IRC client");
-            ui.label(RichText::new("Built with Rust + egui").small().color(Color32::GRAY));
+            ui.label(
+                RichText::new("Built with Rust + egui")
+                    .small()
+                    .color(Color32::GRAY),
+            );
             ui.add_space(20.0);
             ui.label(RichText::new("Windows ARM64 / x86 / Linux").small());
         });
@@ -573,9 +642,12 @@ impl IrcApp {
                 let mut filtered: Vec<_> = if filter.is_empty() {
                     self.channel_list.iter().collect()
                 } else {
-                    self.channel_list.iter()
-                        .filter(|e| e.name.to_lowercase().contains(&filter)
-                            || e.topic.to_lowercase().contains(&filter))
+                    self.channel_list
+                        .iter()
+                        .filter(|e| {
+                            e.name.to_lowercase().contains(&filter)
+                                || e.topic.to_lowercase().contains(&filter)
+                        })
                         .collect()
                 };
 
@@ -584,9 +656,13 @@ impl IrcApp {
                 let sort_dir = self.channel_list_sort_dir;
                 filtered.sort_by(|a, b| {
                     let cmp = match sort_col {
-                        ChannelListSort::Channel => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
+                        ChannelListSort::Channel => {
+                            a.name.to_lowercase().cmp(&b.name.to_lowercase())
+                        }
                         ChannelListSort::Users => a.user_count.cmp(&b.user_count),
-                        ChannelListSort::Topic => a.topic.to_lowercase().cmp(&b.topic.to_lowercase()),
+                        ChannelListSort::Topic => {
+                            a.topic.to_lowercase().cmp(&b.topic.to_lowercase())
+                        }
                     };
                     match sort_dir {
                         SortDirection::Ascending => cmp,
@@ -597,11 +673,21 @@ impl IrcApp {
                 // Filter input and status
                 ui.horizontal(|ui| {
                     ui.label("Filter:");
-                    ui.add(TextEdit::singleline(&mut self.channel_list_filter).desired_width(150.0));
+                    ui.add(
+                        TextEdit::singleline(&mut self.channel_list_filter).desired_width(150.0),
+                    );
                     ui.add_space(8.0);
-                    ui.label(format!("{}/{} channels", filtered.len(), self.channel_list.len()));
+                    ui.label(format!(
+                        "{}/{} channels",
+                        filtered.len(),
+                        self.channel_list.len()
+                    ));
                     if self.channel_list.is_empty() && !self.channel_list_loading {
-                        ui.label(RichText::new("(No channels found - server may be restricting /list)").color(Color32::GOLD).small());
+                        ui.label(
+                            RichText::new("(No channels found - server may be restricting /list)")
+                                .color(Color32::GOLD)
+                                .small(),
+                        );
                     }
 
                     if self.channel_list_loading {
@@ -633,7 +719,15 @@ impl IrcApp {
                 ui.horizontal(|ui| {
                     // Channel header
                     let chan_text = format!("Channel{}", arrow(ChannelListSort::Channel));
-                    if ui.add_sized([channel_width, 16.0], egui::Button::new(RichText::new(chan_text).strong().color(Color32::WHITE))).clicked() {
+                    if ui
+                        .add_sized(
+                            [channel_width, 16.0],
+                            egui::Button::new(
+                                RichText::new(chan_text).strong().color(Color32::WHITE),
+                            ),
+                        )
+                        .clicked()
+                    {
                         if self.channel_list_sort == ChannelListSort::Channel {
                             self.channel_list_sort_dir = match self.channel_list_sort_dir {
                                 SortDirection::Ascending => SortDirection::Descending,
@@ -647,7 +741,15 @@ impl IrcApp {
 
                     // Users header
                     let users_text = format!("#{}", arrow(ChannelListSort::Users));
-                    if ui.add_sized([users_width, 16.0], egui::Button::new(RichText::new(users_text).strong().color(Color32::WHITE))).clicked() {
+                    if ui
+                        .add_sized(
+                            [users_width, 16.0],
+                            egui::Button::new(
+                                RichText::new(users_text).strong().color(Color32::WHITE),
+                            ),
+                        )
+                        .clicked()
+                    {
                         if self.channel_list_sort == ChannelListSort::Users {
                             self.channel_list_sort_dir = match self.channel_list_sort_dir {
                                 SortDirection::Ascending => SortDirection::Descending,
@@ -661,7 +763,15 @@ impl IrcApp {
 
                     // Topic header
                     let topic_text = format!("Topic{}", arrow(ChannelListSort::Topic));
-                    if ui.add_sized([topic_width, 16.0], egui::Button::new(RichText::new(topic_text).strong().color(Color32::WHITE))).clicked() {
+                    if ui
+                        .add_sized(
+                            [topic_width, 16.0],
+                            egui::Button::new(
+                                RichText::new(topic_text).strong().color(Color32::WHITE),
+                            ),
+                        )
+                        .clicked()
+                    {
                         if self.channel_list_sort == ChannelListSort::Topic {
                             self.channel_list_sort_dir = match self.channel_list_sort_dir {
                                 SortDirection::Ascending => SortDirection::Descending,
@@ -714,7 +824,7 @@ impl IrcApp {
                                 let response = ui.add_sized(
                                     [channel_width, row_height],
                                     egui::Button::new(RichText::new(&entry.name).color(text_color))
-                                        .frame(false)
+                                        .frame(false),
                                 );
 
                                 if response.clicked() {
@@ -735,9 +845,14 @@ impl IrcApp {
                                     if !channel_topic.is_empty() {
                                         ui.separator();
                                         ui.label(RichText::new("Topic:").small());
-                                        ui.add(egui::Label::new(
-                                            RichText::new(&channel_topic).small().color(Color32::GRAY)
-                                        ).wrap_mode(egui::TextWrapMode::Wrap));
+                                        ui.add(
+                                            egui::Label::new(
+                                                RichText::new(&channel_topic)
+                                                    .small()
+                                                    .color(Color32::GRAY),
+                                            )
+                                            .wrap_mode(egui::TextWrapMode::Wrap),
+                                        );
                                     }
                                     ui.separator();
                                     if ui.button("Join Channel").clicked() {
@@ -753,15 +868,20 @@ impl IrcApp {
                                 // User count
                                 ui.add_sized(
                                     [users_width, row_height],
-                                    egui::Label::new(RichText::new(format!("{}", entry.user_count)).color(Color32::LIGHT_GREEN))
+                                    egui::Label::new(
+                                        RichText::new(format!("{}", entry.user_count))
+                                            .color(Color32::LIGHT_GREEN),
+                                    ),
                                 );
 
                                 // Topic (clipped, with IRC formatting stripped)
                                 let clean_topic = strip_irc_formatting(&entry.topic);
                                 ui.add_sized(
                                     [topic_width, row_height],
-                                    egui::Label::new(RichText::new(&clean_topic).color(Color32::GRAY))
-                                        .truncate()
+                                    egui::Label::new(
+                                        RichText::new(&clean_topic).color(Color32::GRAY),
+                                    )
+                                    .truncate(),
                                 );
                             });
                         }
@@ -780,7 +900,11 @@ impl IrcApp {
 
                     ui.label("Min:");
                     let mut min_users = self.list_min_users as i32;
-                    ui.add(egui::DragValue::new(&mut min_users).range(0..=1000).speed(1));
+                    ui.add(
+                        egui::DragValue::new(&mut min_users)
+                            .range(0..=1000)
+                            .speed(1),
+                    );
                     self.list_min_users = min_users.max(0) as u32;
 
                     if ui.button("Refresh").clicked() {
@@ -788,7 +912,10 @@ impl IrcApp {
                         self.channel_list_selected = None;
                         // >N means "more than N users", so for min 5, send >4
                         if self.list_min_users >= 1 {
-                            self.send_command(IrcCommand::List(Some(format!(">{}", self.list_min_users.saturating_sub(1)))));
+                            self.send_command(IrcCommand::List(Some(format!(
+                                ">{}",
+                                self.list_min_users.saturating_sub(1)
+                            ))));
                         } else {
                             self.send_command(IrcCommand::List(None));
                         }
@@ -875,12 +1002,15 @@ impl IrcApp {
                     if let Some(topic) = &ch.topic {
                         ui.add(egui::Label::new(topic).wrap());
                         if let Some(setter) = &ch.topic_set_by {
-                            let time_str = ch.topic_set_time
+                            let time_str = ch
+                                .topic_set_time
                                 .map(|ts| format_timestamp(ts))
                                 .unwrap_or_else(|| "Unknown".to_string());
-                            ui.label(RichText::new(format!("Set by {} on {}", setter, time_str))
-                                .small()
-                                .color(Color32::GRAY));
+                            ui.label(
+                                RichText::new(format!("Set by {} on {}", setter, time_str))
+                                    .small()
+                                    .color(Color32::GRAY),
+                            );
                         }
                     } else {
                         ui.label(RichText::new("No topic set").italics().color(Color32::GRAY));
@@ -903,19 +1033,22 @@ impl IrcApp {
                                 }
                             }
                         } else {
-                            ScrollArea::vertical()
-                                .max_height(150.0)
-                                .show(ui, |ui| {
-                                    for ban in &ch.bans {
-                                        ui.horizontal(|ui| {
-                                            ui.label(RichText::new(&ban.mask).monospace());
-                                            ui.label(RichText::new(format!("by {} on {}",
-                                                ban.set_by, format_timestamp(ban.set_time)))
-                                                .small()
-                                                .color(Color32::GRAY));
-                                        });
-                                    }
-                                });
+                            ScrollArea::vertical().max_height(150.0).show(ui, |ui| {
+                                for ban in &ch.bans {
+                                    ui.horizontal(|ui| {
+                                        ui.label(RichText::new(&ban.mask).monospace());
+                                        ui.label(
+                                            RichText::new(format!(
+                                                "by {} on {}",
+                                                ban.set_by,
+                                                format_timestamp(ban.set_time)
+                                            ))
+                                            .small()
+                                            .color(Color32::GRAY),
+                                        );
+                                    });
+                                }
+                            });
                         }
                     });
 
@@ -923,21 +1056,19 @@ impl IrcApp {
 
                     // User list section
                     ui.collapsing(format!("Users ({})", ch.users.len()), |ui| {
-                        ScrollArea::vertical()
-                            .max_height(150.0)
-                            .show(ui, |ui| {
-                                ui.horizontal_wrapped(|ui| {
-                                    for user in &ch.users {
-                                        let prefix = user.mode.prefix();
-                                        let display = if user.is_away() {
-                                            format!("{}{} (away)", prefix, user.nick)
-                                        } else {
-                                            format!("{}{}", prefix, user.nick)
-                                        };
-                                        ui.label(&display);
-                                    }
-                                });
+                        ScrollArea::vertical().max_height(150.0).show(ui, |ui| {
+                            ui.horizontal_wrapped(|ui| {
+                                for user in &ch.users {
+                                    let prefix = user.mode.prefix();
+                                    let display = if user.is_away() {
+                                        format!("{}{} (away)", prefix, user.nick)
+                                    } else {
+                                        format!("{}{}", prefix, user.nick)
+                                    };
+                                    ui.label(&display);
+                                }
                             });
+                        });
                     });
                 } else {
                     ui.label("Channel not found");
@@ -1025,7 +1156,7 @@ impl IrcApp {
                                 if self.color_picker_fg {
                                     // First click - foreground color, now ask for background
                                     result = Some(format!("\x03{:02}", code));
-                                    self.color_picker_fg = false;  // Switch to background selection
+                                    self.color_picker_fg = false; // Switch to background selection
                                 } else {
                                     // Second click - background color
                                     result = Some(format!(",{:02}", code));
@@ -1057,12 +1188,16 @@ impl IrcApp {
 
                 // Show formatting shortcuts help
                 ui.add_space(4.0);
-                ui.label(RichText::new("Shortcuts: Ctrl+B Bold, Ctrl+U Underline, Ctrl+I Italic").small().color(Color32::GRAY));
+                ui.label(
+                    RichText::new("Shortcuts: Ctrl+B Bold, Ctrl+U Underline, Ctrl+I Italic")
+                        .small()
+                        .color(Color32::GRAY),
+                );
             });
 
         if close {
             self.show_color_picker = false;
-            self.color_picker_fg = true;  // Reset for next time
+            self.color_picker_fg = true; // Reset for next time
         }
 
         result

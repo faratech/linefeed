@@ -1,8 +1,8 @@
 //! IRC command processing and help system
 
-use crate::irc::IrcCommand;
-use super::{IrcApp, ChatMessage};
 use super::helpers::{is_channel, nick_to_mask};
+use super::{ChatMessage, IrcApp};
+use crate::irc::IrcCommand;
 
 impl IrcApp {
     pub fn process_command(&mut self, input: &str) {
@@ -22,7 +22,8 @@ impl IrcApp {
                 };
                 // Store key for use when channel is created
                 if let Some(ref k) = key {
-                    self.pending_channel_keys.insert(channel.to_lowercase(), k.clone());
+                    self.pending_channel_keys
+                        .insert(channel.to_lowercase(), k.clone());
                 }
                 self.send_command(IrcCommand::Join(channel, key, None, None));
             }
@@ -62,7 +63,9 @@ impl IrcApp {
                     let chat_msg = ChatMessage::new(&self.my_nick, message);
                     self.add_message_to_channel(target, chat_msg);
                 } else {
-                    self.add_message_to_current(ChatMessage::system("Usage: /msg <target> <message>"));
+                    self.add_message_to_current(ChatMessage::system(
+                        "Usage: /msg <target> <message>",
+                    ));
                 }
             }
 
@@ -70,7 +73,9 @@ impl IrcApp {
                 let msg_parts: Vec<&str> = args.splitn(2, ' ').collect();
                 if let Some(&target) = msg_parts.get(0) {
                     if target.is_empty() {
-                        self.add_server_message(ChatMessage::system("Usage: /query <nick> [message]"));
+                        self.add_server_message(ChatMessage::system(
+                            "Usage: /query <nick> [message]",
+                        ));
                         return;
                     }
                     // Open query window (loads history via add_message_to_channel)
@@ -83,7 +88,10 @@ impl IrcApp {
                     // If there's a message, send it
                     if let Some(&message) = msg_parts.get(1) {
                         if !message.is_empty() {
-                            self.send_command(IrcCommand::Privmsg(target.to_string(), message.to_string()));
+                            self.send_command(IrcCommand::Privmsg(
+                                target.to_string(),
+                                message.to_string(),
+                            ));
                             let chat_msg = ChatMessage::new(&self.my_nick, message);
                             self.add_message_to_channel(target, chat_msg);
                         }
@@ -129,7 +137,10 @@ impl IrcApp {
                     if args.is_empty() {
                         self.send_command(IrcCommand::Topic(channel.clone(), None));
                     } else {
-                        self.send_command(IrcCommand::Topic(channel.clone(), Some(args.to_string())));
+                        self.send_command(IrcCommand::Topic(
+                            channel.clone(),
+                            Some(args.to_string()),
+                        ));
                     }
                 }
             }
@@ -156,7 +167,9 @@ impl IrcApp {
                     // Update our own status in all channels
                     let my_nick = self.my_nick.clone();
                     self.update_user_away_status(&my_nick, None);
-                    self.add_server_message(ChatMessage::system("You are no longer marked as away"));
+                    self.add_server_message(ChatMessage::system(
+                        "You are no longer marked as away",
+                    ));
                 } else {
                     let reason = args.to_string();
                     self.send_command(IrcCommand::Away(Some(reason.clone())));
@@ -165,7 +178,10 @@ impl IrcApp {
                     // Update our own status in all channels
                     let my_nick = self.my_nick.clone();
                     self.update_user_away_status(&my_nick, Some(reason.clone()));
-                    self.add_server_message(ChatMessage::system(&format!("You are now marked as away: {}", reason)));
+                    self.add_server_message(ChatMessage::system(&format!(
+                        "You are now marked as away: {}",
+                        reason
+                    )));
                 }
             }
 
@@ -180,12 +196,14 @@ impl IrcApp {
             }
 
             // === Network Service Shortcuts ===
-
             "NS" | "NICKSERV" => {
                 if args.is_empty() {
                     self.add_message_to_current(ChatMessage::system("Usage: /ns <command> [args]"));
                 } else {
-                    self.send_command(IrcCommand::Privmsg("NickServ".to_string(), args.to_string()));
+                    self.send_command(IrcCommand::Privmsg(
+                        "NickServ".to_string(),
+                        args.to_string(),
+                    ));
                     self.add_message_to_channel("NickServ", ChatMessage::new(&self.my_nick, args));
                 }
             }
@@ -194,7 +212,10 @@ impl IrcApp {
                 if args.is_empty() {
                     self.add_message_to_current(ChatMessage::system("Usage: /cs <command> [args]"));
                 } else {
-                    self.send_command(IrcCommand::Privmsg("ChanServ".to_string(), args.to_string()));
+                    self.send_command(IrcCommand::Privmsg(
+                        "ChanServ".to_string(),
+                        args.to_string(),
+                    ));
                     self.add_message_to_channel("ChanServ", ChatMessage::new(&self.my_nick, args));
                 }
             }
@@ -203,7 +224,10 @@ impl IrcApp {
                 if args.is_empty() {
                     self.add_message_to_current(ChatMessage::system("Usage: /ms <command> [args]"));
                 } else {
-                    self.send_command(IrcCommand::Privmsg("MemoServ".to_string(), args.to_string()));
+                    self.send_command(IrcCommand::Privmsg(
+                        "MemoServ".to_string(),
+                        args.to_string(),
+                    ));
                     self.add_message_to_channel("MemoServ", ChatMessage::new(&self.my_nick, args));
                 }
             }
@@ -212,7 +236,10 @@ impl IrcApp {
                 if args.is_empty() {
                     self.add_message_to_current(ChatMessage::system("Usage: /hs <command> [args]"));
                 } else {
-                    self.send_command(IrcCommand::Privmsg("HostServ".to_string(), args.to_string()));
+                    self.send_command(IrcCommand::Privmsg(
+                        "HostServ".to_string(),
+                        args.to_string(),
+                    ));
                     self.add_message_to_channel("HostServ", ChatMessage::new(&self.my_nick, args));
                 }
             }
@@ -221,7 +248,10 @@ impl IrcApp {
                 if args.is_empty() {
                     self.add_message_to_current(ChatMessage::system("Usage: /os <command> [args]"));
                 } else {
-                    self.send_command(IrcCommand::Privmsg("OperServ".to_string(), args.to_string()));
+                    self.send_command(IrcCommand::Privmsg(
+                        "OperServ".to_string(),
+                        args.to_string(),
+                    ));
                     self.add_message_to_channel("OperServ", ChatMessage::new(&self.my_nick, args));
                 }
             }
@@ -252,12 +282,13 @@ impl IrcApp {
                         format!("\x01{} {}\x01", ctcp_cmd, ctcp_args)
                     };
                     self.send_command(IrcCommand::Privmsg(target.to_string(), ctcp_msg));
-                    self.add_message_to_current(ChatMessage::system(
-                        &format!("[CTCP] Sent {} to {}", ctcp_cmd, target)
-                    ));
+                    self.add_message_to_current(ChatMessage::system(&format!(
+                        "[CTCP] Sent {} to {}",
+                        ctcp_cmd, target
+                    )));
                 } else {
                     self.add_message_to_current(ChatMessage::system(
-                        "Usage: /ctcp <nick> <command> [args]"
+                        "Usage: /ctcp <nick> <command> [args]",
                     ));
                 }
             }
@@ -267,13 +298,12 @@ impl IrcApp {
                 if !args.is_empty() {
                     let ctcp_msg = "\x01VERSION\x01".to_string();
                     self.send_command(IrcCommand::Privmsg(args.to_string(), ctcp_msg));
-                    self.add_message_to_current(ChatMessage::system(
-                        &format!("[CTCP] Sent VERSION to {}", args)
-                    ));
+                    self.add_message_to_current(ChatMessage::system(&format!(
+                        "[CTCP] Sent VERSION to {}",
+                        args
+                    )));
                 } else {
-                    self.add_message_to_current(ChatMessage::system(
-                        "Usage: /version <nick>"
-                    ));
+                    self.add_message_to_current(ChatMessage::system("Usage: /version <nick>"));
                 }
             }
 
@@ -286,9 +316,10 @@ impl IrcApp {
                     .as_millis();
                 let ctcp_msg = format!("\x01PING {}\x01", timestamp);
                 self.send_command(IrcCommand::Privmsg(args.to_string(), ctcp_msg));
-                self.add_message_to_current(ChatMessage::system(
-                    &format!("[CTCP] Sent PING to {}", args)
-                ));
+                self.add_message_to_current(ChatMessage::system(&format!(
+                    "[CTCP] Sent PING to {}",
+                    args
+                )));
             }
 
             // Catch the cases the guarded PING arm above rejects (empty target, or a
@@ -350,7 +381,10 @@ impl IrcApp {
                 if args.is_empty() {
                     // >N means "more than N users", so for min 5, send >4
                     if self.list_min_users >= 1 {
-                        self.send_command(IrcCommand::List(Some(format!(">{}", self.list_min_users.saturating_sub(1)))));
+                        self.send_command(IrcCommand::List(Some(format!(
+                            ">{}",
+                            self.list_min_users.saturating_sub(1)
+                        ))));
                     } else {
                         self.send_command(IrcCommand::List(None));
                     }
@@ -363,16 +397,21 @@ impl IrcApp {
             }
 
             // === Channel Operator Commands ===
-
             "KICK" | "K" => {
                 let parts: Vec<&str> = args.splitn(2, ' ').collect();
                 let nick = parts.get(0).copied().unwrap_or("");
                 if nick.is_empty() {
-                    self.add_message_to_current(ChatMessage::system("Usage: /kick <nick> [reason]"));
+                    self.add_message_to_current(ChatMessage::system(
+                        "Usage: /kick <nick> [reason]",
+                    ));
                 } else if let Some(channel) = &self.current_channel.clone() {
                     if is_channel(channel) {
                         let reason = parts.get(1).map(|s| s.to_string());
-                        self.send_command(IrcCommand::Kick(channel.clone(), nick.to_string(), reason));
+                        self.send_command(IrcCommand::Kick(
+                            channel.clone(),
+                            nick.to_string(),
+                            reason,
+                        ));
                     }
                 }
             }
@@ -383,13 +422,21 @@ impl IrcApp {
                         if is_channel(channel) {
                             // Convert nick to ban mask if it's just a nick
                             let mask = nick_to_mask(args);
-                            self.send_command(IrcCommand::Mode(channel.clone(), Some("+b".to_string()), Some(mask)));
+                            self.send_command(IrcCommand::Mode(
+                                channel.clone(),
+                                Some("+b".to_string()),
+                                Some(mask),
+                            ));
                         }
                     }
                 } else {
                     // Show ban list
                     if let Some(channel) = &self.current_channel.clone() {
-                        self.send_command(IrcCommand::Mode(channel.clone(), Some("+b".to_string()), None));
+                        self.send_command(IrcCommand::Mode(
+                            channel.clone(),
+                            Some("+b".to_string()),
+                            None,
+                        ));
                     }
                 }
             }
@@ -399,7 +446,11 @@ impl IrcApp {
                     if let Some(channel) = &self.current_channel.clone() {
                         if is_channel(channel) {
                             let mask = nick_to_mask(args);
-                            self.send_command(IrcCommand::Mode(channel.clone(), Some("-b".to_string()), Some(mask)));
+                            self.send_command(IrcCommand::Mode(
+                                channel.clone(),
+                                Some("-b".to_string()),
+                                Some(mask),
+                            ));
                         }
                     }
                 } else {
@@ -411,14 +462,24 @@ impl IrcApp {
                 let parts: Vec<&str> = args.splitn(2, ' ').collect();
                 let nick = parts.get(0).copied().unwrap_or("");
                 if nick.is_empty() {
-                    self.add_message_to_current(ChatMessage::system("Usage: /kickban <nick> [reason]"));
+                    self.add_message_to_current(ChatMessage::system(
+                        "Usage: /kickban <nick> [reason]",
+                    ));
                 } else if let Some(channel) = &self.current_channel.clone() {
                     if is_channel(channel) {
                         // Ban first, then kick
                         let mask = format!("{}!*@*", nick);
-                        self.send_command(IrcCommand::Mode(channel.clone(), Some("+b".to_string()), Some(mask)));
+                        self.send_command(IrcCommand::Mode(
+                            channel.clone(),
+                            Some("+b".to_string()),
+                            Some(mask),
+                        ));
                         let reason = parts.get(1).map(|s| s.to_string());
-                        self.send_command(IrcCommand::Kick(channel.clone(), nick.to_string(), reason));
+                        self.send_command(IrcCommand::Kick(
+                            channel.clone(),
+                            nick.to_string(),
+                            reason,
+                        ));
                     }
                 }
             }
@@ -428,12 +489,18 @@ impl IrcApp {
                     if let Some(channel) = &self.current_channel.clone() {
                         if is_channel(channel) {
                             for nick in args.split_whitespace() {
-                                self.send_command(IrcCommand::Mode(channel.clone(), Some("+o".to_string()), Some(nick.to_string())));
+                                self.send_command(IrcCommand::Mode(
+                                    channel.clone(),
+                                    Some("+o".to_string()),
+                                    Some(nick.to_string()),
+                                ));
                             }
                         }
                     }
                 } else {
-                    self.add_message_to_current(ChatMessage::system("Usage: /op <nick> [nick2] ..."));
+                    self.add_message_to_current(ChatMessage::system(
+                        "Usage: /op <nick> [nick2] ...",
+                    ));
                 }
             }
 
@@ -442,12 +509,18 @@ impl IrcApp {
                     if let Some(channel) = &self.current_channel.clone() {
                         if is_channel(channel) {
                             for nick in args.split_whitespace() {
-                                self.send_command(IrcCommand::Mode(channel.clone(), Some("-o".to_string()), Some(nick.to_string())));
+                                self.send_command(IrcCommand::Mode(
+                                    channel.clone(),
+                                    Some("-o".to_string()),
+                                    Some(nick.to_string()),
+                                ));
                             }
                         }
                     }
                 } else {
-                    self.add_message_to_current(ChatMessage::system("Usage: /deop <nick> [nick2] ..."));
+                    self.add_message_to_current(ChatMessage::system(
+                        "Usage: /deop <nick> [nick2] ...",
+                    ));
                 }
             }
 
@@ -456,12 +529,18 @@ impl IrcApp {
                     if let Some(channel) = &self.current_channel.clone() {
                         if is_channel(channel) {
                             for nick in args.split_whitespace() {
-                                self.send_command(IrcCommand::Mode(channel.clone(), Some("+v".to_string()), Some(nick.to_string())));
+                                self.send_command(IrcCommand::Mode(
+                                    channel.clone(),
+                                    Some("+v".to_string()),
+                                    Some(nick.to_string()),
+                                ));
                             }
                         }
                     }
                 } else {
-                    self.add_message_to_current(ChatMessage::system("Usage: /voice <nick> [nick2] ..."));
+                    self.add_message_to_current(ChatMessage::system(
+                        "Usage: /voice <nick> [nick2] ...",
+                    ));
                 }
             }
 
@@ -470,12 +549,18 @@ impl IrcApp {
                     if let Some(channel) = &self.current_channel.clone() {
                         if is_channel(channel) {
                             for nick in args.split_whitespace() {
-                                self.send_command(IrcCommand::Mode(channel.clone(), Some("-v".to_string()), Some(nick.to_string())));
+                                self.send_command(IrcCommand::Mode(
+                                    channel.clone(),
+                                    Some("-v".to_string()),
+                                    Some(nick.to_string()),
+                                ));
                             }
                         }
                     }
                 } else {
-                    self.add_message_to_current(ChatMessage::system("Usage: /devoice <nick> [nick2] ..."));
+                    self.add_message_to_current(ChatMessage::system(
+                        "Usage: /devoice <nick> [nick2] ...",
+                    ));
                 }
             }
 
@@ -484,7 +569,11 @@ impl IrcApp {
                     if let Some(channel) = &self.current_channel.clone() {
                         if is_channel(channel) {
                             for nick in args.split_whitespace() {
-                                self.send_command(IrcCommand::Mode(channel.clone(), Some("+h".to_string()), Some(nick.to_string())));
+                                self.send_command(IrcCommand::Mode(
+                                    channel.clone(),
+                                    Some("+h".to_string()),
+                                    Some(nick.to_string()),
+                                ));
                             }
                         }
                     }
@@ -496,7 +585,11 @@ impl IrcApp {
                     if let Some(channel) = &self.current_channel.clone() {
                         if is_channel(channel) {
                             for nick in args.split_whitespace() {
-                                self.send_command(IrcCommand::Mode(channel.clone(), Some("-h".to_string()), Some(nick.to_string())));
+                                self.send_command(IrcCommand::Mode(
+                                    channel.clone(),
+                                    Some("-h".to_string()),
+                                    Some(nick.to_string()),
+                                ));
                             }
                         }
                     }
@@ -523,7 +616,11 @@ impl IrcApp {
                     self.send_command(IrcCommand::Mode(self.my_nick.clone(), None, None));
                 } else {
                     // Set modes on self
-                    self.send_command(IrcCommand::Mode(self.my_nick.clone(), Some(args.to_string()), None));
+                    self.send_command(IrcCommand::Mode(
+                        self.my_nick.clone(),
+                        Some(args.to_string()),
+                        None,
+                    ));
                 }
             }
 
@@ -552,14 +649,18 @@ impl IrcApp {
             }
 
             // === Messaging Commands ===
-
             "NOTICE" | "N" => {
                 let parts: Vec<&str> = args.splitn(2, ' ').collect();
                 if let (Some(target), Some(message)) = (parts.get(0), parts.get(1)) {
                     self.send_command(IrcCommand::Notice(target.to_string(), message.to_string()));
-                    self.add_message_to_current(ChatMessage::system(&format!("-> -{}- {}", target, message)));
+                    self.add_message_to_current(ChatMessage::system(&format!(
+                        "-> -{}- {}",
+                        target, message
+                    )));
                 } else {
-                    self.add_message_to_current(ChatMessage::system("Usage: /notice <target> <message>"));
+                    self.add_message_to_current(ChatMessage::system(
+                        "Usage: /notice <target> <message>",
+                    ));
                 }
             }
 
@@ -570,8 +671,14 @@ impl IrcApp {
                     if let Some(channel) = &self.current_channel.clone() {
                         if is_channel(channel) {
                             let target = format!("@{}", channel);
-                            self.send_command(IrcCommand::Notice(target.clone(), message.to_string()));
-                            self.add_message_to_current(ChatMessage::system(&format!("-> -{}- {}", target, message)));
+                            self.send_command(IrcCommand::Notice(
+                                target.clone(),
+                                message.to_string(),
+                            ));
+                            self.add_message_to_current(ChatMessage::system(&format!(
+                                "-> -{}- {}",
+                                target, message
+                            )));
                         }
                     }
                 } else {
@@ -584,7 +691,10 @@ impl IrcApp {
                 if !args.is_empty() {
                     for channel_name in self.channels.keys().cloned().collect::<Vec<_>>() {
                         if is_channel(&channel_name) {
-                            self.send_command(IrcCommand::Privmsg(channel_name.clone(), args.to_string()));
+                            self.send_command(IrcCommand::Privmsg(
+                                channel_name.clone(),
+                                args.to_string(),
+                            ));
                             let msg = ChatMessage::new(&self.my_nick, args);
                             self.add_message_to_channel(&channel_name, msg);
                         }
@@ -600,7 +710,10 @@ impl IrcApp {
                     let action = format!("\x01ACTION {}\x01", args);
                     for channel_name in self.channels.keys().cloned().collect::<Vec<_>>() {
                         if is_channel(&channel_name) {
-                            self.send_command(IrcCommand::Privmsg(channel_name.clone(), action.clone()));
+                            self.send_command(IrcCommand::Privmsg(
+                                channel_name.clone(),
+                                action.clone(),
+                            ));
                             let msg = ChatMessage::action(&self.my_nick, args);
                             self.add_message_to_channel(&channel_name, msg);
                         }
@@ -630,23 +743,31 @@ impl IrcApp {
                     let msg = ChatMessage::action(&self.my_nick, action_text);
                     self.add_message_to_channel(target, msg);
                 } else {
-                    self.add_message_to_current(ChatMessage::system("Usage: /describe <target> <action>"));
+                    self.add_message_to_current(ChatMessage::system(
+                        "Usage: /describe <target> <action>",
+                    ));
                 }
             }
 
             // === Channel Management ===
-
             "INVITE" => {
                 let parts: Vec<&str> = args.splitn(2, ' ').collect();
                 let nick = parts.get(0).copied().unwrap_or("");
-                let channel = parts.get(1).map(|s| s.to_string())
+                let channel = parts
+                    .get(1)
+                    .map(|s| s.to_string())
                     .or_else(|| self.current_channel.clone())
                     .unwrap_or_default();
                 if nick.is_empty() || channel.is_empty() {
-                    self.add_message_to_current(ChatMessage::system("Usage: /invite <nick> [#channel]"));
+                    self.add_message_to_current(ChatMessage::system(
+                        "Usage: /invite <nick> [#channel]",
+                    ));
                 } else {
                     self.send_command(IrcCommand::Invite(nick.to_string(), channel.clone()));
-                    self.add_message_to_current(ChatMessage::system(&format!("Inviting {} to {}", nick, channel)));
+                    self.add_message_to_current(ChatMessage::system(&format!(
+                        "Inviting {} to {}",
+                        nick, channel
+                    )));
                 }
             }
 
@@ -660,7 +781,10 @@ impl IrcApp {
                     if is_channel(&ch) {
                         // Get the stored key for auto-rejoin if available
                         let key = self.channels.get(&ch).and_then(|c| c.key.clone());
-                        self.send_command(IrcCommand::Part(ch.clone(), Some("Cycling".to_string())));
+                        self.send_command(IrcCommand::Part(
+                            ch.clone(),
+                            Some("Cycling".to_string()),
+                        ));
                         self.send_command(IrcCommand::Join(ch, key, None, None));
                     }
                 }
@@ -669,9 +793,16 @@ impl IrcApp {
             "KNOCK" => {
                 // Request invite to a channel
                 if !args.is_empty() {
-                    let channel = if args.starts_with('#') { args.to_string() } else { format!("#{}", args) };
+                    let channel = if args.starts_with('#') {
+                        args.to_string()
+                    } else {
+                        format!("#{}", args)
+                    };
                     self.send_command(IrcCommand::Raw(format!("KNOCK {}", channel)));
-                    self.add_message_to_current(ChatMessage::system(&format!("Knocking on {}", channel)));
+                    self.add_message_to_current(ChatMessage::system(&format!(
+                        "Knocking on {}",
+                        channel
+                    )));
                 } else {
                     self.add_message_to_current(ChatMessage::system("Usage: /knock <#channel>"));
                 }
@@ -690,24 +821,39 @@ impl IrcApp {
             }
 
             // === Server Info Commands ===
-
             "MOTD" => {
-                let server = if args.is_empty() { None } else { Some(args.to_string()) };
+                let server = if args.is_empty() {
+                    None
+                } else {
+                    Some(args.to_string())
+                };
                 self.send_command(IrcCommand::Motd(server));
             }
 
             "TIME" => {
-                let server = if args.is_empty() { None } else { Some(args.to_string()) };
+                let server = if args.is_empty() {
+                    None
+                } else {
+                    Some(args.to_string())
+                };
                 self.send_command(IrcCommand::Time(server));
             }
 
             "ADMIN" => {
-                let server = if args.is_empty() { None } else { Some(args.to_string()) };
+                let server = if args.is_empty() {
+                    None
+                } else {
+                    Some(args.to_string())
+                };
                 self.send_command(IrcCommand::Admin(server));
             }
 
             "INFO" => {
-                let server = if args.is_empty() { None } else { Some(args.to_string()) };
+                let server = if args.is_empty() {
+                    None
+                } else {
+                    Some(args.to_string())
+                };
                 self.send_command(IrcCommand::Info(server));
             }
 
@@ -716,7 +862,11 @@ impl IrcApp {
             }
 
             "LINKS" => {
-                let mask = if args.is_empty() { None } else { Some(args.to_string()) };
+                let mask = if args.is_empty() {
+                    None
+                } else {
+                    Some(args.to_string())
+                };
                 self.send_command(IrcCommand::Links(mask));
             }
 
@@ -724,12 +874,18 @@ impl IrcApp {
                 if !args.is_empty() {
                     self.send_command(IrcCommand::Stats(args.to_string()));
                 } else {
-                    self.add_message_to_current(ChatMessage::system("Usage: /stats <query> (c=servers, m=commands, o=opers, u=uptime)"));
+                    self.add_message_to_current(ChatMessage::system(
+                        "Usage: /stats <query> (c=servers, m=commands, o=opers, u=uptime)",
+                    ));
                 }
             }
 
             "TRACE" => {
-                let target = if args.is_empty() { None } else { Some(args.to_string()) };
+                let target = if args.is_empty() {
+                    None
+                } else {
+                    Some(args.to_string())
+                };
                 self.send_command(IrcCommand::Trace(target));
             }
 
@@ -737,7 +893,9 @@ impl IrcApp {
                 if !args.is_empty() {
                     self.send_command(IrcCommand::Userhost(args.to_string()));
                 } else {
-                    self.add_message_to_current(ChatMessage::system("Usage: /userhost <nick> [nick2] ..."));
+                    self.add_message_to_current(ChatMessage::system(
+                        "Usage: /userhost <nick> [nick2] ...",
+                    ));
                 }
             }
 
@@ -745,7 +903,9 @@ impl IrcApp {
                 if !args.is_empty() {
                     self.send_command(IrcCommand::Ison(args.to_string()));
                 } else {
-                    self.add_message_to_current(ChatMessage::system("Usage: /ison <nick> [nick2] ..."));
+                    self.add_message_to_current(ChatMessage::system(
+                        "Usage: /ison <nick> [nick2] ...",
+                    ));
                 }
             }
 
@@ -753,19 +913,19 @@ impl IrcApp {
             "MONITOR" | "MON" => {
                 if args.is_empty() {
                     self.add_message_to_current(ChatMessage::system(
-                        "Usage: /monitor + nick1,nick2 - Add to monitor list"
+                        "Usage: /monitor + nick1,nick2 - Add to monitor list",
                     ));
                     self.add_message_to_current(ChatMessage::system(
-                        "       /monitor - nick1,nick2 - Remove from list"
+                        "       /monitor - nick1,nick2 - Remove from list",
                     ));
                     self.add_message_to_current(ChatMessage::system(
-                        "       /monitor L - List monitored nicks"
+                        "       /monitor L - List monitored nicks",
                     ));
                     self.add_message_to_current(ChatMessage::system(
-                        "       /monitor C - Clear monitor list"
+                        "       /monitor C - Clear monitor list",
                     ));
                     self.add_message_to_current(ChatMessage::system(
-                        "       /monitor S - Show status of monitored nicks"
+                        "       /monitor S - Show status of monitored nicks",
                     ));
                 } else {
                     let parts: Vec<&str> = args.splitn(2, ' ').collect();
@@ -778,7 +938,10 @@ impl IrcApp {
                         }
                         _ => {
                             // Assume it's a nick to add
-                            self.send_command(IrcCommand::Monitor("+".to_string(), Some(args.to_string())));
+                            self.send_command(IrcCommand::Monitor(
+                                "+".to_string(),
+                                Some(args.to_string()),
+                            ));
                         }
                     }
                 }
@@ -793,7 +956,6 @@ impl IrcApp {
             }
 
             // === Connection Commands ===
-
             "SERVER" => {
                 if !args.is_empty() {
                     // Parse server:port or server port format
@@ -806,6 +968,7 @@ impl IrcApp {
                     if let Some(port) = parts.get(1) {
                         self.server_port = port.to_string();
                     }
+                    self.reset_session_state();
                     // Disconnect from current server if connected
                     if self.connected {
                         self.send_command(IrcCommand::Quit(Some("Changing servers".to_string())));
@@ -813,15 +976,25 @@ impl IrcApp {
                     }
                     // Trigger reconnect
                     self.connecting = true;
-                    self.add_server_message(ChatMessage::system(&format!("Connecting to {}:{}...", self.server_host, self.server_port)));
+                    self.add_server_message(ChatMessage::system(&format!(
+                        "Connecting to {}:{}...",
+                        self.server_host, self.server_port
+                    )));
                 } else {
-                    self.add_message_to_current(ChatMessage::system(&format!("Current server: {}:{}", self.server_host, self.server_port)));
+                    self.add_message_to_current(ChatMessage::system(&format!(
+                        "Current server: {}:{}",
+                        self.server_host, self.server_port
+                    )));
                 }
             }
 
             "DISCONNECT" => {
                 if self.connected {
-                    let reason = if args.is_empty() { None } else { Some(args.to_string()) };
+                    let reason = if args.is_empty() {
+                        None
+                    } else {
+                        Some(args.to_string())
+                    };
                     self.send_command(IrcCommand::Quit(reason));
                     self.connected = false;
                     self.auto_reconnect = false; // Disable auto-reconnect on manual disconnect
@@ -839,7 +1012,6 @@ impl IrcApp {
             }
 
             // === Utility Commands ===
-
             "ECHO" => {
                 if !args.is_empty() {
                     self.add_message_to_current(ChatMessage::system(args));
@@ -852,7 +1024,9 @@ impl IrcApp {
                     if self.ignore_list.is_empty() {
                         self.add_message_to_current(ChatMessage::system("Ignore list is empty"));
                     } else {
-                        let list: Vec<String> = self.ignore_list.iter()
+                        let list: Vec<String> = self
+                            .ignore_list
+                            .iter()
                             .enumerate()
                             .map(|(i, mask)| format!("  {}. {}", i + 1, mask))
                             .collect();
@@ -864,32 +1038,52 @@ impl IrcApp {
                 } else {
                     // Add to ignore list
                     let mask = args.to_string();
-                    if !self.ignore_list.iter().any(|m| m.eq_ignore_ascii_case(&mask)) {
+                    if !self
+                        .ignore_list
+                        .iter()
+                        .any(|m| m.eq_ignore_ascii_case(&mask))
+                    {
                         self.ignore_list_lower.push(mask.to_lowercase());
                         self.ignore_list.push(mask.clone());
-                        self.add_message_to_current(ChatMessage::system(&format!("Now ignoring: {}", mask)));
+                        self.add_message_to_current(ChatMessage::system(&format!(
+                            "Now ignoring: {}",
+                            mask
+                        )));
                         // Save settings
                         self.get_settings().save();
                     } else {
-                        self.add_message_to_current(ChatMessage::system(&format!("Already ignoring: {}", mask)));
+                        self.add_message_to_current(ChatMessage::system(&format!(
+                            "Already ignoring: {}",
+                            mask
+                        )));
                     }
                 }
             }
 
             "UNIGNORE" => {
                 if args.is_empty() {
-                    self.add_message_to_current(ChatMessage::system("Usage: /unignore <nick|mask>"));
+                    self.add_message_to_current(ChatMessage::system(
+                        "Usage: /unignore <nick|mask>",
+                    ));
                 } else {
                     let mask_lower = args.to_lowercase();
                     let before_len = self.ignore_list.len();
-                    self.ignore_list.retain(|m| !m.to_lowercase().eq(&mask_lower));
+                    self.ignore_list
+                        .retain(|m| !m.to_lowercase().eq(&mask_lower));
                     if self.ignore_list.len() < before_len {
                         // Rebuild cached lowercase list
-                        self.ignore_list_lower = self.ignore_list.iter().map(|s| s.to_lowercase()).collect();
-                        self.add_message_to_current(ChatMessage::system(&format!("No longer ignoring: {}", args)));
+                        self.ignore_list_lower =
+                            self.ignore_list.iter().map(|s| s.to_lowercase()).collect();
+                        self.add_message_to_current(ChatMessage::system(&format!(
+                            "No longer ignoring: {}",
+                            args
+                        )));
                         self.get_settings().save();
                     } else {
-                        self.add_message_to_current(ChatMessage::system(&format!("Not in ignore list: {}", args)));
+                        self.add_message_to_current(ChatMessage::system(&format!(
+                            "Not in ignore list: {}",
+                            args
+                        )));
                     }
                 }
             }
@@ -911,11 +1105,13 @@ impl IrcApp {
                                 .rev()
                                 .take(500)
                                 .filter(|msg| {
-                                    msg.content.to_lowercase().contains(&pattern) ||
-                                    msg.sender.to_lowercase().contains(&pattern)
+                                    msg.content.to_lowercase().contains(&pattern)
+                                        || msg.sender.to_lowercase().contains(&pattern)
                                 })
                                 .take(50)
-                                .map(|msg| format!("[{}] <{}> {}", msg.timestamp, msg.sender, msg.content))
+                                .map(|msg| {
+                                    format!("[{}] <{}> {}", msg.timestamp, msg.sender, msg.content)
+                                })
                                 .collect()
                         } else {
                             Vec::new()
@@ -923,11 +1119,17 @@ impl IrcApp {
                     };
 
                     // Now display results
-                    self.add_message_to_current(ChatMessage::system(&format!("Searching for: {}", args)));
+                    self.add_message_to_current(ChatMessage::system(&format!(
+                        "Searching for: {}",
+                        args
+                    )));
                     for match_line in &matches {
                         self.add_message_to_current(ChatMessage::system(match_line));
                     }
-                    self.add_message_to_current(ChatMessage::system(&format!("Found {} matches", matches.len())));
+                    self.add_message_to_current(ChatMessage::system(&format!(
+                        "Found {} matches",
+                        matches.len()
+                    )));
                 } else {
                     self.add_message_to_current(ChatMessage::system("Usage: /lastlog <pattern>"));
                 }
@@ -935,7 +1137,11 @@ impl IrcApp {
 
             "SVERSION" => {
                 // Server VERSION (not CTCP)
-                let server = if args.is_empty() { None } else { Some(args.to_string()) };
+                let server = if args.is_empty() {
+                    None
+                } else {
+                    Some(args.to_string())
+                };
                 self.send_command(IrcCommand::Version(server));
             }
 
@@ -943,9 +1149,13 @@ impl IrcApp {
                 if args.is_empty() {
                     // Show current auto-perform
                     if self.auto_perform.is_empty() {
-                        self.add_message_to_current(ChatMessage::system("No auto-perform commands set. Use /perform <command> to add."));
+                        self.add_message_to_current(ChatMessage::system(
+                            "No auto-perform commands set. Use /perform <command> to add.",
+                        ));
                     } else {
-                        let lines: Vec<String> = self.auto_perform.lines()
+                        let lines: Vec<String> = self
+                            .auto_perform
+                            .lines()
                             .filter(|line| !line.trim().is_empty())
                             .enumerate()
                             .map(|(i, line)| format!("  {}. {}", i + 1, line))
@@ -958,7 +1168,9 @@ impl IrcApp {
                 } else if args.eq_ignore_ascii_case("clear") {
                     self.auto_perform.clear();
                     self.get_settings().save();
-                    self.add_message_to_current(ChatMessage::system("Auto-perform commands cleared."));
+                    self.add_message_to_current(ChatMessage::system(
+                        "Auto-perform commands cleared.",
+                    ));
                 } else {
                     // Add to auto-perform
                     if !self.auto_perform.is_empty() {
@@ -966,7 +1178,10 @@ impl IrcApp {
                     }
                     self.auto_perform.push_str(args);
                     self.get_settings().save();
-                    self.add_message_to_current(ChatMessage::system(&format!("Added to auto-perform: {}", args)));
+                    self.add_message_to_current(ChatMessage::system(&format!(
+                        "Added to auto-perform: {}",
+                        args
+                    )));
                 }
             }
 
@@ -979,101 +1194,137 @@ impl IrcApp {
             }
 
             _ => {
-                self.add_message_to_current(ChatMessage::system(&format!("Unknown command: {}. Type /help for list.", cmd)));
+                self.add_message_to_current(ChatMessage::system(&format!(
+                    "Unknown command: {}. Type /help for list.",
+                    cmd
+                )));
             }
         }
     }
 
     pub fn show_help(&mut self) {
         let help_sections = vec![
-            ("=== Basic Commands ===", vec![
-                "/join #channel      - Join a channel (alias: /j)",
-                "/part [#channel]    - Leave channel (alias: /leave)",
-                "/msg <nick> <text>  - Send private message (alias: /query)",
-                "/me <action>        - Send action message",
-                "/nick <newnick>     - Change nickname",
-                "/quit [message]     - Disconnect from server",
-            ]),
-            ("=== Channel Commands ===", vec![
-                "/topic [text]       - View or set topic",
-                "/names [#channel]   - List users in channel",
-                "/list [pattern]     - List channels",
-                "/cycle              - Part and rejoin (alias: /hop, /rejoin)",
-                "/invite <nick>      - Invite user to channel",
-                "/knock <#channel>   - Request invite",
-            ]),
-            ("=== Operator Commands ===", vec![
-                "/kick <nick> [why]  - Kick user (alias: /k)",
-                "/ban <mask>         - Ban user (+b)",
-                "/unban <mask>       - Remove ban (-b)",
-                "/kickban <nick>     - Ban and kick (alias: /kb)",
-                "/op <nick>          - Give ops (+o)",
-                "/deop <nick>        - Remove ops (-o)",
-                "/voice <nick>       - Give voice (+v)",
-                "/devoice <nick>     - Remove voice (-v)",
-                "/mode <+/-modes>    - Set channel/user modes",
-            ]),
-            ("=== Messaging ===", vec![
-                "/notice <tgt> <msg> - Send notice (alias: /n)",
-                "/onotice <message>  - Notice to channel ops",
-                "/amsg <message>     - Message all channels",
-                "/ame <action>       - Action to all channels",
-                "/say <text>         - Send as message (even if /)",
-                "/describe <t> <act> - Send action to target",
-            ]),
-            ("=== Info Commands ===", vec![
-                "/whois <nick>       - User info",
-                "/whowas <nick>      - Offline user info",
-                "/who <mask>         - Query users",
-                "/userhost <nick>    - Get user@host",
-                "/ison <nicks>       - Check if online",
-                "/motd               - Show MOTD",
-                "/lusers             - Network stats",
-                "/time               - Server time",
-            ]),
-            ("=== CTCP ===", vec![
-                "/ctcp <n> <cmd>     - Send CTCP request",
-                "/version <nick>     - Query version",
-                "/ping <nick>        - Measure latency",
-            ]),
-            ("=== Connection ===", vec![
-                "/server <host:port> - Connect to server",
-                "/disconnect         - Disconnect",
-                "/reconnect          - Reconnect",
-                "/away [message]     - Set away message",
-                "/back               - Clear away status",
-            ]),
-            ("=== Utility ===", vec![
-                "/clear              - Clear window",
-                "/lastlog <pattern>  - Search messages",
-                "/ignore [mask]      - List or add to ignore list",
-                "/unignore <mask>    - Remove from ignore list",
-                "/perform [cmd]      - View/add auto-perform",
-                "/echo <text>        - Echo to window",
-                "/raw <command>      - Send raw IRC",
-                "/settings           - Open settings",
-                "/slap <nick>        - Slap with trout",
-            ]),
-            ("=== Services ===", vec![
-                "/ns <command>       - NickServ message",
-                "/cs <command>       - ChanServ message",
-                "/ms <command>       - MemoServ message",
-                "/hs <command>       - HostServ message",
-                "/os <command>       - OperServ message",
-                "/bs <command>       - BotServ message",
-            ]),
-            ("=== Advanced ===", vec![
-                "/umode [modes]      - Set/view user modes",
-                "/silence [+/-mask]  - Server-side ignore",
-                "/accept [nick]      - Callerid accept list",
-                "/monitor + nicks    - Track online status",
-            ]),
-            ("=== Shortcuts ===", vec![
-                "Alt+1-9             - Switch tabs",
-                "Ctrl+W              - Close tab",
-                "Up/Down             - Command history",
-                "Tab                 - Nick completion",
-            ]),
+            (
+                "=== Basic Commands ===",
+                vec![
+                    "/join #channel      - Join a channel (alias: /j)",
+                    "/part [#channel]    - Leave channel (alias: /leave)",
+                    "/msg <nick> <text>  - Send private message (alias: /query)",
+                    "/me <action>        - Send action message",
+                    "/nick <newnick>     - Change nickname",
+                    "/quit [message]     - Disconnect from server",
+                ],
+            ),
+            (
+                "=== Channel Commands ===",
+                vec![
+                    "/topic [text]       - View or set topic",
+                    "/names [#channel]   - List users in channel",
+                    "/list [pattern]     - List channels",
+                    "/cycle              - Part and rejoin (alias: /hop, /rejoin)",
+                    "/invite <nick>      - Invite user to channel",
+                    "/knock <#channel>   - Request invite",
+                ],
+            ),
+            (
+                "=== Operator Commands ===",
+                vec![
+                    "/kick <nick> [why]  - Kick user (alias: /k)",
+                    "/ban <mask>         - Ban user (+b)",
+                    "/unban <mask>       - Remove ban (-b)",
+                    "/kickban <nick>     - Ban and kick (alias: /kb)",
+                    "/op <nick>          - Give ops (+o)",
+                    "/deop <nick>        - Remove ops (-o)",
+                    "/voice <nick>       - Give voice (+v)",
+                    "/devoice <nick>     - Remove voice (-v)",
+                    "/mode <+/-modes>    - Set channel/user modes",
+                ],
+            ),
+            (
+                "=== Messaging ===",
+                vec![
+                    "/notice <tgt> <msg> - Send notice (alias: /n)",
+                    "/onotice <message>  - Notice to channel ops",
+                    "/amsg <message>     - Message all channels",
+                    "/ame <action>       - Action to all channels",
+                    "/say <text>         - Send as message (even if /)",
+                    "/describe <t> <act> - Send action to target",
+                ],
+            ),
+            (
+                "=== Info Commands ===",
+                vec![
+                    "/whois <nick>       - User info",
+                    "/whowas <nick>      - Offline user info",
+                    "/who <mask>         - Query users",
+                    "/userhost <nick>    - Get user@host",
+                    "/ison <nicks>       - Check if online",
+                    "/motd               - Show MOTD",
+                    "/lusers             - Network stats",
+                    "/time               - Server time",
+                ],
+            ),
+            (
+                "=== CTCP ===",
+                vec![
+                    "/ctcp <n> <cmd>     - Send CTCP request",
+                    "/version <nick>     - Query version",
+                    "/ping <nick>        - Measure latency",
+                ],
+            ),
+            (
+                "=== Connection ===",
+                vec![
+                    "/server <host:port> - Connect to server",
+                    "/disconnect         - Disconnect",
+                    "/reconnect          - Reconnect",
+                    "/away [message]     - Set away message",
+                    "/back               - Clear away status",
+                ],
+            ),
+            (
+                "=== Utility ===",
+                vec![
+                    "/clear              - Clear window",
+                    "/lastlog <pattern>  - Search messages",
+                    "/ignore [mask]      - List or add to ignore list",
+                    "/unignore <mask>    - Remove from ignore list",
+                    "/perform [cmd]      - View/add auto-perform",
+                    "/echo <text>        - Echo to window",
+                    "/raw <command>      - Send raw IRC",
+                    "/settings           - Open settings",
+                    "/slap <nick>        - Slap with trout",
+                ],
+            ),
+            (
+                "=== Services ===",
+                vec![
+                    "/ns <command>       - NickServ message",
+                    "/cs <command>       - ChanServ message",
+                    "/ms <command>       - MemoServ message",
+                    "/hs <command>       - HostServ message",
+                    "/os <command>       - OperServ message",
+                    "/bs <command>       - BotServ message",
+                ],
+            ),
+            (
+                "=== Advanced ===",
+                vec![
+                    "/umode [modes]      - Set/view user modes",
+                    "/silence [+/-mask]  - Server-side ignore",
+                    "/accept [nick]      - Callerid accept list",
+                    "/monitor + nicks    - Track online status",
+                ],
+            ),
+            (
+                "=== Shortcuts ===",
+                vec![
+                    "Alt+1-9             - Switch tabs",
+                    "Ctrl+W              - Close tab",
+                    "Up/Down             - Command history",
+                    "Tab                 - Nick completion",
+                ],
+            ),
         ];
 
         for (section, commands) in help_sections {
