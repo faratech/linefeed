@@ -13,7 +13,7 @@ use crate::irc::client::ServerConfig;
 use crate::irc::numerics::*;
 use crate::irc::{IrcCommand, IrcMessage};
 use formatting::{nick_color, render_irc_text, render_segments};
-use helpers::{format_timestamp, mask_matches, truncate_chars};
+use helpers::{epoch_time_formatted, format_timestamp, mask_matches, truncate_chars};
 pub use types::{
     BanEntry, Channel, ChannelListEntry, ChannelListSort, ChatMessage, NetworkSupport,
     ServerFavorite, Settings, SortDirection, TabCompletion, UserMode,
@@ -788,8 +788,11 @@ impl IrcApp {
                 // Check if the message mentions our nick (case-insensitive word boundary check)
                 let is_highlight = self.check_nick_mention(content);
 
-                // Get server-time from IRCv3 tags if available
-                let server_time = msg.get_server_time();
+                // Get server-time from IRCv3 tags if available, converted to
+                // local time and rendered in the user's timestamp format.
+                let server_time = msg
+                    .get_server_time()
+                    .map(|epoch| epoch_time_formatted(epoch, &self.timestamp_format));
 
                 let fmt = &self.timestamp_format;
                 let chat_msg = if is_action {
@@ -1249,11 +1252,27 @@ impl IrcApp {
                 if !value.is_empty() {
                     self.network_support.channel_types = value.to_string();
                 }
-            } else if let Some(value) = token.strip_prefix("PREFIX=")
-                && let Some((_, prefixes)) = value.rsplit_once(')')
-                && !prefixes.is_empty()
-            {
-                self.network_support.user_prefixes = prefixes.to_string();
+            } else if let Some(value) = token.strip_prefix("PREFIX=") {
+                // PREFIX=(modes)symbols - keep the mode letters too, so MODE
+                // parsing knows which modes take a nick parameter.
+                if let Some(rest) = value.strip_prefix('(')
+                    && let Some((letters, symbols)) = rest.split_once(')')
+                    && !symbols.is_empty()
+                    && letters.chars().count() == symbols.chars().count()
+                {
+                    self.network_support.prefix_modes = letters.to_string();
+                    self.network_support.user_prefixes = symbols.to_string();
+                }
+            } else if let Some(value) = token.strip_prefix("CHANMODES=") {
+                // CHANMODES=A,B,C,D - which channel modes consume a parameter.
+                let mut groups = value.split(',');
+                if let (Some(a), Some(b), Some(c), Some(_d)) =
+                    (groups.next(), groups.next(), groups.next(), groups.next())
+                {
+                    self.network_support.chanmodes_a = a.to_string();
+                    self.network_support.chanmodes_b = b.to_string();
+                    self.network_support.chanmodes_c = c.to_string();
+                }
             }
         }
     }
@@ -1273,51 +1292,61 @@ impl IrcApp {
         let mut sign = '+';
         let max = self.max_scrollback;
         let timestamp_format = self.timestamp_format.clone();
+        // Which modes consume a parameter comes from ISUPPORT (PREFIX mode
+        // letters + CHANMODES groups); hardcoded sets misalign parameters on
+        // networks with extra parameterized modes (e.g. `MODE #c +fo [4:5] nick`
+        // would read "[4:5]" as the nick to op).
+        let ns = self.network_support.clone();
 
         if is_channel {
             if let Some(channel) = self.channels.get_mut(target) {
                 for c in mode.chars() {
                     match c {
                         '+' | '-' => sign = c,
-                        'q' | 'a' | 'o' | 'h' | 'v' => {
+                        // Prefix (user) modes: always take a nick parameter.
+                        c if ns.prefix_modes.contains(c) => {
                             if let Some(nick) = params.get(param_idx) {
                                 param_idx += 1;
                                 let new_mode = if sign == '+' {
-                                    match c {
-                                        'q' => UserMode::Owner,
-                                        'a' => UserMode::Admin,
-                                        'o' => UserMode::Op,
-                                        'h' => UserMode::HalfOp,
-                                        'v' => UserMode::Voice,
-                                        _ => UserMode::Normal,
-                                    }
+                                    ns.user_mode_for_letter(c).unwrap_or(UserMode::Normal)
                                 } else {
                                     UserMode::Normal
                                 };
                                 channel.set_user_mode(nick, new_mode);
                             }
                         }
-                        'b' | 'e' | 'I' => {
-                            // List modes carry a parameter but are tracked through
-                            // their numeric list replies, not as persistent channel modes.
+                        // Type A list modes (bans etc.): parameter in both
+                        // directions, tracked through their numeric list replies
+                        // rather than as persistent channel modes.
+                        c if ns.chanmodes_a.contains(c) => {
                             if params.get(param_idx).is_some() {
                                 param_idx += 1;
                             }
                         }
-                        other => {
-                            if sign == '+' && matches!(other, 'k' | 'l') {
-                                if params.get(param_idx).is_some() {
-                                    param_idx += 1;
-                                }
-                            } else if sign == '-' && other == 'k' && params.get(param_idx).is_some()
-                            {
+                        // Type B: parameter in both directions.
+                        c if ns.chanmodes_b.contains(c) => {
+                            if params.get(param_idx).is_some() {
                                 param_idx += 1;
                             }
+                            channel.apply_channel_mode_flag(sign, c);
+                        }
+                        // Type C: parameter only when set.
+                        c if ns.chanmodes_c.contains(c) => {
+                            if sign == '+' && params.get(param_idx).is_some() {
+                                param_idx += 1;
+                            }
+                            channel.apply_channel_mode_flag(sign, c);
+                        }
+                        // Type D (and unknown): never takes a parameter.
+                        other => {
                             channel.apply_channel_mode_flag(sign, other);
                         }
                     }
                 }
-                channel.mode_params = params.to_vec();
+                // Note: mode_params deliberately NOT overwritten here; it holds
+                // the parameters from RPL_CHANNELMODEIS (324). Overwriting it
+                // with a MODE change's raw params would show nicks from +o/-o
+                // changes as channel mode parameters in the Channel Info dialog.
                 let rendered = if params.is_empty() {
                     mode.to_string()
                 } else {
@@ -3387,6 +3416,44 @@ mod tests {
 
         let alice = app.channels["#chan"].get_user("alice").unwrap();
         assert_eq!(alice.mode, UserMode::Op);
+    }
+
+    #[test]
+    fn mode_params_align_with_isupport_chanmodes() {
+        let mut app = test_app();
+        // InspIRCd-style network: +f (flood limit) is a type-C mode that takes
+        // a parameter when set; PREFIX only has o/v.
+        app.handle_numeric(
+            RPL_ISUPPORT,
+            &[
+                "nick".to_string(),
+                "CHANMODES=eIbq,k,flj,imnpst".to_string(),
+                "PREFIX=(ov)@+".to_string(),
+                "are supported".to_string(),
+            ],
+        );
+        let mut channel = Channel::new();
+        channel.add_user("alice", UserMode::Normal);
+        app.channels.insert("#chan".to_string(), channel);
+
+        // "+fo [4:5] alice": 'f' must consume "[4:5]" so 'o' reads "alice".
+        app.handle_mode_message(
+            "oper",
+            "#chan",
+            Some("+fo"),
+            &["[4:5]".to_string(), "alice".to_string()],
+        );
+        let alice = app.channels["#chan"].get_user("alice").unwrap();
+        assert_eq!(alice.mode, UserMode::Op);
+
+        // Libera-style +q is a quiet LIST mode here, not owner: consuming the
+        // mask must not create or promote any user.
+        app.handle_mode_message("oper", "#chan", Some("+q"), &["*!*@spam".to_string()]);
+        assert!(!app.channels["#chan"].has_user("*!*@spam"));
+        assert_eq!(
+            app.channels["#chan"].get_user("alice").unwrap().mode,
+            UserMode::Op
+        );
     }
 
     #[test]

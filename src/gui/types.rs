@@ -319,6 +319,16 @@ impl UserMode {
 pub struct NetworkSupport {
     pub channel_types: String,
     pub user_prefixes: String,
+    /// Mode letters corresponding position-wise to `user_prefixes`
+    /// (from ISUPPORT `PREFIX=(modes)symbols`).
+    pub prefix_modes: String,
+    /// ISUPPORT CHANMODES groups. They decide which channel modes consume a
+    /// parameter, which is essential to keep MODE parameters aligned:
+    /// type A (lists; parameter in both directions), type B (parameter in both
+    /// directions), type C (parameter only when set), type D (never).
+    pub chanmodes_a: String,
+    pub chanmodes_b: String,
+    pub chanmodes_c: String,
 }
 
 impl Default for NetworkSupport {
@@ -326,6 +336,10 @@ impl Default for NetworkSupport {
         Self {
             channel_types: "#&+!".to_string(),
             user_prefixes: "~&@%+".to_string(),
+            prefix_modes: "qaohv".to_string(),
+            chanmodes_a: "beI".to_string(),
+            chanmodes_b: "k".to_string(),
+            chanmodes_c: "l".to_string(),
         }
     }
 }
@@ -335,6 +349,16 @@ impl NetworkSupport {
         name.chars()
             .next()
             .is_some_and(|c| self.channel_types.contains(c))
+    }
+
+    /// Map a PREFIX mode letter (e.g. 'o') to its user mode via the
+    /// position-matched prefix symbol (e.g. '@').
+    pub fn user_mode_for_letter(&self, letter: char) -> Option<UserMode> {
+        let idx = self.prefix_modes.chars().position(|c| c == letter)?;
+        self.user_prefixes
+            .chars()
+            .nth(idx)
+            .and_then(UserMode::from_prefix)
     }
 }
 

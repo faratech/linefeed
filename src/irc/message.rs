@@ -90,11 +90,12 @@ impl IrcMessage {
         let raw = line.to_string();
         let mut remaining = line.trim();
 
-        // Parse optional tags (@key=value;key2=value2)
+        // Parse optional tags (@key=value;key2=value2). The grammar permits
+        // multiple spaces between sections (RFC 1459), hence the trim_start.
         let tags = if remaining.starts_with('@') {
             let end = remaining.find(' ')?;
             let tags = remaining[1..end].to_string();
-            remaining = &remaining[end + 1..];
+            remaining = remaining[end + 1..].trim_start();
             Some(tags)
         } else {
             None
@@ -104,7 +105,7 @@ impl IrcMessage {
         let prefix = if remaining.starts_with(':') {
             let end = remaining.find(' ')?;
             let prefix = remaining[1..end].to_string();
-            remaining = &remaining[end + 1..];
+            remaining = remaining[end + 1..].trim_start();
             Some(prefix)
         } else {
             None
@@ -130,7 +131,10 @@ impl IrcMessage {
 
     fn parse_params(s: &str) -> Vec<String> {
         let mut params = Vec::new();
-        let mut remaining = s;
+        // Tolerate extra spaces before the first parameter; interior runs are
+        // handled by the trim_start below (spaces inside a :trailing parameter
+        // are preserved).
+        let mut remaining = s.trim_start();
 
         while !remaining.is_empty() {
             if let Some(stripped) = remaining.strip_prefix(':') {
@@ -250,25 +254,13 @@ impl IrcMessage {
         })
     }
 
-    /// Get server-time from tags (IRCv3 server-time)
-    /// Returns formatted time string if present
-    pub fn get_server_time(&self) -> Option<String> {
-        self.get_tag("time").and_then(|iso| {
-            // Parse ISO 8601 format: 2025-12-28T19:30:00.000Z
-            // Extract just the time portion for display
-            if let Some(t_pos) = iso.find('T') {
-                let time_part = &iso[t_pos + 1..];
-                // Remove milliseconds and Z suffix
-                let time_clean = time_part
-                    .split('.')
-                    .next()
-                    .unwrap_or(time_part)
-                    .trim_end_matches('Z');
-                Some(time_clean.to_string())
-            } else {
-                None
-            }
-        })
+    /// Get server-time from tags (IRCv3 server-time) as a Unix timestamp.
+    /// The tag value is ISO 8601 in UTC (e.g. "2025-12-28T19:30:00.000Z");
+    /// strict parsing here also means a malicious tag value cannot smuggle
+    /// arbitrary text (e.g. newlines) into timestamps or log lines. The GUI
+    /// converts the timestamp to local time in the user's chosen format.
+    pub fn get_server_time(&self) -> Option<u64> {
+        self.get_tag("time").and_then(|iso| parse_iso8601_utc(&iso))
     }
 
     /// Get account name from tags (IRCv3 account tag)
@@ -280,6 +272,44 @@ impl IrcMessage {
     pub fn get_batch(&self) -> Option<String> {
         self.get_tag("batch")
     }
+}
+
+/// Parse an ISO 8601 UTC timestamp ("YYYY-MM-DDThh:mm:ss[.fff]Z") into Unix
+/// epoch seconds. Returns None for anything malformed.
+fn parse_iso8601_utc(iso: &str) -> Option<u64> {
+    let (date, time) = iso.split_once('T')?;
+
+    let mut date_parts = date.splitn(3, '-');
+    let year: i64 = date_parts.next()?.parse().ok()?;
+    let month: u32 = date_parts.next()?.parse().ok()?;
+    let day: u32 = date_parts.next()?.parse().ok()?;
+    if !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+        return None;
+    }
+
+    let time = time.trim_end_matches('Z');
+    let time = time.split('.').next().unwrap_or(time);
+    let mut time_parts = time.splitn(3, ':');
+    let hours: u64 = time_parts.next()?.parse().ok()?;
+    let minutes: u64 = time_parts.next()?.parse().ok()?;
+    // Clamp leap seconds to :59.
+    let seconds: u64 = time_parts.next().unwrap_or("0").parse::<u64>().ok()?.min(59);
+    if hours > 23 || minutes > 59 {
+        return None;
+    }
+
+    // Howard Hinnant's days_from_civil
+    let y = if month <= 2 { year - 1 } else { year };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400;
+    let mp = if month > 2 { month - 3 } else { month + 9 } as i64;
+    let doy = (153 * mp + 2) / 5 + day as i64 - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146097 + doe - 719468;
+    if days < 0 {
+        return None;
+    }
+    Some(days as u64 * 86400 + hours * 3600 + minutes * 60 + seconds)
 }
 
 /// Unescape an IRCv3 message-tag value per the spec
@@ -525,6 +555,43 @@ mod tests {
             assert_eq!(content, "\u{0001}");
         } else {
             panic!("expected Notice");
+        }
+    }
+
+    #[test]
+    fn server_time_parses_to_epoch() {
+        let m = IrcMessage::parse("@time=2025-12-28T19:30:00.000Z :n!u@h PRIVMSG #c :hi").unwrap();
+        // 2025-12-28 19:30:00 UTC
+        assert_eq!(m.get_server_time(), Some(1_766_950_200));
+
+        // Malformed / injected values are rejected outright.
+        let m = IrcMessage::parse("@time=19:30\\nforged :n!u@h PRIVMSG #c :hi").unwrap();
+        assert_eq!(m.get_server_time(), None);
+        let m = IrcMessage::parse("@time=not-a-time :n!u@h PRIVMSG #c :hi").unwrap();
+        assert_eq!(m.get_server_time(), None);
+    }
+
+    #[test]
+    fn consecutive_spaces_are_tolerated() {
+        // RFC 1459 permits multiple spaces between message sections.
+        let m = IrcMessage::parse(":nick!u@h  PRIVMSG  #chan  :hi  there").unwrap();
+        match m.command {
+            IrcCommand::Privmsg(target, content) => {
+                assert_eq!(target, "#chan");
+                // Spaces inside the trailing parameter are preserved.
+                assert_eq!(content, "hi  there");
+            }
+            other => panic!("expected Privmsg, got {:?}", other),
+        }
+
+        let m = IrcMessage::parse("@t=1  :nick!u@h  KICK  #chan  bob  :bye").unwrap();
+        match m.command {
+            IrcCommand::Kick(channel, nick, reason) => {
+                assert_eq!(channel, "#chan");
+                assert_eq!(nick, "bob");
+                assert_eq!(reason.as_deref(), Some("bye"));
+            }
+            other => panic!("expected Kick, got {:?}", other),
         }
     }
 

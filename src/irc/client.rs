@@ -73,6 +73,32 @@ fn bytes_to_string_lossy(buf: &[u8]) -> String {
     String::from_utf8_lossy(buf).trim().to_string()
 }
 
+/// Redact credentials from an outgoing line before it reaches the log output.
+/// PASS carries the server/bouncer password, AUTHENTICATE carries the base64
+/// SASL payload, and NickServ IDENTIFY/GHOST/REGAIN/RECOVER lines (from
+/// auto-perform or /ns) carry the account password.
+fn redact_for_log(line: &str) -> std::borrow::Cow<'_, str> {
+    let trimmed = line.trim_end();
+    let upper = trimmed.to_uppercase();
+    if upper.starts_with("PASS ") {
+        return "PASS <redacted>".into();
+    }
+    if let Some(arg) = trimmed.strip_prefix("AUTHENTICATE ")
+        && arg != "+"
+        && !arg.eq_ignore_ascii_case("PLAIN")
+    {
+        return "AUTHENTICATE <redacted>".into();
+    }
+    if (upper.starts_with("PRIVMSG NICKSERV") || upper.starts_with("NICKSERV"))
+        && ["IDENTIFY", "GHOST", "REGAIN", "RECOVER"]
+            .iter()
+            .any(|w| upper.contains(w))
+    {
+        return "PRIVMSG NickServ :<redacted>".into();
+    }
+    trimmed.into()
+}
+
 /// Read the next protocol message during the registration handshake: parse it,
 /// forward a copy to the GUI, and transparently answer server PINGs (which can
 /// arrive mid-handshake, before the writer task that normally handles them
@@ -332,7 +358,7 @@ impl IrcClient {
                     Some(cmd) = outgoing_rx.recv() => {
                         let should_close = matches!(cmd, IrcCommand::Quit(_));
                         let line = format!("{}\r\n", cmd);
-                        tracing::debug!("> {}", line.trim());
+                        tracing::debug!("> {}", redact_for_log(&line));
                         if let Err(e) = writer.write_all(line.as_bytes()).await {
                             tracing::error!("Write error: {}", e);
                             break;
@@ -345,7 +371,7 @@ impl IrcClient {
                         while let Ok(Some(cmd)) = timeout(Duration::from_micros(100), outgoing_rx.recv()).await {
                             let should_close = matches!(cmd, IrcCommand::Quit(_));
                             let line = format!("{}\r\n", cmd);
-                            tracing::debug!("> {}", line.trim());
+                            tracing::debug!("> {}", redact_for_log(&line));
                             if let Err(e) = writer.write_all(line.as_bytes()).await {
                                 // Exit the whole task, matching the outer loop: a
                                 // plain `break` would only leave this drain loop and
@@ -396,11 +422,11 @@ impl IrcClient {
         // Always do CAP negotiation to request IRCv3 features
         self.do_cap_negotiation(writer, reader, incoming_tx).await?;
 
-        // Send PASS if configured
+        // Send PASS if configured (never log the password itself)
         if let Some(ref pass) = config.password {
             let pass_cmd = IrcCommand::Pass(pass.clone());
             let line = format!("{}\r\n", pass_cmd);
-            tracing::debug!("> {}", line.trim());
+            tracing::debug!("> PASS <redacted>");
             writer.write_all(line.as_bytes()).await?;
         }
 
@@ -896,7 +922,7 @@ impl IrcClient {
                 Err(_) => {
                     probe_sent = true;
                     if let Some(ref tx) = self.tx {
-                        let _ = tx.try_send("PING :linefeed-keepalive\r\n".to_string());
+                        let _ = tx.send("PING :linefeed-keepalive\r\n".to_string()).await;
                     }
                     continue;
                 }
@@ -940,11 +966,16 @@ impl IrcClient {
                         if !trimmed.is_empty() {
                             tracing::debug!("< {}", trimmed);
                             if let Some(msg) = IrcMessage::parse(trimmed) {
-                                // Handle PING automatically
+                                // Handle PING automatically. Awaiting the send
+                                // (instead of try_send) means a saturated writer
+                                // queue delays the PONG rather than silently
+                                // dropping it and risking a server ping-timeout.
                                 if let IrcCommand::Ping(server) = &msg.command {
                                     let pong = format!("PONG :{}\r\n", server);
-                                    if let Some(ref tx) = self.tx {
-                                        let _ = tx.try_send(pong);
+                                    if let Some(ref tx) = self.tx
+                                        && tx.send(pong).await.is_err()
+                                    {
+                                        tracing::warn!("Writer task gone; cannot send PONG");
                                     }
                                 }
                                 // Awaiting send applies backpressure (and naturally throttles

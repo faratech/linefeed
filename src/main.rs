@@ -211,8 +211,12 @@ fn main() -> eframe::Result<()> {
         return Ok(());
     }
 
+    // INFO by default: DEBUG logs every raw IRC line to stdout, which both
+    // costs a formatting pass per message and lands in terminal scrollback /
+    // session journals (credentials on those lines are additionally redacted
+    // in the writer task as defense in depth).
     tracing_subscriber::fmt()
-        .with_max_level(tracing::Level::DEBUG)
+        .with_max_level(tracing::Level::INFO)
         .with_target(false)
         .init();
 
