@@ -1009,3 +1009,104 @@ impl IrcClient {
         tracing::info!("Read loop exited");
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+
+    /// End-to-end: CAP negotiation, registration, and message forwarding
+    /// against a scripted fake server over a real (plaintext) socket.
+    #[test]
+    fn plain_connection_registers_and_forwards_messages() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+
+            let server = tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                let (read_half, mut write_half) = stream.into_split();
+                let mut reader = tokio::io::BufReader::new(read_half);
+                let mut line = String::new();
+
+                reader.read_line(&mut line).await.unwrap();
+                assert!(line.starts_with("CAP LS"), "expected CAP LS, got {line:?}");
+                write_half
+                    .write_all(b":srv CAP * LS :away-notify\r\n")
+                    .await
+                    .unwrap();
+
+                line.clear();
+                reader.read_line(&mut line).await.unwrap();
+                assert!(line.starts_with("CAP REQ"), "expected CAP REQ, got {line:?}");
+                write_half
+                    .write_all(b":srv CAP * ACK :away-notify\r\n")
+                    .await
+                    .unwrap();
+
+                // CAP END, NICK, USER
+                let mut got = Vec::new();
+                for _ in 0..3 {
+                    line.clear();
+                    reader.read_line(&mut line).await.unwrap();
+                    got.push(line.trim().to_string());
+                }
+                assert!(got.iter().any(|l| l == "CAP END"), "{got:?}");
+                assert!(got.iter().any(|l| l == "NICK tester"), "{got:?}");
+                assert!(got.iter().any(|l| l.starts_with("USER ")), "{got:?}");
+
+                write_half
+                    .write_all(b":srv 001 tester :Welcome\r\n:alice!a@h KICK #chan tester :bye\r\n")
+                    .await
+                    .unwrap();
+                // Hold the socket open long enough for the client to read.
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            });
+
+            let config = ServerConfig {
+                host: "127.0.0.1".to_string(),
+                port: addr.port(),
+                use_tls: false,
+                nick: "tester".to_string(),
+                ..Default::default()
+            };
+            let (msg_tx, mut msg_rx) = mpsc::channel(100);
+            // Named binding: dropping the sender would close the command channel.
+            let (_cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+            let mut client = IrcClient::new(config);
+            let client_task = tokio::spawn(async move {
+                let _ = client.connect(msg_tx, cmd_rx).await;
+            });
+
+            let mut saw_welcome = false;
+            let mut saw_kick = false;
+            let result = tokio::time::timeout(Duration::from_secs(5), async {
+                while let Some(msg) = msg_rx.recv().await {
+                    match &msg.command {
+                        IrcCommand::Numeric(1, _) => saw_welcome = true,
+                        IrcCommand::Kick(chan, nick, reason) => {
+                            assert_eq!(chan, "#chan");
+                            assert_eq!(nick, "tester");
+                            assert_eq!(reason.as_deref(), Some("bye"));
+                            saw_kick = true;
+                            break;
+                        }
+                        _ => {}
+                    }
+                }
+            })
+            .await;
+
+            assert!(result.is_ok(), "timed out waiting for server messages");
+            assert!(saw_welcome, "RPL_WELCOME was not forwarded");
+            assert!(saw_kick, "KICK was not forwarded");
+
+            server.abort();
+            client_task.abort();
+        });
+    }
+}
