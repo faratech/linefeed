@@ -13,17 +13,31 @@ use super::numerics::*;
 /// our read buffer past this bound.
 const MAX_LINE_LEN: usize = 16 * 1024;
 const HANDSHAKE_STEP_TIMEOUT: Duration = Duration::from_secs(15);
+/// Overall deadline for the whole registration handshake (CAP + SASL + NICK/USER).
+/// The per-step timeout resets on every received line, so without this a server
+/// that drips unrelated lines could keep the handshake running forever.
+const REGISTRATION_TIMEOUT: Duration = Duration::from_secs(60);
+/// How long the read loop tolerates total silence before probing with a PING.
+const READ_IDLE_TIMEOUT: Duration = Duration::from_secs(240);
+/// How long to wait for any data after the keepalive probe before declaring
+/// the connection dead.
+const PONG_GRACE: Duration = Duration::from_secs(30);
 
-/// Read bytes up to and including the next `\n` into `buf`, enforcing an upper
-/// bound so a newline-less flood cannot exhaust memory. Returns the number of
-/// bytes buffered (0 only at EOF with nothing pending). If `max` is reached
-/// before a newline, returns `InvalidData` so the caller drops the connection.
+/// Read bytes up to and including the next `\n`, appending to `buf` and
+/// enforcing an upper bound so a newline-less flood cannot exhaust memory.
+/// Returns the total bytes buffered (0 only at EOF with nothing pending). If
+/// `max` is reached before a newline, returns `InvalidData` so the caller
+/// drops the connection.
+///
+/// `buf` is NOT cleared here: the caller clears it after consuming a complete
+/// line. That way a caller whose read future is cancelled (e.g. by a timeout)
+/// resumes accumulating the partially-read line on the next call instead of
+/// silently losing the consumed bytes and misparsing the line's tail.
 async fn read_until_lf_bounded<R: tokio::io::AsyncBufRead + Unpin>(
     reader: &mut R,
     buf: &mut Vec<u8>,
     max: usize,
 ) -> std::io::Result<usize> {
-    buf.clear();
     loop {
         let available = reader.fill_buf().await?;
         if available.is_empty() {
@@ -75,10 +89,19 @@ where
     R: tokio::io::AsyncBufRead + Unpin,
 {
     loop {
-        if read_line_lossy(reader, buf).await? == 0 {
+        // The GUI dropping its receiver is a disconnect request; honor it even
+        // though the writer task (which normally carries QUIT) doesn't exist yet.
+        if incoming_tx.is_closed() {
+            return Err("Connection cancelled during registration".into());
+        }
+        let n = read_line_lossy(reader, buf).await?;
+        if n == 0 || !buf.ends_with(b"\n") {
+            // EOF, possibly mid-line: never parse a truncated fragment as a
+            // complete message (mirrors the main read loop).
             return Err("Connection closed during registration".into());
         }
         let trimmed = bytes_to_string_lossy(buf);
+        buf.clear();
         tracing::debug!("< {}", trimmed);
         if let Some(msg) = IrcMessage::parse(&trimmed) {
             let _ = incoming_tx.try_send(msg.clone());
@@ -282,9 +305,20 @@ impl IrcClient {
         let (reader, mut writer) = tokio::io::split(stream);
         let mut reader = BufReader::new(reader);
 
-        // Send registration (may include SASL handshake)
-        self.send_registration(&mut writer, &mut reader, &incoming_tx)
-            .await?;
+        // Send registration (may include SASL handshake), bounded by an overall
+        // deadline so a hostile or broken server cannot wedge the connection
+        // thread forever (which would also block every future reconnect).
+        match timeout(
+            REGISTRATION_TIMEOUT,
+            self.send_registration(&mut writer, &mut reader, &incoming_tx),
+        )
+        .await
+        {
+            Ok(result) => result?,
+            Err(_) => {
+                return Err("Registration timed out; server never completed the handshake".into());
+            }
+        }
 
         // Create channel for sending
         let (send_tx, mut send_rx) = mpsc::channel::<String>(100);
@@ -313,8 +347,11 @@ impl IrcClient {
                             let line = format!("{}\r\n", cmd);
                             tracing::debug!("> {}", line.trim());
                             if let Err(e) = writer.write_all(line.as_bytes()).await {
+                                // Exit the whole task, matching the outer loop: a
+                                // plain `break` would only leave this drain loop and
+                                // keep consuming (and dropping) queued commands.
                                 tracing::error!("Write error: {}", e);
-                                break;
+                                return;
                             }
                             if should_close {
                                 let _ = writer.flush().await;
@@ -817,10 +854,54 @@ impl IrcClient {
         incoming_tx: mpsc::Sender<IrcMessage>,
     ) {
         let mut buf = Vec::with_capacity(2048);
+        // Dead-connection detection: if nothing arrives for READ_IDLE_TIMEOUT we
+        // probe with a PING; if the server stays silent through PONG_GRACE the
+        // link is treated as dead. Without this, silent TCP death (suspend/resume,
+        // expired NAT entries) leaves the app showing "connected" forever.
+        let mut probe_sent = false;
         loop {
+            if incoming_tx.is_closed() {
+                tracing::info!("GUI receiver dropped; stopping read loop");
+                break;
+            }
+            let idle_limit = if probe_sent {
+                PONG_GRACE
+            } else {
+                READ_IDLE_TIMEOUT
+            };
             // Read bytes until newline to handle non-UTF8 encodings (common on older
             // IRC networks); bounded so a newline-less flood cannot exhaust memory.
-            match read_until_lf_bounded(&mut reader, &mut buf, MAX_LINE_LEN).await {
+            // A timeout here cancels the read mid-line safely: read_until_lf_bounded
+            // keeps partial bytes in `buf` and the next call resumes accumulating.
+            let read_result = match timeout(
+                idle_limit,
+                read_until_lf_bounded(&mut reader, &mut buf, MAX_LINE_LEN),
+            )
+            .await
+            {
+                Ok(result) => result,
+                Err(_) if probe_sent => {
+                    tracing::warn!("No data from server after keepalive probe; connection is dead");
+                    let _ = incoming_tx.try_send(IrcMessage {
+                        tags: None,
+                        prefix: None,
+                        command: IrcCommand::Notice(
+                            "*".to_string(),
+                            "Connection timed out (no response from server)".to_string(),
+                        ),
+                        raw: String::new(),
+                    });
+                    break;
+                }
+                Err(_) => {
+                    probe_sent = true;
+                    if let Some(ref tx) = self.tx {
+                        let _ = tx.try_send("PING :linefeed-keepalive\r\n".to_string());
+                    }
+                    continue;
+                }
+            };
+            match read_result {
                 Ok(0) => {
                     tracing::info!("Connection closed by server (EOF)");
                     let _ = incoming_tx.try_send(IrcMessage {
@@ -836,6 +917,7 @@ impl IrcClient {
                 }
                 Ok(n) => {
                     tracing::trace!("Read {} bytes", n);
+                    probe_sent = false;
                     if !buf.ends_with(b"\n") {
                         // EOF reached mid-line: the trailing fragment is an incomplete
                         // message, so discard it rather than parsing a truncated line.
@@ -852,27 +934,30 @@ impl IrcClient {
                         break;
                     }
                     // Convert to UTF-8 lossily (replaces invalid sequences with replacement char)
-                    let line = String::from_utf8_lossy(&buf);
-                    let trimmed = line.trim();
-                    if !trimmed.is_empty() {
-                        tracing::debug!("< {}", trimmed);
-                        if let Some(msg) = IrcMessage::parse(trimmed) {
-                            // Handle PING automatically
-                            if let IrcCommand::Ping(server) = &msg.command {
-                                let pong = format!("PONG :{}\r\n", server);
-                                if let Some(ref tx) = self.tx {
-                                    let _ = tx.try_send(pong);
+                    {
+                        let line = String::from_utf8_lossy(&buf);
+                        let trimmed = line.trim();
+                        if !trimmed.is_empty() {
+                            tracing::debug!("< {}", trimmed);
+                            if let Some(msg) = IrcMessage::parse(trimmed) {
+                                // Handle PING automatically
+                                if let IrcCommand::Ping(server) = &msg.command {
+                                    let pong = format!("PONG :{}\r\n", server);
+                                    if let Some(ref tx) = self.tx {
+                                        let _ = tx.try_send(pong);
+                                    }
                                 }
-                            }
-                            // Awaiting send applies backpressure (and naturally throttles
-                            // our socket reads) instead of silently dropping messages when
-                            // the GUI is briefly behind.
-                            if incoming_tx.send(msg).await.is_err() {
-                                tracing::warn!("GUI receiver dropped; stopping read loop");
-                                break;
+                                // Awaiting send applies backpressure (and naturally throttles
+                                // our socket reads) instead of silently dropping messages when
+                                // the GUI is briefly behind.
+                                if incoming_tx.send(msg).await.is_err() {
+                                    tracing::warn!("GUI receiver dropped; stopping read loop");
+                                    break;
+                                }
                             }
                         }
                     }
+                    buf.clear();
                 }
                 Err(e) => {
                     let err_msg = format!("{}", e);

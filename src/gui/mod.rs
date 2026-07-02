@@ -589,15 +589,37 @@ impl IrcApp {
         self.nick_retry_attempts = 0;
     }
 
+    /// Clamp a QUIT reason so the resulting line always fits in one IRC line.
+    /// An overlong reason must never cause the QUIT itself to be dropped by the
+    /// send_command length check: that would orphan the connection thread.
+    fn clamp_quit_reason(reason: Option<String>) -> Option<String> {
+        const MAX_REASON_BYTES: usize = IRC_MAX_LINE_BYTES - "QUIT :".len();
+        reason.map(|r| {
+            if r.len() <= MAX_REASON_BYTES {
+                r
+            } else {
+                let mut end = MAX_REASON_BYTES;
+                while end > 0 && !r.is_char_boundary(end) {
+                    end -= 1;
+                }
+                r[..end].to_string()
+            }
+        })
+    }
+
     pub fn request_manual_disconnect(&mut self, reason: Option<String>) {
         self.connection_intent = ConnectionIntent::ManualDisconnect;
         if self.cmd_tx.is_some() {
-            let _ = self.send_command(IrcCommand::Quit(reason));
+            let _ = self.send_command(IrcCommand::Quit(Self::clamp_quit_reason(reason)));
         }
         self.connected = false;
         self.connecting = false;
         self.connection_lost = false;
         self.cmd_tx = None;
+        // Dropping the receiver signals the connection thread (the handshake and
+        // read loop both watch for a closed channel), so a wedged connect attempt
+        // can be aborted instead of blocking future reconnects.
+        self.msg_rx = None;
         self.lag_ms = None;
         self.ping_sent_time = None;
     }
@@ -605,7 +627,9 @@ impl IrcApp {
     pub fn request_reconnect_after_close(&mut self, reason: &str) {
         if self.cmd_tx.is_some() {
             self.connection_intent = ConnectionIntent::ReconnectAfterClose;
-            let _ = self.send_command(IrcCommand::Quit(Some(reason.to_string())));
+            let _ = self.send_command(IrcCommand::Quit(Self::clamp_quit_reason(Some(
+                reason.to_string(),
+            ))));
             self.connected = false;
             self.connecting = false;
             self.connection_lost = false;
@@ -947,6 +971,41 @@ impl IrcApp {
                 }
             }
 
+            IrcCommand::Kick(channel, kicked, reason) => {
+                let sender = msg.get_sender_nick().unwrap_or_default();
+                let reason_str = reason.as_deref().unwrap_or("");
+                let max = self.max_scrollback;
+                if kicked.eq_ignore_ascii_case(&self.my_nick) {
+                    // We were kicked: keep the tab visible with a notice, but clear
+                    // membership state since the server has removed us.
+                    if let Some(ch) = self.channels.get_mut(channel) {
+                        ch.users.clear();
+                        ch.push_trimmed(
+                            ChatMessage::system(&format!(
+                                "You were kicked from {} by {} ({})",
+                                channel, sender, reason_str
+                            )),
+                            max,
+                        );
+                    }
+                    self.send_notification(
+                        &format!("Kicked from {}", channel),
+                        &format!("by {} ({})", sender, reason_str),
+                        false,
+                    );
+                } else {
+                    // Kicks are moderation events, shown even when join/part is hidden.
+                    let sys_msg = ChatMessage::system(&format!(
+                        "{} was kicked from {} by {} ({})",
+                        kicked, channel, sender, reason_str
+                    ));
+                    self.add_message_to_channel(channel, sys_msg);
+                    if let Some(ch) = self.channels.get_mut(channel) {
+                        ch.remove_user(kicked);
+                    }
+                }
+            }
+
             IrcCommand::Quit(reason) => {
                 let sender = msg.get_sender_nick().unwrap_or_default();
                 let reason_str = reason.as_deref().unwrap_or("Quit");
@@ -1259,6 +1318,8 @@ impl IrcApp {
                 self.reset_reconnect_state(); // Reset reconnect attempts on successful connection
                 self.connection_intent = ConnectionIntent::None;
                 self.nick_retry_attempts = 0;
+                // Clear any lag reading left over from a previous connection.
+                self.lag_ms = None;
                 if let Some(nick) = params.first() {
                     self.set_my_nick(nick.clone());
                 }
@@ -1440,7 +1501,22 @@ impl IrcApp {
             }
 
             ERR_NICKNAMEINUSE => {
-                if !self.connected && self.nick_retry_attempts >= 3 {
+                // After registration this is a failed /nick attempt: report it and
+                // keep our current nick. Auto-retrying here would silently rename
+                // the user to "<current>_" and desync my_nick from the server.
+                if self.connected {
+                    let rejected = params.get(1).cloned().unwrap_or_default();
+                    let text = params
+                        .last()
+                        .cloned()
+                        .unwrap_or_else(|| "Nickname is already in use".to_string());
+                    self.add_server_message(ChatMessage::system_fmt(
+                        &format!("{}: {}", rejected, text),
+                        &self.timestamp_format,
+                    ));
+                    return;
+                }
+                if self.nick_retry_attempts >= 3 {
                     let text = params
                         .last()
                         .cloned()
@@ -2625,8 +2701,12 @@ impl eframe::App for IrcApp {
                             self.show_connect_dialog = true;
                         }
                     } else if self.connected && ui.button("Disconnect").clicked() {
-                        self.send_command(IrcCommand::Quit(Some("Linefeed".to_string())));
-                        self.connected = false;
+                        let reason = if self.quit_message.is_empty() {
+                            "Linefeed".to_string()
+                        } else {
+                            self.quit_message.clone()
+                        };
+                        self.request_manual_disconnect(Some(reason));
                     }
                 });
             });
@@ -3199,7 +3279,11 @@ mod tests {
     use super::*;
 
     fn test_app() -> IrcApp {
-        IrcApp::with_settings(Settings::default())
+        IrcApp::with_settings(Settings {
+            // Keep unit tests from writing chat logs to the real config dir.
+            logging_enabled: false,
+            ..Settings::default()
+        })
     }
 
     #[test]
@@ -3248,6 +3332,111 @@ mod tests {
 
         let alice = app.channels["#chan"].get_user("alice").unwrap();
         assert_eq!(alice.mode, UserMode::Op);
+    }
+
+    #[test]
+    fn incoming_kick_removes_user_and_notes_channel() {
+        let mut app = test_app();
+        let mut channel = Channel::new();
+        channel.add_user("bob", UserMode::Normal);
+        app.channels.insert("#chan".to_string(), channel);
+
+        let msg = IrcMessage::parse(":alice!a@h KICK #chan bob :spamming").unwrap();
+        app.handle_incoming_message(msg);
+
+        let ch = &app.channels["#chan"];
+        assert!(!ch.has_user("bob"));
+        assert!(
+            ch.messages
+                .iter()
+                .any(|m| m.content.contains("bob was kicked from #chan by alice (spamming)"))
+        );
+    }
+
+    #[test]
+    fn incoming_self_kick_clears_users_but_keeps_tab() {
+        let mut app = test_app();
+        app.set_my_nick("me".to_string());
+        let mut channel = Channel::new();
+        channel.add_user("me", UserMode::Normal);
+        channel.add_user("bob", UserMode::Normal);
+        app.channels.insert("#chan".to_string(), channel);
+        app.current_channel = Some("#chan".to_string());
+
+        let msg = IrcMessage::parse(":alice!a@h KICK #chan me :bye").unwrap();
+        app.handle_incoming_message(msg);
+
+        let ch = &app.channels["#chan"];
+        assert!(ch.users.is_empty());
+        assert!(
+            ch.messages
+                .iter()
+                .any(|m| m.content.contains("You were kicked from #chan by alice (bye)"))
+        );
+    }
+
+    #[test]
+    fn nick_in_use_while_connected_reports_without_renaming() {
+        let mut app = test_app();
+        app.set_my_nick("mike".to_string());
+        app.connected = true;
+        app.handle_numeric(
+            ERR_NICKNAMEINUSE,
+            &[
+                "mike".to_string(),
+                "john".to_string(),
+                "Nickname is already in use".to_string(),
+            ],
+        );
+        assert_eq!(app.my_nick, "mike");
+        assert!(
+            app.server_messages
+                .last()
+                .is_some_and(|m| m.content.contains("john"))
+        );
+    }
+
+    #[test]
+    fn nick_in_use_during_registration_retries_with_suffix() {
+        let mut app = test_app();
+        app.set_my_nick("mike".to_string());
+        app.connected = false;
+        app.handle_numeric(
+            ERR_NICKNAMEINUSE,
+            &[
+                "*".to_string(),
+                "mike".to_string(),
+                "Nickname is already in use".to_string(),
+            ],
+        );
+        assert_eq!(app.my_nick, "mike_");
+    }
+
+    #[test]
+    fn overlong_quit_reason_is_clamped_to_fit_one_line() {
+        let clamped = IrcApp::clamp_quit_reason(Some("é".repeat(600))).unwrap();
+        let line = format!("{}", IrcCommand::Quit(Some(clamped.clone())));
+        assert!(line.len() <= IRC_MAX_LINE_BYTES);
+        assert!(clamped.is_char_boundary(clamped.len()));
+        // Short reasons pass through untouched.
+        assert_eq!(
+            IrcApp::clamp_quit_reason(Some("bye".to_string())).as_deref(),
+            Some("bye")
+        );
+    }
+
+    #[test]
+    fn disconnect_command_stops_reconnect_loop_without_touching_setting() {
+        let mut app = test_app();
+        app.connection_lost = true;
+        app.auto_reconnect = true;
+        app.last_disconnect_time = None;
+
+        app.process_command("/disconnect");
+
+        assert!(!app.connection_lost);
+        assert!(!app.should_reconnect());
+        assert!(app.auto_reconnect, "persisted setting must not be flipped");
     }
 
     #[test]

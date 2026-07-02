@@ -1039,15 +1039,25 @@ impl IrcApp {
             }
 
             "DISCONNECT" => {
-                if self.connected {
+                // Works in every connection state: connected, mid-connect, or in a
+                // reconnect backoff loop (this is the only way to stop the latter).
+                // request_manual_disconnect clears connecting/connection_lost, which
+                // suppresses further reconnect attempts without touching the
+                // persisted auto_reconnect setting.
+                if self.connected
+                    || self.connecting
+                    || self.connection_lost
+                    || self.cmd_tx.is_some()
+                {
                     let reason = if args.is_empty() {
                         None
                     } else {
                         Some(args.to_string())
                     };
                     self.request_manual_disconnect(reason);
-                    self.auto_reconnect = false; // Disable auto-reconnect on manual disconnect
                     self.add_server_message(ChatMessage::system("Disconnected from server"));
+                } else {
+                    self.add_server_message(ChatMessage::system("Not connected"));
                 }
             }
 
