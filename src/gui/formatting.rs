@@ -338,13 +338,47 @@ fn split_urls(text: &str) -> Vec<(String, bool)> {
     result
 }
 
-/// Render IRC formatted text with colors, bold, underline, italic, and clickable URLs
-pub fn render_irc_text(ui: &mut egui::Ui, text: &str, default_color: Color32) {
-    let spans = parse_irc_colors(text);
+/// A fully-parsed segment ready for rendering: formatting controls resolved
+/// and URL detection already done. Cached per message (see
+/// `ChatMessage::render_segments`) so the per-frame render path does no
+/// parsing and no allocation.
+#[derive(Clone, Debug)]
+pub struct RenderSegment {
+    pub text: String,
+    pub fg_color: Option<Color32>,
+    pub bg_color: Option<Color32>,
+    pub bold: bool,
+    pub underline: bool,
+    pub italic: bool,
+    pub reverse: bool,
+    pub is_url: bool,
+}
 
+/// Parse IRC formatting and detect URLs once, producing render-ready segments.
+pub fn layout_irc_text(text: &str) -> Vec<RenderSegment> {
+    let mut segments = Vec::new();
+    for span in parse_irc_colors(text) {
+        for (segment, is_url) in split_urls(&span.text) {
+            segments.push(RenderSegment {
+                text: segment,
+                fg_color: span.fg_color,
+                bg_color: span.bg_color,
+                bold: span.bold,
+                underline: span.underline,
+                italic: span.italic,
+                reverse: span.reverse,
+                is_url,
+            });
+        }
+    }
+    segments
+}
+
+/// Render pre-parsed segments (see `layout_irc_text`).
+pub fn render_segments(ui: &mut egui::Ui, segments: &[RenderSegment], default_color: Color32) {
     ui.horizontal_wrapped(|ui| {
         ui.spacing_mut().item_spacing.x = 0.0;
-        for span in spans {
+        for span in segments {
             let mut color = span.fg_color.unwrap_or(default_color);
             let mut bg_color = span.bg_color;
             if span.reverse {
@@ -353,56 +387,58 @@ pub fn render_irc_text(ui: &mut egui::Ui, text: &str, default_color: Color32) {
                 bg_color = Some(old_color);
             }
 
-            // Split the span text into URL and non-URL parts
-            let segments = split_urls(&span.text);
-
-            for (segment, is_url) in segments {
-                if is_url {
-                    // Render as clickable hyperlink
-                    let url = if segment.starts_with("www.") {
-                        format!("https://{}", segment)
-                    } else {
-                        segment.clone()
-                    };
-                    ui.hyperlink_to(
-                        RichText::new(&segment)
-                            .color(Color32::from_rgb(100, 150, 255))
-                            .underline(),
-                        &url,
-                    );
+            if span.is_url {
+                // Render as clickable hyperlink
+                let url = if span.text.starts_with("www.") {
+                    format!("https://{}", span.text)
                 } else {
-                    // Render as regular text with formatting
-                    // For bold, brighten the color slightly to make it more visible
-                    let effective_color = if span.bold {
-                        let r = (color.r() as u16 + 40).min(255) as u8;
-                        let g = (color.g() as u16 + 40).min(255) as u8;
-                        let b = (color.b() as u16 + 40).min(255) as u8;
-                        Color32::from_rgb(r, g, b)
-                    } else {
-                        color
-                    };
+                    span.text.clone()
+                };
+                ui.hyperlink_to(
+                    RichText::new(&span.text)
+                        .color(Color32::from_rgb(100, 150, 255))
+                        .underline(),
+                    &url,
+                );
+            } else {
+                // Render as regular text with formatting
+                // For bold, brighten the color slightly to make it more visible
+                let effective_color = if span.bold {
+                    let r = (color.r() as u16 + 40).min(255) as u8;
+                    let g = (color.g() as u16 + 40).min(255) as u8;
+                    let b = (color.b() as u16 + 40).min(255) as u8;
+                    Color32::from_rgb(r, g, b)
+                } else {
+                    color
+                };
 
-                    let mut rich_text = RichText::new(&segment).color(effective_color);
+                let mut rich_text = RichText::new(&span.text).color(effective_color);
 
-                    if span.bold {
-                        rich_text = rich_text.strong();
-                    }
-                    if span.underline {
-                        rich_text = rich_text.underline();
-                    }
-                    if span.italic {
-                        rich_text = rich_text.italics();
-                    }
-
-                    if let Some(bg) = bg_color {
-                        rich_text = rich_text.background_color(bg);
-                    }
-
-                    ui.label(rich_text);
+                if span.bold {
+                    rich_text = rich_text.strong();
                 }
+                if span.underline {
+                    rich_text = rich_text.underline();
+                }
+                if span.italic {
+                    rich_text = rich_text.italics();
+                }
+
+                if let Some(bg) = bg_color {
+                    rich_text = rich_text.background_color(bg);
+                }
+
+                ui.label(rich_text);
             }
         }
     });
+}
+
+/// Render IRC formatted text with colors, bold, underline, italic, and clickable URLs.
+/// Parses on every call: use only for rarely-rendered or frequently-changing text
+/// (message scrollback goes through the per-message cache instead).
+pub fn render_irc_text(ui: &mut egui::Ui, text: &str, default_color: Color32) {
+    render_segments(ui, &layout_irc_text(text), default_color);
 }
 
 #[cfg(test)]

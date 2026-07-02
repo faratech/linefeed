@@ -6,13 +6,13 @@ mod logging;
 mod types;
 
 use egui::{Color32, RichText, ScrollArea, TextEdit};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use tokio::sync::mpsc;
 
 use crate::irc::client::ServerConfig;
 use crate::irc::numerics::*;
 use crate::irc::{IrcCommand, IrcMessage};
-use formatting::{nick_color, render_irc_text};
+use formatting::{nick_color, render_irc_text, render_segments};
 use helpers::{format_timestamp, mask_matches, truncate_chars};
 pub use types::{
     BanEntry, Channel, ChannelListEntry, ChannelListSort, ChatMessage, NetworkSupport,
@@ -48,7 +48,7 @@ pub struct IrcApp {
     // Channels and messages
     pub channels: HashMap<String, Channel>,
     pub current_channel: Option<String>,
-    pub server_messages: Vec<ChatMessage>,
+    pub server_messages: VecDeque<ChatMessage>,
     pub server_unread: usize,
 
     // Input
@@ -77,6 +77,15 @@ pub struct IrcApp {
     pub channel_list_selected: Option<String>,
     pub channel_list_sort: ChannelListSort,
     pub channel_list_sort_dir: SortDirection,
+
+    // Channel list view cache: filtered+sorted indices into channel_list,
+    // recomputed only when the list, filter, or sort changes (re-sorting up to
+    // 50k rows every frame would otherwise burn a core while the dialog is open).
+    pub(crate) channel_list_cache: Vec<usize>,
+    pub(crate) channel_list_dirty: bool,
+    pub(crate) channel_list_cache_filter: String,
+    pub(crate) channel_list_cache_sort: (ChannelListSort, SortDirection),
+    pub(crate) channel_list_last_refilter: Option<std::time::Instant>,
 
     // Tab completion
     pub tab_completion: Option<TabCompletion>,
@@ -192,6 +201,10 @@ pub struct IrcApp {
     // CPU optimization state
     pub had_messages_this_frame: bool,
 
+    // Rate limiting for desktop notifications (each one spawns a thread and,
+    // on Linux/macOS, a subprocess - a flood must not spawn one per message).
+    last_notification_time: Option<std::time::Instant>,
+
     nick_retry_attempts: u8,
 }
 
@@ -227,7 +240,7 @@ impl IrcApp {
 
             channels: HashMap::new(),
             current_channel: None,
-            server_messages: Vec::new(),
+            server_messages: VecDeque::new(),
             server_unread: 0,
 
             input_text: String::new(),
@@ -251,6 +264,12 @@ impl IrcApp {
             channel_list_selected: None,
             channel_list_sort: ChannelListSort::Users,
             channel_list_sort_dir: SortDirection::Descending,
+
+            channel_list_cache: Vec::new(),
+            channel_list_dirty: false,
+            channel_list_cache_filter: String::new(),
+            channel_list_cache_sort: (ChannelListSort::Users, SortDirection::Descending),
+            channel_list_last_refilter: None,
 
             tab_completion: None,
 
@@ -350,6 +369,7 @@ impl IrcApp {
 
             // CPU optimization
             had_messages_this_frame: false,
+            last_notification_time: None,
             nick_retry_attempts: 0,
         }
     }
@@ -500,10 +520,11 @@ impl IrcApp {
         for msg in messages {
             self.handle_incoming_message(msg);
         }
+        self.log_manager.flush_all();
     }
 
     /// Send a desktop notification
-    pub fn send_notification(&self, title: &str, body: &str, force: bool) {
+    pub fn send_notification(&mut self, title: &str, body: &str, force: bool) {
         // Always log the notification
         tracing::info!("Notification: {} - {}", title, body);
 
@@ -517,6 +538,18 @@ impl IrcApp {
             tracing::debug!("Window focused, skipping notification");
             return;
         }
+
+        // Rate-limit: each notification spawns an OS thread (and on Linux/macOS a
+        // subprocess), so a netsplit replay or highlight flood must not spawn one
+        // per message.
+        const MIN_NOTIFICATION_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
+        if let Some(last) = self.last_notification_time
+            && last.elapsed() < MIN_NOTIFICATION_INTERVAL
+        {
+            tracing::debug!("Notification rate-limited");
+            return;
+        }
+        self.last_notification_time = Some(std::time::Instant::now());
 
         // Use notify-send on Linux/BSD (usually pre-installed on Linux desktops)
         #[cfg(all(unix, not(target_os = "macos")))]
@@ -658,6 +691,7 @@ impl IrcApp {
         self.pending_invites.clear();
         self.pending_channel_keys.clear();
         self.channel_list.clear();
+        self.channel_list_dirty = true;
         self.channel_list_loading = false;
         self.away_status = None;
         self.auto_away_triggered = false;
@@ -906,7 +940,7 @@ impl IrcApp {
                                 self.logging_history_lines,
                             );
                             if !history.is_empty() {
-                                new_channel.messages.push(ChatMessage::system(&format!(
+                                new_channel.messages.push_back(ChatMessage::system(&format!(
                                     "--- {} lines of history loaded ---",
                                     history.len()
                                 )));
@@ -1383,12 +1417,12 @@ impl IrcApp {
             }
 
             RPL_TOPIC => {
+                let max = self.max_scrollback;
                 if let (Some(channel), Some(topic)) = (params.get(1), params.get(2))
                     && let Some(ch) = self.channels.get_mut(channel)
                 {
                     ch.topic = Some(topic.clone());
-                    ch.messages
-                        .push(ChatMessage::system(&format!("Topic: {}", topic)));
+                    ch.push_trimmed(ChatMessage::system(&format!("Topic: {}", topic)), max);
                 }
             }
 
@@ -1426,11 +1460,15 @@ impl IrcApp {
                     }
 
                     let time_str = format_timestamp(ts);
+                    let max = self.max_scrollback;
                     if let Some(ch) = self.channels.get_mut(channel) {
-                        ch.messages.push(ChatMessage::system(&format!(
-                            "Topic set by {} on {}",
-                            setter, time_str
-                        )));
+                        ch.push_trimmed(
+                            ChatMessage::system(&format!(
+                                "Topic set by {} on {}",
+                                setter, time_str
+                            )),
+                            max,
+                        );
                     }
                 }
             }
@@ -1454,18 +1492,24 @@ impl IrcApp {
                                     }
                                 })
                                 .unwrap_or(UserMode::Normal);
-                            ch.add_user_with_prefixes(name, mode, &prefixes);
+                            // Deferred dedup+sort: one pass at RPL_ENDOFNAMES
+                            // instead of O(N²·logN) across a large NAMES burst.
+                            ch.add_user_burst(name, mode, &prefixes);
                         }
                     }
                 }
             }
 
             RPL_ENDOFNAMES => {
-                // After getting the user list, send WHO to get away status
-                if let Some(channel) = params.get(1)
-                    && self.is_channel_name(channel)
-                {
-                    self.send_command(IrcCommand::Who(channel.clone()));
+                if let Some(channel) = params.get(1) {
+                    // NAMES burst complete: dedup and sort the user list once.
+                    if let Some(ch) = self.channels.get_mut(channel) {
+                        ch.finish_user_burst();
+                    }
+                    // After getting the user list, send WHO to get away status
+                    if self.is_channel_name(channel) {
+                        self.send_command(IrcCommand::Who(channel.clone()));
+                    }
                 }
             }
 
@@ -1554,6 +1598,7 @@ impl IrcApp {
             RPL_LISTSTART => {
                 // Clear old list, start collecting
                 self.channel_list.clear();
+                self.channel_list_dirty = true;
                 self.channel_list_loading = true;
                 self.show_channel_list = true;
             }
@@ -1595,26 +1640,28 @@ impl IrcApp {
                 }
 
                 if let Some(name) = channel {
-                    self.channel_list.push(ChannelListEntry {
-                        name,
-                        user_count,
-                        topic,
-                    });
+                    self.channel_list
+                        .push(ChannelListEntry::new(name, user_count, topic));
+                    self.channel_list_dirty = true;
                 } else {
                     // Fallback: if we have at least 3 params, assume standard format
                     // [client, channel, count, topic]
                     if params.len() >= 3 {
-                        self.channel_list.push(ChannelListEntry {
-                            name: params[1].clone(),
-                            user_count: params[2].replace(',', "").parse().unwrap_or(0),
-                            topic: params.get(3).cloned().unwrap_or_default(),
-                        });
+                        self.channel_list.push(ChannelListEntry::new(
+                            params[1].clone(),
+                            params[2].replace(',', "").parse().unwrap_or(0),
+                            params.get(3).cloned().unwrap_or_default(),
+                        ));
+                        self.channel_list_dirty = true;
                     }
                 }
             }
 
             RPL_LISTEND => {
                 self.channel_list_loading = false;
+                // Force a final view refresh in case the streaming throttle
+                // skipped the last appends.
+                self.channel_list_dirty = true;
             }
 
             RPL_AWAY => {
@@ -2013,7 +2060,7 @@ impl IrcApp {
                     self.logging_history_lines,
                 );
                 if !history.is_empty() {
-                    new_channel.messages.push(ChatMessage::system(&format!(
+                    new_channel.messages.push_back(ChatMessage::system(&format!(
                         "--- {} lines of history loaded ---",
                         history.len()
                     )));
@@ -2029,24 +2076,18 @@ impl IrcApp {
             .log_message(&self.server_host, channel, &msg);
 
         if let Some(ch) = self.channels.get_mut(channel) {
-            ch.messages.push(msg);
-            // Limit scrollback
-            if ch.messages.len() > self.max_scrollback {
-                let excess = ch.messages.len() - self.max_scrollback;
-                ch.messages.drain(0..excess);
-            }
-            if self.current_channel.as_ref() != Some(&channel.to_string()) {
+            ch.push_trimmed(msg, self.max_scrollback);
+            if self.current_channel.as_deref() != Some(channel) {
                 ch.unread += 1;
             }
         }
     }
 
     pub fn add_server_message(&mut self, msg: ChatMessage) {
-        self.server_messages.push(msg);
+        self.server_messages.push_back(msg);
         // Limit scrollback
-        if self.server_messages.len() > self.max_scrollback {
-            let excess = self.server_messages.len() - self.max_scrollback;
-            self.server_messages.drain(0..excess);
+        while self.server_messages.len() > self.max_scrollback {
+            self.server_messages.pop_front();
         }
         // Increment unread if not viewing server buffer
         if self.current_channel.is_some() {
@@ -2462,18 +2503,20 @@ impl IrcApp {
         }
 
         ctx.input(|i| {
-            // Alt+1-9 to switch channels
-            // Build ordered list: Server (0), then channels sorted alphabetically
-            let mut tabs: Vec<Option<String>> = vec![None]; // Server buffer is index 0 (Alt+1)
-            let mut channel_names: Vec<_> = self.channels.keys().cloned().collect();
-            channel_names.sort_by_key(|a| a.to_lowercase());
-            for name in channel_names {
-                tabs.push(Some(name));
-            }
-
             // Check Alt+1 through Alt+9
             let alt = i.modifiers.alt;
             if alt {
+                // Alt+1-9 to switch channels. Build the ordered tab list (Server
+                // is index 0, then channels sorted alphabetically) only while Alt
+                // is actually held - building and sorting it every frame is
+                // wasted work on nearly all frames.
+                let mut tabs: Vec<Option<String>> = vec![None]; // Server buffer is index 0 (Alt+1)
+                let mut channel_names: Vec<_> = self.channels.keys().cloned().collect();
+                channel_names.sort_by_key(|a| a.to_lowercase());
+                for name in channel_names {
+                    tabs.push(Some(name));
+                }
+
                 for (idx, key) in [
                     egui::Key::Num1,
                     egui::Key::Num2,
@@ -2552,6 +2595,10 @@ impl eframe::App for IrcApp {
         if has_more {
             ctx.request_repaint();
         }
+
+        // Push this frame's logged lines to disk in one flush per file instead of
+        // one flush syscall per message.
+        self.log_manager.flush_all();
 
         // Execute pending auto-perform commands (one per frame to avoid flooding)
         if let Some(ref mut commands) = self.pending_auto_perform.take()
@@ -2897,13 +2944,23 @@ impl eframe::App for IrcApp {
                         let current_selected = self.selected_user.clone();
                         let mut new_selected: Option<String> = current_selected.clone();
 
-                        ScrollArea::vertical().show(ui, |ui| {
-                            for user in &channel.users {
+                        // Row virtualization: only the visible slice is built each
+                        // frame, which matters for channels with thousands of users.
+                        let row_height = ui.text_style_height(&egui::TextStyle::Body);
+                        ScrollArea::vertical().show_rows(
+                            ui,
+                            row_height,
+                            channel.users.len(),
+                            |ui, row_range| {
+                            for user in &channel.users[row_range] {
                                 let nick = &user.nick;
                                 let mode = &user.mode;
                                 let prefix = mode.prefix();
                                 let is_selected = current_selected.as_ref() == Some(nick);
-                                let is_away = channel.is_user_away(nick);
+                                // The loop already holds the user entry; a
+                                // channel.is_user_away(nick) lookup here would be a
+                                // redundant O(n) scan per user (O(n²) per frame).
+                                let is_away = user.is_away();
 
                                 // Color based on mode, dimmed if away
                                 let base_color = match mode {
@@ -2937,10 +2994,7 @@ impl eframe::App for IrcApp {
                                 let response = ui.selectable_label(is_selected, text);
 
                                 // Show away message on hover
-                                if is_away
-                                    && let Some(user) = channel.get_user(nick)
-                                    && let Some(away_msg) = &user.away
-                                {
+                                if let Some(away_msg) = &user.away {
                                     response
                                         .clone()
                                         .on_hover_text(format!("Away: {}", away_msg));
@@ -2984,7 +3038,8 @@ impl eframe::App for IrcApp {
                                     }
                                 });
                             }
-                        });
+                        },
+                        );
 
                         // Update selected user
                         self.selected_user = new_selected;
@@ -3098,7 +3153,7 @@ impl eframe::App for IrcApp {
 
                                     if msg.is_system {
                                         // System messages with IRC color support
-                                        render_irc_text(ui, &msg.content, Color32::GRAY);
+                                        render_segments(ui, msg.render_segments(), Color32::GRAY);
                                     } else if msg.is_action {
                                         // Action messages - highlighted actions use yellow, own use cyan
                                         let action_color = if msg.is_highlight {
@@ -3112,7 +3167,7 @@ impl eframe::App for IrcApp {
                                             RichText::new(format!("* {} ", msg.sender))
                                                 .color(action_color),
                                         );
-                                        render_irc_text(ui, &msg.content, action_color);
+                                        render_segments(ui, msg.render_segments(), action_color);
                                     } else {
                                         // Regular messages
                                         // Own messages use cyan nick, others use computed color
@@ -3133,7 +3188,7 @@ impl eframe::App for IrcApp {
                                         } else {
                                             Color32::WHITE
                                         };
-                                        render_irc_text(ui, &msg.content, text_color);
+                                        render_segments(ui, msg.render_segments(), text_color);
                                     }
                                 });
                             });
@@ -3316,7 +3371,7 @@ mod tests {
         assert_eq!(app.connection_intent, ConnectionIntent::ManualDisconnect);
         assert!(
             app.server_messages
-                .last()
+                .back()
                 .is_some_and(|m| m.content.contains("Registration failed"))
         );
     }
@@ -3391,7 +3446,7 @@ mod tests {
         assert_eq!(app.my_nick, "mike");
         assert!(
             app.server_messages
-                .last()
+                .back()
                 .is_some_and(|m| m.content.contains("john"))
         );
     }

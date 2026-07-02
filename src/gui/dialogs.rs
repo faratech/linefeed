@@ -631,50 +631,69 @@ impl IrcApp {
         });
     }
 
+    /// Recompute the channel-list view (filtered + sorted row indices) only when
+    /// the underlying list, the filter text, or the sort order actually changed.
+    /// While the list is still streaming in from the server, refresh at most a
+    /// few times per second instead of re-sorting tens of thousands of rows on
+    /// every frame.
+    fn ensure_channel_list_cache(&mut self) {
+        use super::types::{ChannelListSort, SortDirection};
+
+        let sort_key = (self.channel_list_sort, self.channel_list_sort_dir);
+        let filter_changed = self.channel_list_filter != self.channel_list_cache_filter;
+        let sort_changed = sort_key != self.channel_list_cache_sort;
+        if !self.channel_list_dirty && !filter_changed && !sort_changed {
+            return;
+        }
+        if self.channel_list_loading
+            && !filter_changed
+            && !sort_changed
+            && let Some(last) = self.channel_list_last_refilter
+            && last.elapsed() < std::time::Duration::from_millis(250)
+        {
+            return; // throttled; channel_list_dirty stays set for the next pass
+        }
+        self.channel_list_last_refilter = Some(std::time::Instant::now());
+        self.channel_list_dirty = false;
+        self.channel_list_cache_filter = self.channel_list_filter.clone();
+        self.channel_list_cache_sort = sort_key;
+
+        let filter = self.channel_list_filter.to_lowercase();
+        let list = &self.channel_list;
+        let mut rows: Vec<usize> = (0..list.len())
+            .filter(|&i| {
+                filter.is_empty()
+                    || list[i].name_lower.contains(&filter)
+                    || list[i].topic_lower.contains(&filter)
+            })
+            .collect();
+        rows.sort_by(|&a, &b| {
+            let (a, b) = (&list[a], &list[b]);
+            let cmp = match self.channel_list_sort {
+                ChannelListSort::Channel => a.name_lower.cmp(&b.name_lower),
+                ChannelListSort::Users => a.user_count.cmp(&b.user_count),
+                ChannelListSort::Topic => a.topic_lower.cmp(&b.topic_lower),
+            };
+            match self.channel_list_sort_dir {
+                SortDirection::Ascending => cmp,
+                SortDirection::Descending => cmp.reverse(),
+            }
+        });
+        self.channel_list_cache = rows;
+    }
+
     pub fn show_channel_list_window(&mut self, ctx: &egui::Context) {
-        use super::formatting::strip_irc_formatting;
         use super::types::{ChannelListSort, SortDirection};
 
         let mut close = false;
         let mut join_channel: Option<String> = None;
 
+        self.ensure_channel_list_cache();
+
         egui::Window::new("Channel List")
             .resizable(false)
             .fixed_size([600.0, 400.0])
             .show(ctx, |ui| {
-                // Pre-filter and sort the channel list
-                let filter = self.channel_list_filter.to_lowercase();
-                let mut filtered: Vec<_> = if filter.is_empty() {
-                    self.channel_list.iter().collect()
-                } else {
-                    self.channel_list
-                        .iter()
-                        .filter(|e| {
-                            e.name.to_lowercase().contains(&filter)
-                                || e.topic.to_lowercase().contains(&filter)
-                        })
-                        .collect()
-                };
-
-                // Sort the filtered list
-                let sort_col = self.channel_list_sort;
-                let sort_dir = self.channel_list_sort_dir;
-                filtered.sort_by(|a, b| {
-                    let cmp = match sort_col {
-                        ChannelListSort::Channel => {
-                            a.name.to_lowercase().cmp(&b.name.to_lowercase())
-                        }
-                        ChannelListSort::Users => a.user_count.cmp(&b.user_count),
-                        ChannelListSort::Topic => {
-                            a.topic.to_lowercase().cmp(&b.topic.to_lowercase())
-                        }
-                    };
-                    match sort_dir {
-                        SortDirection::Ascending => cmp,
-                        SortDirection::Descending => cmp.reverse(),
-                    }
-                });
-
                 // Filter input and status
                 ui.horizontal(|ui| {
                     ui.label("Filter:");
@@ -684,7 +703,7 @@ impl IrcApp {
                     ui.add_space(8.0);
                     ui.label(format!(
                         "{}/{} channels",
-                        filtered.len(),
+                        self.channel_list_cache.len(),
                         self.channel_list.len()
                     ));
                     if self.channel_list.is_empty() && !self.channel_list_loading {
@@ -794,14 +813,20 @@ impl IrcApp {
                 let current_selected = self.channel_list_selected.clone();
                 let mut new_selected = current_selected.clone();
                 let row_height = 16.0;
-                let total_rows = filtered.len();
+                let total_rows = self.channel_list_cache.len();
 
                 ScrollArea::vertical()
                     .auto_shrink([false; 2])
                     .max_height(280.0)
                     .show_rows(ui, row_height, total_rows, |ui, row_range| {
                         for row_idx in row_range {
-                            let entry = &filtered[row_idx];
+                            let Some(entry) = self
+                                .channel_list_cache
+                                .get(row_idx)
+                                .and_then(|&i| self.channel_list.get(i))
+                            else {
+                                continue;
+                            };
                             let is_selected = current_selected.as_ref() == Some(&entry.name);
 
                             // Alternate row background
@@ -841,7 +866,7 @@ impl IrcApp {
 
                                 // Context menu
                                 let channel_name = entry.name.clone();
-                                let channel_topic = strip_irc_formatting(&entry.topic);
+                                let channel_topic = entry.topic_clean.clone();
                                 let channel_users = entry.user_count;
                                 response.context_menu(|ui| {
                                     ui.set_max_width(300.0);
@@ -879,12 +904,11 @@ impl IrcApp {
                                     ),
                                 );
 
-                                // Topic (clipped, with IRC formatting stripped)
-                                let clean_topic = strip_irc_formatting(&entry.topic);
+                                // Topic (clipped, with IRC formatting pre-stripped)
                                 ui.add_sized(
                                     [topic_width, row_height],
                                     egui::Label::new(
-                                        RichText::new(&clean_topic).color(Color32::GRAY),
+                                        RichText::new(&entry.topic_clean).color(Color32::GRAY),
                                     )
                                     .truncate(),
                                 );
@@ -914,6 +938,7 @@ impl IrcApp {
 
                     if ui.button("Refresh").clicked() {
                         self.channel_list.clear();
+                        self.channel_list_dirty = true;
                         self.channel_list_selected = None;
                         self.channel_list_loading = true;
                         // >N means "more than N users", so for min 5, send >4
@@ -951,16 +976,19 @@ impl IrcApp {
             None => return,
         };
 
-        let channel_data = self.channels.get(&channel_name).cloned();
-
         let mut close = false;
+        // Button actions are deferred to after the window closure so the channel
+        // can be borrowed instead of deep-cloned (cloning the full scrollback,
+        // user list, and bans every frame is several MB of allocation traffic).
+        let mut load_ban_list = false;
+        let mut refresh = false;
 
         egui::Window::new(format!("Channel Info: {}", channel_name))
             .collapsible(false)
             .resizable(true)
             .default_size([500.0, 400.0])
             .show(ctx, |ui| {
-                if let Some(ch) = channel_data {
+                if let Some(ch) = self.channels.get(&channel_name) {
                     // Channel name and modes
                     ui.horizontal(|ui| {
                         ui.label(RichText::new(&channel_name).strong().size(16.0));
@@ -1024,18 +1052,18 @@ impl IrcApp {
 
                     ui.separator();
 
-                    // Ban list section
-                    ui.collapsing(format!("Ban List ({})", ch.bans.len()), |ui| {
+    // Ban list section. The stable id_salt keeps the section's
+                    // open/closed state when the count in the title changes
+                    // (a title-derived id would collapse it on every new entry).
+                    egui::CollapsingHeader::new(format!("Ban List ({})", ch.bans.len()))
+                        .id_salt("channel_info_bans")
+                        .show(ui, |ui| {
                         if ch.bans.is_empty() {
                             if ch.ban_list_complete {
                                 ui.label(RichText::new("No bans").italics().color(Color32::GRAY));
                             } else {
                                 if ui.button("Load Ban List").clicked() {
-                                    self.send_command(IrcCommand::Mode(
-                                        channel_name.clone(),
-                                        Some("+b".to_string()),
-                                        Vec::new(),
-                                    ));
+                                    load_ban_list = true;
                                 }
                             }
                         } else {
@@ -1060,8 +1088,10 @@ impl IrcApp {
 
                     ui.separator();
 
-                    // User list section
-                    ui.collapsing(format!("Users ({})", ch.users.len()), |ui| {
+                    // User list section (stable id_salt: see ban list above).
+                    egui::CollapsingHeader::new(format!("Users ({})", ch.users.len()))
+                        .id_salt("channel_info_users")
+                        .show(ui, |ui| {
                         ScrollArea::vertical().max_height(150.0).show(ui, |ui| {
                             ui.horizontal_wrapped(|ui| {
                                 for user in &ch.users {
@@ -1083,13 +1113,7 @@ impl IrcApp {
                 ui.separator();
                 ui.horizontal(|ui| {
                     if ui.button("Refresh").clicked() {
-                        // Request fresh channel info
-                        self.send_command(IrcCommand::Mode(channel_name.clone(), None, Vec::new()));
-                        // Clear and re-request ban list
-                        if let Some(ch) = self.channels.get_mut(&channel_name) {
-                            ch.bans.clear();
-                            ch.ban_list_complete = false;
-                        }
+                        refresh = true;
                     }
                     if ui.button("Close").clicked() {
                         close = true;
@@ -1097,6 +1121,22 @@ impl IrcApp {
                 });
             });
 
+        if load_ban_list {
+            self.send_command(IrcCommand::Mode(
+                channel_name.clone(),
+                Some("+b".to_string()),
+                Vec::new(),
+            ));
+        }
+        if refresh {
+            // Request fresh channel info
+            self.send_command(IrcCommand::Mode(channel_name.clone(), None, Vec::new()));
+            // Clear and re-request ban list
+            if let Some(ch) = self.channels.get_mut(&channel_name) {
+                ch.bans.clear();
+                ch.ban_list_complete = false;
+            }
+        }
         if close {
             self.show_channel_info = false;
             self.channel_info_target = None;

@@ -1,7 +1,10 @@
 //! Core types for the IRC GUI
 
+use super::formatting::{RenderSegment, layout_irc_text, strip_irc_formatting};
 use super::helpers::current_time_formatted;
 use serde::{Deserialize, Serialize};
+use std::cell::OnceCell;
+use std::collections::VecDeque;
 use std::path::PathBuf;
 
 /// Sort column for channel list
@@ -190,9 +193,18 @@ pub struct ChatMessage {
     pub is_action: bool,
     pub is_system: bool,
     pub is_highlight: bool,
+    /// Parsed formatting + URL segments, computed lazily on first render.
+    /// Content never changes after construction, so the cache never invalidates.
+    pub render_cache: OnceCell<Vec<RenderSegment>>,
 }
 
 impl ChatMessage {
+    /// Render-ready segments for this message, parsed once and cached.
+    pub fn render_segments(&self) -> &[RenderSegment] {
+        self.render_cache
+            .get_or_init(|| layout_irc_text(&self.content))
+    }
+
     pub fn new_fmt(sender: &str, content: &str, format: &str) -> Self {
         Self {
             timestamp: current_time_formatted(format),
@@ -201,6 +213,7 @@ impl ChatMessage {
             is_action: false,
             is_system: false,
             is_highlight: false,
+            render_cache: OnceCell::new(),
         }
     }
 
@@ -216,6 +229,7 @@ impl ChatMessage {
             is_action: false,
             is_system: true,
             is_highlight: false,
+            render_cache: OnceCell::new(),
         }
     }
 
@@ -227,6 +241,7 @@ impl ChatMessage {
             is_action: true,
             is_system: false,
             is_highlight: false,
+            render_cache: OnceCell::new(),
         }
     }
 
@@ -238,6 +253,7 @@ impl ChatMessage {
             is_action: false,
             is_system: false,
             is_highlight: true,
+            render_cache: OnceCell::new(),
         }
     }
 
@@ -249,6 +265,7 @@ impl ChatMessage {
             is_action: true,
             is_system: false,
             is_highlight: true,
+            render_cache: OnceCell::new(),
         }
     }
 
@@ -363,7 +380,7 @@ pub struct Channel {
     pub mode_params: Vec<String>, // Mode parameters (limit, key, etc.)
     pub created: Option<u64>,     // Channel creation timestamp
     pub users: Vec<ChannelUser>,
-    pub messages: Vec<ChatMessage>,
+    pub messages: VecDeque<ChatMessage>,
     pub unread: usize,
     pub key: Option<String>, // Channel key for auto-rejoin
     pub bans: Vec<BanEntry>,
@@ -380,7 +397,7 @@ impl Channel {
             mode_params: Vec::new(),
             created: None,
             users: Vec::new(),
-            messages: Vec::new(),
+            messages: VecDeque::new(),
             unread: 0,
             key: None,
             bans: Vec::new(),
@@ -408,6 +425,28 @@ impl Channel {
                 .push(ChannelUser::new(clean_nick.to_string(), mode));
             self.sort_users();
         }
+    }
+
+    /// Insert a user without sorting or duplicate checking. Used while streaming
+    /// a NAMES burst, where a per-insert sort would make a large join O(N²·logN);
+    /// the caller MUST invoke `finish_user_burst` when the burst completes
+    /// (RPL_ENDOFNAMES) to dedup and sort once.
+    pub fn add_user_burst(&mut self, nick: &str, mode: UserMode, prefixes: &str) {
+        let clean_nick = nick.trim_start_matches(|c| prefixes.contains(c));
+        if clean_nick.is_empty() {
+            return;
+        }
+        self.users
+            .push(ChannelUser::new(clean_nick.to_string(), mode));
+    }
+
+    /// Dedup (keeping the first, state-carrying entry) and sort after a NAMES
+    /// burst. Safe to call even if no burst inserts happened.
+    pub fn finish_user_burst(&mut self) {
+        let mut seen: std::collections::HashSet<String> =
+            std::collections::HashSet::with_capacity(self.users.len());
+        self.users.retain(|u| seen.insert(u.nick.to_lowercase()));
+        self.sort_users();
     }
 
     pub fn set_user_mode(&mut self, nick: &str, mode: UserMode) {
@@ -467,15 +506,16 @@ impl Channel {
     /// Used by callers that push directly to `messages` (e.g. Quit/Nick loops
     /// over all channels) so they respect the same cap as add_message_to_channel.
     pub fn push_trimmed(&mut self, msg: ChatMessage, max: usize) {
-        self.messages.push(msg);
-        if max > 0 && self.messages.len() > max {
-            let excess = self.messages.len() - max;
-            self.messages.drain(0..excess);
+        self.messages.push_back(msg);
+        if max > 0 {
+            while self.messages.len() > max {
+                self.messages.pop_front();
+            }
         }
     }
 
     pub fn has_user(&self, nick: &str) -> bool {
-        self.users.iter().any(|u| u.nick.eq_ignore_ascii_case(nick))
+        self.get_user(nick).is_some()
     }
 
     pub fn get_user(&self, nick: &str) -> Option<&ChannelUser> {
@@ -491,10 +531,14 @@ impl Channel {
     }
 
     fn sort_users(&mut self) {
+        // Case-insensitive comparison without allocating per comparison (nick
+        // casing on IRC is ASCII-folded; full Unicode folding is unnecessary).
         self.users.sort_by(|a, b| {
-            a.mode
-                .cmp(&b.mode)
-                .then_with(|| a.nick.to_lowercase().cmp(&b.nick.to_lowercase()))
+            a.mode.cmp(&b.mode).then_with(|| {
+                let a_bytes = a.nick.as_bytes().iter().map(u8::to_ascii_lowercase);
+                let b_bytes = b.nick.as_bytes().iter().map(u8::to_ascii_lowercase);
+                a_bytes.cmp(b_bytes)
+            })
         });
     }
 
@@ -512,23 +556,40 @@ impl Channel {
         }
     }
 
-    /// Check if a user is away
-    pub fn is_user_away(&self, nick: &str) -> bool {
-        self.get_user(nick).map(|u| u.is_away()).unwrap_or(false)
-    }
-
     /// Get count of away users
     pub fn away_count(&self) -> usize {
         self.users.iter().filter(|u| u.is_away()).count()
     }
 }
 
-/// Entry in the channel list dialog
+/// Entry in the channel list dialog. Derived keys (lowercase name, stripped
+/// topic) are computed once at insert so filtering and sorting up to 50k rows
+/// is allocation-free.
 #[derive(Debug, Clone)]
 pub struct ChannelListEntry {
     pub name: String,
     pub user_count: usize,
-    pub topic: String,
+    /// Lowercased name, for filtering and sorting.
+    pub name_lower: String,
+    /// Topic with IRC formatting stripped, for display.
+    pub topic_clean: String,
+    /// Lowercased stripped topic, for filtering and sorting.
+    pub topic_lower: String,
+}
+
+impl ChannelListEntry {
+    pub fn new(name: String, user_count: usize, topic: String) -> Self {
+        let name_lower = name.to_lowercase();
+        let topic_clean = strip_irc_formatting(&topic);
+        let topic_lower = topic_clean.to_lowercase();
+        Self {
+            name,
+            user_count,
+            name_lower,
+            topic_clean,
+            topic_lower,
+        }
+    }
 }
 
 /// Tab completion state
@@ -537,4 +598,45 @@ pub struct TabCompletion {
     pub prefix: String,
     pub matches: Vec<String>,
     pub index: usize,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn user_burst_dedups_and_sorts_once() {
+        let mut ch = Channel::new();
+        ch.add_user("zed", UserMode::Normal);
+        ch.set_user_away("zed", Some("afk".to_string()));
+        // A NAMES refresh streams in, including a duplicate of the existing user.
+        ch.add_user_burst("@alice", UserMode::Op, "~&@%+");
+        ch.add_user_burst("ZED", UserMode::Normal, "~&@%+");
+        ch.add_user_burst("bob", UserMode::Normal, "~&@%+");
+        ch.finish_user_burst();
+
+        let nicks: Vec<&str> = ch.users.iter().map(|u| u.nick.as_str()).collect();
+        assert_eq!(nicks, vec!["alice", "bob", "zed"]);
+        // The original, state-carrying entry survived the dedup.
+        assert!(ch.get_user("zed").unwrap().is_away());
+    }
+
+    #[test]
+    fn push_trimmed_caps_scrollback() {
+        let mut ch = Channel::new();
+        for i in 0..10 {
+            ch.push_trimmed(ChatMessage::system(&format!("m{}", i)), 5);
+        }
+        assert_eq!(ch.messages.len(), 5);
+        assert_eq!(ch.messages.front().unwrap().content, "m5");
+        assert_eq!(ch.messages.back().unwrap().content, "m9");
+    }
+
+    #[test]
+    fn channel_list_entry_precomputes_keys() {
+        let e = ChannelListEntry::new("#Rust".into(), 42, "\x0304Hot\x03 topic".into());
+        assert_eq!(e.name_lower, "#rust");
+        assert_eq!(e.topic_clean, "Hot topic");
+        assert_eq!(e.topic_lower, "hot topic");
+    }
 }

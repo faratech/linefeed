@@ -413,6 +413,7 @@ impl IrcApp {
             "LIST" => {
                 // Prepare the channel list dialog
                 self.channel_list.clear();
+                self.channel_list_dirty = true;
                 self.channel_list_loading = true;
                 self.show_channel_list = true;
 

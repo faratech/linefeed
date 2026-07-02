@@ -54,7 +54,18 @@ impl LogManager {
             }
         };
         f(writer);
-        let _ = writer.flush();
+        // Flushing is deferred to flush_all(), called once per GUI frame, so a
+        // message flood does not pay one flush syscall per logged line.
+    }
+
+    /// Flush all cached writers. Called once per frame (and on shutdown via
+    /// BufWriter's Drop) instead of after every logged line.
+    pub fn flush_all(&self) {
+        for (path, writer) in self.writers.borrow_mut().iter_mut() {
+            if let Err(e) = writer.flush() {
+                tracing::error!("Failed to flush log file {:?}: {}", path, e);
+            }
+        }
     }
 
     /// Get the log file path for a channel/query
@@ -90,6 +101,12 @@ impl LogManager {
         }
 
         let path = self.log_path(network, channel);
+
+        // Push any buffered-but-unflushed lines for this target to disk first,
+        // so freshly logged messages are visible to the history read below.
+        if let Some(writer) = self.writers.borrow_mut().get_mut(&path) {
+            let _ = writer.flush();
+        }
 
         let mut file = match File::open(&path) {
             Ok(f) => f,
@@ -213,6 +230,7 @@ fn parse_log_line(line: &str) -> Option<ChatMessage> {
             is_action: false,
             is_system: true,
             is_highlight: false,
+            render_cache: Default::default(),
         })
     } else if let Some(action_rest) = rest.strip_prefix("* ") {
         // Action message: "* nick does something"
@@ -225,6 +243,7 @@ fn parse_log_line(line: &str) -> Option<ChatMessage> {
                 is_action: true,
                 is_system: false,
                 is_highlight: false,
+                render_cache: Default::default(),
             })
         } else {
             None
@@ -241,6 +260,7 @@ fn parse_log_line(line: &str) -> Option<ChatMessage> {
                 is_action: false,
                 is_system: false,
                 is_highlight: false,
+                render_cache: Default::default(),
             })
         } else {
             None
@@ -253,7 +273,10 @@ fn parse_log_line(line: &str) -> Option<ChatMessage> {
 /// Read the last N lines from a file by reading backwards in chunks
 fn read_last_n_lines(file: &mut File, file_size: u64, max_lines: usize) -> Vec<String> {
     const CHUNK_SIZE: u64 = 8192;
-    let mut remaining_bytes: Vec<u8> = Vec::new();
+    // Chunks are collected newest-first and concatenated once at the end;
+    // prepending per chunk would re-copy the accumulated buffer every
+    // iteration (O(k²) memcpy on large history loads).
+    let mut chunks_rev: Vec<Vec<u8>> = Vec::new();
     let mut pos = file_size;
     let mut newline_count = 0usize;
 
@@ -273,12 +296,14 @@ fn read_last_n_lines(file: &mut File, file_size: u64, max_lines: usize) -> Vec<S
         }
 
         newline_count += chunk.iter().filter(|&&b| b == b'\n').count();
-
-        // Prepend this chunk to what we have so far.
-        chunk.extend_from_slice(&remaining_bytes);
-        remaining_bytes = chunk;
-
+        chunks_rev.push(chunk);
         pos = chunk_start;
+    }
+
+    let total_len: usize = chunks_rev.iter().map(Vec::len).sum();
+    let mut remaining_bytes: Vec<u8> = Vec::with_capacity(total_len);
+    for chunk in chunks_rev.iter().rev() {
+        remaining_bytes.extend_from_slice(chunk);
     }
 
     // Decode once (not per chunk), then return only the last `max_lines` lines.
@@ -329,6 +354,7 @@ mod tests {
             is_action: action,
             is_system: system,
             is_highlight: false,
+            render_cache: Default::default(),
         }
     }
 
