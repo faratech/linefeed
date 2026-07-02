@@ -1077,6 +1077,28 @@ impl IrcApp {
                         channel.rename_user(&old_nick, new_nick);
                     }
                 }
+                // Re-key an open query (PM) window so the conversation follows
+                // the rename: otherwise new messages open a second tab under
+                // the new nick and replies in the stale tab go to the old nick.
+                let query_key = self
+                    .channels
+                    .keys()
+                    .find(|k| !self.is_channel_name(k) && k.eq_ignore_ascii_case(&old_nick))
+                    .cloned();
+                if let Some(key) = query_key
+                    && !self
+                        .channels
+                        .keys()
+                        .any(|k| k.eq_ignore_ascii_case(new_nick))
+                    && let Some(mut ch) = self.channels.remove(&key)
+                {
+                    ch.push_trimmed(sys_msg, max);
+                    let was_current = self.current_channel.as_deref() == Some(key.as_str());
+                    self.channels.insert(new_nick.clone(), ch);
+                    if was_current {
+                        self.current_channel = Some(new_nick.clone());
+                    }
+                }
             }
 
             IrcCommand::Topic(channel, topic) => {
@@ -3373,6 +3395,15 @@ mod tests {
         })
     }
 
+    /// A connected app whose outgoing commands can be inspected.
+    fn test_app_connected() -> (IrcApp, mpsc::UnboundedReceiver<IrcCommand>) {
+        let mut app = test_app();
+        let (tx, rx) = mpsc::unbounded_channel();
+        app.cmd_tx = Some(tx);
+        app.connected = true;
+        (app, rx)
+    }
+
     #[test]
     fn isupport_updates_channel_types() {
         let mut app = test_app();
@@ -3562,6 +3593,103 @@ mod tests {
         assert!(!app.connection_lost);
         assert!(!app.should_reconnect());
         assert!(app.auto_reconnect, "persisted setting must not be flipped");
+    }
+
+    #[test]
+    fn msg_with_doubled_space_still_reaches_target() {
+        let (mut app, mut rx) = test_app_connected();
+        app.process_command("/msg  alice hi");
+        match rx.try_recv() {
+            Ok(IrcCommand::Privmsg(target, content)) => {
+                assert_eq!(target, "alice");
+                assert_eq!(content, "hi");
+            }
+            other => panic!("expected Privmsg, got {:?}", other),
+        }
+        assert!(!app.channels.contains_key(""), "no phantom empty-name tab");
+    }
+
+    #[test]
+    fn kickban_with_hostmask_bans_mask_and_skips_kick() {
+        let (mut app, mut rx) = test_app_connected();
+        app.channels.insert("#chan".to_string(), Channel::new());
+        app.current_channel = Some("#chan".to_string());
+
+        app.process_command("/kb *!*@spam.example.com flooding");
+        match rx.try_recv() {
+            Ok(IrcCommand::Mode(chan, mode, params)) => {
+                assert_eq!(chan, "#chan");
+                assert_eq!(mode.as_deref(), Some("+b"));
+                assert_eq!(params, vec!["*!*@spam.example.com".to_string()]);
+            }
+            other => panic!("expected Mode, got {:?}", other),
+        }
+        assert!(rx.try_recv().is_err(), "no KICK for a hostmask");
+
+        // A bare nick still bans nick!*@* and kicks.
+        app.process_command("/kb spammer flooding");
+        match rx.try_recv() {
+            Ok(IrcCommand::Mode(_, _, params)) => {
+                assert_eq!(params, vec!["spammer!*@*".to_string()]);
+            }
+            other => panic!("expected Mode, got {:?}", other),
+        }
+        match rx.try_recv() {
+            Ok(IrcCommand::Kick(chan, nick, reason)) => {
+                assert_eq!(chan, "#chan");
+                assert_eq!(nick, "spammer");
+                assert_eq!(reason.as_deref(), Some("flooding"));
+            }
+            other => panic!("expected Kick, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn monitor_attached_sign_is_parsed() {
+        let (mut app, mut rx) = test_app_connected();
+        app.process_command("/monitor +friend");
+        match rx.try_recv() {
+            Ok(IrcCommand::Monitor(sub, targets)) => {
+                assert_eq!(sub, "+");
+                assert_eq!(targets.as_deref(), Some("friend"));
+            }
+            other => panic!("expected Monitor, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn part_while_disconnected_closes_window_locally() {
+        let mut app = test_app();
+        app.channels.insert("#stale".to_string(), Channel::new());
+        app.current_channel = Some("#stale".to_string());
+
+        app.process_command("/part");
+
+        assert!(!app.channels.contains_key("#stale"));
+        assert_ne!(app.current_channel.as_deref(), Some("#stale"));
+    }
+
+    #[test]
+    fn nick_change_rekeys_query_window() {
+        let mut app = test_app();
+        let mut query = Channel::new();
+        query.push_trimmed(ChatMessage::system("old talk"), 100);
+        app.channels.insert("alice".to_string(), query);
+        app.current_channel = Some("alice".to_string());
+
+        let msg = IrcMessage::parse(":alice!u@h NICK :alice2").unwrap();
+        app.handle_incoming_message(msg);
+
+        assert!(!app.channels.contains_key("alice"));
+        let renamed = app.channels.get("alice2").expect("window re-keyed");
+        assert!(renamed.messages.iter().any(|m| m.content.contains("old talk")));
+        assert!(
+            renamed
+                .messages
+                .iter()
+                .any(|m| m.content.contains("alice is now known as alice2"))
+        );
+        assert_eq!(app.current_channel.as_deref(), Some("alice2"));
     }
 
     #[test]
