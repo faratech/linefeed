@@ -210,25 +210,7 @@ impl Settings {
         // Write to a temp file and rename over the original: a crash or power
         // loss mid-write can then never leave settings.json truncated.
         let tmp = path.with_extension("json.tmp");
-        let write_result = (|| {
-            #[cfg(unix)]
-            {
-                use std::io::Write;
-                use std::os::unix::fs::OpenOptionsExt;
-                let mut file = std::fs::OpenOptions::new()
-                    .write(true)
-                    .create(true)
-                    .truncate(true)
-                    .mode(0o600) // contains server and SASL passwords
-                    .open(&tmp)?;
-                file.write_all(data.as_bytes())?;
-                file.sync_all()
-            }
-            #[cfg(not(unix))]
-            {
-                std::fs::write(&tmp, &data)
-            }
-        })();
+        let write_result = write_settings_file(&tmp, &data);
         match write_result.and_then(|_| std::fs::rename(&tmp, &path)) {
             Ok(_) => tracing::debug!("Saved settings to {:?}", path),
             Err(e) => {
@@ -237,6 +219,28 @@ impl Settings {
             }
         }
     }
+}
+
+/// Write the settings payload to `tmp`, private (0600) on Unix since it
+/// contains server and SASL passwords, and fsynced so the atomic rename that
+/// follows lands on durable bytes.
+#[cfg(unix)]
+fn write_settings_file(tmp: &std::path::Path, data: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(tmp)?;
+    file.write_all(data.as_bytes())?;
+    file.sync_all()
+}
+
+#[cfg(not(unix))]
+fn write_settings_file(tmp: &std::path::Path, data: &str) -> std::io::Result<()> {
+    std::fs::write(tmp, data)
 }
 
 /// A chat message with metadata

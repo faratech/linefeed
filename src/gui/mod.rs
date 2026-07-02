@@ -575,12 +575,11 @@ impl IrcApp {
             });
         }
 
-        // On Windows, flash the taskbar to alert the user
+        // On Windows, flash the taskbar - or, when hidden to the tray (no
+        // taskbar button to flash), show a tray balloon instead.
         #[cfg(windows)]
         {
-            let _ = (title, body); // Used for logging above
-            // Flash taskbar via the tray module
-            crate::systray::flash_window();
+            crate::systray::notify(title, body);
         }
     }
 

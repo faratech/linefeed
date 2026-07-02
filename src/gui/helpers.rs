@@ -90,6 +90,8 @@ fn epoch_to_local_parts(secs: u64) -> (u64, u64, u64, u64, u64) {
 fn windows_local_offset_secs() -> i64 {
     use std::mem::MaybeUninit;
     use std::time::{SystemTime, UNIX_EPOCH};
+    // Mirrors the Win32 struct name.
+    #[allow(clippy::upper_case_acronyms)]
     #[repr(C)]
     struct SYSTEMTIME {
         year: u16,

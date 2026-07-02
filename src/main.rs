@@ -124,16 +124,19 @@ fn setup_fonts(ctx: &egui::Context) {
 #[cfg(windows)]
 fn enable_efficiency_mode() {
     use windows::Win32::System::Threading::{
-        GetCurrentProcess, IDLE_PRIORITY_CLASS, PROCESS_POWER_THROTTLING_EXECUTION_SPEED,
+        GetCurrentProcess, PROCESS_POWER_THROTTLING_EXECUTION_SPEED,
         PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION, PROCESS_POWER_THROTTLING_STATE,
-        ProcessPowerThrottling, SetPriorityClass, SetProcessInformation,
+        ProcessPowerThrottling, SetProcessInformation,
     };
 
     unsafe {
         let handle = GetCurrentProcess();
 
-        // Set to idle priority class (lowest scheduling priority)
-        let _ = SetPriorityClass(handle, IDLE_PRIORITY_CLASS);
+        // Note: deliberately no SetPriorityClass(IDLE_PRIORITY_CLASS) here.
+        // Idle priority starves the UI and the IRC connection thread whenever
+        // anything else saturates the CPU (frozen UI, delayed PONGs leading to
+        // server ping timeouts). EcoQoS below provides the power savings
+        // without starvation.
 
         // Enable EcoQoS power throttling
         let mut throttle_state = PROCESS_POWER_THROTTLING_STATE {
@@ -201,11 +204,6 @@ fn ensure_single_instance() -> bool {
 
 fn main() -> eframe::Result<()> {
     // Check for existing instance FIRST (before any GUI setup)
-    #[cfg(windows)]
-    {
-        systray::setup_event_handler();
-    }
-
     if !ensure_single_instance() {
         // Another instance is running, exit silently
         return Ok(());
@@ -312,14 +310,15 @@ impl eframe::App for LinefeedApp {
             }
 
             // Intercept X button when minimize_to_tray is enabled (only when visible)
-            if self.app.minimize_to_tray && systray::is_active() {
-                if ctx.input(|i| i.viewport().close_requested()) {
-                    ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-                    // Tell egui we're minimized so it stops rendering
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
-                    systray::hide_window();
-                    return;
-                }
+            if self.app.minimize_to_tray
+                && systray::is_active()
+                && ctx.input(|i| i.viewport().close_requested())
+            {
+                ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                // Tell egui we're minimized so it stops rendering
+                ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+                systray::hide_window();
+                return;
             }
         }
 

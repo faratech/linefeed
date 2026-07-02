@@ -72,18 +72,31 @@ END
         ])
         .status();
 
+    // Failures use cargo:warning so they are actually visible in build output
+    // (eprintln! from a build script is swallowed unless the script fails).
     match status {
         Ok(s) if s.success() => {
             println!("cargo:rustc-link-arg={}", res_path.display());
         }
         Ok(s) => {
-            eprintln!("Warning: windres failed with status: {}", s);
+            println!(
+                "cargo:warning=windres failed with status {}: the Windows exe will have no icon/version resources",
+                s
+            );
         }
         Err(e) => {
-            eprintln!("Warning: Failed to run windres: {}", e);
+            println!(
+                "cargo:warning=failed to run windres ({}): {}. The Windows exe will have no icon/version resources; is llvm-mingw on PATH or LLVM_MINGW_HOME set?",
+                windres, e
+            );
         }
     }
 
     println!("cargo:rerun-if-changed=assets/linefeed.ico");
     println!("cargo:rerun-if-changed=build.rs");
+    // Re-run when the toolchain location changes, so installing/fixing
+    // llvm-mingw actually restores the resources on the next build instead of
+    // silently reusing the resource-less result until `cargo clean`.
+    println!("cargo:rerun-if-env-changed=LLVM_MINGW_HOME");
+    println!("cargo:rerun-if-env-changed=PATH");
 }
