@@ -1160,6 +1160,10 @@ impl IrcApp {
                             msgs.iter()
                                 .rev()
                                 .take(500)
+                                // Skip display-only output (previous search
+                                // results, /help text) so a repeated search
+                                // does not match its own banner and results.
+                                .filter(|msg| !msg.no_log)
                                 .filter(|msg| {
                                     msg.content.to_lowercase().contains(&pattern)
                                         || msg.sender.to_lowercase().contains(&pattern)
@@ -1174,18 +1178,17 @@ impl IrcApp {
                         }
                     };
 
-                    // Now display results
-                    self.add_message_to_current(ChatMessage::system(&format!(
-                        "Searching for: {}",
-                        args
-                    )));
+                    // Now display results (display-only: kept out of the log file)
+                    self.add_message_to_current(
+                        ChatMessage::system(&format!("Searching for: {}", args)).without_logging(),
+                    );
                     for match_line in &matches {
-                        self.add_message_to_current(ChatMessage::system(match_line));
+                        self.add_message_to_current(ChatMessage::system(match_line).without_logging());
                     }
-                    self.add_message_to_current(ChatMessage::system(&format!(
-                        "Found {} matches",
-                        matches.len()
-                    )));
+                    self.add_message_to_current(
+                        ChatMessage::system(&format!("Found {} matches", matches.len()))
+                            .without_logging(),
+                    );
                 } else {
                     self.add_message_to_current(ChatMessage::system("Usage: /lastlog <pattern>"));
                 }
@@ -1384,9 +1387,10 @@ impl IrcApp {
         ];
 
         for (section, commands) in help_sections {
-            self.add_message_to_current(ChatMessage::system(section));
+            // Display-only: help text does not belong in the persistent chat log.
+            self.add_message_to_current(ChatMessage::system(section).without_logging());
             for cmd in commands {
-                self.add_message_to_current(ChatMessage::system(cmd));
+                self.add_message_to_current(ChatMessage::system(cmd).without_logging());
             }
         }
     }

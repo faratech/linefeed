@@ -155,30 +155,85 @@ impl Settings {
     pub fn load() -> Self {
         if let Some(path) = Self::config_path()
             && path.exists()
-            && let Ok(data) = std::fs::read_to_string(&path)
-            && let Ok(settings) = serde_json::from_str(&data)
         {
-            tracing::info!("Loaded settings from {:?}", path);
-            return settings;
+            match std::fs::read_to_string(&path) {
+                Ok(data) => match serde_json::from_str(&data) {
+                    Ok(settings) => {
+                        tracing::info!("Loaded settings from {:?}", path);
+                        return settings;
+                    }
+                    Err(e) => {
+                        // Preserve the unreadable file instead of leaving it to be
+                        // overwritten: starting with defaults and then saving would
+                        // permanently destroy every server favorite (and stored
+                        // password) after e.g. a torn write.
+                        tracing::error!("Failed to parse settings file {:?}: {}", path, e);
+                        let backup = path.with_extension("json.bak");
+                        match std::fs::rename(&path, &backup) {
+                            Ok(_) => tracing::warn!(
+                                "Unreadable settings file backed up to {:?}",
+                                backup
+                            ),
+                            Err(e) => tracing::error!("Failed to back up settings: {}", e),
+                        }
+                    }
+                },
+                Err(e) => tracing::error!("Failed to read settings file {:?}: {}", path, e),
+            }
         }
         tracing::info!("Using default settings");
         Self::default()
     }
 
     pub fn save(&self) {
-        if let Some(path) = Self::config_path() {
-            if let Some(parent) = path.parent() {
-                let _ = std::fs::create_dir_all(parent);
+        let Some(path) = Self::config_path() else {
+            return;
+        };
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+            // The directory holds plaintext credentials (settings and logs);
+            // keep it private on multi-user systems.
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ =
+                    std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
             }
-            match serde_json::to_string_pretty(self) {
-                Ok(data) => {
-                    if let Err(e) = std::fs::write(&path, data) {
-                        tracing::error!("Failed to save settings: {}", e);
-                    } else {
-                        tracing::debug!("Saved settings to {:?}", path);
-                    }
-                }
-                Err(e) => tracing::error!("Failed to serialize settings: {}", e),
+        }
+        let data = match serde_json::to_string_pretty(self) {
+            Ok(data) => data,
+            Err(e) => {
+                tracing::error!("Failed to serialize settings: {}", e);
+                return;
+            }
+        };
+        // Write to a temp file and rename over the original: a crash or power
+        // loss mid-write can then never leave settings.json truncated.
+        let tmp = path.with_extension("json.tmp");
+        let write_result = (|| {
+            #[cfg(unix)]
+            {
+                use std::io::Write;
+                use std::os::unix::fs::OpenOptionsExt;
+                let mut file = std::fs::OpenOptions::new()
+                    .write(true)
+                    .create(true)
+                    .truncate(true)
+                    .mode(0o600) // contains server and SASL passwords
+                    .open(&tmp)?;
+                file.write_all(data.as_bytes())?;
+                file.sync_all()
+            }
+            #[cfg(not(unix))]
+            {
+                std::fs::write(&tmp, &data)
+            }
+        })();
+        match write_result.and_then(|_| std::fs::rename(&tmp, &path)) {
+            Ok(_) => tracing::debug!("Saved settings to {:?}", path),
+            Err(e) => {
+                tracing::error!("Failed to save settings: {}", e);
+                let _ = std::fs::remove_file(&tmp);
             }
         }
     }
@@ -193,6 +248,10 @@ pub struct ChatMessage {
     pub is_action: bool,
     pub is_system: bool,
     pub is_highlight: bool,
+    /// Display-only message (e.g. /lastlog results, /help): excluded from the
+    /// on-disk chat log and from /lastlog searches so search output does not
+    /// pollute history or match itself on repeated searches.
+    pub no_log: bool,
     /// Parsed formatting + URL segments, computed lazily on first render.
     /// Content never changes after construction, so the cache never invalidates.
     pub render_cache: OnceCell<Vec<RenderSegment>>,
@@ -205,6 +264,12 @@ impl ChatMessage {
             .get_or_init(|| layout_irc_text(&self.content))
     }
 
+    /// Mark this message as display-only (not logged, not searchable).
+    pub fn without_logging(mut self) -> Self {
+        self.no_log = true;
+        self
+    }
+
     pub fn new_fmt(sender: &str, content: &str, format: &str) -> Self {
         Self {
             timestamp: current_time_formatted(format),
@@ -213,6 +278,7 @@ impl ChatMessage {
             is_action: false,
             is_system: false,
             is_highlight: false,
+            no_log: false,
             render_cache: OnceCell::new(),
         }
     }
@@ -229,6 +295,7 @@ impl ChatMessage {
             is_action: false,
             is_system: true,
             is_highlight: false,
+            no_log: false,
             render_cache: OnceCell::new(),
         }
     }
@@ -241,6 +308,7 @@ impl ChatMessage {
             is_action: true,
             is_system: false,
             is_highlight: false,
+            no_log: false,
             render_cache: OnceCell::new(),
         }
     }
@@ -253,6 +321,7 @@ impl ChatMessage {
             is_action: false,
             is_system: false,
             is_highlight: true,
+            no_log: false,
             render_cache: OnceCell::new(),
         }
     }
@@ -265,6 +334,7 @@ impl ChatMessage {
             is_action: true,
             is_system: false,
             is_highlight: true,
+            no_log: false,
             render_cache: OnceCell::new(),
         }
     }

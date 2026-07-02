@@ -6,13 +6,23 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::PathBuf;
 
+/// Maximum simultaneously open log file handles. Long sessions across many
+/// channels/queries/networks would otherwise accumulate one FD per distinct
+/// target for the process lifetime; reopening in append mode is cheap.
+const MAX_OPEN_LOG_WRITERS: usize = 32;
+
+struct CachedWriter {
+    writer: std::io::BufWriter<File>,
+    last_used: std::time::Instant,
+}
+
 /// Manages chat logging to disk
 pub struct LogManager {
     log_dir: PathBuf,
     enabled: bool,
     /// Cache of open append writers, keyed by file path, so we don't re-open the
-    /// file (and re-create its directory) on every logged line.
-    writers: std::cell::RefCell<std::collections::HashMap<PathBuf, std::io::BufWriter<File>>>,
+    /// file (and re-create its directory) on every logged line. LRU-capped.
+    writers: std::cell::RefCell<std::collections::HashMap<PathBuf, CachedWriter>>,
 }
 
 impl LogManager {
@@ -29,13 +39,42 @@ impl LogManager {
         }
     }
 
-    /// Get-or-open a buffered append writer for `path`, run `f` on it, then flush.
+    /// Get-or-open a buffered append writer for `path` and run `f` on it.
     /// Keeping the handle open removes the per-message `create_dir_all` + open +
     /// close syscalls from the hot path (called for every incoming message).
-    fn with_writer<F: FnOnce(&mut std::io::BufWriter<File>)>(&self, path: PathBuf, f: F) {
+    /// On write failure the cached handle is evicted so the next write retries
+    /// a fresh open (which also recreates deleted directories).
+    fn with_writer<F: FnOnce(&mut std::io::BufWriter<File>) -> std::io::Result<()>>(
+        &self,
+        path: PathBuf,
+        f: F,
+    ) {
         use std::collections::hash_map::Entry;
         let mut writers = self.writers.borrow_mut();
-        let writer = match writers.entry(path.clone()) {
+
+        // Revalidate a cached handle: if the file was deleted or rotated away
+        // underneath us, writes would keep "succeeding" into an unlinked inode
+        // with no error and the history silently lost.
+        if let Entry::Occupied(entry) = writers.entry(path.clone())
+            && !path.exists()
+        {
+            tracing::warn!("Log file {:?} disappeared; reopening", path);
+            entry.remove();
+        }
+
+        // LRU-evict before inserting a new handle at the cap.
+        if !writers.contains_key(&path)
+            && writers.len() >= MAX_OPEN_LOG_WRITERS
+            && let Some(oldest) = writers
+                .iter()
+                .min_by_key(|(_, w)| w.last_used)
+                .map(|(p, _)| p.clone())
+            && let Some(mut evicted) = writers.remove(&oldest)
+        {
+            let _ = evicted.writer.flush();
+        }
+
+        let cached = match writers.entry(path.clone()) {
             Entry::Occupied(e) => e.into_mut(),
             Entry::Vacant(v) => {
                 if let Some(parent) = path.parent()
@@ -45,7 +84,10 @@ impl LogManager {
                     return;
                 }
                 match OpenOptions::new().create(true).append(true).open(&path) {
-                    Ok(file) => v.insert(std::io::BufWriter::new(file)),
+                    Ok(file) => v.insert(CachedWriter {
+                        writer: std::io::BufWriter::new(file),
+                        last_used: std::time::Instant::now(),
+                    }),
                     Err(e) => {
                         tracing::error!("Failed to open log file {:?}: {}", path, e);
                         return;
@@ -53,18 +95,30 @@ impl LogManager {
                 }
             }
         };
-        f(writer);
+        cached.last_used = std::time::Instant::now();
+        if let Err(e) = f(&mut cached.writer) {
+            tracing::error!("Failed to write to log {:?}: {}", path, e);
+            writers.remove(&path);
+        }
         // Flushing is deferred to flush_all(), called once per GUI frame, so a
         // message flood does not pay one flush syscall per logged line.
     }
 
     /// Flush all cached writers. Called once per frame (and on shutdown via
-    /// BufWriter's Drop) instead of after every logged line.
+    /// BufWriter's Drop) instead of after every logged line. Writers whose
+    /// flush fails (e.g. disk full) are evicted so the next write retries a
+    /// fresh open instead of silently dropping data forever.
     pub fn flush_all(&self) {
-        for (path, writer) in self.writers.borrow_mut().iter_mut() {
-            if let Err(e) = writer.flush() {
+        let mut writers = self.writers.borrow_mut();
+        let mut failed: Vec<PathBuf> = Vec::new();
+        for (path, cached) in writers.iter_mut() {
+            if let Err(e) = cached.writer.flush() {
                 tracing::error!("Failed to flush log file {:?}: {}", path, e);
+                failed.push(path.clone());
             }
+        }
+        for path in failed {
+            writers.remove(&path);
         }
     }
 
@@ -87,11 +141,7 @@ impl LogManager {
         let path = self.log_path(network, channel);
         // Format message (irssi-style)
         let line = format_log_line(msg);
-        self.with_writer(path, |w| {
-            if let Err(e) = writeln!(w, "{}", line) {
-                tracing::error!("Failed to write to log: {}", e);
-            }
-        });
+        self.with_writer(path, |w| writeln!(w, "{}", line));
     }
 
     /// Load recent history from a log file (reads from end to avoid loading entire file)
@@ -104,8 +154,8 @@ impl LogManager {
 
         // Push any buffered-but-unflushed lines for this target to disk first,
         // so freshly logged messages are visible to the history read below.
-        if let Some(writer) = self.writers.borrow_mut().get_mut(&path) {
-            let _ = writer.flush();
+        if let Some(cached) = self.writers.borrow_mut().get_mut(&path) {
+            let _ = cached.writer.flush();
         }
 
         let mut file = match File::open(&path) {
@@ -149,9 +199,7 @@ impl LogManager {
 
         let path = self.log_path(network, channel);
         let now = current_datetime_string();
-        self.with_writer(path, |w| {
-            let _ = writeln!(w, "--- Log opened {}", now);
-        });
+        self.with_writer(path, |w| writeln!(w, "--- Log opened {}", now));
     }
 }
 
@@ -173,9 +221,33 @@ fn sanitize_filename(name: &str) -> String {
     // Strip leading dots to avoid hidden files / ".." remnants.
     let cleaned = trimmed.trim_start_matches('.');
     if cleaned.is_empty() {
-        "_".to_string()
+        return "_".to_string();
+    }
+    // Windows reserved device names (CON, PRN, AUX, NUL, COM1-9, LPT1-9) refer
+    // to the device even with an extension appended ("nul.log" is still NUL),
+    // so a PM from a nick like "nul" would silently log into the void. Prefix
+    // them on every platform to keep log directories portable.
+    let stem = cleaned.split('.').next().unwrap_or(cleaned);
+    let stem_upper = stem.to_ascii_uppercase();
+    let reserved = matches!(stem_upper.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+        || (stem_upper.len() == 4
+            && (stem_upper.starts_with("COM") || stem_upper.starts_with("LPT"))
+            && stem_upper.as_bytes()[3].is_ascii_digit());
+    if reserved {
+        format!("_{}", cleaned)
     } else {
         cleaned.to_string()
+    }
+}
+
+/// Replace CR/LF so no field can inject forged lines into the log
+/// (defense in depth: the server-time tag is now strictly parsed, but any
+/// future field source gets the same guarantee).
+fn sanitize_log_field(s: &str) -> std::borrow::Cow<'_, str> {
+    if s.contains(['\r', '\n']) {
+        s.replace(['\r', '\n'], " ").into()
+    } else {
+        s.into()
     }
 }
 
@@ -183,13 +255,16 @@ fn sanitize_filename(name: &str) -> String {
 fn format_log_line(msg: &ChatMessage) -> String {
     // Remove brackets from timestamp for cleaner logs
     let time = msg.timestamp.trim_start_matches('[').trim_end_matches(']');
+    let time = sanitize_log_field(time);
+    let sender = sanitize_log_field(&msg.sender);
+    let content = sanitize_log_field(&msg.content);
 
     if msg.is_system {
-        format!("{} -!- {}", time, msg.content)
+        format!("{} -!- {}", time, content)
     } else if msg.is_action {
-        format!("{} * {} {}", time, msg.sender, msg.content)
+        format!("{} * {} {}", time, sender, content)
     } else {
-        format!("{} <{}> {}", time, msg.sender, msg.content)
+        format!("{} <{}> {}", time, sender, content)
     }
 }
 
@@ -230,6 +305,7 @@ fn parse_log_line(line: &str) -> Option<ChatMessage> {
             is_action: false,
             is_system: true,
             is_highlight: false,
+            no_log: false,
             render_cache: Default::default(),
         })
     } else if let Some(action_rest) = rest.strip_prefix("* ") {
@@ -243,6 +319,7 @@ fn parse_log_line(line: &str) -> Option<ChatMessage> {
                 is_action: true,
                 is_system: false,
                 is_highlight: false,
+                no_log: false,
                 render_cache: Default::default(),
             })
         } else {
@@ -260,6 +337,7 @@ fn parse_log_line(line: &str) -> Option<ChatMessage> {
                 is_action: false,
                 is_system: false,
                 is_highlight: false,
+                no_log: false,
                 render_cache: Default::default(),
             })
         } else {
@@ -354,6 +432,7 @@ mod tests {
             is_action: action,
             is_system: system,
             is_highlight: false,
+            no_log: false,
             render_cache: Default::default(),
         }
     }
@@ -406,5 +485,29 @@ mod tests {
         assert_eq!(sanitize_filename("../etc"), "_etc");
         assert_eq!(sanitize_filename("normal"), "normal");
         assert_eq!(sanitize_filename("#channel"), "#channel");
+    }
+
+    #[test]
+    fn sanitize_filename_blocks_windows_device_names() {
+        assert_eq!(sanitize_filename("nul"), "_nul");
+        assert_eq!(sanitize_filename("NUL"), "_NUL");
+        assert_eq!(sanitize_filename("CoN"), "_CoN");
+        assert_eq!(sanitize_filename("com1"), "_com1");
+        assert_eq!(sanitize_filename("LPT9"), "_LPT9");
+        // The stem before the first dot is what Windows reserves.
+        assert_eq!(sanitize_filename("nul.chan"), "_nul.chan");
+        // Non-reserved lookalikes pass through.
+        assert_eq!(sanitize_filename("nullable"), "nullable");
+        assert_eq!(sanitize_filename("com10"), "com10");
+        assert_eq!(sanitize_filename("console"), "console");
+    }
+
+    #[test]
+    fn log_lines_cannot_be_forged_via_newlines() {
+        let mut bad = msg("[09:30]", "alice", "hello", false, false);
+        bad.content = "hello\n09:31 <ops> you are banned".to_string();
+        let line = format_log_line(&bad);
+        assert!(!line.contains('\n'));
+        assert!(!line.contains('\r'));
     }
 }

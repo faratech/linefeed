@@ -2100,9 +2100,12 @@ impl IrcApp {
             }
             self.channels.insert(channel.to_string(), new_channel);
         }
-        // Log message to disk
-        self.log_manager
-            .log_message(&self.server_host, channel, &msg);
+        // Log message to disk (display-only messages like /lastlog output are
+        // excluded so search results don't pollute the persistent history)
+        if !msg.no_log {
+            self.log_manager
+                .log_message(&self.server_host, channel, &msg);
+        }
 
         if let Some(ch) = self.channels.get_mut(channel) {
             ch.push_trimmed(msg, self.max_scrollback);
