@@ -136,21 +136,44 @@ async def build_target(name: str, target: str | None, src_name: str, dst_name: s
     return True
 
 
-async def compress_with_upx(filename: str) -> tuple[str, bool, int, int]:
-    """Compress a binary with UPX. Returns (filename, success, before_size, after_size)"""
+async def compress_with_upx(filename: str) -> tuple[str, bool, int, int, str]:
+    """Compress a binary with UPX and retain diagnostics for failures."""
     filepath = OUT_DIR / filename
     before_size = filepath.stat().st_size
 
     if not UPX_SUPPORTED.get(filename, False):
-        return (filename, True, before_size, before_size)  # No change
+        return (filename, True, before_size, before_size, "")  # No change
 
     if not shutil.which("upx"):
-        return (filename, True, before_size, before_size)  # No change
+        return (filename, True, before_size, before_size, "")  # No change
 
     success, output = await run_cmd(["upx", "--best", "-q", str(filepath)])
     after_size = filepath.stat().st_size if success else before_size
 
-    return (filename, success, before_size, after_size)
+    return (filename, success, before_size, after_size, output)
+
+
+def summarize_upx_results(
+    results: list[tuple[str, bool, int, int, str]],
+) -> tuple[dict[str, tuple[int, int]], bool]:
+    """Report compression results and return sizes plus aggregate failure."""
+    file_sizes: dict[str, tuple[int, int]] = {}
+    compression_failed = False
+    for filename, success, before, after, output in results:
+        file_sizes[filename] = (before, after)
+        if not success:
+            compression_failed = True
+            print(f"ERROR compressing {filename} with UPX:")
+            print(output.rstrip() or "UPX exited unsuccessfully without output")
+        elif before != after:
+            ratio = (after / before) * 100
+            print(
+                f"    {filename}: {before/1024/1024:.1f} MB -> "
+                f"{after/1024/1024:.1f} MB ({ratio:.0f}%)"
+            )
+        elif not UPX_SUPPORTED.get(filename, False):
+            print(f"    {filename}: skipped (UPX unsupported)")
+    return file_sizes, compression_failed
 
 
 def parse_args():
@@ -274,14 +297,11 @@ async def main():
         print("[2/2] Compressing with UPX...")
         compress_tasks = [compress_with_upx(f) for f in built_files]
         results = await asyncio.gather(*compress_tasks)
-        for filename, success, before, after in results:
-            file_sizes[filename] = (before, after)
-            if before != after:
-                ratio = (after / before) * 100
-                print(f"    {filename}: {before/1024/1024:.1f} MB -> {after/1024/1024:.1f} MB ({ratio:.0f}%)")
-            elif not UPX_SUPPORTED.get(filename, False):
-                print(f"    {filename}: skipped (UPX unsupported)")
+        file_sizes, compression_failed = summarize_upx_results(results)
         print()
+        if compression_failed:
+            print("ERROR: UPX compression failed; build artifacts may be incomplete")
+            sys.exit(1)
     else:
         print("[2/2] Skipping UPX compression")
         for f in built_files:

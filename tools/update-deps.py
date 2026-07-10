@@ -12,6 +12,7 @@ from pathlib import Path
 # Project root is parent of tools/
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 CARGO_TOML = PROJECT_ROOT / "Cargo.toml"
+CARGO_LOCK = PROJECT_ROOT / "Cargo.lock"
 
 
 def run_cmd(cmd: list[str], capture: bool = True) -> subprocess.CompletedProcess:
@@ -148,6 +149,37 @@ def update_cargo_toml(updates: dict[str, str], dry_run: bool = False) -> None:
         print(f"\nUpdated Cargo.toml with {len(updates)} changes")
 
 
+def update_manifest_and_lock(updates: dict[str, str]) -> bool:
+    """Update Cargo.toml and Cargo.lock as one rollback-safe operation."""
+    original_toml = CARGO_TOML.read_bytes()
+    original_lock = CARGO_LOCK.read_bytes() if CARGO_LOCK.exists() else None
+
+    try:
+        update_cargo_toml(updates)
+        result = run_cmd(["cargo", "update"])
+        if result.returncode != 0:
+            detail = (result.stdout or "") + (result.stderr or "")
+            raise RuntimeError(f"cargo update failed:\n{detail.rstrip()}")
+
+        result = run_cmd(
+            ["cargo", "metadata", "--locked", "--no-deps", "--format-version", "1"]
+        )
+        if result.returncode != 0:
+            detail = (result.stdout or "") + (result.stderr or "")
+            raise RuntimeError(f"locked dependency validation failed:\n{detail.rstrip()}")
+    except Exception as exc:
+        CARGO_TOML.write_bytes(original_toml)
+        if original_lock is None:
+            CARGO_LOCK.unlink(missing_ok=True)
+        else:
+            CARGO_LOCK.write_bytes(original_lock)
+        print(f"\nDependency update rolled back: {exc}", file=sys.stderr)
+        return False
+
+    print("Cargo.toml and Cargo.lock updated and validated together")
+    return True
+
+
 def main():
     import argparse
 
@@ -211,8 +243,9 @@ def main():
     if args.dry_run:
         update_cargo_toml(updates, dry_run=True)
     else:
-        update_cargo_toml(updates)
-        print("\nRun 'cargo build' to fetch new versions.")
+        if not update_manifest_and_lock(updates):
+            sys.exit(1)
+        print("\nDependency files are ready for a --locked build.")
         print("Note: Major version updates may require code changes!")
 
 

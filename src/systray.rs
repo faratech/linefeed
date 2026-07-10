@@ -272,11 +272,12 @@ unsafe extern "system" fn wnd_proc(
             // app becomes completely unreachable (no icon, no taskbar button).
             let taskbar_created = TASKBAR_CREATED_MSG.load(Ordering::SeqCst);
             if taskbar_created != 0 && msg == taskbar_created {
-                if TRAY_ACTIVE.load(Ordering::SeqCst) {
-                    let added = add_icon_to_shell();
-                    TRAY_ICON_ADDED.store(added, Ordering::SeqCst);
-                    tracing::info!("Explorer restarted; tray icon re-added: {}", added);
-                }
+                // Explorer may have been unavailable for every startup retry,
+                // so recovery must not depend on already being active.
+                let added = add_icon_to_shell();
+                TRAY_ICON_ADDED.store(added, Ordering::SeqCst);
+                TRAY_ACTIVE.store(added, Ordering::SeqCst);
+                tracing::info!("Explorer started/restarted; tray icon added: {}", added);
                 return LRESULT(0);
             }
             unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }

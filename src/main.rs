@@ -250,12 +250,14 @@ fn main() -> eframe::Result<()> {
                 opts.reduce_texture_memory = true;
             });
 
+            let app = IrcApp::new(cc);
             let mut style = (*cc.egui_ctx.global_style()).clone();
             style.spacing.item_spacing = egui::vec2(8.0, 4.0);
             cc.egui_ctx.set_global_style(style);
+            gui::apply_font_size(&cc.egui_ctx, app.font_size);
 
             Ok(Box::new(LinefeedApp {
-                app: IrcApp::new(cc),
+                app,
                 connection_thread: None,
                 last_message_time: std::time::Instant::now(),
                 window_size_ok: false,
@@ -295,8 +297,7 @@ impl eframe::App for LinefeedApp {
             // When hidden to system tray, skip all UI work
             // But check if user restored via taskbar (not our tray menu)
             if systray::is_window_hidden() {
-                self.app.update_minimal();
-                self.process_connection_lifecycle(ctx);
+                self.background_tick(ctx);
                 let minimized = ctx.input(|i| i.viewport().minimized.unwrap_or(true));
                 if !minimized {
                     // User restored via taskbar, clear our flag
@@ -318,6 +319,8 @@ impl eframe::App for LinefeedApp {
                 // Tell egui we're minimized so it stops rendering
                 ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
                 systray::hide_window();
+                self.background_tick(ctx);
+                ctx.request_repaint_after(std::time::Duration::from_millis(250));
                 return;
             }
         }
@@ -326,8 +329,7 @@ impl eframe::App for LinefeedApp {
         let is_minimized = ctx.input(|i| i.viewport().minimized.unwrap_or(false));
         if is_minimized {
             // Process messages to prevent buffer overflow, but skip rendering.
-            self.app.update_minimal();
-            self.process_connection_lifecycle(ctx);
+            self.background_tick(ctx);
             // Drain reasonably often while minimized: update_minimal() empties the
             // channel each call, so polling ~4x/second keeps the message-loss window
             // small without the cost of full-rate rendering.
@@ -393,6 +395,11 @@ impl eframe::App for LinefeedApp {
 }
 
 impl LinefeedApp {
+    fn background_tick(&mut self, ctx: &egui::Context) {
+        self.app.update_minimal();
+        self.process_connection_lifecycle(ctx);
+    }
+
     fn process_connection_lifecycle(&mut self, ctx: &egui::Context) {
         if self
             .connection_thread
@@ -403,6 +410,10 @@ impl LinefeedApp {
             match self.app.connection_intent {
                 ConnectionIntent::ReconnectAfterClose => {
                     self.app.connection_intent = ConnectionIntent::None;
+                    // An explicit endpoint switch is staged while the old
+                    // socket closes. Promote it only now so late messages from
+                    // the old server cannot be relabelled as the new session.
+                    self.app.promote_pending_session();
                     self.app.connecting = true;
                     self.app.connected = false;
                     self.app
@@ -439,12 +450,22 @@ impl LinefeedApp {
 
         // Start connection if requested.
         if self.app.connecting && self.connection_thread.is_none() {
+            if !self.app.ensure_active_session() {
+                return;
+            }
             self.start_connection(ctx.clone());
         }
     }
 
     fn start_connection(&mut self, ctx: egui::Context) {
-        let config = self.app.get_server_config();
+        let Some(config) = self.app.active_server_config() else {
+            self.app.connecting = false;
+            self.app.show_connect_dialog = true;
+            self.app.add_server_message(ChatMessage::system(
+                "Cannot connect without a validated server endpoint",
+            ));
+            return;
+        };
         tracing::info!("Connecting to {}:{}", config.host, config.port);
 
         let (msg_tx, msg_rx) = mpsc::channel::<IrcMessage>(1000);
@@ -499,5 +520,32 @@ impl LinefeedApp {
                 ctx.request_repaint();
             });
         }));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn background_tick_observes_finished_connection_threads() {
+        let handle = std::thread::spawn(|| {});
+        while !handle.is_finished() {
+            std::thread::yield_now();
+        }
+
+        let mut app = IrcApp::default();
+        app.connected = true;
+        let mut linefeed = LinefeedApp {
+            app,
+            connection_thread: Some(handle),
+            last_message_time: std::time::Instant::now(),
+            window_size_ok: true,
+        };
+        linefeed.background_tick(&egui::Context::default());
+
+        assert!(linefeed.connection_thread.is_none());
+        assert!(linefeed.app.connection_lost);
+        assert!(!linefeed.app.connected);
     }
 }

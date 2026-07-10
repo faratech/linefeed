@@ -13,6 +13,7 @@ const MAX_OPEN_LOG_WRITERS: usize = 32;
 
 struct CachedWriter {
     writer: std::io::BufWriter<File>,
+    identity: same_file::Handle,
     last_used: std::time::Instant,
 }
 
@@ -52,14 +53,17 @@ impl LogManager {
         use std::collections::hash_map::Entry;
         let mut writers = self.writers.borrow_mut();
 
-        // Revalidate a cached handle: if the file was deleted or rotated away
-        // underneath us, writes would keep "succeeding" into an unlinked inode
-        // with no error and the history silently lost.
-        if let Entry::Occupied(entry) = writers.entry(path.clone())
-            && !path.exists()
-        {
-            tracing::warn!("Log file {:?} disappeared; reopening", path);
-            entry.remove();
+        // Revalidate the cached descriptor against the file currently at the
+        // path. Existence alone is insufficient: logrotate commonly renames
+        // the old inode and creates a replacement at the same path.
+        if let Entry::Occupied(entry) = writers.entry(path.clone()) {
+            let replaced = same_file::Handle::from_path(&path)
+                .map(|current| current != entry.get().identity)
+                .unwrap_or(true);
+            if replaced {
+                tracing::warn!("Log file {:?} was removed or replaced; reopening", path);
+                entry.remove();
+            }
         }
 
         // LRU-evict before inserting a new handle at the cap.
@@ -70,8 +74,9 @@ impl LogManager {
                 .min_by_key(|(_, w)| w.last_used)
                 .map(|(p, _)| p.clone())
             && let Some(mut evicted) = writers.remove(&oldest)
+            && let Err(e) = evicted.writer.flush()
         {
-            let _ = evicted.writer.flush();
+            tracing::error!("Failed to flush evicted log file {:?}: {}", oldest, e);
         }
 
         let cached = match writers.entry(path.clone()) {
@@ -84,10 +89,25 @@ impl LogManager {
                     return;
                 }
                 match OpenOptions::new().create(true).append(true).open(&path) {
-                    Ok(file) => v.insert(CachedWriter {
-                        writer: std::io::BufWriter::new(file),
-                        last_used: std::time::Instant::now(),
-                    }),
+                    Ok(file) => {
+                        let identity = match file.try_clone().and_then(same_file::Handle::from_file)
+                        {
+                            Ok(identity) => identity,
+                            Err(e) => {
+                                tracing::error!(
+                                    "Failed to identify log file {:?}; not caching it: {}",
+                                    path,
+                                    e
+                                );
+                                return;
+                            }
+                        };
+                        v.insert(CachedWriter {
+                            writer: std::io::BufWriter::new(file),
+                            identity,
+                            last_used: std::time::Instant::now(),
+                        })
+                    }
                     Err(e) => {
                         tracing::error!("Failed to open log file {:?}: {}", path, e);
                         return;
@@ -124,17 +144,94 @@ impl LogManager {
 
     /// Get the log file path for a channel/query
     fn log_path(&self, network: &str, channel: &str) -> PathBuf {
-        // Sanitize network and channel names for filesystem
-        let safe_network = sanitize_filename(network);
-        let safe_channel = sanitize_filename(channel);
+        // Keep a readable prefix, then append a stable hash of the complete raw
+        // identifier. The hash prevents collisions from lossy filesystem
+        // sanitization and from case-insensitive filesystems.
+        let safe_network = encoded_path_component(network);
+        let safe_channel = encoded_path_component(channel);
         self.log_dir
             .join(&safe_network)
             .join(format!("{}.log", safe_channel))
     }
 
+    fn legacy_log_path(&self, network: &str, channel: &str) -> PathBuf {
+        self.log_dir
+            .join(sanitize_filename(network))
+            .join(format!("{}.log", sanitize_filename(channel)))
+    }
+
+    /// Claim and move one legacy host-only log into a validated endpoint path.
+    /// Migration is deliberately conservative: lossy legacy components are
+    /// never read, and an atomic per-network claim prevents two endpoints from
+    /// importing the same old host-only history.
+    fn migrate_legacy_history(
+        &self,
+        network: &str,
+        legacy_network: &str,
+        channel: &str,
+        allow_migration: bool,
+    ) {
+        if !allow_migration
+            || sanitize_filename(legacy_network) != legacy_network
+            || sanitize_filename(channel) != channel
+        {
+            return;
+        }
+
+        let destination = self.log_path(network, channel);
+        if destination.exists() {
+            return;
+        }
+        let legacy = self.legacy_log_path(legacy_network, channel);
+        if !legacy.is_file() {
+            return;
+        }
+
+        let Some(legacy_dir) = legacy.parent() else {
+            return;
+        };
+        let claim_path = legacy_dir.join(".linefeed-endpoint-migration");
+        let claimed = match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&claim_path)
+        {
+            Ok(mut claim) => claim
+                .write_all(network.as_bytes())
+                .and_then(|_| claim.flush())
+                .is_ok(),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                fs::read_to_string(&claim_path).is_ok_and(|value| value == network)
+            }
+            Err(_) => false,
+        };
+        if !claimed {
+            return;
+        }
+
+        if let Some(parent) = destination.parent()
+            && fs::create_dir_all(parent).is_ok()
+        {
+            match fs::rename(&legacy, &destination) {
+                Ok(()) => tracing::info!(
+                    "Migrated legacy chat history {:?} to endpoint-scoped path {:?}",
+                    legacy,
+                    destination
+                ),
+                Err(error) => tracing::warn!(
+                    "Could not migrate legacy chat history {:?}: {}",
+                    legacy,
+                    error
+                ),
+            }
+        }
+    }
+
     /// Log a message to disk
     pub fn log_message(&self, network: &str, channel: &str, msg: &ChatMessage) {
-        if !self.enabled {
+        if !self.enabled
+            || super::commands::service_message_contains_credentials(channel, &msg.content)
+        {
             return;
         }
 
@@ -144,18 +241,33 @@ impl LogManager {
         self.with_writer(path, |w| writeln!(w, "{}", line));
     }
 
-    /// Load recent history from a log file (reads from end to avoid loading entire file)
-    pub fn load_history(&self, network: &str, channel: &str, max_lines: usize) -> Vec<ChatMessage> {
+    pub fn load_history_with_legacy(
+        &self,
+        network: &str,
+        legacy_network: &str,
+        channel: &str,
+        max_lines: usize,
+        allow_legacy_migration: bool,
+    ) -> Vec<ChatMessage> {
         if !self.enabled || max_lines == 0 {
             return Vec::new();
         }
 
+        self.migrate_legacy_history(network, legacy_network, channel, allow_legacy_migration);
         let path = self.log_path(network, channel);
 
         // Push any buffered-but-unflushed lines for this target to disk first,
         // so freshly logged messages are visible to the history read below.
-        if let Some(cached) = self.writers.borrow_mut().get_mut(&path) {
-            let _ = cached.writer.flush();
+        let flush_error = {
+            let mut writers = self.writers.borrow_mut();
+            writers
+                .get_mut(&path)
+                .and_then(|cached| cached.writer.flush().err())
+        };
+        if let Some(e) = flush_error {
+            tracing::error!("Failed to flush log file {:?} before reading: {}", path, e);
+            self.writers.borrow_mut().remove(&path);
+            return Vec::new();
         }
 
         let mut file = match File::open(&path) {
@@ -177,18 +289,36 @@ impl LogManager {
             let reader = BufReader::new(file);
             let lines: Vec<String> = reader.lines().map_while(Result::ok).collect();
             let start = lines.len().saturating_sub(max_lines);
-            return lines[start..]
+            let mut messages: Vec<ChatMessage> = lines[start..]
                 .iter()
                 .filter_map(|line| parse_log_line(line))
                 .collect();
+            redact_sensitive_history(channel, &mut messages);
+            return messages;
         }
 
         // For larger files, read backwards in chunks to find the last N lines
         let lines = read_last_n_lines(&mut file, file_size, max_lines);
-        lines
+        let mut messages: Vec<ChatMessage> = lines
             .iter()
             .filter_map(|line| parse_log_line(line))
-            .collect()
+            .collect();
+        redact_sensitive_history(channel, &mut messages);
+        messages
+    }
+
+    #[cfg(test)]
+    pub(super) fn with_test_dir(log_dir: PathBuf) -> Self {
+        Self {
+            log_dir,
+            enabled: true,
+            writers: std::cell::RefCell::new(std::collections::HashMap::new()),
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn test_log_path(&self, network: &str, channel: &str) -> PathBuf {
+        self.log_path(network, channel)
     }
 
     /// Write a session marker (log opened/closed)
@@ -240,6 +370,25 @@ fn sanitize_filename(name: &str) -> String {
     }
 }
 
+/// Return a portable, collision-resistant path component. FNV-1a is used only
+/// as a stable identifier suffix (not for security); the readable prefix keeps
+/// log directories usable by humans while distinct raw IRC identifiers no
+/// longer collapse to the same sanitized name.
+fn encoded_path_component(name: &str) -> String {
+    const FNV_OFFSET: u64 = 0xcbf29ce484222325;
+    const FNV_PRIME: u64 = 0x100000001b3;
+
+    let mut hash = FNV_OFFSET;
+    for byte in name.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(FNV_PRIME);
+    }
+
+    let readable = sanitize_filename(name);
+    let prefix: String = readable.chars().take(80).collect();
+    format!("{prefix}~{hash:016x}")
+}
+
 /// Replace CR/LF so no field can inject forged lines into the log
 /// (defense in depth: the server-time tag is now strictly parsed, but any
 /// future field source gets the same guarantee).
@@ -248,6 +397,16 @@ fn sanitize_log_field(s: &str) -> std::borrow::Cow<'_, str> {
         s.replace(['\r', '\n'], " ").into()
     } else {
         s.into()
+    }
+}
+
+fn redact_sensitive_history(channel: &str, messages: &mut [ChatMessage]) {
+    for message in messages {
+        if super::commands::service_message_contains_credentials(channel, &message.content) {
+            message.content = "<credential command redacted>".to_string();
+            message.no_log = true;
+            message.render_cache = Default::default();
+        }
     }
 }
 
@@ -423,6 +582,26 @@ fn current_datetime_string() -> String {
 mod tests {
     use super::*;
     use crate::gui::types::ChatMessage;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static NEXT_TEST_DIR: AtomicU64 = AtomicU64::new(0);
+
+    fn test_manager(test_name: &str) -> (LogManager, PathBuf) {
+        let unique = NEXT_TEST_DIR.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "linefeed-logging-{test_name}-{}-{unique}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&dir).expect("create temporary log directory");
+        (
+            LogManager {
+                log_dir: dir.clone(),
+                enabled: true,
+                writers: std::cell::RefCell::new(std::collections::HashMap::new()),
+            },
+            dir,
+        )
+    }
 
     fn msg(ts: &str, sender: &str, content: &str, system: bool, action: bool) -> ChatMessage {
         ChatMessage {
@@ -500,6 +679,185 @@ mod tests {
         assert_eq!(sanitize_filename("nullable"), "nullable");
         assert_eq!(sanitize_filename("com10"), "com10");
         assert_eq!(sanitize_filename("console"), "console");
+    }
+
+    #[test]
+    fn encoded_components_do_not_collapse_distinct_targets_or_endpoints() {
+        let (manager, dir) = test_manager("collision");
+        assert_ne!(
+            manager.log_path("tls:irc.example:6697", "#a/b"),
+            manager.log_path("tls:irc.example:6697", "#a?b")
+        );
+        assert_ne!(
+            manager.log_path("tls:irc.example:6697", "#room"),
+            manager.log_path("tls:irc.example:7000", "#room")
+        );
+        assert_ne!(
+            manager.log_path("tls:IRC.example:6697", "#room"),
+            manager.log_path("tls:irc.example:6697", "#room")
+        );
+        fs::remove_dir_all(dir).expect("remove temporary log directory");
+    }
+
+    #[test]
+    fn lossless_legacy_history_migrates_once_to_endpoint_identity() {
+        let (manager, dir) = test_manager("legacy-migration");
+        let legacy = manager.legacy_log_path("irc.example", "#room");
+        fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+        fs::write(&legacy, "09:30 <alice> legacy hello\n").unwrap();
+
+        let history = manager.load_history_with_legacy(
+            "tls://irc.example:6697",
+            "irc.example",
+            "#room",
+            20,
+            true,
+        );
+
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].content, "legacy hello");
+        assert!(!legacy.exists());
+        assert!(manager.log_path("tls://irc.example:6697", "#room").exists());
+        assert_eq!(
+            fs::read_to_string(
+                legacy
+                    .parent()
+                    .unwrap()
+                    .join(".linefeed-endpoint-migration")
+            )
+            .unwrap(),
+            "tls://irc.example:6697"
+        );
+
+        drop(manager);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn lossy_legacy_names_are_never_imported() {
+        let (manager, dir) = test_manager("legacy-lossy");
+        let colliding_legacy = manager.legacy_log_path("irc.example", "#a/b");
+        fs::create_dir_all(colliding_legacy.parent().unwrap()).unwrap();
+        fs::write(&colliding_legacy, "09:30 <alice> wrong channel\n").unwrap();
+
+        let history = manager.load_history_with_legacy(
+            "tls://irc.example:6697",
+            "irc.example",
+            "#a/b",
+            20,
+            true,
+        );
+
+        assert!(history.is_empty());
+        assert!(colliding_legacy.exists());
+        assert!(!manager.log_path("tls://irc.example:6697", "#a/b").exists());
+
+        drop(manager);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn legacy_network_claim_prevents_cross_endpoint_import() {
+        let (manager, dir) = test_manager("legacy-endpoint-claim");
+        let first = manager.legacy_log_path("irc.example", "#one");
+        fs::create_dir_all(first.parent().unwrap()).unwrap();
+        fs::write(&first, "09:30 <alice> endpoint one\n").unwrap();
+        assert_eq!(
+            manager
+                .load_history_with_legacy(
+                    "tls://irc.example:6697",
+                    "irc.example",
+                    "#one",
+                    20,
+                    true,
+                )
+                .len(),
+            1
+        );
+
+        let second = manager.legacy_log_path("irc.example", "#two");
+        fs::write(&second, "09:31 <bob> must stay legacy\n").unwrap();
+        let other_endpoint = manager.load_history_with_legacy(
+            "plain://irc.example:6667",
+            "irc.example",
+            "#two",
+            20,
+            true,
+        );
+        assert!(other_endpoint.is_empty());
+        assert!(second.exists());
+        assert!(
+            !manager
+                .log_path("plain://irc.example:6667", "#two")
+                .exists()
+        );
+
+        drop(manager);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn credential_commands_are_suppressed_on_write_and_redacted_on_load() {
+        let (manager, dir) = test_manager("credential-redaction");
+        let identity = "tls://irc.example:6697";
+        let sensitive = msg("[09:30]", "me", "IDENTIFY plaintext-secret", false, false);
+        manager.log_message(identity, "NickServ", &sensitive);
+        manager.flush_all();
+        let path = manager.log_path(identity, "NickServ");
+        assert!(!path.exists());
+
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, "09:30 <me> IDENTIFY legacy-secret\n").unwrap();
+        let history =
+            manager.load_history_with_legacy(identity, "irc.example", "NickServ", 20, false);
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].content, "<credential command redacted>");
+        assert!(history[0].no_log);
+        assert!(!history[0].content.contains("legacy-secret"));
+
+        drop(manager);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn replaced_log_file_is_reopened_before_the_next_write() {
+        let (manager, dir) = test_manager("rotation");
+        let first = msg("[09:30]", "alice", "before rotation", false, false);
+        let second = msg("[09:31]", "alice", "after rotation", false, false);
+        let path = manager.log_path("tls:irc.example:6697", "#room");
+        let rotated = path.with_extension("log.1");
+
+        manager.log_message("tls:irc.example:6697", "#room", &first);
+        manager.flush_all();
+        fs::rename(&path, &rotated).expect("rotate old log");
+        File::create(&path).expect("create replacement log");
+
+        manager.log_message("tls:irc.example:6697", "#room", &second);
+        manager.flush_all();
+
+        let old_contents = fs::read_to_string(&rotated).expect("read rotated log");
+        let new_contents = fs::read_to_string(&path).expect("read replacement log");
+        assert!(old_contents.contains("before rotation"));
+        assert!(!old_contents.contains("after rotation"));
+        assert!(!new_contents.contains("before rotation"));
+        assert!(new_contents.contains("after rotation"));
+
+        drop(manager);
+        fs::remove_dir_all(dir).expect("remove temporary log directory");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn flush_failure_evicts_the_cached_writer() {
+        let (manager, dir) = test_manager("flush-failure");
+        let full = PathBuf::from("/dev/full");
+        manager.with_writer(full.clone(), |writer| writeln!(writer, "buffered line"));
+        assert!(manager.writers.borrow().contains_key(&full));
+
+        manager.flush_all();
+
+        assert!(!manager.writers.borrow().contains_key(&full));
+        fs::remove_dir_all(dir).expect("remove temporary log directory");
     }
 
     #[test]

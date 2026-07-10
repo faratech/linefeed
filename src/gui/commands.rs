@@ -1,6 +1,6 @@
 //! IRC command processing and help system
 
-use super::helpers::{is_channel, nick_to_mask};
+use super::helpers::nick_to_mask;
 use super::{ChatMessage, IrcApp};
 use crate::irc::IrcCommand;
 
@@ -29,7 +29,7 @@ impl IrcApp {
                 // Store key for use when channel is created
                 if let Some(ref k) = key {
                     self.pending_channel_keys
-                        .insert(channel.to_lowercase(), k.clone());
+                        .insert(self.network_support.canonicalize(&channel), k.clone());
                 }
                 self.send_command(IrcCommand::Join(channel, key, None, None));
             }
@@ -43,7 +43,7 @@ impl IrcApp {
                 } else {
                     let mut it = args.splitn(2, ' ');
                     let first = it.next().unwrap_or("");
-                    if is_channel(first) {
+                    if self.is_channel_name(first) {
                         (Some(first.to_string()), it.next().map(|r| r.to_string()))
                     } else {
                         (self.current_channel.clone(), Some(args.to_string()))
@@ -62,8 +62,8 @@ impl IrcApp {
                         // Disconnected: the server can't confirm the part, so
                         // close the stale channel window locally instead of
                         // leaving a tab that cannot be removed.
-                        self.channels.remove(&ch);
-                        if self.current_channel.as_ref() == Some(&ch) {
+                        self.remove_channel(&ch);
+                        if self.current_target_is(&ch) {
                             self.current_channel = self.channels.keys().next().cloned();
                         }
                     }
@@ -74,8 +74,12 @@ impl IrcApp {
                 let msg_parts: Vec<&str> = args.splitn(2, ' ').collect();
                 if let (Some(target), Some(message)) = (msg_parts.first(), msg_parts.get(1)) {
                     if self.connected && self.send_privmsg_text(target, message) {
-                        let chat_msg =
-                            ChatMessage::new_fmt(&self.my_nick, message, &self.timestamp_format);
+                        let chat_msg = outgoing_local_echo(
+                            target,
+                            &self.my_nick,
+                            message,
+                            &self.timestamp_format,
+                        );
                         self.add_message_to_channel(target, chat_msg);
                     } else {
                         self.add_message_to_current(ChatMessage::system_fmt(
@@ -99,19 +103,20 @@ impl IrcApp {
                         ));
                         return;
                     }
-                    // Open query window (loads history via add_message_to_channel)
-                    if !self.channels.contains_key(target) {
-                        // Create the query window with a system message to trigger history load
-                        let sys_msg = ChatMessage::system(&format!("Conversation with {}", target));
-                        self.add_message_to_channel(target, sys_msg);
+                    if !self.open_query(target) {
+                        self.add_server_message(ChatMessage::system_fmt(
+                            "Unable to open query window",
+                            &self.timestamp_format,
+                        ));
+                        return;
                     }
-                    self.current_channel = Some(target.to_string());
                     // If there's a message, send it
                     if let Some(&message) = msg_parts.get(1)
                         && !message.is_empty()
                     {
                         if self.connected && self.send_privmsg_text(target, message) {
-                            let chat_msg = ChatMessage::new_fmt(
+                            let chat_msg = outgoing_local_echo(
+                                target,
                                 &self.my_nick,
                                 message,
                                 &self.timestamp_format,
@@ -320,11 +325,16 @@ impl IrcApp {
                     } else {
                         format!("\x01{} {}\x01", ctcp_cmd, ctcp_args)
                     };
-                    self.send_command(IrcCommand::Privmsg(target.to_string(), ctcp_msg));
-                    self.add_message_to_current(ChatMessage::system(&format!(
-                        "[CTCP] Sent {} to {}",
-                        ctcp_cmd, target
-                    )));
+                    if self.send_command(IrcCommand::Privmsg(target.to_string(), ctcp_msg)) {
+                        self.add_message_to_current(ChatMessage::system(&format!(
+                            "[CTCP] Sent {} to {}",
+                            ctcp_cmd, target
+                        )));
+                    } else {
+                        self.add_message_to_current(ChatMessage::system(
+                            "CTCP request not sent (not connected or message too long)",
+                        ));
+                    }
                 } else {
                     self.add_message_to_current(ChatMessage::system(
                         "Usage: /ctcp <nick> <command> [args]",
@@ -336,11 +346,16 @@ impl IrcApp {
                 // Convenience: /version <nick> is shorthand for /ctcp <nick> VERSION
                 if !args.is_empty() {
                     let ctcp_msg = "\x01VERSION\x01".to_string();
-                    self.send_command(IrcCommand::Privmsg(args.to_string(), ctcp_msg));
-                    self.add_message_to_current(ChatMessage::system(&format!(
-                        "[CTCP] Sent VERSION to {}",
-                        args
-                    )));
+                    if self.send_command(IrcCommand::Privmsg(args.to_string(), ctcp_msg)) {
+                        self.add_message_to_current(ChatMessage::system(&format!(
+                            "[CTCP] Sent VERSION to {}",
+                            args
+                        )));
+                    } else {
+                        self.add_message_to_current(ChatMessage::system(
+                            "CTCP VERSION not sent (not connected or message too long)",
+                        ));
+                    }
                 } else {
                     self.add_message_to_current(ChatMessage::system("Usage: /version <nick>"));
                 }
@@ -354,11 +369,16 @@ impl IrcApp {
                     .unwrap_or_default()
                     .as_millis();
                 let ctcp_msg = format!("\x01PING {}\x01", timestamp);
-                self.send_command(IrcCommand::Privmsg(args.to_string(), ctcp_msg));
-                self.add_message_to_current(ChatMessage::system(&format!(
-                    "[CTCP] Sent PING to {}",
-                    args
-                )));
+                if self.send_command(IrcCommand::Privmsg(args.to_string(), ctcp_msg)) {
+                    self.add_message_to_current(ChatMessage::system(&format!(
+                        "[CTCP] Sent PING to {}",
+                        args
+                    )));
+                } else {
+                    self.add_message_to_current(ChatMessage::system(
+                        "CTCP PING not sent (not connected or message too long)",
+                    ));
+                }
             }
 
             // Catch the cases the guarded PING arm above rejects (empty target, or a
@@ -410,29 +430,36 @@ impl IrcApp {
             }
 
             "LIST" => {
-                // Prepare the channel list dialog
-                self.channel_list.clear();
-                self.channel_list_dirty = true;
-                self.channel_list_loading = true;
                 self.show_channel_list = true;
 
                 // Use configurable min users filter to avoid flooding on large networks
                 // Users can override with /list * or /list <filter>
-                if args.is_empty() {
+                let request = if args.is_empty() {
                     // >N means "more than N users", so for min 5, send >4
                     if self.list_min_users >= 1 {
-                        self.send_command(IrcCommand::List(Some(format!(
+                        IrcCommand::List(Some(format!(
                             ">{}",
                             self.list_min_users.saturating_sub(1)
-                        ))));
+                        )))
                     } else {
-                        self.send_command(IrcCommand::List(None));
+                        IrcCommand::List(None)
                     }
                 } else if args == "*" {
                     // Allow /list * to get all channels (use at your own risk)
-                    self.send_command(IrcCommand::List(None));
+                    IrcCommand::List(None)
                 } else {
-                    self.send_command(IrcCommand::List(Some(args.to_string())));
+                    IrcCommand::List(Some(args.to_string()))
+                };
+                if self.send_command(request) {
+                    self.channel_list.clear();
+                    self.channel_list_dirty = true;
+                    self.channel_list_loading = true;
+                } else {
+                    self.channel_list_loading = false;
+                    self.add_server_message(ChatMessage::system_fmt(
+                        "Not connected - channel list was not refreshed",
+                        &self.timestamp_format,
+                    ));
                 }
             }
 
@@ -445,7 +472,7 @@ impl IrcApp {
                         "Usage: /kick <nick> [reason]",
                     ));
                 } else if let Some(channel) = &self.current_channel.clone()
-                    && is_channel(channel)
+                    && self.is_channel_name(channel)
                 {
                     let reason = parts.get(1).map(|s| s.to_string());
                     self.send_command(IrcCommand::Kick(channel.clone(), nick.to_string(), reason));
@@ -455,7 +482,7 @@ impl IrcApp {
             "BAN" => {
                 if !args.is_empty() {
                     if let Some(channel) = &self.current_channel.clone()
-                        && is_channel(channel)
+                        && self.is_channel_name(channel)
                     {
                         // Convert nick to ban mask if it's just a nick
                         let mask = nick_to_mask(args);
@@ -480,7 +507,7 @@ impl IrcApp {
             "UNBAN" => {
                 if !args.is_empty() {
                     if let Some(channel) = &self.current_channel.clone()
-                        && is_channel(channel)
+                        && self.is_channel_name(channel)
                     {
                         let mask = nick_to_mask(args);
                         self.send_command(IrcCommand::Mode(
@@ -502,7 +529,7 @@ impl IrcApp {
                         "Usage: /kickban <nick> [reason]",
                     ));
                 } else if let Some(channel) = &self.current_channel.clone()
-                    && is_channel(channel)
+                    && self.is_channel_name(channel)
                 {
                     // Ban first, then kick. nick_to_mask passes a full/partial
                     // hostmask through and completes a bare nick to nick!*@*
@@ -534,7 +561,7 @@ impl IrcApp {
             "OP" => {
                 if !args.is_empty() {
                     if let Some(channel) = &self.current_channel.clone()
-                        && is_channel(channel)
+                        && self.is_channel_name(channel)
                     {
                         for nick in args.split_whitespace() {
                             self.send_command(IrcCommand::Mode(
@@ -554,7 +581,7 @@ impl IrcApp {
             "DEOP" => {
                 if !args.is_empty() {
                     if let Some(channel) = &self.current_channel.clone()
-                        && is_channel(channel)
+                        && self.is_channel_name(channel)
                     {
                         for nick in args.split_whitespace() {
                             self.send_command(IrcCommand::Mode(
@@ -574,7 +601,7 @@ impl IrcApp {
             "VOICE" | "V" => {
                 if !args.is_empty() {
                     if let Some(channel) = &self.current_channel.clone()
-                        && is_channel(channel)
+                        && self.is_channel_name(channel)
                     {
                         for nick in args.split_whitespace() {
                             self.send_command(IrcCommand::Mode(
@@ -594,7 +621,7 @@ impl IrcApp {
             "DEVOICE" => {
                 if !args.is_empty() {
                     if let Some(channel) = &self.current_channel.clone()
-                        && is_channel(channel)
+                        && self.is_channel_name(channel)
                     {
                         for nick in args.split_whitespace() {
                             self.send_command(IrcCommand::Mode(
@@ -611,10 +638,10 @@ impl IrcApp {
                 }
             }
 
-            "HALFOP" | "HOP" => {
+            "HALFOP" => {
                 if !args.is_empty()
                     && let Some(channel) = &self.current_channel.clone()
-                    && is_channel(channel)
+                    && self.is_channel_name(channel)
                 {
                     for nick in args.split_whitespace() {
                         self.send_command(IrcCommand::Mode(
@@ -629,7 +656,7 @@ impl IrcApp {
             "DEHALFOP" | "DEHOP" => {
                 if !args.is_empty()
                     && let Some(channel) = &self.current_channel.clone()
-                    && is_channel(channel)
+                    && self.is_channel_name(channel)
                 {
                     for nick in args.split_whitespace() {
                         self.send_command(IrcCommand::Mode(
@@ -643,14 +670,15 @@ impl IrcApp {
 
             "MODE" | "M" => {
                 if !args.is_empty() {
-                    let parts: Vec<&str> = args.splitn(3, ' ').collect();
-                    let target = parts[0];
-                    let mode = parts.get(1).map(|s| s.to_string());
-                    let params = parts
-                        .get(2)
-                        .map(|s| s.split_whitespace().map(str::to_string).collect())
-                        .unwrap_or_default();
-                    self.send_command(IrcCommand::Mode(target.to_string(), mode, params));
+                    if let Some((target, mode, params)) =
+                        mode_command_args(args, self.current_channel.as_deref())
+                    {
+                        self.send_command(IrcCommand::Mode(target, mode, params));
+                    } else {
+                        self.add_message_to_current(ChatMessage::system(
+                            "Usage: /mode [target] [+/-modes] [params]",
+                        ));
+                    }
                 } else if let Some(channel) = &self.current_channel.clone() {
                     // Query channel modes
                     self.send_command(IrcCommand::Mode(channel.clone(), None, Vec::new()));
@@ -701,10 +729,20 @@ impl IrcApp {
                 let parts: Vec<&str> = args.splitn(2, ' ').collect();
                 if let (Some(target), Some(message)) = (parts.first(), parts.get(1)) {
                     if self.connected && self.send_notice_text(target, message) {
-                        self.add_message_to_current(ChatMessage::system_fmt(
-                            &format!("-> -{}- {}", target, message),
-                            &self.timestamp_format,
-                        ));
+                        let confirmation = if service_message_contains_credentials(target, message)
+                        {
+                            ChatMessage::system_fmt(
+                                &format!("-> -{}- <credential command sent>", target),
+                                &self.timestamp_format,
+                            )
+                            .without_logging()
+                        } else {
+                            ChatMessage::system_fmt(
+                                &format!("-> -{}- {}", target, message),
+                                &self.timestamp_format,
+                            )
+                        };
+                        self.add_message_to_current(confirmation);
                     } else {
                         self.add_message_to_current(ChatMessage::system_fmt(
                             "Not connected - notice not sent",
@@ -723,7 +761,7 @@ impl IrcApp {
                 let message = args;
                 if !message.is_empty() {
                     if let Some(channel) = &self.current_channel.clone()
-                        && is_channel(channel)
+                        && self.is_channel_name(channel)
                     {
                         let target = format!("@{}", channel);
                         if self.connected && self.send_notice_text(&target, message) {
@@ -754,7 +792,8 @@ impl IrcApp {
                     ));
                 } else {
                     for channel_name in self.channels.keys().cloned().collect::<Vec<_>>() {
-                        if is_channel(&channel_name) && self.send_privmsg_text(&channel_name, args)
+                        if self.is_channel_name(&channel_name)
+                            && self.send_privmsg_text(&channel_name, args)
                         {
                             let msg =
                                 ChatMessage::new_fmt(&self.my_nick, args, &self.timestamp_format);
@@ -775,7 +814,8 @@ impl IrcApp {
                     ));
                 } else {
                     for channel_name in self.channels.keys().cloned().collect::<Vec<_>>() {
-                        if is_channel(&channel_name) && self.send_action_text(&channel_name, args)
+                        if self.is_channel_name(&channel_name)
+                            && self.send_action_text(&channel_name, args)
                         {
                             let msg = ChatMessage::action_fmt(
                                 &self.my_nick,
@@ -843,25 +883,33 @@ impl IrcApp {
                         "Usage: /invite <nick> [#channel]",
                     ));
                 } else {
-                    self.send_command(IrcCommand::Invite(nick.to_string(), channel.clone()));
-                    self.add_message_to_current(ChatMessage::system(&format!(
-                        "Inviting {} to {}",
-                        nick, channel
-                    )));
+                    if self.send_command(IrcCommand::Invite(nick.to_string(), channel.clone())) {
+                        self.add_message_to_current(ChatMessage::system(&format!(
+                            "Inviting {} to {}",
+                            nick, channel
+                        )));
+                    } else {
+                        self.add_message_to_current(ChatMessage::system(
+                            "Invite not sent (not connected or command too long)",
+                        ));
+                    }
                 }
             }
 
-            "CYCLE" | "REJOIN" => {
+            "CYCLE" | "REJOIN" | "HOP" => {
                 let channel = if args.is_empty() {
                     self.current_channel.clone()
                 } else {
                     Some(args.to_string())
                 };
                 if let Some(ch) = channel
-                    && is_channel(&ch)
+                    && self.is_channel_name(&ch)
                 {
                     // Get the stored key for auto-rejoin if available
-                    let key = self.channels.get(&ch).and_then(|c| c.key.clone());
+                    let key = self
+                        .channel_key(&ch)
+                        .and_then(|stored| self.channels.get(&stored))
+                        .and_then(|c| c.key.clone());
                     self.send_command(IrcCommand::Part(ch.clone(), Some("Cycling".to_string())));
                     self.send_command(IrcCommand::Join(ch, key, None, None));
                 }
@@ -875,31 +923,23 @@ impl IrcApp {
                     } else {
                         format!("#{}", args)
                     };
-                    self.send_command(IrcCommand::Raw(format!("KNOCK {}", channel)));
-                    self.add_message_to_current(ChatMessage::system(&format!(
-                        "Knocking on {}",
-                        channel
-                    )));
+                    if self.send_command(IrcCommand::Raw(format!("KNOCK {}", channel))) {
+                        self.add_message_to_current(ChatMessage::system(&format!(
+                            "Knocking on {}",
+                            channel
+                        )));
+                    } else {
+                        self.add_message_to_current(ChatMessage::system(
+                            "Knock request not sent (not connected or command too long)",
+                        ));
+                    }
                 } else {
                     self.add_message_to_current(ChatMessage::system("Usage: /knock <#channel>"));
                 }
             }
 
             "CLOSE" | "WC" => {
-                // Close current window
-                if let Some(channel_name) = self.current_channel.clone() {
-                    // Live channels are PARTed (the Part echo removes the window);
-                    // query windows and stale channel tabs from a dead connection
-                    // are closed locally.
-                    if is_channel(&channel_name)
-                        && self.send_command(IrcCommand::Part(channel_name.clone(), None))
-                    {
-                        // Window is removed when the server confirms the PART.
-                    } else {
-                        self.channels.remove(&channel_name);
-                        self.current_channel = self.channels.keys().next().cloned();
-                    }
-                }
+                self.close_current_tab();
             }
 
             // === Server Info Commands ===
@@ -1029,17 +1069,41 @@ impl IrcApp {
                     // Handles "host", "host port", "host:port", "[v6::1]:port",
                     // and bare IPv6 literals (which contain multiple colons and
                     // must not be split on the first one).
-                    let (host, port) = parse_server_arg(args);
+                    let (host, port) = match parse_server_arg(args) {
+                        Ok(endpoint) => endpoint,
+                        Err(error) => {
+                            self.add_server_message(ChatMessage::system_fmt(
+                                &error,
+                                &self.timestamp_format,
+                            ));
+                            return;
+                        }
+                    };
+                    let selected_port = port.as_deref().unwrap_or(&self.server_port);
+                    if host.trim().is_empty() {
+                        self.add_server_message(ChatMessage::system_fmt(
+                            "Server host cannot be empty",
+                            &self.timestamp_format,
+                        ));
+                        return;
+                    }
+                    if let Err(error) = parse_server_port(selected_port) {
+                        self.add_server_message(ChatMessage::system_fmt(
+                            &error,
+                            &self.timestamp_format,
+                        ));
+                        return;
+                    }
+                    // /server is deliberately unprofiled. /reconnect preserves
+                    // the active profile; /server never inherits its secrets,
+                    // even if the user names the same host and port again.
+                    self.clear_endpoint_credentials();
                     self.server_host = host;
                     if let Some(port) = port {
                         self.server_port = port;
                     }
-                    self.reset_session_state();
-                    // Disconnect from current server if connected
-                    if self.connected || self.connecting || self.cmd_tx.is_some() {
-                        self.request_reconnect_after_close("Changing servers");
-                    } else {
-                        self.connecting = true;
+                    if !self.switch_session_from_form("Changing servers") {
+                        return;
                     }
                     self.add_server_message(ChatMessage::system(&format!(
                         "Connecting to {}:{}...",
@@ -1047,8 +1111,8 @@ impl IrcApp {
                     )));
                 } else {
                     self.add_message_to_current(ChatMessage::system(&format!(
-                        "Current server: {}:{}",
-                        self.server_host, self.server_port
+                        "Current server: {}",
+                        self.active_endpoint_label()
                     )));
                 }
             }
@@ -1108,12 +1172,13 @@ impl IrcApp {
                 } else {
                     // Add to ignore list
                     let mask = args.to_string();
+                    let mask_key = self.network_support.canonicalize(&mask);
                     if !self
                         .ignore_list
                         .iter()
-                        .any(|m| m.eq_ignore_ascii_case(&mask))
+                        .any(|m| self.network_support.canonicalize(m) == mask_key)
                     {
-                        self.ignore_list_lower.push(mask.to_lowercase());
+                        self.ignore_list_lower.push(mask_key);
                         self.ignore_list.push(mask.clone());
                         self.add_message_to_current(ChatMessage::system(&format!(
                             "Now ignoring: {}",
@@ -1136,14 +1201,17 @@ impl IrcApp {
                         "Usage: /unignore <nick|mask>",
                     ));
                 } else {
-                    let mask_lower = args.to_lowercase();
+                    let mask_key = self.network_support.canonicalize(args);
+                    let case_mapping = self.network_support.case_mapping;
                     let before_len = self.ignore_list.len();
                     self.ignore_list
-                        .retain(|m| !m.to_lowercase().eq(&mask_lower));
+                        .retain(|m| case_mapping.canonicalize(m) != mask_key);
                     if self.ignore_list.len() < before_len {
-                        // Rebuild cached lowercase list
-                        self.ignore_list_lower =
-                            self.ignore_list.iter().map(|s| s.to_lowercase()).collect();
+                        self.ignore_list_lower = self
+                            .ignore_list
+                            .iter()
+                            .map(|s| case_mapping.canonicalize(s))
+                            .collect();
                         self.add_message_to_current(ChatMessage::system(&format!(
                             "No longer ignoring: {}",
                             args
@@ -1197,7 +1265,9 @@ impl IrcApp {
                         ChatMessage::system(&format!("Searching for: {}", args)).without_logging(),
                     );
                     for match_line in &matches {
-                        self.add_message_to_current(ChatMessage::system(match_line).without_logging());
+                        self.add_message_to_current(
+                            ChatMessage::system(match_line).without_logging(),
+                        );
                     }
                     self.add_message_to_current(
                         ChatMessage::system(&format!("Found {} matches", matches.len()))
@@ -1231,11 +1301,22 @@ impl IrcApp {
                             .lines()
                             .filter(|line| !line.trim().is_empty())
                             .enumerate()
-                            .map(|(i, line)| format!("  {}. {}", i + 1, line))
+                            .map(|(i, line)| {
+                                let shown = if command_line_contains_credentials(line) {
+                                    "<credential command redacted>"
+                                } else {
+                                    line
+                                };
+                                format!("  {}. {}", i + 1, shown)
+                            })
                             .collect();
-                        self.add_message_to_current(ChatMessage::system("Auto-perform commands:"));
+                        self.add_message_to_current(
+                            ChatMessage::system("Auto-perform commands:").without_logging(),
+                        );
                         for line in lines {
-                            self.add_message_to_current(ChatMessage::system(&line));
+                            self.add_message_to_current(
+                                ChatMessage::system(&line).without_logging(),
+                            );
                         }
                     }
                 } else if args.eq_ignore_ascii_case("clear") {
@@ -1251,10 +1332,9 @@ impl IrcApp {
                     }
                     self.auto_perform.push_str(args);
                     self.get_settings().save();
-                    self.add_message_to_current(ChatMessage::system(&format!(
-                        "Added to auto-perform: {}",
-                        args
-                    )));
+                    self.add_message_to_current(
+                        ChatMessage::system("Added command to auto-perform.").without_logging(),
+                    );
                 }
             }
 
@@ -1283,7 +1363,7 @@ impl IrcApp {
         if self.connected && self.send_privmsg_text(service, args) {
             self.add_message_to_channel(
                 service,
-                ChatMessage::new_fmt(&self.my_nick, args, &self.timestamp_format),
+                outgoing_local_echo(service, &self.my_nick, args, &self.timestamp_format),
             );
         } else {
             self.add_message_to_current(ChatMessage::system_fmt(
@@ -1291,6 +1371,18 @@ impl IrcApp {
                 &self.timestamp_format,
             ));
         }
+    }
+
+    /// Secrets and automation belong to one configured network profile. An
+    /// unprofiled endpoint change must never inherit them from the old server.
+    pub(crate) fn clear_endpoint_credentials(&mut self) {
+        self.password.clear();
+        self.sasl_username.clear();
+        self.sasl_password.clear();
+        self.auto_join_channels.clear();
+        self.auto_perform.clear();
+        self.pending_auto_perform = None;
+        self.accept_invalid_certs = false;
     }
 
     pub fn show_help(&mut self) {
@@ -1428,6 +1520,87 @@ impl IrcApp {
     }
 }
 
+pub(super) fn service_message_contains_credentials(target: &str, message: &str) -> bool {
+    // IRC permits comma-separated message targets and network-qualified nicks
+    // (NickServ@services.example). Treat a command as sensitive if any target
+    // is an authentication service.
+    let is_nickserv = target.split(',').any(|target| {
+        target
+            .trim_start_matches(['~', '&', '@', '%', '+'])
+            .split('@')
+            .next()
+            .unwrap_or(target)
+            .eq_ignore_ascii_case("NickServ")
+    });
+    let is_authserv = target.split(',').any(|target| {
+        target
+            .trim_start_matches(['~', '&', '@', '%', '+'])
+            .split('@')
+            .next()
+            .unwrap_or(target)
+            .eq_ignore_ascii_case("AuthServ")
+    });
+    if !is_nickserv && !is_authserv {
+        return false;
+    }
+
+    let mut words = message.trim_start_matches(':').split_whitespace();
+    let command = words.next().unwrap_or("").to_ascii_uppercase();
+    if is_authserv && matches!(command.as_str(), "AUTH" | "LOGIN" | "IDENTIFY" | "ID") {
+        return true;
+    }
+    if matches!(
+        command.as_str(),
+        "IDENTIFY"
+            | "ID"
+            | "SIDENTIFY"
+            | "AUTH"
+            | "LOGIN"
+            | "REGISTER"
+            | "GHOST"
+            | "REGAIN"
+            | "RECOVER"
+            | "RELEASE"
+            | "GROUP"
+            | "SETPASS"
+            | "RESETPASS"
+    ) {
+        return true;
+    }
+    command.eq_ignore_ascii_case("SET")
+        && words.next().is_some_and(|word| {
+            word.eq_ignore_ascii_case("PASSWORD") || word.eq_ignore_ascii_case("PASS")
+        })
+}
+
+pub(super) fn command_line_contains_credentials(line: &str) -> bool {
+    let line = line.trim().trim_start_matches('/');
+    let mut parts = line.splitn(2, char::is_whitespace);
+    let command = parts.next().unwrap_or("");
+    let args = parts.next().unwrap_or("").trim_start();
+    match command.to_ascii_uppercase().as_str() {
+        "PASS" | "AUTHENTICATE" | "OPER" => true,
+        "NS" | "NICKSERV" => service_message_contains_credentials("NickServ", args),
+        "MSG" | "PRIVMSG" | "QUERY" | "Q" | "NOTICE" | "N" => {
+            let mut message = args.splitn(2, char::is_whitespace);
+            let target = message.next().unwrap_or("");
+            let content = message.next().unwrap_or("").trim_start();
+            service_message_contains_credentials(target, content)
+        }
+        "RAW" | "QUOTE" => command_line_contains_credentials(args),
+        "PERFORM" if !args.eq_ignore_ascii_case("clear") => command_line_contains_credentials(args),
+        _ => false,
+    }
+}
+
+fn outgoing_local_echo(target: &str, sender: &str, content: &str, format: &str) -> ChatMessage {
+    if service_message_contains_credentials(target, content) {
+        ChatMessage::new_fmt(sender, "<credential command sent>", format).without_logging()
+    } else {
+        ChatMessage::new_fmt(sender, content, format)
+    }
+}
+
 /// Split /monitor arguments into (subcommand, targets), accepting both the
 /// documented "+ nick1,nick2" form and the attached "+nick1,nick2" form
 /// (which would otherwise send the sign as part of the nick: "MONITOR + +nick").
@@ -1457,76 +1630,327 @@ fn monitor_args(args: &str) -> (String, Option<String>) {
     }
 }
 
+/// Parse `/mode` while supporting both explicit targets and the documented
+/// shorthand `/mode +m`, which applies to the current channel.
+fn mode_command_args(
+    args: &str,
+    current_channel: Option<&str>,
+) -> Option<(String, Option<String>, Vec<String>)> {
+    let mut parts = args.split_whitespace();
+    let first = parts.next()?;
+    if first.starts_with(['+', '-']) {
+        let target = current_channel?;
+        return Some((
+            target.to_string(),
+            Some(first.to_string()),
+            parts.map(str::to_string).collect(),
+        ));
+    }
+
+    Some((
+        first.to_string(),
+        parts.next().map(str::to_string),
+        parts.map(str::to_string).collect(),
+    ))
+}
+
 /// Parse the /server argument: "host", "host port", "host:port",
 /// "[v6::addr]:port", or a bare IPv6 literal (multiple colons; must not be
 /// split on the first one).
-fn parse_server_arg(args: &str) -> (String, Option<String>) {
+fn parse_server_arg(args: &str) -> Result<(String, Option<String>), String> {
     let args = args.trim();
     // Space-separated form: "host 6697" (works for any host including IPv6).
     if let Some((host, port)) = args.split_once(' ') {
         let host = host.trim_matches(['[', ']']);
-        return (host.to_string(), Some(port.trim().to_string()));
+        let port = parse_server_port(port)?;
+        return Ok((host.to_string(), Some(port.to_string())));
     }
     // Bracketed IPv6 with optional port: "[::1]:6697" or "[::1]".
     if let Some(rest) = args.strip_prefix('[') {
         if let Some((host, after)) = rest.split_once(']') {
-            let port = after.strip_prefix(':').map(|p| p.to_string());
-            return (host.to_string(), port);
+            let port = match after.strip_prefix(':') {
+                Some(port) => Some(parse_server_port(port)?.to_string()),
+                None if after.is_empty() => None,
+                None => return Err(format!("Invalid server endpoint: {args}")),
+            };
+            return Ok((host.to_string(), port));
         }
-        return (rest.to_string(), None);
+        return Ok((rest.to_string(), None));
     }
     // "host:port" - only with exactly one colon and a numeric port; an IPv6
     // literal has several colons and falls through as a bare host.
     if args.chars().filter(|&c| c == ':').count() == 1
         && let Some((host, port)) = args.rsplit_once(':')
-        && !host.is_empty()
-        && !port.is_empty()
-        && port.parse::<u16>().is_ok()
     {
-        return (host.to_string(), Some(port.to_string()));
+        if host.is_empty() {
+            return Err("Server host cannot be empty".to_string());
+        }
+        let port = parse_server_port(port)?;
+        return Ok((host.to_string(), Some(port.to_string())));
     }
-    (args.to_string(), None)
+    Ok((args.to_string(), None))
+}
+
+pub(crate) fn parse_server_port(value: &str) -> Result<u16, String> {
+    match value.trim().parse::<u16>() {
+        Ok(port) if port > 0 => Ok(port),
+        _ => Err(format!(
+            "Invalid server port {:?}; enter a number from 1 to 65535",
+            value.trim()
+        )),
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::gui::types::Channel;
+    use tokio::sync::mpsc;
+
+    fn connected_command_app() -> (IrcApp, mpsc::UnboundedReceiver<IrcCommand>) {
+        let mut app = IrcApp::default();
+        let (tx, rx) = mpsc::unbounded_channel();
+        app.cmd_tx = Some(tx);
+        app.connected = true;
+        (app, rx)
+    }
 
     #[test]
     fn monitor_args_accepts_attached_sign() {
-        assert_eq!(monitor_args("+ friend"), ("+".into(), Some("friend".into())));
+        assert_eq!(
+            monitor_args("+ friend"),
+            ("+".into(), Some("friend".into()))
+        );
         assert_eq!(monitor_args("+friend"), ("+".into(), Some("friend".into())));
         assert_eq!(monitor_args("-friend"), ("-".into(), Some("friend".into())));
-        assert_eq!(
-            monitor_args("+a,b c"),
-            ("+".into(), Some("a,b,c".into()))
-        );
+        assert_eq!(monitor_args("+a,b c"), ("+".into(), Some("a,b,c".into())));
         assert_eq!(monitor_args("L"), ("L".into(), None));
         assert_eq!(monitor_args("friend"), ("+".into(), Some("friend".into())));
+    }
+
+    #[test]
+    fn mode_args_support_current_channel_shorthand() {
+        assert_eq!(
+            mode_command_args("+m", Some("#room")),
+            Some(("#room".into(), Some("+m".into()), Vec::new()))
+        );
+        assert_eq!(
+            mode_command_args("+kl secret 20", Some("#room")),
+            Some((
+                "#room".into(),
+                Some("+kl".into()),
+                vec!["secret".into(), "20".into()]
+            ))
+        );
+        assert_eq!(
+            mode_command_args("#other +m", Some("#room")),
+            Some(("#other".into(), Some("+m".into()), Vec::new()))
+        );
+        assert_eq!(
+            mode_command_args("#other", Some("#room")),
+            Some(("#other".into(), None, Vec::new()))
+        );
+        assert_eq!(mode_command_args("+m", None), None);
+    }
+
+    #[test]
+    fn hop_cycles_channel_while_halfop_remains_a_mode_command() {
+        let (mut app, mut rx) = connected_command_app();
+        let mut channel = Channel::new();
+        channel.key = Some("secret-key".into());
+        app.channels.insert("#Room".into(), channel);
+        app.current_channel = Some("#Room".into());
+
+        app.process_command("/hop");
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            IrcCommand::Part("#Room".into(), Some("Cycling".into()))
+        );
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            IrcCommand::Join("#Room".into(), Some("secret-key".into()), None, None)
+        );
+
+        app.process_command("/halfop alice");
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            IrcCommand::Mode("#Room".into(), Some("+h".into()), vec!["alice".into()])
+        );
+    }
+
+    #[test]
+    fn targetless_mode_queues_current_channel() {
+        let (mut app, mut rx) = connected_command_app();
+        app.current_channel = Some("#room".into());
+        app.process_command("/mode +m");
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            IrcCommand::Mode("#room".into(), Some("+m".into()), Vec::new())
+        );
+    }
+
+    #[test]
+    fn disconnected_commands_never_claim_they_were_sent() {
+        let mut app = IrcApp::default();
+        app.process_command("/ctcp bob VERSION");
+        app.process_command("/invite bob #room");
+        app.process_command("/knock #room");
+        app.channel_list_loading = true;
+        app.process_command("/list");
+
+        let feedback: Vec<&str> = app
+            .server_messages
+            .iter()
+            .map(|message| message.content.as_str())
+            .collect();
+        assert_eq!(feedback.len(), 4);
+        assert!(
+            feedback
+                .iter()
+                .all(|line| line.contains("not sent") || line.contains("not refreshed"))
+        );
+        assert!(feedback.iter().all(|line| !line.contains("Sent")));
+        assert!(!app.channel_list_loading);
+    }
+
+    #[test]
+    fn credential_commands_are_redacted_from_local_echoes_and_perform_output() {
+        for message in [
+            "IDENTIFY hunter2",
+            "REGISTER hunter2 user@example.test",
+            "SIDENTIFY hunter2",
+            "GHOST oldnick hunter2",
+            "REGAIN nick hunter2",
+            "RECOVER nick hunter2",
+            "RELEASE nick hunter2",
+            "SET PASSWORD hunter2",
+        ] {
+            assert!(service_message_contains_credentials("NickServ", message));
+            let echo = outgoing_local_echo("NickServ", "me", message, "short");
+            assert!(echo.no_log);
+            assert_eq!(echo.content, "<credential command sent>");
+            assert!(!echo.content.contains("hunter2"));
+        }
+
+        for line in [
+            "/ns identify hunter2",
+            "/msg NickServ identify hunter2",
+            "/query NickServ recover nick hunter2",
+            "/notice NickServ identify hunter2",
+            "/msg NickServ@services.example identify hunter2",
+            "/msg NickServ,alice identify hunter2",
+            "/perform /ns identify hunter2",
+            "/raw PASS hunter2",
+            "/quote AUTHENTICATE hunter2",
+        ] {
+            assert!(command_line_contains_credentials(line), "{line}");
+        }
+
+        let ordinary = outgoing_local_echo("NickServ", "me", "INFO alice", "short");
+        assert!(!ordinary.no_log);
+        assert_eq!(ordinary.content, "INFO alice");
+        assert!(!command_line_contains_credentials("/join #rust"));
+    }
+
+    #[test]
+    fn unprofiled_endpoint_changes_clear_server_scoped_secrets() {
+        let mut app = IrcApp {
+            password: "server-pass".into(),
+            sasl_username: "account".into(),
+            sasl_password: "sasl-pass".into(),
+            auto_join_channels: "#secret key".into(),
+            auto_perform: "/ns identify nickserv-pass".into(),
+            pending_auto_perform: Some(vec!["/ns identify nickserv-pass".into()]),
+            accept_invalid_certs: true,
+            ..IrcApp::default()
+        };
+
+        app.clear_endpoint_credentials();
+
+        assert!(app.password.is_empty());
+        assert!(app.sasl_username.is_empty());
+        assert!(app.sasl_password.is_empty());
+        assert!(app.auto_join_channels.is_empty());
+        assert!(app.auto_perform.is_empty());
+        assert!(app.pending_auto_perform.is_none());
+        assert!(!app.accept_invalid_certs);
+    }
+
+    #[test]
+    fn server_command_validates_before_mutation_and_never_inherits_a_profile() {
+        let mut app = IrcApp {
+            password: "server-pass".into(),
+            sasl_username: "account".into(),
+            sasl_password: "sasl-pass".into(),
+            auto_join_channels: "#private key".into(),
+            auto_perform: "/ns identify nickserv-pass".into(),
+            accept_invalid_certs: true,
+            ..IrcApp::default()
+        };
+        let original_host = app.server_host.clone();
+        app.process_command("/server new.example 0");
+        assert_eq!(app.server_host, original_host);
+        assert_eq!(app.password, "server-pass");
+        assert!(!app.connecting);
+        assert!(
+            app.server_messages
+                .back()
+                .is_some_and(|message| message.content.contains("1 to 65535"))
+        );
+
+        // Even naming the current endpoint is an unprofiled /server action.
+        let command = format!("/server {} {}", app.server_host, app.server_port);
+        app.process_command(&command);
+        assert!(app.connecting);
+        assert!(app.password.is_empty());
+        assert!(app.sasl_username.is_empty());
+        assert!(app.sasl_password.is_empty());
+        assert!(app.auto_join_channels.is_empty());
+        assert!(app.auto_perform.is_empty());
+        assert!(!app.accept_invalid_certs);
+        let active = app.active_server_config().unwrap();
+        assert!(active.password.is_none());
+        assert!(active.sasl_username.is_none());
+        assert!(active.sasl_password.is_none());
     }
 
     #[test]
     fn server_arg_handles_ipv6() {
         assert_eq!(
             parse_server_arg("irc.libera.chat:6697"),
-            ("irc.libera.chat".into(), Some("6697".into()))
+            Ok(("irc.libera.chat".into(), Some("6697".into())))
         );
         assert_eq!(
             parse_server_arg("irc.libera.chat 6697"),
-            ("irc.libera.chat".into(), Some("6697".into()))
+            Ok(("irc.libera.chat".into(), Some("6697".into())))
         );
         assert_eq!(
             parse_server_arg("2001:db8::1 6697"),
-            ("2001:db8::1".into(), Some("6697".into()))
+            Ok(("2001:db8::1".into(), Some("6697".into())))
         );
-        assert_eq!(parse_server_arg("2001:db8::1"), ("2001:db8::1".into(), None));
+        assert_eq!(
+            parse_server_arg("2001:db8::1"),
+            Ok(("2001:db8::1".into(), None))
+        );
         assert_eq!(
             parse_server_arg("[::1]:7000"),
-            ("::1".into(), Some("7000".into()))
+            Ok(("::1".into(), Some("7000".into())))
         );
-        assert_eq!(parse_server_arg("[2001:db8::1]"), ("2001:db8::1".into(), None));
-        assert_eq!(parse_server_arg("irc.example.org"), ("irc.example.org".into(), None));
-        // A non-numeric tail is not a port.
-        assert_eq!(parse_server_arg("host:junk"), ("host:junk".into(), None));
+        assert_eq!(
+            parse_server_arg("[2001:db8::1]"),
+            Ok(("2001:db8::1".into(), None))
+        );
+        assert_eq!(
+            parse_server_arg("irc.example.org"),
+            Ok(("irc.example.org".into(), None))
+        );
+        assert!(parse_server_arg("host:junk").is_err());
+        assert!(parse_server_arg("host:").is_err());
+        assert!(parse_server_arg(":6697").is_err());
+        assert!(parse_server_arg("host 0").is_err());
+        assert!(parse_server_arg("host 70000").is_err());
+        assert!(parse_server_arg("host abc").is_err());
+        assert_eq!(parse_server_port("1"), Ok(1));
+        assert_eq!(parse_server_port("65535"), Ok(65535));
     }
 }

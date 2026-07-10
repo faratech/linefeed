@@ -25,6 +25,7 @@ tracing-subscriber = { version = "0.3.23", default-features = false, features = 
 dirs = "6.0.0"
 base64 = "0.22.1"  # For SASL authentication
 mimalloc = { version = "0.1.52", default-features = false }  # Lower memory allocator
+same-file = "1.0.6"  # Detect replaced/rotated log files portably
 
 # Platform-specific: eframe with x11/wayland only on Linux
 [target.'cfg(target_os = "linux")'.dependencies]
@@ -44,6 +45,12 @@ windows = { version = "0.62.2", features = [
     "Win32_System_Threading",
     "Win32_System_LibraryLoader",
 ] }
+
+# Compatibility-preserving copy of the published scanner with only its XML
+# parser dependency advanced past RUSTSEC-2026-0194 and RUSTSEC-2026-0195.
+# Remove this patch once crates.io publishes a scanner using quick-xml >=0.41.
+[patch.crates-io]
+wayland-scanner = { path = "vendor/wayland-scanner" }
 
 # Fast incremental dev builds
 [profile.dev]

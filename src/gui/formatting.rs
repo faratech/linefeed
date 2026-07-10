@@ -549,6 +549,9 @@ mod tests {
         assert_eq!(url[0].text, "www.example.com");
 
         let segs = layout_irc_text("(https://rust-lang.org)");
-        assert!(segs.iter().any(|s| s.is_url && s.text == "https://rust-lang.org"));
+        assert!(
+            segs.iter()
+                .any(|s| s.is_url && s.text == "https://rust-lang.org")
+        );
     }
 }

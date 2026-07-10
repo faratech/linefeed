@@ -1,13 +1,5 @@
 //! Helper utilities for the GUI module
 
-/// Check if a name is an IRC channel using the common default CHANTYPES.
-/// Runtime code should prefer `IrcApp::is_channel_name` after RPL_ISUPPORT.
-pub fn is_channel(name: &str) -> bool {
-    name.chars()
-        .next()
-        .is_some_and(|c| matches!(c, '#' | '&' | '+' | '!'))
-}
-
 /// Convert a nick or partial mask into a complete `nick!user@host` ban mask.
 /// A full mask (a '!' followed later by an '@') is returned unchanged; partial
 /// forms like "nick", "nick@host", or "nick!user" are completed with `*`
@@ -283,12 +275,4 @@ mod tests {
         assert!(mask_matches("**a", "a"));
     }
 
-    #[test]
-    fn default_channel_detection_includes_common_prefixes() {
-        assert!(is_channel("#chan"));
-        assert!(is_channel("&local"));
-        assert!(is_channel("+modeless"));
-        assert!(is_channel("!safe"));
-        assert!(!is_channel("nick"));
-    }
 }

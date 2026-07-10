@@ -87,8 +87,18 @@ pub struct IrcMessage {
 
 impl IrcMessage {
     pub fn parse(line: &str) -> Option<Self> {
+        // Strip only the IRC framing terminator. General trimming would corrupt
+        // meaningful spaces at the end of a trailing parameter.
+        let line = if let Some(without_lf) = line.strip_suffix('\n') {
+            without_lf.strip_suffix('\r').unwrap_or(without_lf)
+        } else {
+            line
+        };
         let raw = line.to_string();
-        let mut remaining = line.trim();
+        let mut remaining = line.trim_start();
+        if remaining.is_empty() {
+            return None;
+        }
 
         // Parse optional tags (@key=value;key2=value2). The grammar permits
         // multiple spaces between sections (RFC 1459), hence the trim_start.
@@ -274,42 +284,83 @@ impl IrcMessage {
     }
 }
 
-/// Parse an ISO 8601 UTC timestamp ("YYYY-MM-DDThh:mm:ss[.fff]Z") into Unix
-/// epoch seconds. Returns None for anything malformed.
+/// Parse the canonical IRCv3 server-time form
+/// `YYYY-MM-DDThh:mm:ss.sssZ` into Unix epoch seconds.
 fn parse_iso8601_utc(iso: &str) -> Option<u64> {
-    let (date, time) = iso.split_once('T')?;
+    fn digits(bytes: &[u8]) -> Option<u32> {
+        bytes.iter().try_fold(0_u32, |value, byte| {
+            let digit = byte.checked_sub(b'0')?;
+            if digit > 9 {
+                return None;
+            }
+            value.checked_mul(10)?.checked_add(u32::from(digit))
+        })
+    }
 
-    let mut date_parts = date.splitn(3, '-');
-    let year: i64 = date_parts.next()?.parse().ok()?;
-    let month: u32 = date_parts.next()?.parse().ok()?;
-    let day: u32 = date_parts.next()?.parse().ok()?;
-    if !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+    let bytes = iso.as_bytes();
+    if bytes.len() != 24
+        || bytes[4] != b'-'
+        || bytes[7] != b'-'
+        || bytes[10] != b'T'
+        || bytes[13] != b':'
+        || bytes[16] != b':'
+        || bytes[19] != b'.'
+        || bytes[23] != b'Z'
+    {
         return None;
     }
 
-    let time = time.trim_end_matches('Z');
-    let time = time.split('.').next().unwrap_or(time);
-    let mut time_parts = time.splitn(3, ':');
-    let hours: u64 = time_parts.next()?.parse().ok()?;
-    let minutes: u64 = time_parts.next()?.parse().ok()?;
-    // Clamp leap seconds to :59.
-    let seconds: u64 = time_parts.next().unwrap_or("0").parse::<u64>().ok()?.min(59);
-    if hours > 23 || minutes > 59 {
+    let year = digits(&bytes[0..4])?;
+    let month = digits(&bytes[5..7])?;
+    let day = digits(&bytes[8..10])?;
+    let hours = digits(&bytes[11..13])?;
+    let minutes = digits(&bytes[14..16])?;
+    let seconds = digits(&bytes[17..19])?;
+    // Parse milliseconds even though this API intentionally returns seconds.
+    let _milliseconds = digits(&bytes[20..23])?;
+
+    if year < 1970 || !(1..=12).contains(&month) || hours > 23 || minutes > 59 || seconds > 59 {
+        return None;
+    }
+
+    let leap_year =
+        year.is_multiple_of(4) && (!year.is_multiple_of(100) || year.is_multiple_of(400));
+    let days_in_month = match month {
+        2 if leap_year => 29,
+        2 => 28,
+        4 | 6 | 9 | 11 => 30,
+        _ => 31,
+    };
+    if day == 0 || day > days_in_month {
         return None;
     }
 
     // Howard Hinnant's days_from_civil
+    let year = i64::from(year);
     let y = if month <= 2 { year - 1 } else { year };
-    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let era = y / 400;
     let yoe = y - era * 400;
     let mp = if month > 2 { month - 3 } else { month + 9 } as i64;
-    let doy = (153 * mp + 2) / 5 + day as i64 - 1;
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    let days = era * 146097 + doe - 719468;
-    if days < 0 {
-        return None;
-    }
-    Some(days as u64 * 86400 + hours * 3600 + minutes * 60 + seconds)
+    let doy = 153_i64
+        .checked_mul(mp)?
+        .checked_add(2)?
+        .checked_div(5)?
+        .checked_add(i64::from(day))?
+        .checked_sub(1)?;
+    let doe = yoe
+        .checked_mul(365)?
+        .checked_add(yoe / 4)?
+        .checked_sub(yoe / 100)?
+        .checked_add(doy)?;
+    let days = era
+        .checked_mul(146_097)?
+        .checked_add(doe)?
+        .checked_sub(719_468)?;
+    let days = u64::try_from(days).ok()?;
+    days.checked_mul(86_400)?
+        .checked_add(u64::from(hours).checked_mul(3_600)?)?
+        .checked_add(u64::from(minutes).checked_mul(60)?)?
+        .checked_add(u64::from(seconds))
 }
 
 /// Unescape an IRCv3 message-tag value per the spec
@@ -569,6 +620,51 @@ mod tests {
         assert_eq!(m.get_server_time(), None);
         let m = IrcMessage::parse("@time=not-a-time :n!u@h PRIVMSG #c :hi").unwrap();
         assert_eq!(m.get_server_time(), None);
+    }
+
+    #[test]
+    fn server_time_rejects_overflow_and_noncanonical_dates() {
+        assert_eq!(
+            parse_iso8601_utc("9223372036854775807-01-01T00:00:00.000Z"),
+            None
+        );
+        for invalid in [
+            "2025-02-29T00:00:00.000Z", // impossible calendar date
+            "2025-04-31T00:00:00.000Z",
+            "2025-01-01T00:00Z",         // missing seconds and fraction
+            "2025-01-01T00:00:00Z",      // missing milliseconds
+            "2025-01-01T00:00:00.000",   // missing Z
+            "2025-01-01T00:00:00.000ZZ", // repeated Z
+            "2025-01-01T00:00:60.000Z",  // out-of-range seconds
+            "2025-01-01T24:00:00.000Z",  // out-of-range hour
+            "1969-12-31T23:59:59.999Z",  // cannot fit the u64 epoch API
+        ] {
+            assert_eq!(parse_iso8601_utc(invalid), None, "accepted {invalid}");
+        }
+
+        assert!(parse_iso8601_utc("2024-02-29T23:59:59.999Z").is_some());
+        assert!(parse_iso8601_utc("9999-12-31T23:59:59.999Z").is_some());
+    }
+
+    #[test]
+    fn trailing_parameter_spaces_survive_line_framing() {
+        let message = IrcMessage::parse(":alice!u@h PRIVMSG me :hello  \r\n").unwrap();
+        assert_eq!(message.raw, ":alice!u@h PRIVMSG me :hello  ");
+        match message.command {
+            IrcCommand::Privmsg(target, content) => {
+                assert_eq!(target, "me");
+                assert_eq!(content, "hello  ");
+            }
+            other => panic!("expected Privmsg, got {other:?}"),
+        }
+
+        // A lone CR is not an IRC line terminator and must not be silently
+        // discarded by the parser.
+        let message = IrcMessage::parse(":alice PRIVMSG me :hello\r").unwrap();
+        assert!(matches!(
+            message.command,
+            IrcCommand::Privmsg(_, ref content) if content == "hello\r"
+        ));
     }
 
     #[test]

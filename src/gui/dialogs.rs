@@ -1,7 +1,7 @@
 //! Dialog windows for connect, settings, and channel list
 
 use super::helpers::format_timestamp;
-use super::{IrcApp, ServerFavorite};
+use super::{ChatMessage, IrcApp, ServerFavorite};
 use crate::irc::IrcCommand;
 use egui::{Color32, RichText, ScrollArea, TextEdit, Vec2};
 
@@ -39,9 +39,7 @@ impl IrcApp {
                         ui.horizontal_wrapped(|ui| {
                             for (name, host, port, tls) in NETWORK_PRESETS {
                                 if ui.small_button(*name).clicked() {
-                                    self.server_host = host.to_string();
-                                    self.server_port = port.to_string();
-                                    self.use_tls = *tls;
+                                    self.apply_unprofiled_endpoint(host, port, *tls);
                                 }
                             }
                         });
@@ -83,10 +81,10 @@ impl IrcApp {
                                     if let Some(idx) = connect_idx
                                         && let Some(fav) = self.server_favorites.get(idx).cloned() {
                                             self.load_favorite(&fav);
-                                            self.save_settings();
-                                            self.show_connect_dialog = false;
-                                            self.connecting = true;
-                                            self.set_my_nick(self.nickname.clone());
+                                            if self.start_session_from_form() {
+                                                self.save_settings();
+                                                self.show_connect_dialog = false;
+                                            }
                                         }
                                 });
 
@@ -112,10 +110,10 @@ impl IrcApp {
                                     && let Some(idx) = self.selected_favorite
                                                 && let Some(fav) = self.server_favorites.get(idx).cloned() {
                                                     self.load_favorite(&fav);
-                                                    self.save_settings();
-                                                    self.show_connect_dialog = false;
-                                                    self.connecting = true;
-                                                    self.set_my_nick(self.nickname.clone());
+                                                    if self.start_session_from_form() {
+                                                        self.save_settings();
+                                                        self.show_connect_dialog = false;
+                                                    }
                                                 }
                             });
                         }
@@ -124,16 +122,27 @@ impl IrcApp {
                 ui.separator();
 
                 // ===== Server Details =====
+                let mut endpoint_edited = false;
                 ui.horizontal(|ui| {
                     ui.label("Server:");
-                    ui.add(TextEdit::singleline(&mut self.server_host).desired_width(200.0));
+                    endpoint_edited |= ui
+                        .add(TextEdit::singleline(&mut self.server_host).desired_width(200.0))
+                        .changed();
                 });
 
                 ui.horizontal(|ui| {
                     ui.label("Port:");
-                    ui.add(TextEdit::singleline(&mut self.server_port).desired_width(80.0));
-                    ui.checkbox(&mut self.use_tls, "Use TLS");
+                    endpoint_edited |= ui
+                        .add(TextEdit::singleline(&mut self.server_port).desired_width(80.0))
+                        .changed();
+                    endpoint_edited |= ui.checkbox(&mut self.use_tls, "Use TLS").changed();
                 });
+                if endpoint_edited {
+                    self.note_unprofiled_endpoint_edit();
+                }
+                if let Some(error) = self.connection_error() {
+                    ui.label(RichText::new(error).color(Color32::RED));
+                }
 
                 if self.use_tls {
                     ui.horizontal(|ui| {
@@ -208,7 +217,10 @@ impl IrcApp {
                     ui.horizontal(|ui| {
                         ui.label("Name:");
                         ui.add(TextEdit::singleline(&mut self.new_favorite_name).desired_width(150.0));
-                        if ui.button("Save").clicked() && !self.new_favorite_name.is_empty() {
+                        if ui.button("Save").clicked()
+                            && !self.new_favorite_name.is_empty()
+                            && self.validate_connection_form()
+                        {
                             let new_fav = ServerFavorite {
                                 name: self.new_favorite_name.clone(),
                                 host: self.server_host.clone(),
@@ -249,11 +261,9 @@ impl IrcApp {
 
                 // ===== Connect/Cancel Buttons =====
                 ui.horizontal(|ui| {
-                    if ui.button("Connect").clicked() {
+                    if ui.button("Connect").clicked() && self.start_session_from_form() {
                         self.save_settings();
                         self.show_connect_dialog = false;
-                        self.connecting = true;
-                        self.set_my_nick(self.nickname.clone());
                     }
                     if ui.button("Cancel").clicked() {
                         self.show_connect_dialog = false;
@@ -326,6 +336,11 @@ impl IrcApp {
         ui.heading("Server Defaults");
         ui.add_space(4.0);
 
+        let old_endpoint = (
+            self.server_host.clone(),
+            self.server_port.clone(),
+            self.use_tls,
+        );
         egui::Grid::new("connection_grid")
             .num_columns(2)
             .spacing([10.0, 6.0])
@@ -340,6 +355,18 @@ impl IrcApp {
             });
 
         ui.checkbox(&mut self.use_tls, "Use TLS by default");
+        if old_endpoint
+            != (
+                self.server_host.clone(),
+                self.server_port.clone(),
+                self.use_tls,
+            )
+        {
+            self.note_unprofiled_endpoint_edit();
+        }
+        if let Some(error) = self.connection_error() {
+            ui.label(RichText::new(error).color(Color32::RED));
+        }
 
         ui.add_space(8.0);
         ui.heading("Identity");
@@ -386,6 +413,7 @@ impl IrcApp {
                     );
                 });
         });
+        ChatMessage::configure_default_timestamp_format(&self.timestamp_format);
 
         ui.add_space(8.0);
         ui.heading("Messages");
@@ -411,15 +439,20 @@ impl IrcApp {
 
         ui.horizontal(|ui| {
             ui.label("Size:");
-            ui.add(
-                egui::DragValue::new(&mut self.font_size)
-                    .speed(0.5)
-                    .range(10.0..=24.0),
-            );
+            let changed = ui
+                .add(
+                    egui::DragValue::new(&mut self.font_size)
+                        .speed(0.5)
+                        .range(10.0..=24.0),
+                )
+                .changed();
+            if changed {
+                super::apply_font_size(ui.ctx(), self.font_size);
+            }
             ui.label("px");
         });
         ui.label(
-            RichText::new("Restart required for font changes")
+            RichText::new("Applied immediately and saved for restart")
                 .small()
                 .color(Color32::GRAY),
         );
@@ -937,18 +970,26 @@ impl IrcApp {
                     self.list_min_users = min_users.max(0) as u32;
 
                     if ui.button("Refresh").clicked() {
-                        self.channel_list.clear();
-                        self.channel_list_dirty = true;
-                        self.channel_list_selected = None;
-                        self.channel_list_loading = true;
                         // >N means "more than N users", so for min 5, send >4
-                        if self.list_min_users >= 1 {
-                            self.send_command(IrcCommand::List(Some(format!(
+                        let request = if self.list_min_users >= 1 {
+                            IrcCommand::List(Some(format!(
                                 ">{}",
                                 self.list_min_users.saturating_sub(1)
-                            ))));
+                            )))
                         } else {
-                            self.send_command(IrcCommand::List(None));
+                            IrcCommand::List(None)
+                        };
+                        if self.send_command(request) {
+                            self.channel_list.clear();
+                            self.channel_list_dirty = true;
+                            self.channel_list_selected = None;
+                            self.channel_list_loading = true;
+                        } else {
+                            self.channel_list_loading = false;
+                            self.add_server_message(super::types::ChatMessage::system_fmt(
+                                "Not connected - channel list was not refreshed",
+                                &self.timestamp_format,
+                            ));
                         }
                     }
                     if ui.button("Close").clicked() {
@@ -1052,39 +1093,41 @@ impl IrcApp {
 
                     ui.separator();
 
-    // Ban list section. The stable id_salt keeps the section's
+                    // Ban list section. The stable id_salt keeps the section's
                     // open/closed state when the count in the title changes
                     // (a title-derived id would collapse it on every new entry).
                     egui::CollapsingHeader::new(format!("Ban List ({})", ch.bans.len()))
                         .id_salt("channel_info_bans")
                         .show(ui, |ui| {
-                        if ch.bans.is_empty() {
-                            if ch.ban_list_complete {
-                                ui.label(RichText::new("No bans").italics().color(Color32::GRAY));
+                            if ch.bans.is_empty() {
+                                if ch.ban_list_complete {
+                                    ui.label(
+                                        RichText::new("No bans").italics().color(Color32::GRAY),
+                                    );
+                                } else {
+                                    if ui.button("Load Ban List").clicked() {
+                                        load_ban_list = true;
+                                    }
+                                }
                             } else {
-                                if ui.button("Load Ban List").clicked() {
-                                    load_ban_list = true;
-                                }
+                                ScrollArea::vertical().max_height(150.0).show(ui, |ui| {
+                                    for ban in &ch.bans {
+                                        ui.horizontal(|ui| {
+                                            ui.label(RichText::new(&ban.mask).monospace());
+                                            ui.label(
+                                                RichText::new(format!(
+                                                    "by {} on {}",
+                                                    ban.set_by,
+                                                    format_timestamp(ban.set_time)
+                                                ))
+                                                .small()
+                                                .color(Color32::GRAY),
+                                            );
+                                        });
+                                    }
+                                });
                             }
-                        } else {
-                            ScrollArea::vertical().max_height(150.0).show(ui, |ui| {
-                                for ban in &ch.bans {
-                                    ui.horizontal(|ui| {
-                                        ui.label(RichText::new(&ban.mask).monospace());
-                                        ui.label(
-                                            RichText::new(format!(
-                                                "by {} on {}",
-                                                ban.set_by,
-                                                format_timestamp(ban.set_time)
-                                            ))
-                                            .small()
-                                            .color(Color32::GRAY),
-                                        );
-                                    });
-                                }
-                            });
-                        }
-                    });
+                        });
 
                     ui.separator();
 
@@ -1092,20 +1135,20 @@ impl IrcApp {
                     egui::CollapsingHeader::new(format!("Users ({})", ch.users.len()))
                         .id_salt("channel_info_users")
                         .show(ui, |ui| {
-                        ScrollArea::vertical().max_height(150.0).show(ui, |ui| {
-                            ui.horizontal_wrapped(|ui| {
-                                for user in &ch.users {
-                                    let prefix = user.mode.prefix();
-                                    let display = if user.is_away() {
-                                        format!("{}{} (away)", prefix, user.nick)
-                                    } else {
-                                        format!("{}{}", prefix, user.nick)
-                                    };
-                                    ui.label(&display);
-                                }
+                            ScrollArea::vertical().max_height(150.0).show(ui, |ui| {
+                                ui.horizontal_wrapped(|ui| {
+                                    for user in &ch.users {
+                                        let prefix = user.mode.prefix();
+                                        let display = if user.is_away() {
+                                            format!("{}{} (away)", prefix, user.nick)
+                                        } else {
+                                            format!("{}{}", prefix, user.nick)
+                                        };
+                                        ui.label(&display);
+                                    }
+                                });
                             });
                         });
-                    });
                 } else {
                     ui.label("Channel not found");
                 }
@@ -1129,12 +1172,25 @@ impl IrcApp {
             ));
         }
         if refresh {
-            // Request fresh channel info
-            self.send_command(IrcCommand::Mode(channel_name.clone(), None, Vec::new()));
-            // Clear and re-request ban list
-            if let Some(ch) = self.channels.get_mut(&channel_name) {
-                ch.bans.clear();
-                ch.ban_list_complete = false;
+            // Clear displayed data only when both refresh requests were queued;
+            // otherwise a disconnected click preserves the last snapshot.
+            let modes_sent =
+                self.send_command(IrcCommand::Mode(channel_name.clone(), None, Vec::new()));
+            let bans_sent = self.send_command(IrcCommand::Mode(
+                channel_name.clone(),
+                Some("+b".to_string()),
+                Vec::new(),
+            ));
+            if modes_sent && bans_sent {
+                if let Some(ch) = self.channels.get_mut(&channel_name) {
+                    ch.bans.clear();
+                    ch.ban_list_complete = false;
+                }
+            } else {
+                self.add_server_message(super::types::ChatMessage::system_fmt(
+                    "Not connected - channel information was not refreshed",
+                    &self.timestamp_format,
+                ));
             }
         }
         if close {

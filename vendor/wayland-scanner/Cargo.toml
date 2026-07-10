@@ -1,0 +1,22 @@
+[package]
+name = "wayland-scanner"
+version = "0.31.10"
+edition = "2021"
+rust-version = "1.71"
+authors = ["Elinor Berger <elinor@safaradeg.net>"]
+description = "Wayland Scanner for generating rust APIs from XML wayland protocol files."
+documentation = "https://docs.rs/wayland-scanner/"
+readme = "README.md"
+license = "MIT"
+repository = "https://github.com/smithay/wayland-rs"
+
+[lib]
+proc-macro = true
+
+[dependencies]
+proc-macro2 = "1.0.11"
+quote = "1.0"
+quick-xml = "0.41"
+
+[dev-dependencies]
+similar = "2"

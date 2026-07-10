@@ -3,9 +3,17 @@
 use super::formatting::{RenderSegment, layout_irc_text, strip_irc_formatting};
 use super::helpers::current_time_formatted;
 use serde::{Deserialize, Serialize};
-use std::cell::OnceCell;
-use std::collections::VecDeque;
+use std::cell::{Cell, OnceCell};
+use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
+
+thread_local! {
+    /// `ChatMessage::system` is used throughout GUI, command, and top-level
+    /// lifecycle code. Keep its configured format on the GUI thread so every
+    /// local/system message follows the user's setting without global test
+    /// races or threading a format argument through every call site.
+    static DEFAULT_SYSTEM_TIMESTAMP_FORMAT: Cell<u8> = const { Cell::new(0) };
+}
 
 /// Sort column for channel list
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
@@ -170,10 +178,9 @@ impl Settings {
                         tracing::error!("Failed to parse settings file {:?}: {}", path, e);
                         let backup = path.with_extension("json.bak");
                         match std::fs::rename(&path, &backup) {
-                            Ok(_) => tracing::warn!(
-                                "Unreadable settings file backed up to {:?}",
-                                backup
-                            ),
+                            Ok(_) => {
+                                tracing::warn!("Unreadable settings file backed up to {:?}", backup)
+                            }
                             Err(e) => tracing::error!("Failed to back up settings: {}", e),
                         }
                     }
@@ -196,8 +203,7 @@ impl Settings {
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;
-                let _ =
-                    std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
+                let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
             }
         }
         let data = match serde_json::to_string_pretty(self) {
@@ -262,6 +268,23 @@ pub struct ChatMessage {
 }
 
 impl ChatMessage {
+    pub fn configure_default_timestamp_format(format: &str) {
+        let code = match format {
+            "long" => 1,
+            "full" => 2,
+            _ => 0,
+        };
+        DEFAULT_SYSTEM_TIMESTAMP_FORMAT.set(code);
+    }
+
+    fn default_timestamp_format() -> &'static str {
+        DEFAULT_SYSTEM_TIMESTAMP_FORMAT.with(|format| match format.get() {
+            1 => "long",
+            2 => "full",
+            _ => "short",
+        })
+    }
+
     /// Render-ready segments for this message, parsed once and cached.
     pub fn render_segments(&self) -> &[RenderSegment] {
         self.render_cache
@@ -288,7 +311,7 @@ impl ChatMessage {
     }
 
     pub fn system(content: &str) -> Self {
-        Self::system_fmt(content, "short")
+        Self::system_fmt(content, Self::default_timestamp_format())
     }
 
     pub fn system_fmt(content: &str, format: &str) -> Self {
@@ -365,13 +388,24 @@ pub enum UserMode {
 }
 
 impl UserMode {
-    pub fn from_prefix(c: char) -> Option<Self> {
+    fn bit(self) -> u8 {
+        match self {
+            UserMode::Owner => 1 << 0,
+            UserMode::Admin => 1 << 1,
+            UserMode::Op => 1 << 2,
+            UserMode::HalfOp => 1 << 3,
+            UserMode::Voice => 1 << 4,
+            UserMode::Normal => 0,
+        }
+    }
+
+    pub fn from_mode_letter(c: char) -> Option<Self> {
         match c {
-            '~' => Some(UserMode::Owner),
-            '&' => Some(UserMode::Admin),
-            '@' => Some(UserMode::Op),
-            '%' => Some(UserMode::HalfOp),
-            '+' => Some(UserMode::Voice),
+            'q' => Some(UserMode::Owner),
+            'a' => Some(UserMode::Admin),
+            'o' => Some(UserMode::Op),
+            'h' => Some(UserMode::HalfOp),
+            'v' => Some(UserMode::Voice),
             _ => None,
         }
     }
@@ -388,9 +422,42 @@ impl UserMode {
     }
 }
 
+/// IRC identifier case folding advertised by ISUPPORT CASEMAPPING.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CaseMapping {
+    Ascii,
+    StrictRfc1459,
+    #[default]
+    Rfc1459,
+}
+
+impl CaseMapping {
+    /// Produce a stable key for an IRC nickname or channel. IRC casemapping is
+    /// deliberately ASCII-only; Unicode text outside the IRC identifier range
+    /// must not acquire locale- or Unicode-dependent equivalences.
+    pub fn canonicalize(self, value: &str) -> String {
+        value
+            .chars()
+            .map(|c| match c {
+                'A'..='Z' => c.to_ascii_lowercase(),
+                '[' if self != CaseMapping::Ascii => '{',
+                ']' if self != CaseMapping::Ascii => '}',
+                '\\' if self != CaseMapping::Ascii => '|',
+                '^' if self == CaseMapping::Rfc1459 => '~',
+                other => other,
+            })
+            .collect()
+    }
+
+    pub fn eq(self, left: &str, right: &str) -> bool {
+        self.canonicalize(left) == self.canonicalize(right)
+    }
+}
+
 /// Server-advertised IRC support that affects routing and user prefixes.
 #[derive(Debug, Clone)]
 pub struct NetworkSupport {
+    pub case_mapping: CaseMapping,
     pub channel_types: String,
     pub user_prefixes: String,
     /// Mode letters corresponding position-wise to `user_prefixes`
@@ -408,6 +475,7 @@ pub struct NetworkSupport {
 impl Default for NetworkSupport {
     fn default() -> Self {
         Self {
+            case_mapping: CaseMapping::Rfc1459,
             channel_types: "#&+!".to_string(),
             user_prefixes: "~&@%+".to_string(),
             prefix_modes: "qaohv".to_string(),
@@ -419,6 +487,14 @@ impl Default for NetworkSupport {
 }
 
 impl NetworkSupport {
+    pub fn canonicalize(&self, value: &str) -> String {
+        self.case_mapping.canonicalize(value)
+    }
+
+    pub fn identifiers_equal(&self, left: &str, right: &str) -> bool {
+        self.case_mapping.eq(left, right)
+    }
+
     pub fn is_channel(&self, name: &str) -> bool {
         name.chars()
             .next()
@@ -428,11 +504,28 @@ impl NetworkSupport {
     /// Map a PREFIX mode letter (e.g. 'o') to its user mode via the
     /// position-matched prefix symbol (e.g. '@').
     pub fn user_mode_for_letter(&self, letter: char) -> Option<UserMode> {
-        let idx = self.prefix_modes.chars().position(|c| c == letter)?;
-        self.user_prefixes
-            .chars()
-            .nth(idx)
-            .and_then(UserMode::from_prefix)
+        UserMode::from_mode_letter(letter)
+    }
+
+    /// Split all advertised status prefixes from a NAMES token. With the
+    /// IRCv3 multi-prefix capability a user can carry several prefixes (for
+    /// example `@+alice`), all of which must survive later MODE changes.
+    pub fn parse_prefixed_nick<'a>(&self, token: &'a str) -> (&'a str, Vec<UserMode>) {
+        let mut end = 0;
+        let mut modes = Vec::new();
+        for (idx, c) in token.char_indices() {
+            let Some(prefix_idx) = self.user_prefixes.chars().position(|p| p == c) else {
+                break;
+            };
+            end = idx + c.len_utf8();
+            if let Some(letter) = self.prefix_modes.chars().nth(prefix_idx)
+                && let Some(mode) = UserMode::from_mode_letter(letter)
+                && !modes.contains(&mode)
+            {
+                modes.push(mode);
+            }
+        }
+        (&token[end..], modes)
     }
 }
 
@@ -449,6 +542,7 @@ pub struct BanEntry {
 pub struct ChannelUser {
     pub nick: String,
     pub mode: UserMode,
+    mode_bits: u8,
     pub away: Option<String>, // None = not away, Some(msg) = away with message
     pub account: Option<String>, // IRCv3 account name
 }
@@ -458,6 +552,7 @@ impl ChannelUser {
         Self {
             nick,
             mode,
+            mode_bits: mode.bit(),
             away: None,
             account: None,
         }
@@ -465,6 +560,37 @@ impl ChannelUser {
 
     pub fn is_away(&self) -> bool {
         self.away.is_some()
+    }
+
+    pub fn has_mode(&self, mode: UserMode) -> bool {
+        if mode == UserMode::Normal {
+            self.mode_bits == 0
+        } else {
+            self.mode_bits & mode.bit() != 0
+        }
+    }
+
+    fn add_mode(&mut self, mode: UserMode) {
+        self.mode_bits |= mode.bit();
+        self.refresh_display_mode();
+    }
+
+    fn remove_mode(&mut self, mode: UserMode) {
+        self.mode_bits &= !mode.bit();
+        self.refresh_display_mode();
+    }
+
+    fn refresh_display_mode(&mut self) {
+        self.mode = [
+            UserMode::Owner,
+            UserMode::Admin,
+            UserMode::Op,
+            UserMode::HalfOp,
+            UserMode::Voice,
+        ]
+        .into_iter()
+        .find(|mode| self.has_mode(*mode))
+        .unwrap_or(UserMode::Normal);
     }
 }
 
@@ -483,6 +609,12 @@ pub struct Channel {
     pub key: Option<String>, // Channel key for auto-rejoin
     pub bans: Vec<BanEntry>,
     pub ban_list_complete: bool,
+    /// Whether the local user is currently a member. Query windows are not
+    /// channels and therefore leave this false without affecting sends.
+    pub joined: bool,
+    case_mapping: CaseMapping,
+    names_snapshot: Option<Vec<ChannelUser>>,
+    mode_parameters: HashMap<char, String>,
 }
 
 impl Channel {
@@ -500,7 +632,15 @@ impl Channel {
             key: None,
             bans: Vec::new(),
             ban_list_complete: false,
+            joined: false,
+            case_mapping: CaseMapping::Rfc1459,
+            names_snapshot: None,
+            mode_parameters: HashMap::new(),
         }
+    }
+
+    pub fn set_case_mapping(&mut self, case_mapping: CaseMapping) {
+        self.case_mapping = case_mapping;
     }
 
     pub fn add_user(&mut self, nick: &str, mode: UserMode) {
@@ -514,44 +654,111 @@ impl Channel {
         if clean_nick.is_empty() {
             return;
         }
-        if !self
+        if let Some(user) = self
             .users
-            .iter()
-            .any(|u| u.nick.eq_ignore_ascii_case(clean_nick))
+            .iter_mut()
+            .find(|u| self.case_mapping.eq(&u.nick, clean_nick))
         {
+            user.add_mode(mode);
+        } else {
             self.users
                 .push(ChannelUser::new(clean_nick.to_string(), mode));
             self.sort_users();
         }
+
+        // A JOIN can interleave with a multi-line NAMES response. Mirror that
+        // membership into the pending snapshot so it is not lost at 366.
+        if let Some(snapshot) = &mut self.names_snapshot {
+            if let Some(user) = snapshot
+                .iter_mut()
+                .find(|u| self.case_mapping.eq(&u.nick, clean_nick))
+            {
+                user.add_mode(mode);
+            } else {
+                snapshot.push(ChannelUser::new(clean_nick.to_string(), mode));
+            }
+        }
     }
 
-    /// Insert a user without sorting or duplicate checking. Used while streaming
-    /// a NAMES burst, where a per-insert sort would make a large join O(N²·logN);
-    /// the caller MUST invoke `finish_user_burst` when the burst completes
-    /// (RPL_ENDOFNAMES) to dedup and sort once.
-    pub fn add_user_burst(&mut self, nick: &str, mode: UserMode, prefixes: &str) {
-        let clean_nick = nick.trim_start_matches(|c| prefixes.contains(c));
+    /// Start an authoritative NAMES snapshot. The visible membership is left
+    /// untouched until RPL_ENDOFNAMES, avoiding partial-list flicker.
+    pub fn begin_user_burst(&mut self) {
+        if self.names_snapshot.is_none() {
+            self.names_snapshot = Some(Vec::new());
+        }
+    }
+
+    /// Insert a user into the pending NAMES snapshot. Used while streaming a
+    /// burst, where a per-insert visible-list sort would make a large join
+    /// O(N²·logN). The caller must invoke `finish_user_burst` at 366.
+    pub fn add_user_burst_modes(&mut self, clean_nick: &str, modes: &[UserMode]) {
         if clean_nick.is_empty() {
             return;
         }
-        self.users
-            .push(ChannelUser::new(clean_nick.to_string(), mode));
+        self.begin_user_burst();
+        let snapshot = self.names_snapshot.as_mut().expect("burst just started");
+        if let Some(existing) = snapshot
+            .iter_mut()
+            .find(|u| self.case_mapping.eq(&u.nick, clean_nick))
+        {
+            for mode in modes {
+                existing.add_mode(*mode);
+            }
+        } else {
+            let mut user = ChannelUser::new(clean_nick.to_string(), UserMode::Normal);
+            for mode in modes {
+                user.add_mode(*mode);
+            }
+            snapshot.push(user);
+        }
     }
 
-    /// Dedup (keeping the first, state-carrying entry) and sort after a NAMES
-    /// burst. Safe to call even if no burst inserts happened.
+    /// Atomically replace membership with the authoritative NAMES snapshot,
+    /// preserving away/account metadata for users who are still present.
     pub fn finish_user_burst(&mut self) {
-        let mut seen: std::collections::HashSet<String> =
-            std::collections::HashSet::with_capacity(self.users.len());
-        self.users.retain(|u| seen.insert(u.nick.to_lowercase()));
+        let Some(mut snapshot) = self.names_snapshot.take() else {
+            return;
+        };
+        for fresh in &mut snapshot {
+            if let Some(previous) = self
+                .users
+                .iter()
+                .find(|old| self.case_mapping.eq(&old.nick, &fresh.nick))
+            {
+                fresh.away = previous.away.clone();
+                fresh.account = previous.account.clone();
+            }
+        }
+        self.users = snapshot;
         self.sort_users();
     }
 
-    pub fn set_user_mode(&mut self, nick: &str, mode: UserMode) {
+    pub fn add_user_mode(&mut self, nick: &str, mode: UserMode) {
         if let Some(user) = self.get_user_mut(nick) {
-            user.mode = mode;
-            self.sort_users();
+            user.add_mode(mode);
         }
+        if let Some(snapshot) = &mut self.names_snapshot
+            && let Some(user) = snapshot
+                .iter_mut()
+                .find(|u| self.case_mapping.eq(&u.nick, nick))
+        {
+            user.add_mode(mode);
+        }
+        self.sort_users();
+    }
+
+    pub fn remove_user_mode(&mut self, nick: &str, mode: UserMode) {
+        if let Some(user) = self.get_user_mut(nick) {
+            user.remove_mode(mode);
+        }
+        if let Some(snapshot) = &mut self.names_snapshot
+            && let Some(user) = snapshot
+                .iter_mut()
+                .find(|u| self.case_mapping.eq(&u.nick, nick))
+        {
+            user.remove_mode(mode);
+        }
+        self.sort_users();
     }
 
     pub fn apply_channel_mode_flag(&mut self, sign: char, mode: char) {
@@ -569,34 +776,107 @@ impl Channel {
                 self.modes.clear();
             }
         }
+        if sign == '-' {
+            self.mode_parameters.remove(&mode);
+        }
+        self.rebuild_mode_params();
+    }
+
+    pub fn apply_channel_mode(&mut self, sign: char, mode: char, parameter: Option<&str>) {
+        if sign == '+' {
+            if let Some(parameter) = parameter {
+                self.mode_parameters.insert(mode, parameter.to_string());
+            }
+        } else if sign == '-' {
+            self.mode_parameters.remove(&mode);
+        }
+        self.apply_channel_mode_flag(sign, mode);
+    }
+
+    pub fn set_channel_modes_from_reply(
+        &mut self,
+        modes: &str,
+        params: &[String],
+        support: &NetworkSupport,
+    ) {
+        self.modes.clear();
+        self.mode_params.clear();
+        self.mode_parameters.clear();
+        let mut sign = '+';
+        let mut param_idx = 0;
+        for mode in modes.chars() {
+            match mode {
+                '+' | '-' => sign = mode,
+                mode => {
+                    let takes_parameter = support.chanmodes_b.contains(mode)
+                        || (sign == '+' && support.chanmodes_c.contains(mode));
+                    let parameter = if takes_parameter {
+                        let value = params.get(param_idx).map(String::as_str);
+                        if value.is_some() {
+                            param_idx += 1;
+                        }
+                        value
+                    } else {
+                        None
+                    };
+                    self.apply_channel_mode(sign, mode, parameter);
+                }
+            }
+        }
+        self.rebuild_mode_params();
+    }
+
+    fn rebuild_mode_params(&mut self) {
+        self.mode_params = self
+            .modes
+            .chars()
+            .filter(|c| *c != '+' && *c != '-')
+            .filter_map(|mode| self.mode_parameters.get(&mode).cloned())
+            .collect();
     }
 
     pub fn remove_user(&mut self, nick: &str) {
-        self.users.retain(|u| !u.nick.eq_ignore_ascii_case(nick));
+        let mapping = self.case_mapping;
+        self.users.retain(|u| !mapping.eq(&u.nick, nick));
+        if let Some(snapshot) = &mut self.names_snapshot {
+            snapshot.retain(|u| !mapping.eq(&u.nick, nick));
+        }
+    }
+
+    pub fn clear_users(&mut self) {
+        self.users.clear();
+        self.names_snapshot = None;
     }
 
     pub fn rename_user(&mut self, old_nick: &str, new_nick: &str) {
         // If the target nick already exists as a different user, drop the old entry
         // rather than creating a duplicate (can happen with out-of-order NICK/JOIN).
         // A pure case change of the same nick still falls through to the rename.
-        if !old_nick.eq_ignore_ascii_case(new_nick)
+        if !self.case_mapping.eq(old_nick, new_nick)
             && self
                 .users
                 .iter()
-                .any(|u| u.nick.eq_ignore_ascii_case(new_nick))
+                .any(|u| self.case_mapping.eq(&u.nick, new_nick))
         {
-            self.users
-                .retain(|u| !u.nick.eq_ignore_ascii_case(old_nick));
+            let mapping = self.case_mapping;
+            self.users.retain(|u| !mapping.eq(&u.nick, old_nick));
             self.sort_users();
             return;
         }
         if let Some(user) = self
             .users
             .iter_mut()
-            .find(|u| u.nick.eq_ignore_ascii_case(old_nick))
+            .find(|u| self.case_mapping.eq(&u.nick, old_nick))
         {
             user.nick = new_nick.to_string();
             self.sort_users();
+        }
+        if let Some(snapshot) = &mut self.names_snapshot
+            && let Some(user) = snapshot
+                .iter_mut()
+                .find(|u| self.case_mapping.eq(&u.nick, old_nick))
+        {
+            user.nick = new_nick.to_string();
         }
     }
 
@@ -619,23 +899,23 @@ impl Channel {
     pub fn get_user(&self, nick: &str) -> Option<&ChannelUser> {
         self.users
             .iter()
-            .find(|u| u.nick.eq_ignore_ascii_case(nick))
+            .find(|u| self.case_mapping.eq(&u.nick, nick))
     }
 
     pub fn get_user_mut(&mut self, nick: &str) -> Option<&mut ChannelUser> {
-        self.users
-            .iter_mut()
-            .find(|u| u.nick.eq_ignore_ascii_case(nick))
+        let mapping = self.case_mapping;
+        self.users.iter_mut().find(|u| mapping.eq(&u.nick, nick))
     }
 
     fn sort_users(&mut self) {
         // Case-insensitive comparison without allocating per comparison (nick
         // casing on IRC is ASCII-folded; full Unicode folding is unnecessary).
+        let mapping = self.case_mapping;
         self.users.sort_by(|a, b| {
             a.mode.cmp(&b.mode).then_with(|| {
-                let a_bytes = a.nick.as_bytes().iter().map(u8::to_ascii_lowercase);
-                let b_bytes = b.nick.as_bytes().iter().map(u8::to_ascii_lowercase);
-                a_bytes.cmp(b_bytes)
+                mapping
+                    .canonicalize(&a.nick)
+                    .cmp(&mapping.canonicalize(&b.nick))
             })
         });
     }
@@ -643,6 +923,12 @@ impl Channel {
     /// IRCv3 away-notify: update user's away status
     pub fn set_user_away(&mut self, nick: &str, away_msg: Option<String>) {
         if let Some(user) = self.get_user_mut(nick) {
+            user.away = away_msg.clone();
+        }
+        let mapping = self.case_mapping;
+        if let Some(snapshot) = &mut self.names_snapshot
+            && let Some(user) = snapshot.iter_mut().find(|u| mapping.eq(&u.nick, nick))
+        {
             user.away = away_msg;
         }
     }
@@ -650,6 +936,12 @@ impl Channel {
     /// IRCv3 account-notify: update user's logged-in account
     pub fn set_user_account(&mut self, nick: &str, account: Option<String>) {
         if let Some(user) = self.get_user_mut(nick) {
+            user.account = account.clone();
+        }
+        let mapping = self.case_mapping;
+        if let Some(snapshot) = &mut self.names_snapshot
+            && let Some(user) = snapshot.iter_mut().find(|u| mapping.eq(&u.nick, nick))
+        {
             user.account = account;
         }
     }
@@ -693,9 +985,13 @@ impl ChannelListEntry {
 /// Tab completion state
 #[derive(Debug, Clone)]
 pub struct TabCompletion {
-    pub prefix: String,
     pub matches: Vec<String>,
     pub index: usize,
+    /// Input before the original token being completed.
+    pub base: String,
+    /// Text appended after each candidate (`": "` for a leading nick, a
+    /// single space for commands and other nick positions).
+    pub suffix: String,
 }
 
 #[cfg(test)]
@@ -703,20 +999,118 @@ mod tests {
     use super::*;
 
     #[test]
+    fn default_system_timestamp_uses_configured_format() {
+        ChatMessage::configure_default_timestamp_format("long");
+        let long = ChatMessage::system("long");
+        assert_eq!(long.timestamp.len(), "[00:00:00]".len());
+
+        ChatMessage::configure_default_timestamp_format("full");
+        let full = ChatMessage::system("full");
+        assert_eq!(full.timestamp.len(), "[00-00 00:00]".len());
+
+        ChatMessage::configure_default_timestamp_format("short");
+    }
+
+    #[test]
     fn user_burst_dedups_and_sorts_once() {
         let mut ch = Channel::new();
         ch.add_user("zed", UserMode::Normal);
         ch.set_user_away("zed", Some("afk".to_string()));
         // A NAMES refresh streams in, including a duplicate of the existing user.
-        ch.add_user_burst("@alice", UserMode::Op, "~&@%+");
-        ch.add_user_burst("ZED", UserMode::Normal, "~&@%+");
-        ch.add_user_burst("bob", UserMode::Normal, "~&@%+");
+        ch.add_user_burst_modes("alice", &[UserMode::Op]);
+        ch.add_user_burst_modes("ZED", &[UserMode::Normal]);
+        ch.add_user_burst_modes("bob", &[UserMode::Normal]);
         ch.finish_user_burst();
 
         let nicks: Vec<&str> = ch.users.iter().map(|u| u.nick.as_str()).collect();
-        assert_eq!(nicks, vec!["alice", "bob", "zed"]);
-        // The original, state-carrying entry survived the dedup.
+        assert_eq!(nicks, vec!["alice", "bob", "ZED"]);
+        // Fresh NAMES spelling/modes win, while compatible metadata survives.
         assert!(ch.get_user("zed").unwrap().is_away());
+    }
+
+    #[test]
+    fn names_snapshot_replaces_stale_membership() {
+        let mut ch = Channel::new();
+        ch.add_user("alice", UserMode::Op);
+        ch.add_user("bob", UserMode::Voice);
+        ch.set_user_account("alice", Some("account".to_string()));
+
+        ch.begin_user_burst();
+        ch.add_user_burst_modes("Alice", &[UserMode::Voice]);
+        ch.finish_user_burst();
+
+        assert_eq!(ch.users.len(), 1);
+        let alice = ch.get_user("ALICE").unwrap();
+        assert_eq!(alice.mode, UserMode::Voice);
+        assert_eq!(alice.account.as_deref(), Some("account"));
+        assert!(!ch.has_user("bob"));
+    }
+
+    #[test]
+    fn names_snapshot_reconciles_interleaved_membership_events() {
+        let mut ch = Channel::new();
+        ch.add_user("stale", UserMode::Normal);
+        ch.begin_user_burst();
+        ch.add_user_burst_modes("alice", &[UserMode::Normal]);
+        ch.add_user_burst_modes("bob", &[UserMode::Normal]);
+
+        ch.remove_user("bob");
+        ch.add_user("carol", UserMode::Voice);
+        ch.finish_user_burst();
+
+        assert!(ch.has_user("alice"));
+        assert!(ch.has_user("carol"));
+        assert!(!ch.has_user("bob"));
+        assert!(!ch.has_user("stale"));
+    }
+
+    #[test]
+    fn simultaneous_membership_modes_survive_individual_changes() {
+        let support = NetworkSupport::default();
+        let (nick, modes) = support.parse_prefixed_nick("@+alice");
+        let mut ch = Channel::new();
+        ch.add_user_burst_modes(nick, &modes);
+        ch.finish_user_burst();
+
+        let alice = ch.get_user("alice").unwrap();
+        assert!(alice.has_mode(UserMode::Op));
+        assert!(alice.has_mode(UserMode::Voice));
+        assert_eq!(alice.mode, UserMode::Op);
+
+        ch.remove_user_mode("alice", UserMode::Voice);
+        let alice = ch.get_user("alice").unwrap();
+        assert!(alice.has_mode(UserMode::Op));
+        assert!(!alice.has_mode(UserMode::Voice));
+        assert_eq!(alice.mode, UserMode::Op);
+    }
+
+    #[test]
+    fn live_parameter_modes_stay_aligned() {
+        let support = NetworkSupport::default();
+        let mut ch = Channel::new();
+        ch.set_channel_modes_from_reply("+ntk", &["oldkey".to_string()], &support);
+        assert_eq!(ch.modes, "+ntk");
+        assert_eq!(ch.mode_params, ["oldkey"]);
+
+        ch.apply_channel_mode('-', 'k', Some("oldkey"));
+        assert_eq!(ch.modes, "+nt");
+        assert!(ch.mode_params.is_empty());
+
+        ch.apply_channel_mode('+', 'l', Some("50"));
+        assert_eq!(ch.modes, "+ntl");
+        assert_eq!(ch.mode_params, ["50"]);
+        ch.apply_channel_mode('-', 'l', None);
+        assert_eq!(ch.modes, "+nt");
+        assert!(ch.mode_params.is_empty());
+    }
+
+    #[test]
+    fn irc_case_mappings_fold_only_their_advertised_equivalences() {
+        assert!(CaseMapping::Rfc1459.eq("[Nick]\\^", "{nick}|~"));
+        assert!(CaseMapping::StrictRfc1459.eq("[Nick]\\", "{nick}|"));
+        assert!(!CaseMapping::StrictRfc1459.eq("nick^", "nick~"));
+        assert!(!CaseMapping::Ascii.eq("[nick]", "{nick}"));
+        assert!(CaseMapping::Ascii.eq("Alice", "alice"));
     }
 
     #[test]
