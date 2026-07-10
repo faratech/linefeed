@@ -31,6 +31,9 @@ same-file = "1.0.6"  # Detect replaced/rotated log files portably
 # Platform-specific: eframe with x11/wayland only on Linux
 [target.'cfg(target_os = "linux")'.dependencies]
 eframe = { version = "0.34.3", default-features = false, features = ["glow", "persistence", "x11", "wayland"] }
+
+# Used by cfg(unix) code paths (local time conversion), so macOS needs it too
+[target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
 [target.'cfg(not(target_os = "linux"))'.dependencies]
