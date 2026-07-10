@@ -17,3 +17,13 @@ rustflags = ["-C", "target-feature=+crt-static"]
 CC_i686_pc_windows_gnullvm = "i686-w64-mingw32-gcc"
 CXX_i686_pc_windows_gnullvm = "i686-w64-mingw32-g++"
 AR_i686_pc_windows_gnullvm = "i686-w64-mingw32-llvm-ar"
+
+[target.x86_64-pc-windows-gnullvm]
+linker = "x86_64-w64-mingw32-gcc"
+ar = "x86_64-w64-mingw32-llvm-ar"
+rustflags = ["-C", "target-feature=+crt-static"]
+
+[target.x86_64-pc-windows-gnullvm.env]
+CC_x86_64_pc_windows_gnullvm = "x86_64-w64-mingw32-gcc"
+CXX_x86_64_pc_windows_gnullvm = "x86_64-w64-mingw32-g++"
+AR_x86_64_pc_windows_gnullvm = "x86_64-w64-mingw32-llvm-ar"

@@ -15,6 +15,7 @@ OUT_DIR = SCRIPT_DIR / "dist"
 ALL_TARGETS = {
     "linux": ("Linux (native)", None, "linefeed", "linefeed_linux"),
     "arm64": ("Windows ARM64", "aarch64-pc-windows-gnullvm", "linefeed.exe", "linefeed_arm64.exe"),
+    "x64": ("Windows x64", "x86_64-pc-windows-gnullvm", "linefeed.exe", "linefeed_x64.exe"),
     "x86": ("Windows x86", "i686-pc-windows-gnullvm", "linefeed.exe", "linefeed_x86.exe"),
 }
 
@@ -25,6 +26,7 @@ DEFAULT_TARGETS = ["arm64"]
 UPX_SUPPORTED = {
     "linefeed_linux": True,
     "linefeed_x86.exe": True,
+    "linefeed_x64.exe": True,
     "linefeed_arm64.exe": False,  # UPX doesn't support win64/arm64
 }
 
@@ -184,7 +186,7 @@ def parse_args():
 Examples:
   python3 build.py              # Build ARM64 only (default)
   python3 build.py --all        # Build all platforms
-  python3 build.py --arm64 --x86  # Build ARM64 and x86
+  python3 build.py --arm64 --x64  # Build ARM64 and x64
   python3 build.py --linux      # Build Linux only
   python3 build.py --update-deps # Update Cargo.toml dependency pins first
   python3 build.py --no-upx     # Skip UPX compression
@@ -197,6 +199,7 @@ Examples:
     parser.add_argument("--all", action="store_true", help="Build all platforms")
     parser.add_argument("--linux", action="store_true", help="Build Linux (native)")
     parser.add_argument("--arm64", action="store_true", help="Build Windows ARM64")
+    parser.add_argument("--x64", action="store_true", help="Build Windows x64")
     parser.add_argument("--x86", action="store_true", help="Build Windows x86")
 
     # Build options
@@ -231,6 +234,8 @@ async def main():
             targets.append("linux")
         if args.arm64:
             targets.append("arm64")
+        if args.x64:
+            targets.append("x64")
         if args.x86:
             targets.append("x86")
 

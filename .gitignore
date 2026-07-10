@@ -23,3 +23,6 @@ __pycache__/
 
 # Debug files
 *.pdb
+
+# AI tool local state
+.claude/

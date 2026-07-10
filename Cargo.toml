@@ -4,7 +4,8 @@ version = "0.0.1"
 edition = "2024"
 rust-version = "1.92"
 description = "Linefeed IRC Client"
-license = "MIT"
+license = "CC-BY-4.0"
+repository = "https://github.com/faratech/linefeed"
 
 [dependencies]
 # GUI (no default_fonts - we load custom fonts)

@@ -4,16 +4,16 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-Linefeed is a cross-platform IRC client written in Rust using egui/eframe for the GUI. It supports Windows (ARM64, x86) and Linux with TLS encryption via native-tls (SChannel on Windows, OpenSSL on Linux), IRCv3 CAP negotiation, and SASL PLAIN authentication.
+Linefeed is a cross-platform IRC client written in Rust using egui/eframe for the GUI. It supports Windows (ARM64, x64, x86) and Linux with TLS encryption via native-tls (SChannel on Windows, OpenSSL on Linux), IRCv3 CAP negotiation, and SASL PLAIN authentication.
 
 ## Build Commands
 
 ```bash
 # Python build script (recommended)
 python3 build.py              # ARM64 only (default)
-python3 build.py --all        # All platforms (Linux, ARM64, x86) + UPX compression
+python3 build.py --all        # All platforms (Linux, ARM64, x64, x86) + UPX compression
 python3 build.py --linux      # Linux only
-python3 build.py --arm64 --x86  # Multiple targets
+python3 build.py --arm64 --x64  # Multiple targets
 python3 build.py --update-deps # Explicitly update Cargo.toml dependency pins
 
 # Development builds (fast, ~7s incremental)
@@ -23,6 +23,7 @@ cargo build --release                    # Linux release
 # Distribution builds (smallest binaries)
 cargo build --profile dist               # Linux
 cargo build --profile dist --target aarch64-pc-windows-gnullvm  # Windows ARM64
+cargo build --profile dist --target x86_64-pc-windows-gnullvm  # Windows x64
 cargo build --profile dist --target i686-pc-windows-gnullvm     # Windows x86
 ```
 
@@ -58,7 +59,7 @@ python3 -m py_compile build.py tools/update-deps.py
 ## Cross-Compilation
 
 Windows cross-compilation requires llvm-mingw. The `.cargo/config.toml`
-expects `aarch64-w64-mingw32-*` and `i686-w64-mingw32-*` tools on `PATH`; set
+expects `aarch64-w64-mingw32-*`, `x86_64-w64-mingw32-*`, and `i686-w64-mingw32-*` tools on `PATH`; set
 `LLVM_MINGW_HOME` if the tools are not already discoverable. The config uses
 static CRT linking.
 
@@ -66,7 +67,7 @@ static CRT linking.
 
 ```
 src/
-├── main.rs              # Entry point, FmIrcApp, connection thread, system tray (Windows)
+├── main.rs              # Entry point, LinefeedApp, connection thread, system tray (Windows)
 ├── icon_data.rs         # Generated: embedded icon as raw RGBA bytes
 ├── gui/
 │   ├── mod.rs           # IrcApp: UI state, message routing, numeric handlers, lifecycle
@@ -84,7 +85,7 @@ src/
 ```
 
 **Key types:**
-- `FmIrcApp` (main.rs): eframe::App wrapper, owns IrcApp and connection thread
+- `LinefeedApp` (main.rs): eframe::App wrapper, owns IrcApp and connection thread
 - `IrcApp` (gui/mod.rs): UI state, channel data, settings, message processing
 - `IrcClient` (irc/client.rs): Async connection, TLS, SASL negotiation
 - `IrcCommand` (irc/message.rs): Enum for all IRC commands, implements Display for wire format
@@ -95,7 +96,7 @@ src/
 - `LogManager` (gui/logging.rs): Chat history at `~/.config/linefeed/logs/<network>/<channel>.log` on Linux and `%APPDATA%\linefeed\logs\<network>\<channel>.log` on Windows
 
 **Threading model:**
-1. Main thread runs egui event loop via `FmIrcApp::update()`
+1. Main thread runs egui event loop via `LinefeedApp::update()`
 2. Connection thread spawns with single-threaded tokio runtime
 3. Two mpsc channels bridge threads: `cmd_tx` (GUI→IRC), `msg_rx` (IRC→GUI)
 4. IrcClient auto-handles PING/PONG; all messages forwarded to GUI

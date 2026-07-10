@@ -5,7 +5,7 @@ A lightweight, cross-platform IRC client written in Rust with a native GUI.
 ## Features
 
 ### Core
-- **Cross-platform**: Windows (ARM64, x86) and Linux
+- **Cross-platform**: Windows (ARM64, x64, x86) and Linux
 - **TLS encryption**: Native TLS via SChannel (Windows) or OpenSSL (Linux)
 - **SASL authentication**: PLAIN mechanism with timeout/error fallback
 - **Modern UI**: Clean interface built with egui/eframe
@@ -73,8 +73,9 @@ A lightweight, cross-platform IRC client written in Rust with a native GUI.
 
 Download from the [Releases](https://github.com/faratech/linefeed/releases) page:
 - `linefeed_arm64.exe` - Windows ARM64
+- `linefeed_x64.exe` - Windows x64
 - `linefeed_x86.exe` - Windows x86
-- `linefeed` - Linux x86_64
+- `linefeed_linux` - Linux (aarch64 in v0.0.1; built for the build host's architecture)
 
 ### Building from Source
 
@@ -96,8 +97,9 @@ cargo build --release
 python3 build.py            # Windows ARM64 default
 python3 build.py --linux    # Linux
 python3 build.py --arm64    # Windows ARM64
+python3 build.py --x64      # Windows x64
 python3 build.py --x86      # Windows x86
-python3 build.py --arm64 --x86
+python3 build.py --arm64 --x64
 python3 build.py --all      # All platforms
 ```
 
@@ -286,7 +288,15 @@ Linefeed is designed for low resource usage:
 
 ## License
 
-MIT License - See [LICENSE](LICENSE) for details.
+Creative Commons Attribution 4.0 International (CC BY 4.0) - See [LICENSE](LICENSE) for details.
+
+You are free to share and adapt this work for any purpose, including
+commercially, provided you give appropriate credit to the Linefeed project
+(https://github.com/faratech/linefeed), link to the license, and indicate
+if changes were made.
+
+The vendored `vendor/wayland-scanner` crate retains its upstream MIT
+license (see `vendor/wayland-scanner/LICENSE.txt`).
 
 ## Contributing
 
