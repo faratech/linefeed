@@ -5,7 +5,7 @@ A lightweight, cross-platform IRC client written in Rust with a native GUI.
 ## Features
 
 ### Core
-- **Cross-platform**: Windows (ARM64, x64, x86) and Linux
+- **Cross-platform**: Windows (ARM64, x64, x86), Linux (ARM64, x64), and macOS (universal)
 - **TLS encryption**: Native TLS via SChannel (Windows) or OpenSSL (Linux)
 - **SASL authentication**: PLAIN mechanism with timeout/error fallback
 - **Modern UI**: Clean interface built with egui/eframe
@@ -74,8 +74,13 @@ A lightweight, cross-platform IRC client written in Rust with a native GUI.
 Download from the [Releases](https://github.com/faratech/linefeed/releases) page:
 - `linefeed_arm64.exe` - Windows ARM64
 - `linefeed_x64.exe` - Windows x64
-- `linefeed_x86.exe` - Windows x86
-- `linefeed_linux` - Linux (aarch64 in v0.0.1; built for the build host's architecture)
+- `linefeed_x86.exe` - Windows x86 (32-bit)
+- `linefeed_linux_arm64` - Linux ARM64
+- `linefeed_linux_x64` - Linux x86_64
+- `linefeed_macos` - macOS universal (Apple Silicon + Intel)
+
+macOS binaries are unsigned; on first run either right-click > Open, or run
+`xattr -d com.apple.quarantine linefeed_macos`.
 
 ### Building from Source
 

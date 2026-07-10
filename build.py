@@ -4,6 +4,7 @@
 import argparse
 import asyncio
 import os
+import platform
 import shutil
 import sys
 from pathlib import Path
@@ -11,9 +12,14 @@ from pathlib import Path
 SCRIPT_DIR = Path(__file__).parent.resolve()
 OUT_DIR = SCRIPT_DIR / "dist"
 
+# Native Linux builds are named for the host architecture; other-arch Linux
+# and macOS release binaries come from the GitHub Actions release workflow.
+LINUX_ARCH = {"aarch64": "arm64", "x86_64": "x64"}.get(platform.machine(), platform.machine())
+LINUX_BINARY = f"linefeed_linux_{LINUX_ARCH}"
+
 # All build targets: (flag_name, display_name, cargo_target, src_binary, dst_binary)
 ALL_TARGETS = {
-    "linux": ("Linux (native)", None, "linefeed", "linefeed_linux"),
+    "linux": ("Linux (native)", None, "linefeed", LINUX_BINARY),
     "arm64": ("Windows ARM64", "aarch64-pc-windows-gnullvm", "linefeed.exe", "linefeed_arm64.exe"),
     "x64": ("Windows x64", "x86_64-pc-windows-gnullvm", "linefeed.exe", "linefeed_x64.exe"),
     "x86": ("Windows x86", "i686-pc-windows-gnullvm", "linefeed.exe", "linefeed_x86.exe"),
@@ -24,7 +30,7 @@ DEFAULT_TARGETS = ["arm64"]
 
 # UPX-compatible targets
 UPX_SUPPORTED = {
-    "linefeed_linux": True,
+    LINUX_BINARY: True,
     "linefeed_x86.exe": True,
     "linefeed_x64.exe": True,
     "linefeed_arm64.exe": False,  # UPX doesn't support win64/arm64

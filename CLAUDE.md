@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-Linefeed is a cross-platform IRC client written in Rust using egui/eframe for the GUI. It supports Windows (ARM64, x64, x86) and Linux with TLS encryption via native-tls (SChannel on Windows, OpenSSL on Linux), IRCv3 CAP negotiation, and SASL PLAIN authentication.
+Linefeed is a cross-platform IRC client written in Rust using egui/eframe for the GUI. It supports Windows (ARM64, x64, x86), Linux (ARM64, x64), and macOS with TLS encryption via native-tls (SChannel on Windows, OpenSSL on Linux, Security.framework on macOS), IRCv3 CAP negotiation, and SASL PLAIN authentication.
 
 ## Build Commands
 
@@ -29,6 +29,10 @@ cargo build --profile dist --target i686-pc-windows-gnullvm     # Windows x86
 
 Output: `./dist/` when using `build.py`, `./target/<profile>/` for native
 Cargo builds, or `./target/<target>/<profile>/` for Cargo cross-builds.
+
+Linux x86_64 and macOS universal release binaries are built by the GitHub
+Actions release workflow (`.github/workflows/release.yml`) on tag push, or
+manually: `gh workflow run release.yml -f tag=<tag>`.
 
 The build script runs `tools/update-deps.py --check` before building, uses
 `cargo build --locked --profile dist`, and only mutates dependency pins when

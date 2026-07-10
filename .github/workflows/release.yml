@@ -1,0 +1,82 @@
+name: Release builds
+
+# Builds the release binaries this project cannot cross-compile locally:
+# Linux x86_64 and a macOS universal binary (Apple Silicon + Intel).
+# Windows (ARM64/x64/x86) and Linux ARM64 are built locally via build.py.
+#
+# Runs on tag push, or manually via workflow_dispatch to attach binaries
+# to an existing release tag.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing release tag to attach binaries to (e.g. v0.0.1)"
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  linux-x64:
+    # ubuntu-22.04 keeps the glibc requirement low (2.35) for wider compatibility
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libssl-dev pkg-config libxcb-render0-dev \
+            libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-dev libwayland-dev upx-ucl
+      - name: Install Rust
+        run: rustup toolchain install stable --profile minimal && rustup default stable
+      - name: Build
+        run: cargo build --locked --profile dist
+      - name: Package
+        run: |
+          cp target/dist/linefeed linefeed_linux_x64
+          upx --best -q linefeed_linux_x64
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linefeed_linux_x64
+          path: linefeed_linux_x64
+
+  macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        run: |
+          rustup toolchain install stable --profile minimal && rustup default stable
+          rustup target add aarch64-apple-darwin x86_64-apple-darwin
+      - name: Build both architectures
+        run: |
+          cargo build --locked --profile dist --target aarch64-apple-darwin
+          cargo build --locked --profile dist --target x86_64-apple-darwin
+      - name: Create universal binary
+        run: |
+          lipo -create -output linefeed_macos \
+            target/aarch64-apple-darwin/dist/linefeed \
+            target/x86_64-apple-darwin/dist/linefeed
+          lipo -info linefeed_macos
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linefeed_macos
+          path: linefeed_macos
+
+  attach-to-release:
+    needs: [linux-x64, macos]
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+      - name: Upload to release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          gh release upload "$TAG" linefeed_linux_x64 linefeed_macos \
+            --clobber --repo "$GITHUB_REPOSITORY"
