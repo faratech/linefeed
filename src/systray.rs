@@ -15,10 +15,10 @@ use windows::Win32::UI::WindowsAndMessaging::{
     DestroyMenu, DispatchMessageW, EnumWindows, FindWindowW, GetClassNameW, GetCursorPos,
     GetMessageW, GetWindowTextW, GetWindowThreadProcessId, HICON, InsertMenuW, MF_BYPOSITION,
     MF_SEPARATOR, MF_STRING, MSG, PostMessageW, PostQuitMessage, RegisterClassExW,
-    RegisterWindowMessageW, SW_HIDE, SW_RESTORE, SW_SHOW, SetForegroundWindow,
-    SetMenuDefaultItem, ShowWindow, TPM_BOTTOMALIGN, TPM_LEFTALIGN, TPM_RIGHTBUTTON,
-    TrackPopupMenu, TranslateMessage, WINDOW_EX_STYLE, WM_COMMAND, WM_DESTROY, WM_LBUTTONDBLCLK,
-    WM_NULL, WM_RBUTTONUP, WM_USER, WNDCLASSEXW, WS_OVERLAPPEDWINDOW,
+    RegisterWindowMessageW, SW_HIDE, SW_RESTORE, SW_SHOW, SetForegroundWindow, SetMenuDefaultItem,
+    ShowWindow, TPM_BOTTOMALIGN, TPM_LEFTALIGN, TPM_RIGHTBUTTON, TrackPopupMenu, TranslateMessage,
+    WINDOW_EX_STYLE, WM_COMMAND, WM_DESTROY, WM_LBUTTONDBLCLK, WM_NULL, WM_RBUTTONUP, WM_USER,
+    WNDCLASSEXW, WS_OVERLAPPEDWINDOW,
 };
 use windows::core::{BOOL, PCWSTR, w};
 

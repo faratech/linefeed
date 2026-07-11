@@ -274,5 +274,4 @@ mod tests {
         assert!(!mask_matches("", "x"));
         assert!(mask_matches("**a", "a"));
     }
-
 }

@@ -1547,7 +1547,7 @@ impl IrcApp {
 
                 // Remove user from all channels, optionally show quit message
                 let max = self.max_scrollback;
-                for (_, channel) in self.channels.iter_mut() {
+                for channel in self.channels.values_mut() {
                     if channel.has_user(&sender) {
                         if !self.hide_join_part {
                             let sys_msg = ChatMessage::system(&format!(
@@ -1569,7 +1569,7 @@ impl IrcApp {
                 let sys_msg =
                     ChatMessage::system(&format!("{} is now known as {}", old_nick, new_nick));
                 let max = self.max_scrollback;
-                for (_, channel) in self.channels.iter_mut() {
+                for channel in self.channels.values_mut() {
                     if channel.has_user(&old_nick) {
                         channel.push_trimmed(sys_msg.clone(), max);
                         channel.rename_user(&old_nick, new_nick);
@@ -1679,7 +1679,7 @@ impl IrcApp {
                     };
                     // Find first channel where user is present and show message there
                     let max = self.max_scrollback;
-                    for (_, channel) in self.channels.iter_mut() {
+                    for channel in self.channels.values_mut() {
                         if channel.has_user(&sender) {
                             channel.push_trimmed(sys_msg, max);
                             break;
@@ -1692,7 +1692,7 @@ impl IrcApp {
             IrcCommand::Account(account) => {
                 let sender = msg.get_sender_nick().unwrap_or_default();
                 // Update account for user in all channels they're in
-                for (_, channel) in self.channels.iter_mut() {
+                for channel in self.channels.values_mut() {
                     if channel.has_user(&sender) {
                         channel.set_user_account(
                             &sender,
@@ -1713,7 +1713,7 @@ impl IrcApp {
                     };
                     // Show in channels where user is present
                     let max = self.max_scrollback;
-                    for (_, channel) in self.channels.iter_mut() {
+                    for channel in self.channels.values_mut() {
                         if channel.has_user(&sender) {
                             channel.push_trimmed(sys_msg.clone(), max);
                             break; // Only show once
@@ -1732,7 +1732,7 @@ impl IrcApp {
                         sender, new_user, new_host
                     ));
                     let max = self.max_scrollback;
-                    for (_, channel) in self.channels.iter_mut() {
+                    for channel in self.channels.values_mut() {
                         if channel.has_user(&sender) {
                             channel.push_trimmed(sys_msg.clone(), max);
                             break; // Only show once
@@ -2678,7 +2678,7 @@ impl IrcApp {
 
     /// Update a user's away status in all channels they're in
     pub fn update_user_away_status(&mut self, nick: &str, away_msg: Option<String>) {
-        for (_, channel) in self.channels.iter_mut() {
+        for channel in self.channels.values_mut() {
             channel.set_user_away(nick, away_msg.clone());
         }
     }
@@ -3375,7 +3375,7 @@ impl eframe::App for IrcApp {
         }
 
         // Top panel - toolbar
-        egui::Panel::top("toolbar").show_inside(root_ui, |ui| {
+        egui::Panel::top("toolbar").show(root_ui, |ui| {
             ui.horizontal(|ui| {
                 ui.heading("Linefeed");
                 ui.separator();
@@ -3448,7 +3448,7 @@ impl eframe::App for IrcApp {
         egui::Panel::left("channels")
             .resizable(true)
             .default_size(150.0)
-            .show_inside(root_ui, |ui| {
+            .show(root_ui, |ui| {
                 ui.heading("Channels");
                 ui.separator();
 
@@ -3611,7 +3611,7 @@ impl eframe::App for IrcApp {
             egui::Panel::right("users")
                 .resizable(true)
                 .default_size(140.0)
-                .show_inside(root_ui, |ui| {
+                .show(root_ui, |ui| {
                     if let Some(channel) = self.channels.get(&chan_for_context) {
                         // Show user count with away count if any
                         let away_count = channel.away_count();
@@ -3761,7 +3761,7 @@ impl eframe::App for IrcApp {
         }
 
         // Central panel - chat area
-        egui::CentralPanel::default().show_inside(root_ui, |ui| {
+        egui::CentralPanel::default().show(root_ui, |ui| {
             // Channel header with modes and topic
             if let Some(channel_name) = &self.current_channel
                 && let Some(channel) = self.channels.get(channel_name)

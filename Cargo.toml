@@ -1,15 +1,15 @@
 [package]
 name = "linefeed"
-version = "0.0.1"
+version = "0.0.2"
 edition = "2024"
-rust-version = "1.92"
+rust-version = "1.97"
 description = "Linefeed IRC Client"
 license = "CC-BY-4.0"
 repository = "https://github.com/faratech/linefeed"
 
 [dependencies]
 # GUI (no default_fonts - we load custom fonts)
-egui = "0.34.3"
+egui = "0.35.0"
 
 # Async runtime (minimal features for lower memory)
 tokio = { version = "1.52.3", features = ["rt", "net", "io-util", "sync", "time", "macros"] }
@@ -30,14 +30,14 @@ same-file = "1.0.6"  # Detect replaced/rotated log files portably
 
 # Platform-specific: eframe with x11/wayland only on Linux
 [target.'cfg(target_os = "linux")'.dependencies]
-eframe = { version = "0.34.3", default-features = false, features = ["glow", "persistence", "x11", "wayland"] }
+eframe = { version = "0.35.0", default-features = false, features = ["glow", "persistence", "x11", "wayland"] }
 
 # Used by cfg(unix) code paths (local time conversion), so macOS needs it too
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
 [target.'cfg(not(target_os = "linux"))'.dependencies]
-eframe = { version = "0.34.3", default-features = false, features = ["glow", "persistence"] }
+eframe = { version = "0.35.0", default-features = false, features = ["glow", "persistence"] }
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.62.2", features = [
