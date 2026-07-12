@@ -3090,7 +3090,12 @@ impl IrcApp {
         // Build the reply based on the CTCP command
         let reply = match ctcp_cmd.as_str() {
             "VERSION" => Some(
-                "\x01VERSION Linefeed v0.0.1 - Rust/egui cross-platform IRC client\x01".to_string(),
+                concat!(
+                    "\x01VERSION Linefeed v",
+                    env!("CARGO_PKG_VERSION"),
+                    " - Rust/egui cross-platform IRC client\x01"
+                )
+                .to_string(),
             ),
             "TIME" => {
                 // Get current local time

@@ -651,7 +651,7 @@ impl IrcApp {
         ui.add_space(20.0);
         ui.vertical_centered(|ui| {
             ui.heading("Linefeed");
-            ui.label("Version 0.0.1");
+            ui.label(concat!("Version ", env!("CARGO_PKG_VERSION")));
             ui.add_space(10.0);
             ui.label("A cross-platform IRC client");
             ui.label(

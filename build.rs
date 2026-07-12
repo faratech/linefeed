@@ -31,13 +31,18 @@ fn main() {
         "windres".to_string()
     };
 
-    // Create resource script
+    // Create resource script; VERSIONINFO tracks the version in Cargo.toml
+    let version = env::var("CARGO_PKG_VERSION").unwrap();
+    let mut parts = version.split('.');
+    let major = parts.next().unwrap_or("0");
+    let minor = parts.next().unwrap_or("0");
+    let patch = parts.next().unwrap_or("0");
     let rc_path = Path::new(&out_dir).join("linefeed.rc");
     let rc_content = format!(
-        r#"1 ICON "{}/assets/linefeed.ico"
+        r#"1 ICON "{icon_dir}/assets/linefeed.ico"
 1 VERSIONINFO
-FILEVERSION 0,0,1,0
-PRODUCTVERSION 0,0,1,0
+FILEVERSION {major},{minor},{patch},0
+PRODUCTVERSION {major},{minor},{patch},0
 BEGIN
     BLOCK "StringFileInfo"
     BEGIN
@@ -45,8 +50,8 @@ BEGIN
         BEGIN
             VALUE "ProductName", "Linefeed"
             VALUE "FileDescription", "Linefeed IRC Client"
-            VALUE "FileVersion", "0.0.1"
-            VALUE "ProductVersion", "0.0.1"
+            VALUE "FileVersion", "{version}"
+            VALUE "ProductVersion", "{version}"
             VALUE "LegalCopyright", "Copyright 2025"
         END
     END
@@ -56,7 +61,7 @@ BEGIN
     END
 END
 "#,
-        manifest_dir.replace('\\', "/")
+        icon_dir = manifest_dir.replace('\\', "/")
     );
     std::fs::write(&rc_path, rc_content).unwrap();
 

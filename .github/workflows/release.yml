@@ -78,5 +78,12 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ inputs.tag || github.ref_name }}
         run: |
+          # The v0.0.2 run died here with "release not found": tag pushes do
+          # not create a release by themselves. Create a draft-free release
+          # for the tag if one does not exist yet, then attach the binaries.
+          if ! gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release create "$TAG" --repo "$GITHUB_REPOSITORY" \
+              --title "Linefeed ${TAG#v}" --generate-notes
+          fi
           gh release upload "$TAG" linefeed_linux_x64 linefeed_macos \
             --clobber --repo "$GITHUB_REPOSITORY"
