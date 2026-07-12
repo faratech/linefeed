@@ -289,20 +289,24 @@ impl eframe::App for LinefeedApp {
                 return;
             }
 
-            // Handle restore from tray
-            if systray::take_restore_request() {
+            // Handle restore from tray. Remember it for this frame: the
+            // viewport can still read as minimized until the Win32 restore
+            // lands, and the tray intercept below must not re-hide the window.
+            let mut restoring = systray::take_restore_request();
+            if restoring {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
             }
 
-            // When hidden to system tray, skip all UI work
-            // But check if user restored via taskbar (not our tray menu)
+            // When hidden to the system tray, skip all UI work. A hidden
+            // window has no taskbar button, so a restore normally arrives via
+            // the tray (handled above); resync if something else re-showed
+            // the window, e.g. a second instance's activate racing this frame.
             if systray::is_window_hidden() {
                 self.background_tick(ctx);
-                let minimized = ctx.input(|i| i.viewport().minimized.unwrap_or(true));
-                if !minimized {
-                    // User restored via taskbar, clear our flag
+                if systray::is_window_visible() {
                     systray::clear_hidden();
                     ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+                    restoring = true;
                 } else {
                     // Still hidden, skip work
                     ctx.request_repaint_after(std::time::Duration::from_millis(250));
@@ -310,18 +314,23 @@ impl eframe::App for LinefeedApp {
                 }
             }
 
-            // Intercept X button when minimize_to_tray is enabled (only when visible)
-            if self.app.minimize_to_tray
-                && systray::is_active()
-                && ctx.input(|i| i.viewport().close_requested())
-            {
-                ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-                // Tell egui we're minimized so it stops rendering
-                ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
-                systray::hide_window();
-                self.background_tick(ctx);
-                ctx.request_repaint_after(std::time::Duration::from_millis(250));
-                return;
+            // Minimize-to-tray: intercept both the X button and minimize.
+            // Hide outright (SW_HIDE) and never queue Minimized(true): winit
+            // applies viewport commands after the frame, and a minimized
+            // window is a *visible* window on Windows, so it would undo the
+            // hide and leave a taskbar button behind.
+            if self.app.minimize_to_tray && systray::is_active() && !restoring {
+                let close_requested = ctx.input(|i| i.viewport().close_requested());
+                let minimized = ctx.input(|i| i.viewport().minimized.unwrap_or(false));
+                if close_requested || minimized {
+                    if close_requested {
+                        ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                    }
+                    systray::hide_window();
+                    self.background_tick(ctx);
+                    ctx.request_repaint_after(std::time::Duration::from_millis(250));
+                    return;
+                }
             }
         }
 

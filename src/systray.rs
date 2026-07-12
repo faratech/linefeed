@@ -13,8 +13,8 @@ use windows::Win32::UI::Shell::{
 use windows::Win32::UI::WindowsAndMessaging::{
     CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, CreatePopupMenu, CreateWindowExW, DefWindowProcW,
     DestroyMenu, DispatchMessageW, EnumWindows, FindWindowW, GetClassNameW, GetCursorPos,
-    GetMessageW, GetWindowTextW, GetWindowThreadProcessId, HICON, InsertMenuW, MF_BYPOSITION,
-    MF_SEPARATOR, MF_STRING, MSG, PostMessageW, PostQuitMessage, RegisterClassExW,
+    GetMessageW, GetWindowTextW, GetWindowThreadProcessId, HICON, InsertMenuW, IsWindowVisible,
+    MF_BYPOSITION, MF_SEPARATOR, MF_STRING, MSG, PostMessageW, PostQuitMessage, RegisterClassExW,
     RegisterWindowMessageW, SW_HIDE, SW_RESTORE, SW_SHOW, SetForegroundWindow, SetMenuDefaultItem,
     ShowWindow, TPM_BOTTOMALIGN, TPM_LEFTALIGN, TPM_RIGHTBUTTON, TrackPopupMenu, TranslateMessage,
     WINDOW_EX_STYLE, WM_COMMAND, WM_DESTROY, WM_LBUTTONDBLCLK, WM_NULL, WM_RBUTTONUP, WM_USER,
@@ -120,6 +120,14 @@ pub fn hide_window() {
 
 pub fn is_window_hidden() -> bool {
     WINDOW_HIDDEN.load(Ordering::SeqCst)
+}
+
+/// Whether the main window is actually visible on screen (WS_VISIBLE set).
+/// Detects out-of-band re-shows - anything that calls ShowWindow on us while
+/// we believe the window is hidden in the tray - so the GUI can resync
+/// instead of presenting a live window that never repaints.
+pub fn is_window_visible() -> bool {
+    find_main_window().is_some_and(|hwnd| unsafe { IsWindowVisible(hwnd) }.as_bool())
 }
 
 pub fn clear_hidden() {
