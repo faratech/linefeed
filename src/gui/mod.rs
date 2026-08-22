@@ -4377,11 +4377,13 @@ mod tests {
         // Headless egui pass: no renderer needed, real layout runs.
         let ctx = egui::Context::default();
         let mut first_stats = None;
-        let _ = ctx.run_ui(egui::RawInput::default(), |ctx| {
+        ctx.run_ui(egui::RawInput::default(), |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {
                 first_stats = Some(app.draw_scrollback(ui, 400.0));
             });
-        });
+        })
+        .textures_delta
+        .clear();
         let stats = first_stats.expect("panel ran");
         assert_eq!(stats.total_rows, 2000);
         assert!(
@@ -4397,11 +4399,13 @@ mod tests {
         // Second identical frame: everything cached, nothing re-measured,
         // and still only the visible band drawn.
         let mut second_stats = None;
-        let _ = ctx.run_ui(egui::RawInput::default(), |ctx| {
+        ctx.run_ui(egui::RawInput::default(), |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {
                 second_stats = Some(app.draw_scrollback(ui, 400.0));
             });
-        });
+        })
+        .textures_delta
+        .clear();
         let stats2 = second_stats.expect("second panel ran");
         assert_eq!(stats2.measured, 0, "heights must stay cached across frames");
         assert!(
@@ -4422,11 +4426,13 @@ mod tests {
             ..Default::default()
         };
         let mut scrolled_stats = None;
-        let _ = ctx.run_ui(scrolled_input, |ctx| {
+        ctx.run_ui(scrolled_input, |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {
                 scrolled_stats = Some(app.draw_scrollback(ui, 400.0));
             });
-        });
+        })
+        .textures_delta
+        .clear();
         let stats3 = scrolled_stats.expect("scrolled panel ran");
         assert!(
             stats3.drawn < 300,
@@ -4444,7 +4450,7 @@ mod tests {
              several lines when the available width is small enough for wrapping",
         );
         let mut heights = None;
-        let _ = ctx.run_ui(egui::RawInput::default(), |ctx| {
+        ctx.run_ui(egui::RawInput::default(), |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {
                 let width = 120.0;
                 let key = row_layout_key(ui, width);
@@ -4457,7 +4463,9 @@ mod tests {
                     row_height(ui, &long_msg, "me", width, key, &mut stats);
                 heights = Some((h_short, h_long));
             });
-        });
+        })
+        .textures_delta
+        .clear();
         let (h_short, h_long) = heights.expect("panel ran");
         assert!(h_long > h_short * 1.5, "{h_long} vs {h_short}");
     }
@@ -4489,7 +4497,7 @@ mod tests {
                 chan.messages
                     .push_back(ChatMessage::system(&format!("fresh {frame}")));
             }
-            let output = ctx.run_ui(egui::RawInput::default(), |ctx| {
+            let mut output = ctx.run_ui(egui::RawInput::default(), |ctx| {
                 egui::CentralPanel::default().show(ctx, |ui| {
                     app.draw_scrollback(ui, ui.max_rect().height() - 30.0);
                 });
@@ -4508,6 +4516,9 @@ mod tests {
                 "frame {frame}: only {visible_text} visible text shapes - \
                  the message area would flash blank"
             );
+            // Headless: no renderer consumes the font atlas uploads, so drop
+            // them explicitly (egui debug-asserts on unapplied deltas).
+            output.textures_delta.clear();
         }
     }
 

@@ -9,35 +9,35 @@ repository = "https://github.com/faratech/linefeed"
 
 [dependencies]
 # GUI (no default_fonts - we load custom fonts)
-egui = "0.35.0"
+egui = "0.36.1"
 
 # Async runtime (minimal features for lower memory)
-tokio = { version = "1.52.3", features = ["rt", "net", "io-util", "sync", "time", "macros"] }
+tokio = { version = "1.53.1", features = ["rt", "net", "io-util", "sync", "time", "macros"] }
 
 # TLS (uses OS native: SChannel on Windows, OpenSSL on Linux)
 tokio-native-tls = "0.3.1"
 native-tls = "0.2.18"  # for TlsConnector::builder()
 
 # Utilities
-serde = { version = "1.0.228", features = ["derive"] }
-serde_json = "1.0.150"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", default-features = false, features = ["fmt", "std"] }
 dirs = "6.0.0"
-base64 = "0.22.1"  # For SASL authentication
+base64 = "0.23.1"  # For SASL authentication
 mimalloc = { version = "0.1.52", default-features = false }  # Lower memory allocator
 same-file = "1.0.6"  # Detect replaced/rotated log files portably
 
 # Platform-specific: eframe with x11/wayland only on Linux
 [target.'cfg(target_os = "linux")'.dependencies]
-eframe = { version = "0.35.0", default-features = false, features = ["glow", "persistence", "x11", "wayland"] }
+eframe = { version = "0.36.1", default-features = false, features = ["glow", "persistence", "x11", "wayland"] }
 
 # Used by cfg(unix) code paths (local time conversion), so macOS needs it too
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
 [target.'cfg(not(target_os = "linux"))'.dependencies]
-eframe = { version = "0.35.0", default-features = false, features = ["glow", "persistence"] }
+eframe = { version = "0.36.1", default-features = false, features = ["glow", "persistence"] }
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.62.2", features = [
