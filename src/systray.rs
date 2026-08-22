@@ -13,12 +13,12 @@ use windows::Win32::UI::Shell::{
 use windows::Win32::UI::WindowsAndMessaging::{
     CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, CreatePopupMenu, CreateWindowExW, DefWindowProcW,
     DestroyMenu, DispatchMessageW, EnumWindows, FindWindowW, GetClassNameW, GetCursorPos,
-    GetMessageW, GetWindowTextW, GetWindowThreadProcessId, HICON, InsertMenuW, IsWindowVisible,
-    MF_BYPOSITION, MF_SEPARATOR, MF_STRING, MSG, PostMessageW, PostQuitMessage, RegisterClassExW,
-    RegisterWindowMessageW, SW_HIDE, SW_RESTORE, SW_SHOW, SetForegroundWindow, SetMenuDefaultItem,
-    ShowWindow, TPM_BOTTOMALIGN, TPM_LEFTALIGN, TPM_RIGHTBUTTON, TrackPopupMenu, TranslateMessage,
-    WINDOW_EX_STYLE, WM_COMMAND, WM_DESTROY, WM_LBUTTONDBLCLK, WM_NULL, WM_RBUTTONUP, WM_USER,
-    WNDCLASSEXW, WS_OVERLAPPEDWINDOW,
+    GetMessageW, GetWindowTextW, GetWindowThreadProcessId, HICON, InsertMenuW, IsIconic,
+    IsWindowVisible, MF_BYPOSITION, MF_SEPARATOR, MF_STRING, MSG, PostMessageW, PostQuitMessage,
+    RegisterClassExW, RegisterWindowMessageW, SW_HIDE, SW_RESTORE, SW_SHOW, SetForegroundWindow,
+    SetMenuDefaultItem, ShowWindow, TPM_BOTTOMALIGN, TPM_LEFTALIGN, TPM_RIGHTBUTTON,
+    TrackPopupMenu, TranslateMessage, WINDOW_EX_STYLE, WM_COMMAND, WM_DESTROY, WM_LBUTTONDBLCLK,
+    WM_NULL, WM_RBUTTONUP, WM_USER, WNDCLASSEXW, WS_OVERLAPPEDWINDOW,
 };
 use windows::core::{BOOL, PCWSTR, w};
 
@@ -99,7 +99,12 @@ pub fn show_window() {
     if let Some(hwnd) = find_main_window() {
         unsafe {
             let _ = ShowWindow(hwnd, SW_SHOW);
-            let _ = ShowWindow(hwnd, SW_RESTORE);
+            // Restore only when actually minimized: an unconditional
+            // SW_RESTORE would also collapse a maximized window back to its
+            // normal size.
+            if IsIconic(hwnd).as_bool() {
+                let _ = ShowWindow(hwnd, SW_RESTORE);
+            }
             let _ = SetForegroundWindow(hwnd);
         }
         tracing::info!("Window shown via Win32");

@@ -614,6 +614,10 @@ pub struct Channel {
     pub joined: bool,
     case_mapping: CaseMapping,
     names_snapshot: Option<Vec<ChannelUser>>,
+    /// When the newest 353 of the pending burst arrived; a 353 arriving long
+    /// after it means the previous burst was abandoned and must not be
+    /// appended to.
+    burst_activity: Option<std::time::Instant>,
     mode_parameters: HashMap<char, String>,
 }
 
@@ -635,6 +639,7 @@ impl Channel {
             joined: false,
             case_mapping: CaseMapping::Rfc1459,
             names_snapshot: None,
+            burst_activity: None,
             mode_parameters: HashMap::new(),
         }
     }
@@ -683,7 +688,16 @@ impl Channel {
     /// Start an authoritative NAMES snapshot. The visible membership is left
     /// untouched until RPL_ENDOFNAMES, avoiding partial-list flicker.
     pub fn begin_user_burst(&mut self) {
-        if self.names_snapshot.is_none() {
+        // A burst that never reached RPL_ENDOFNAMES leaves a partial snapshot
+        // behind. NAMES lines stream back-to-back, so a 353 arriving long
+        // after the last one means the previous burst was abandoned: start
+        // fresh rather than appending to it (which would resurrect ghost
+        // users when the new burst completes).
+        const BURST_GAP: std::time::Duration = std::time::Duration::from_secs(5);
+        let stale = self
+            .burst_activity
+            .is_some_and(|t| t.elapsed() > BURST_GAP);
+        if self.names_snapshot.is_none() || stale {
             self.names_snapshot = Some(Vec::new());
         }
     }
@@ -696,6 +710,7 @@ impl Channel {
             return;
         }
         self.begin_user_burst();
+        self.burst_activity = Some(std::time::Instant::now());
         let snapshot = self.names_snapshot.as_mut().expect("burst just started");
         if let Some(existing) = snapshot
             .iter_mut()
@@ -716,6 +731,7 @@ impl Channel {
     /// Atomically replace membership with the authoritative NAMES snapshot,
     /// preserving away/account metadata for users who are still present.
     pub fn finish_user_burst(&mut self) {
+        self.burst_activity = None;
         let Some(mut snapshot) = self.names_snapshot.take() else {
             return;
         };

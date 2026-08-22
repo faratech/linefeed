@@ -251,16 +251,19 @@ impl IrcMessage {
     /// Get a specific IRCv3 tag value
     pub fn get_tag(&self, key: &str) -> Option<String> {
         self.tags.as_ref().and_then(|tags| {
+            // A repeated tag key means the sender revised the value; per the
+            // IRCv3 message-tags spec, receivers keep only the final one.
+            let mut found: Option<String> = None;
             for part in tags.split(';') {
                 if let Some((k, v)) = part.split_once('=') {
                     if k == key {
-                        return Some(unescape_tag_value(v));
+                        found = Some(unescape_tag_value(v));
                     }
                 } else if part == key {
-                    return Some(String::new());
+                    found = Some(String::new());
                 }
             }
-            None
+            found
         })
     }
 
@@ -597,6 +600,19 @@ mod tests {
         assert_eq!(m.get_tag("k2").as_deref(), Some("x;y"));
         assert_eq!(m.get_tag("k3").as_deref(), Some(""));
         assert_eq!(m.get_tag("missing"), None);
+    }
+
+    #[test]
+    fn repeated_tag_keys_keep_the_final_value() {
+        // A bouncer prepending its own `time` must not shadow the inner one.
+        let m = IrcMessage::parse(
+            "@time=2020-01-01T00:00:00.000Z;time=2025-12-28T19:30:00.000Z :n!u@h PRIVMSG #c :hi",
+        )
+        .unwrap();
+        assert_eq!(
+            m.get_tag("time").as_deref(),
+            Some("2025-12-28T19:30:00.000Z")
+        );
     }
 
     #[test]

@@ -26,12 +26,24 @@ impl IrcApp {
                     return;
                 }
                 let channel = self.normalize_channel_name(channel_arg);
-                // Store key for use when channel is created
-                if let Some(ref k) = key {
-                    self.pending_channel_keys
-                        .insert(self.network_support.canonicalize(&channel), k.clone());
+                let sent = self.send_command(IrcCommand::Join(
+                    channel.clone(),
+                    key.clone(),
+                    None,
+                    None,
+                ));
+                if !sent {
+                    self.add_message_to_current(ChatMessage::system_fmt(
+                        &format!("Not connected - join {channel} not sent"),
+                        &self.timestamp_format,
+                    ));
+                    return;
                 }
-                self.send_command(IrcCommand::Join(channel, key, None, None));
+                // Store the key only for a channel actually being joined.
+                if let Some(k) = key {
+                    self.pending_channel_keys
+                        .insert(self.network_support.canonicalize(&channel), k);
+                }
             }
 
             "PART" | "LEAVE" => {
@@ -670,8 +682,14 @@ impl IrcApp {
 
             "MODE" | "M" => {
                 if !args.is_empty() {
+                    // The "/mode +m" shorthand applies to the current channel;
+                    // a query tab's target is a peer nick, not a channel.
+                    let shorthand_target = self
+                        .current_channel
+                        .as_deref()
+                        .filter(|name| self.network_support.is_channel(name));
                     if let Some((target, mode, params)) =
-                        mode_command_args(args, self.current_channel.as_deref())
+                        mode_command_args(args, shorthand_target)
                     {
                         self.send_command(IrcCommand::Mode(target, mode, params));
                     } else {

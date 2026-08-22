@@ -261,6 +261,7 @@ fn main() -> eframe::Result<()> {
                 connection_thread: None,
                 last_message_time: std::time::Instant::now(),
                 window_size_ok: false,
+                list_loading_since: None,
             }))
         }),
     )
@@ -274,6 +275,9 @@ struct LinefeedApp {
     /// Set once the window has been confirmed at a sane size; guards the
     /// startup tiny-window self-heal (see `ui`).
     window_size_ok: bool,
+    /// When the current /list started, so a server that never sends
+    /// RPL_LISTEND cannot pin the fast repaint rate forever.
+    list_loading_since: Option<std::time::Instant>,
 }
 
 impl eframe::App for LinefeedApp {
@@ -293,7 +297,10 @@ impl eframe::App for LinefeedApp {
             // viewport can still read as minimized until the Win32 restore
             // lands, and the tray intercept below must not re-hide the window.
             let mut restoring = systray::take_restore_request();
-            if restoring {
+            if restoring && ctx.input(|i| i.viewport().minimized.unwrap_or(false)) {
+                // Un-minimize only when actually iconic: winit implements this
+                // via SW_RESTORE, which would also collapse a merely maximized
+                // window back to its normal size.
                 ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
             }
 
@@ -305,7 +312,9 @@ impl eframe::App for LinefeedApp {
                 self.background_tick(ctx);
                 if systray::is_window_visible() {
                     systray::clear_hidden();
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+                    if ctx.input(|i| i.viewport().minimized.unwrap_or(false)) {
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+                    }
                     restoring = true;
                 } else {
                     // Still hidden, skip work
@@ -381,9 +390,19 @@ impl eframe::App for LinefeedApp {
             || self.app.awaiting_reconnect()
         {
             let interval = if self.app.channel_list_loading {
-                // High-traffic mode during /list - fast polling for UI responsiveness
-                std::time::Duration::from_millis(16)
+                // High-traffic mode during /list - fast polling for UI
+                // responsiveness. A broken or hostile server that never sends
+                // RPL_LISTEND (323) must not pin this rate forever.
+                let since = *self
+                    .list_loading_since
+                    .get_or_insert_with(std::time::Instant::now);
+                if since.elapsed() >= std::time::Duration::from_secs(30) {
+                    std::time::Duration::from_millis(250)
+                } else {
+                    std::time::Duration::from_millis(16)
+                }
             } else {
+                self.list_loading_since = None;
                 // Check how long since last message activity
                 let idle_time = self.last_message_time.elapsed();
                 if idle_time < std::time::Duration::from_secs(2) {
@@ -556,6 +575,7 @@ mod tests {
             connection_thread: Some(handle),
             last_message_time: std::time::Instant::now(),
             window_size_ok: true,
+            list_loading_since: None,
         };
         linefeed.background_tick(&egui::Context::default());
 

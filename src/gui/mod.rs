@@ -2095,11 +2095,27 @@ impl IrcApp {
                 {
                     let ts: u64 = ts_str.parse().unwrap_or(0);
                     if let Some(ch) = self.channel_mut(channel) {
-                        ch.bans.push(BanEntry {
-                            mask: mask.clone(),
-                            set_by: setter.clone(),
-                            set_time: ts,
-                        });
+                        // Overlapping MODE +b requests can list the same mask
+                        // twice; a re-listed ban replaces its earlier entry
+                        // instead of accumulating duplicates.
+                        match ch
+                            .bans
+                            .iter()
+                            .position(|b| b.mask.eq_ignore_ascii_case(mask))
+                        {
+                            Some(slot) => {
+                                let existing = &mut ch.bans[slot];
+                                existing.set_by = setter.clone();
+                                existing.set_time = ts;
+                            }
+                            None => {
+                                ch.bans.push(BanEntry {
+                                    mask: mask.clone(),
+                                    set_by: setter.clone(),
+                                    set_time: ts,
+                                });
+                            }
+                        }
                     }
                 }
             }
@@ -2186,48 +2202,62 @@ impl IrcApp {
                     return;
                 }
 
-                let mut channel = None;
-                let mut user_count = 0;
-                let mut topic = String::new();
+                let channel_idx = params.iter().position(|p| p.starts_with('#') || p.starts_with('&'));
 
-                for (i, p) in params.iter().enumerate() {
-                    // Channel name: first param starting with #, &, or just looks like a channel
-                    // Relaxed check: if it's not a number and channel is none, take it? No, unsafe.
-                    if (p.starts_with('#') || p.starts_with('&')) && channel.is_none() {
-                        channel = Some(p.clone());
-                        if let Some(last_p) = params.last()
-                            && last_p != p
-                            && !last_p.chars().all(|c| c.is_ascii_digit())
+                let parsed = channel_idx.and_then(|ci| {
+                    if ci + 1 >= params.len() {
+                        return None;
+                    }
+                    fn parse_count(p: &str) -> Option<usize> {
+                        let clean = p.replace(',', "");
+                        if !clean.is_empty() && clean.chars().all(|c| c.is_ascii_digit() || c == '+')
                         {
-                            topic = last_p.clone();
+                            clean.trim_start_matches('+').parse().ok()
+                        } else {
+                            None
                         }
                     }
 
-                    // User count: any numeric param. Handle '1000' with commas.
-                    let clean_p = p.replace(',', "");
-                    if i > 0
-                        && clean_p.chars().all(|c| c.is_ascii_digit() || c == '+')
-                        && !clean_p.is_empty()
-                        && let Ok(cnt) = clean_p.trim_start_matches('+').parse::<usize>()
-                    {
-                        user_count = cnt;
-                    }
-                }
+                    let last = params.last()?;
+                    let (user_count, topic) = if ci + 1 == params.len() - 1 {
+                        // One parameter after the channel: per the standard
+                        // format it is the count ("322 me #chan 42"); only a
+                        // non-numeric value there means the server skipped the
+                        // count and sent the topic directly.
+                        match parse_count(last) {
+                            Some(count) => (count, String::new()),
+                            None => (0, last.clone()),
+                        }
+                    } else {
+                        // Standard form: counts sit between the channel name
+                        // and the trailing topic. The trailing parameter is the
+                        // topic even when purely numeric ("322 me #a 12 :2024").
+                        let count = params[ci + 1..params.len() - 1]
+                            .iter()
+                            .find_map(|p| parse_count(p))
+                            .unwrap_or(0);
+                        (count, last.clone())
+                    };
+                    Some((params[ci].clone(), user_count, topic))
+                });
 
-                if let Some(name) = channel {
-                    self.channel_list
-                        .push(ChannelListEntry::new(name, user_count, topic));
-                    self.channel_list_dirty = true;
-                } else {
-                    // Fallback: if we have at least 3 params, assume standard format
-                    // [client, channel, count, topic]
-                    if params.len() >= 3 {
-                        self.channel_list.push(ChannelListEntry::new(
-                            params[1].clone(),
-                            params[2].replace(',', "").parse().unwrap_or(0),
-                            params.get(3).cloned().unwrap_or_default(),
-                        ));
+                match parsed {
+                    Some((name, user_count, topic)) => {
+                        self.channel_list
+                            .push(ChannelListEntry::new(name, user_count, topic));
                         self.channel_list_dirty = true;
+                    }
+                    None => {
+                        // Fallback: if we have at least 3 params, assume standard format
+                        // [client, channel, count, topic]
+                        if params.len() >= 3 {
+                            self.channel_list.push(ChannelListEntry::new(
+                                params[1].clone(),
+                                params[2].replace(',', "").parse().unwrap_or(0),
+                                params.get(3).cloned().unwrap_or_default(),
+                            ));
+                            self.channel_list_dirty = true;
+                        }
                     }
                 }
             }
@@ -4600,6 +4630,39 @@ mod tests {
         assert!(!app.check_nick_mention("xfoo-bar"));
         assert!(!app.check_nick_mention("node.jss"));
         assert!(!app.check_nick_mention("no highlights here"));
+    }
+
+    #[test]
+    fn rpl_list_keeps_numeric_topics_from_becoming_user_counts() {
+        let mut app = test_app();
+
+        // Standard: 322 <me> <#chan> <count> :<topic>
+        app.handle_numeric(
+            RPL_LIST,
+            &[
+                "me".to_string(),
+                "#general".to_string(),
+                "12".to_string(),
+                "2024".to_string(),
+            ],
+        );
+        let entry = &app.channel_list[0];
+        assert_eq!(entry.name, "#general");
+        assert_eq!(entry.user_count, 12, "topic must not overwrite the count");
+        assert_eq!(entry.topic_clean, "2024", "numeric topic must be kept");
+
+        // Ordinary topic still lands.
+        app.handle_numeric(
+            RPL_LIST,
+            &[
+                "me".to_string(),
+                "#other".to_string(),
+                "5".to_string(),
+                "hello world".to_string(),
+            ],
+        );
+        assert_eq!(app.channel_list[1].user_count, 5);
+        assert_eq!(app.channel_list[1].topic_clean, "hello world");
     }
 
     #[test]

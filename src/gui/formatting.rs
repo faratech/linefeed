@@ -326,6 +326,11 @@ fn parse_irc_colors(input: &str) -> Vec<TextSpan> {
 }
 
 /// Split text into URL and non-URL segments
+/// Characters that close a URL: whitespace or common surrounding punctuation.
+fn url_terminates(c: char) -> bool {
+    c.is_whitespace() || matches!(c, '>' | ')' | ']' | '"' | '\'')
+}
+
 fn split_urls(text: &str) -> Vec<(String, bool)> {
     let mut result = Vec::new();
     let mut remaining = text;
@@ -366,16 +371,7 @@ fn split_urls(text: &str) -> Vec<(String, bool)> {
                 // Find the end of the URL (first whitespace or end of string)
                 let url_start = pos;
                 let after_url = &remaining[url_start..];
-                let url_end = after_url
-                    .find(|c: char| {
-                        c.is_whitespace()
-                            || c == '>'
-                            || c == ')'
-                            || c == ']'
-                            || c == '"'
-                            || c == '\''
-                    })
-                    .unwrap_or(after_url.len());
+                let url_end = after_url.find(url_terminates).unwrap_or(after_url.len());
 
                 let url = &after_url[..url_end];
                 result.push((url.to_string(), true));
@@ -409,21 +405,51 @@ pub struct RenderSegment {
     pub is_url: bool,
 }
 
+fn render_segment(span: &TextSpan, text: String, is_url: bool) -> RenderSegment {
+    RenderSegment {
+        text,
+        fg_color: span.fg_color,
+        bg_color: span.bg_color,
+        bold: span.bold,
+        underline: span.underline,
+        italic: span.italic,
+        reverse: span.reverse,
+        is_url,
+    }
+}
+
 /// Parse IRC formatting and detect URLs once, producing render-ready segments.
 pub fn layout_irc_text(text: &str) -> Vec<RenderSegment> {
-    let mut segments = Vec::new();
+    let mut segments: Vec<RenderSegment> = Vec::new();
+    // A formatting control can cut a URL mid-domain ("\x02https://ex\x02ample.com"):
+    // the visible characters continue into the next span with no separator on
+    // the wire, so glue them onto the still-open hyperlink instead of
+    // rendering a truncated link to the wrong host.
+    let mut url_open = false;
     for span in parse_irc_colors(text) {
-        for (segment, is_url) in split_urls(&span.text) {
-            segments.push(RenderSegment {
-                text: segment,
-                fg_color: span.fg_color,
-                bg_color: span.bg_color,
-                bold: span.bold,
-                underline: span.underline,
-                italic: span.italic,
-                reverse: span.reverse,
-                is_url,
-            });
+        let parts = split_urls(&span.text);
+        let count = parts.len();
+        for (i, (part_text, part_is_url)) in parts.into_iter().enumerate() {
+            if url_open {
+                let prev = segments
+                    .last_mut()
+                    .expect("url_open implies a previous URL segment");
+                let run_end = part_text.find(url_terminates).unwrap_or(part_text.len());
+                prev.text.push_str(&part_text[..run_end]);
+                if run_end < part_text.len() {
+                    // Terminator reached inside this span: the URL closes
+                    // here and the rest renders as plain text.
+                    url_open = false;
+                    segments.push(render_segment(&span, part_text[run_end..].to_string(), false));
+                }
+                // Fully absorbed: the link stays open into the next span.
+            } else {
+                segments.push(render_segment(&span, part_text, part_is_url));
+                // split_urls leaves a URL as its span's final part only when
+                // it ran to the end of that span, i.e. it was cut by a
+                // formatting control rather than terminated.
+                url_open = i + 1 == count && part_is_url;
+            }
         }
     }
     segments
@@ -554,4 +580,29 @@ mod tests {
                 .any(|s| s.is_url && s.text == "https://rust-lang.org")
         );
     }
+
+    #[test]
+    fn urls_cut_by_formatting_controls_stay_whole() {
+        // Bold wrapped around the middle of a domain: the fragments must glue
+        // into one link to the full host, not a truncated wrong-host link.
+        let segs = layout_irc_text("\u{2}https://exam\u{2}ple.com/x");
+        let urls: Vec<_> = segs.iter().filter(|s| s.is_url).collect();
+        assert_eq!(urls.len(), 1);
+        assert_eq!(urls[0].text, "https://example.com/x");
+
+        // A URL that ends before the control must not swallow the next word.
+        let segs = layout_irc_text("\u{2}https://a.test\u{2} plain words");
+        assert!(
+            !segs
+                .iter()
+                .any(|s| s.is_url && s.text.contains("plain"))
+        );
+        assert!(segs.iter().any(|s| s.text == " plain words"));
+
+        // Color control inside the URL path.
+        let segs = layout_irc_text("see \u{3}12https://a\u{3}b.test/c now");
+        let url = segs.iter().find(|s| s.is_url).unwrap();
+        assert_eq!(url.text, "https://ab.test/c");
+    }
 }
+

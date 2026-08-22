@@ -3,7 +3,7 @@
 use super::helpers::days_to_ymd;
 use super::types::ChatMessage;
 use std::fs::{self, File, OpenOptions};
-use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::PathBuf;
 
 /// Maximum simultaneously open log file handles. Long sessions across many
@@ -212,17 +212,32 @@ impl LogManager {
         if let Some(parent) = destination.parent()
             && fs::create_dir_all(parent).is_ok()
         {
-            match fs::rename(&legacy, &destination) {
-                Ok(()) => tracing::info!(
-                    "Migrated legacy chat history {:?} to endpoint-scoped path {:?}",
-                    legacy,
-                    destination
-                ),
-                Err(error) => tracing::warn!(
-                    "Could not migrate legacy chat history {:?}: {}",
-                    legacy,
-                    error
-                ),
+            // Link-then-unlink rather than rename: hard_link fails atomically
+            // when the destination already exists, so a log file a concurrent
+            // instance just created cannot be clobbered by the migration
+            // (single-instance enforcement is Windows-only).
+            match fs::hard_link(&legacy, &destination) {
+                Ok(()) => {
+                    let _ = fs::remove_file(&legacy);
+                    tracing::info!(
+                        "Migrated legacy chat history {:?} to endpoint-scoped path {:?}",
+                        legacy,
+                        destination
+                    );
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(_) => match fs::rename(&legacy, &destination) {
+                    Ok(()) => tracing::info!(
+                        "Migrated legacy chat history {:?} to endpoint-scoped path {:?}",
+                        legacy,
+                        destination
+                    ),
+                    Err(error) => tracing::warn!(
+                        "Could not migrate legacy chat history {:?}: {}",
+                        legacy,
+                        error
+                    ),
+                },
             }
         }
     }
@@ -286,8 +301,19 @@ impl LogManager {
             if file.seek(SeekFrom::Start(0)).is_err() {
                 return Vec::new();
             }
-            let reader = BufReader::new(file);
-            let lines: Vec<String> = reader.lines().map_while(Result::ok).collect();
+            let mut raw = String::with_capacity(file_size as usize);
+            // Decode lossily like the large-file branch below: BufRead::lines
+            // yields Err on the first non-UTF-8 byte and would silently
+            // truncate history at that point (irssi logs carry raw wire bytes).
+            if file.read_to_string(&mut raw).is_err() {
+                let mut bytes = Vec::with_capacity(file_size as usize);
+                if file.seek(SeekFrom::Start(0)).is_err() || file.read_to_end(&mut bytes).is_err()
+                {
+                    return Vec::new();
+                }
+                raw = String::from_utf8_lossy(&bytes).into_owned();
+            }
+            let lines: Vec<&str> = raw.lines().collect();
             let start = lines.len().saturating_sub(max_lines);
             let mut messages: Vec<ChatMessage> = lines[start..]
                 .iter()
@@ -817,6 +843,29 @@ mod tests {
 
         drop(manager);
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn history_load_survives_invalid_utf8_bytes() {
+        let (manager, dir) = test_manager("lossy-history");
+        let path = manager.log_path("tls:irc.example:6697", "#room");
+        // irssi-compatible logs may carry raw wire bytes: a non-UTF-8 byte
+        // must not truncate everything after it (BufRead::lines semantics).
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let mut raw = Vec::new();
+        raw.extend_from_slice(b"09:30 <alice> before the glitch\n");
+        raw.push(0xFF);
+        raw.extend_from_slice(b"\n");
+        raw.extend_from_slice(b"09:31 <bob> after the glitch\n");
+        fs::write(&path, &raw).unwrap();
+
+        let messages =
+            manager.load_history_with_legacy("tls:irc.example:6697", "", "#room", 100, false);
+        let contents: Vec<&str> = messages.iter().map(|m| m.content.as_str()).collect();
+        assert!(contents.contains(&"after the glitch"), "{contents:?}");
+
+        drop(manager);
+        fs::remove_dir_all(dir).expect("remove temporary log directory");
     }
 
     #[test]

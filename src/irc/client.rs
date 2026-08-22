@@ -197,37 +197,40 @@ fn redact_for_log(line: &str) -> std::borrow::Cow<'_, str> {
 /// arrive mid-handshake, before the writer task that normally handles them
 /// exists). Loops until it has a non-PING message to return, or errors if the
 /// connection closes.
+/// Read and handle one handshake line. Answers a server PING inline (and
+/// forwards it), returning `None` so the caller re-arms its fresh per-step
+/// budget; returns `Some(msg)` for anything else.
 async fn read_handshake_msg<W, R>(
     writer: &mut W,
     reader: &mut R,
     buf: &mut Vec<u8>,
     incoming_tx: &mpsc::Sender<IrcMessage>,
-) -> Result<IrcMessage, Box<dyn std::error::Error + Send + Sync>>
+) -> Result<Option<IrcMessage>, Box<dyn std::error::Error + Send + Sync>>
 where
     W: tokio::io::AsyncWrite + Unpin,
     R: tokio::io::AsyncBufRead + Unpin,
 {
-    loop {
-        // The GUI dropping its receiver is a disconnect request; honor it even
-        // though the writer task (which normally carries QUIT) doesn't exist yet.
-        if incoming_tx.is_closed() {
+    // The GUI dropping its receiver is a disconnect request; honor it even
+    // though the writer task (which normally carries QUIT) doesn't exist yet.
+    if incoming_tx.is_closed() {
+        return Err("Connection cancelled during registration".into());
+    }
+    let n = tokio::select! {
+        _ = incoming_tx.closed() => {
             return Err("Connection cancelled during registration".into());
         }
-        let n = tokio::select! {
-            _ = incoming_tx.closed() => {
-                return Err("Connection cancelled during registration".into());
-            }
-            result = read_line_lossy(reader, buf) => result?,
-        };
-        if n == 0 || !buf.ends_with(b"\n") {
-            // EOF, possibly mid-line: never parse a truncated fragment as a
-            // complete message (mirrors the main read loop).
-            return Err("Connection closed during registration".into());
-        }
-        let trimmed = bytes_to_string_lossy(buf);
-        buf.clear();
-        tracing::debug!("< {}", trimmed);
-        if let Some(msg) = IrcMessage::parse(&trimmed) {
+        result = read_line_lossy(reader, buf) => result?,
+    };
+    if n == 0 || !buf.ends_with(b"\n") {
+        // EOF, possibly mid-line: never parse a truncated fragment as a
+        // complete message (mirrors the main read loop).
+        return Err("Connection closed during registration".into());
+    }
+    let trimmed = bytes_to_string_lossy(buf);
+    buf.clear();
+    tracing::debug!("< {}", trimmed);
+    match IrcMessage::parse(&trimmed) {
+        Some(msg) => {
             if let IrcCommand::Ping(token) = &msg.command {
                 let pong = format!("PONG :{}\r\n", token);
                 writer.write_all(pong.as_bytes()).await?;
@@ -238,10 +241,12 @@ where
                 .await
                 .map_err(|_| "Connection cancelled during registration")?;
             if matches!(&msg.command, IrcCommand::Ping(_)) {
-                continue;
+                Ok(None)
+            } else {
+                Ok(Some(msg))
             }
-            return Ok(msg);
         }
+        None => Ok(None),
     }
 }
 
@@ -255,15 +260,23 @@ where
     W: tokio::io::AsyncWrite + Unpin,
     R: tokio::io::AsyncBufRead + Unpin,
 {
-    match timeout(
-        HANDSHAKE_STEP_TIMEOUT,
-        read_handshake_msg(writer, reader, buf, incoming_tx),
-    )
-    .await
-    {
-        Ok(Ok(msg)) => Ok(Some(msg)),
-        Ok(Err(e)) => Err(e),
-        Err(_) => Ok(None),
+    // The per-step budget covers a single line, not the whole wait for the
+    // message we actually care about: a server that PINGs during registration
+    // (ZNC-style bouncers do) must not consume the budget for its delayed CAP
+    // or SASL reply. The overall registration deadline still bounds the total.
+    loop {
+        match timeout(
+            HANDSHAKE_STEP_TIMEOUT,
+            read_handshake_msg(writer, reader, buf, incoming_tx),
+        )
+        .await
+        {
+            Ok(Ok(Some(msg))) => return Ok(Some(msg)),
+            // PING answered (or junk line skipped): re-arm a fresh budget.
+            Ok(Ok(None)) => continue,
+            Ok(Err(e)) => return Err(e),
+            Err(_) => return Ok(None),
+        }
     }
 }
 
@@ -680,7 +693,9 @@ impl IrcClient {
     {
         let mut buf = Vec::with_capacity(512);
         loop {
-            let msg = read_handshake_msg(writer, reader, &mut buf, incoming_tx).await?;
+            let msg = read_handshake_msg(writer, reader, &mut buf, incoming_tx)
+                .await?
+                .expect("non-PING handshake message");
             if matches!(msg.command, IrcCommand::Numeric(RPL_WELCOME, _)) {
                 return Ok(());
             }
@@ -1571,6 +1586,71 @@ mod tests {
             timeout(Duration::from_secs(1), client.connect(msg_tx, cmd_rx))
                 .await
                 .expect("legacy registration waited for the CAP timeout")
+                .unwrap();
+            assert!(
+                std::iter::from_fn(|| msg_rx.try_recv().ok())
+                    .any(|msg| matches!(msg.command, IrcCommand::Numeric(RPL_WELCOME, _)))
+            );
+            server.await.unwrap();
+        });
+    }
+
+    #[test]
+    fn handshake_answers_pings_without_stalling_cap_negotiation() {
+        test_runtime().block_on(async {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+
+            let server = tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                let (read_half, mut write_half) = stream.into_split();
+                let mut reader = BufReader::new(read_half);
+                assert_eq!(read_wire_line(&mut reader).await, "CAP LS 302");
+                assert_eq!(read_wire_line(&mut reader).await, "NICK tester");
+                assert!(read_wire_line(&mut reader).await.starts_with("USER "));
+
+                // A bouncer-style server PINGs unregistered clients while its
+                // CAP LS reply is delayed. Each PING must be answered without
+                // consuming the per-step budget meant for the CAP reply.
+                for ping in ["h1", "h2", "h3"] {
+                    write_half
+                        .write_all(format!(":srv PING :{ping}\r\n").as_bytes())
+                        .await
+                        .unwrap();
+                    assert_eq!(read_wire_line(&mut reader).await, format!("PONG :{ping}"));
+                }
+
+                write_half
+                    .write_all(b":srv CAP * LS :multi-prefix\r\n")
+                    .await
+                    .unwrap();
+                assert_eq!(read_wire_line(&mut reader).await, "CAP REQ :multi-prefix");
+                write_half
+                    .write_all(b":srv CAP * ACK :multi-prefix\r\n")
+                    .await
+                    .unwrap();
+                assert_eq!(read_wire_line(&mut reader).await, "CAP END");
+                write_half
+                    .write_all(b":srv 001 tester :Welcome\r\n")
+                    .await
+                    .unwrap();
+                // Hold the socket open long enough for the client to read.
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            });
+
+            let config = ServerConfig {
+                host: "127.0.0.1".to_string(),
+                port: addr.port(),
+                use_tls: false,
+                nick: "tester".to_string(),
+                ..Default::default()
+            };
+            let (msg_tx, mut msg_rx) = mpsc::channel(100);
+            let (_cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+            let mut client = IrcClient::new(config);
+            timeout(Duration::from_secs(5), client.connect(msg_tx, cmd_rx))
+                .await
+                .expect("registration completes despite handshake PINGs")
                 .unwrap();
             assert!(
                 std::iter::from_fn(|| msg_rx.try_recv().ok())
