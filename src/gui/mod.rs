@@ -1071,11 +1071,17 @@ const SCRATCH_MEASURE_OFFSET: f32 = 100_000.0;
 /// The row's cached advance, measuring it first if the cache is cold or was
 /// invalidated by a layout change (width/font size).
 ///
-/// Measurement lays the row out for real inside a scratch Ui far below the
-/// clip rect: nothing paints, but egui runs the full widget layout, so the
-/// cached height is exactly what drawing will occupy - including egui's
+/// Measurement lays the row out for real inside a scratch child Ui far below
+/// the clip rect: nothing paints, but egui runs the full widget layout, so
+/// the cached height is exactly what drawing will occupy - including egui's
 /// trailing item_spacing inside the row's horizontal layout. Metric-based
 /// estimation cannot stay in lockstep with widget rendering; this can.
+///
+/// The scratch Ui is created with [`Ui::new_child`] rather than
+/// `scope_builder` on purpose: scope folds the child's min_rect back into
+/// the parent cursor (`advance_cursor_after_rect`), which would balloon the
+/// scroll content to ~100k px for every frame that measured a new row -
+/// visibly flashing the whole message area blank.
 fn row_height(
     ui: &mut egui::Ui,
     msg: &ChatMessage,
@@ -1095,12 +1101,9 @@ fn row_height(
     );
     let scratch_rect =
         egui::Rect::from_min_size(scratch_origin, egui::vec2(content_width, 0.0));
-    let h = ui
-        .scope_builder(egui::UiBuilder::new().max_rect(scratch_rect), |scratch| {
-            draw_chat_row(scratch, msg, my_nick);
-            scratch.min_rect().height()
-        })
-        .inner;
+    let mut scratch = ui.new_child(egui::UiBuilder::new().max_rect(scratch_rect));
+    draw_chat_row(&mut scratch, msg, my_nick);
+    let h = scratch.min_rect().height();
     msg.row_height.set(RowHeightEntry { key: layout_key, height: h });
     h
 }
@@ -3239,7 +3242,29 @@ impl IrcApp {
                 }
                 ui.set_height((y - spacing.y).max(0.0));
                 if first_idx == msgs.len() {
-                    return; // viewport is below all rows (e.g. mid-scroll)
+                    // The viewport sits past the end of the content (a
+                    // transient state mid-scroll, e.g. right after scrollback
+                    // trimming shrank the history). Pin the buffer's tail to
+                    // the viewport bottom for this frame rather than flashing
+                    // an empty area; egui re-clamps the offset next frame.
+                    let mut yy = viewport.max.y;
+                    for msg in msgs.iter().rev() {
+                        let h = row_height(
+                            ui,
+                            msg,
+                            &my_nick,
+                            content_width,
+                            layout_key,
+                            &mut stats,
+                        );
+                        let top = yy - h;
+                        first_idx -= 1;
+                        first_y = top;
+                        if top <= viewport.min.y {
+                            break;
+                        }
+                        yy = top - spacing.y;
+                    }
                 }
 
                 // Pass 2: lay out only the visible band, flowing naturally
@@ -4441,7 +4466,10 @@ mod tests {
     fn virtualized_rows_paint_inside_the_scroll_clip() {
         // Count-based assertions cannot see coordinate bugs: rows could be
         // laid out invisibly outside the clip rect. Inspect the painted
-        // shapes instead - message text must land inside the panel area.
+        // shapes instead - message text must be visible on EVERY frame,
+        // including the frame right after a new message arrives (whose row
+        // needs measuring). A frame with no visible text is what users see
+        // as the whole message area flashing blank.
         let mut app = test_app();
         let mut channel = Channel::new();
         for i in 0..500 {
@@ -4453,24 +4481,34 @@ mod tests {
         app.current_channel = Some("#chan".to_string());
 
         let ctx = egui::Context::default();
-        let output = ctx.run_ui(egui::RawInput::default(), |ctx| {
-            egui::CentralPanel::default().show(ctx, |ui| {
-                app.draw_scrollback(ui, ui.max_rect().height() - 30.0);
+        for frame in 0..6 {
+            if frame > 0 {
+                // Simulate a newly arrived message: its row has no cached
+                // height yet, forcing a measurement this frame.
+                let chan = app.channels.get_mut("#chan").unwrap();
+                chan.messages
+                    .push_back(ChatMessage::system(&format!("fresh {frame}")));
+            }
+            let output = ctx.run_ui(egui::RawInput::default(), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    app.draw_scrollback(ui, ui.max_rect().height() - 30.0);
+                });
             });
-        });
-        let mut visible_text = 0usize;
-        for clipped in &output.shapes {
-            if let egui::Shape::Text(text) = &clipped.shape {
-                let bounds = egui::Rect::from_min_size(text.pos, text.galley.rect.size());
-                if clipped.clip_rect.intersects(bounds) && !text.galley.is_empty() {
-                    visible_text += 1;
+            let mut visible_text = 0usize;
+            for clipped in &output.shapes {
+                if let egui::Shape::Text(text) = &clipped.shape {
+                    let bounds = egui::Rect::from_min_size(text.pos, text.galley.rect.size());
+                    if clipped.clip_rect.intersects(bounds) && !text.galley.is_empty() {
+                        visible_text += 1;
+                    }
                 }
             }
+            assert!(
+                visible_text >= 5,
+                "frame {frame}: only {visible_text} visible text shapes - \
+                 the message area would flash blank"
+            );
         }
-        assert!(
-            visible_text >= 5,
-            "expected visible message text in painted shapes, got {visible_text}"
-        );
     }
 
     #[test]
