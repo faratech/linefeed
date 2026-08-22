@@ -458,7 +458,7 @@ impl IrcApp {
             highlight_words_lower: settings
                 .highlight_words
                 .split(',')
-                .map(|s| s.trim().to_lowercase())
+                .map(|s| network_support.canonicalize(s.trim()))
                 .filter(|s| !s.is_empty())
                 .collect(),
 
@@ -785,7 +785,7 @@ impl IrcApp {
         self.highlight_words_lower = self
             .highlight_words
             .split(',')
-            .map(|s| s.trim().to_lowercase())
+            .map(|s| self.network_support.canonicalize(s.trim()))
             .filter(|s| !s.is_empty())
             .collect();
         self.ignore_list_lower = self
@@ -1035,6 +1035,22 @@ fn is_irc_nick_char(c: char) -> bool {
             c,
             '-' | '_' | '[' | ']' | '\\' | '`' | '^' | '{' | '}' | '|' | '~'
         )
+}
+
+/// True when `needle_key` occurs in `haystack_key` at IRC-identifier
+/// boundaries: the characters immediately before and after each occurrence
+/// must not themselves be nick characters. Both arguments must already be
+/// casemapped consistently (see `NetworkSupport::canonicalize`).
+fn ident_contains(haystack_key: &str, needle_key: &str) -> bool {
+    if needle_key.is_empty() {
+        return false;
+    }
+    haystack_key.match_indices(needle_key).any(|(start, _)| {
+        let end = start + needle_key.len();
+        let before = haystack_key[..start].chars().next_back();
+        let after = haystack_key[end..].chars().next();
+        !before.is_some_and(is_irc_nick_char) && !after.is_some_and(is_irc_nick_char)
+    })
 }
 
 #[cfg(unix)]
@@ -3183,33 +3199,20 @@ impl IrcApp {
 
     /// Check if a message contains a mention of our nick or highlight words
     fn check_nick_mention(&self, content: &str) -> bool {
-        let content_lower = content.to_lowercase();
+        // IRC nicknames and configured highlight words admit punctuation that
+        // generic "word" tokenizers split (`foo-bar`, `[alice]`, `node.js`,
+        // ...). Search for each complete casemapped needle and validate
+        // IRC-identifier boundaries instead of token equality.
+        let content_key = self.network_support.canonicalize(content);
 
-        // IRC nicknames admit punctuation that generic "word" tokenizers split
-        // (`foo-bar`, `[alice]`, `nick|away`, ...). Search for the complete
-        // casemapped nick and validate IRC-identifier boundaries instead.
-        if !self.my_nick_lower.is_empty() {
-            let content_key = self.network_support.canonicalize(content);
-            for (start, _) in content_key.match_indices(&self.my_nick_lower) {
-                let end = start + self.my_nick_lower.len();
-                let before = content_key[..start].chars().next_back();
-                let after = content_key[end..].chars().next();
-                if !before.is_some_and(is_irc_nick_char) && !after.is_some_and(is_irc_nick_char) {
-                    return true;
-                }
-            }
+        if !self.my_nick_lower.is_empty() && ident_contains(&content_key, &self.my_nick_lower) {
+            return true;
         }
 
-        // Check for highlight words using cached lowercase versions
-        for highlight in &self.highlight_words_lower {
-            for word in content_lower.split(|c: char| !c.is_alphanumeric() && c != '_') {
-                if word == highlight {
-                    return true;
-                }
-            }
-        }
-
-        false
+        // Highlight words are cached casemapped (see update_cached_lowercase)
+        self.highlight_words_lower
+            .iter()
+            .any(|highlight| ident_contains(&content_key, highlight))
     }
 
     /// Handle keyboard shortcuts
@@ -3827,16 +3830,8 @@ impl eframe::App for IrcApp {
                             let is_own_msg =
                                 !msg.is_system && msg.sender.eq_ignore_ascii_case(&self.my_nick);
 
-                            // Use a frame for highlighted or own messages
-                            let frame = if msg.is_highlight {
-                                egui::Frame::NONE.fill(Color32::from_rgb(60, 40, 20))
-                            } else if is_own_msg {
-                                egui::Frame::NONE.fill(Color32::from_rgb(25, 35, 45))
-                            } else {
-                                egui::Frame::NONE
-                            };
-
-                            frame.show(ui, |ui| {
+                            // Render one row: timestamp, optional indicator, nick, body.
+                            let render_row = |ui: &mut egui::Ui| {
                                 ui.horizontal(|ui| {
                                     // Highlight indicator
                                     if msg.is_highlight {
@@ -3891,7 +3886,23 @@ impl eframe::App for IrcApp {
                                         render_segments(ui, msg.render_segments(), text_color);
                                     }
                                 });
-                            });
+                            };
+
+                            // Only highlighted/own rows pay for a Frame (a
+                            // nested Ui with its own layout pass); plain rows -
+                            // the overwhelming majority of scrollback - are laid
+                            // out directly.
+                            if msg.is_highlight {
+                                egui::Frame::NONE
+                                    .fill(Color32::from_rgb(60, 40, 20))
+                                    .show(ui, render_row);
+                            } else if is_own_msg {
+                                egui::Frame::NONE
+                                    .fill(Color32::from_rgb(25, 35, 45))
+                                    .show(ui, render_row);
+                            } else {
+                                render_row(ui);
+                            }
                         }
                     }
                 });
@@ -4572,6 +4583,23 @@ mod tests {
         app.set_my_nick("[alice]".to_string());
         assert!(app.check_nick_mention("hi {ALICE},"));
         assert!(!app.check_nick_mention("x[alice]"));
+    }
+
+    #[test]
+    fn highlight_words_match_with_punctuation_at_identifier_boundaries() {
+        let mut app = test_app();
+        app.highlight_words = "foo-bar, node.js".to_string();
+        app.update_cached_lowercase();
+
+        // Punctuation-bearing words (the dialog hint suggests alt nicks like
+        // "your-other-nick") must fire; token-equality matching silently
+        // dropped them.
+        assert!(app.check_nick_mention("foo-bar: are you there"));
+        assert!(app.check_nick_mention("pinging FOO-BAR again"));
+        assert!(app.check_nick_mention("the node.js bot said hi"));
+        assert!(!app.check_nick_mention("xfoo-bar"));
+        assert!(!app.check_nick_mention("node.jss"));
+        assert!(!app.check_nick_mention("no highlights here"));
     }
 
     #[test]

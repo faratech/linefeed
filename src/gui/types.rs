@@ -808,7 +808,10 @@ impl Channel {
             match mode {
                 '+' | '-' => sign = mode,
                 mode => {
-                    let takes_parameter = support.chanmodes_b.contains(mode)
+                    // CHANMODES list modes (type A: bans, exceptions, invite
+                    // masks) always take a parameter, in either direction.
+                    let takes_parameter = support.chanmodes_a.contains(mode)
+                        || support.chanmodes_b.contains(mode)
                         || (sign == '+' && support.chanmodes_c.contains(mode));
                     let parameter = if takes_parameter {
                         let value = params.get(param_idx).map(String::as_str);
@@ -908,16 +911,20 @@ impl Channel {
     }
 
     fn sort_users(&mut self) {
-        // Case-insensitive comparison without allocating per comparison (nick
-        // casing on IRC is ASCII-folded; full Unicode folding is unnecessary).
+        // Decorate-sort-undecorate: canonicalizing inside the comparator would
+        // allocate two Strings per comparison; computing each key once makes
+        // this one allocation per user regardless of list size.
         let mapping = self.case_mapping;
-        self.users.sort_by(|a, b| {
-            a.mode.cmp(&b.mode).then_with(|| {
-                mapping
-                    .canonicalize(&a.nick)
-                    .cmp(&mapping.canonicalize(&b.nick))
+        let users = std::mem::take(&mut self.users);
+        let mut keyed: Vec<(UserMode, String, ChannelUser)> = users
+            .into_iter()
+            .map(|user| {
+                let key = mapping.canonicalize(&user.nick);
+                (user.mode, key, user)
             })
-        });
+            .collect();
+        keyed.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+        self.users = keyed.into_iter().map(|(_, _, user)| user).collect();
     }
 
     /// IRCv3 away-notify: update user's away status
@@ -1102,6 +1109,35 @@ mod tests {
         ch.apply_channel_mode('-', 'l', None);
         assert_eq!(ch.modes, "+nt");
         assert!(ch.mode_params.is_empty());
+    }
+
+    #[test]
+    fn channel_mode_reply_consumes_type_a_list_parameters() {
+        let support = NetworkSupport::default();
+        let mut ch = Channel::new();
+
+        // 324 <me> #chan +tnk <key> — type B k takes a param, then rebuild.
+        ch.set_channel_modes_from_reply("+ntk", &["secret".to_string()], &support);
+        assert_eq!(ch.modes, "+ntk");
+        assert_eq!(ch.mode_params, ["secret"]);
+
+        // Type A modes (b: bans) take a parameter in either direction; a
+        // following type D mode must not steal the ban mask as its own param.
+        ch.set_channel_modes_from_reply(
+            "+bk-m",
+            &["*!bad@host".to_string(), "secret2".to_string()],
+            &support,
+        );
+        // ("+bkm": the -m half is not representable in the positive-modes
+        // string, matching how live MODE changes are tracked.)
+        assert_eq!(ch.modes, "+bk");
+        assert_eq!(ch.mode_params, ["*!bad@host", "secret2"]);
+
+        // Removing a ban consumes its parameter too; without type-A handling
+        // the mask would be misattributed to a later mode or dropped.
+        ch.set_channel_modes_from_reply("-b+k", &["*!gone@host".to_string(), "newkey".to_string()], &support);
+        assert_eq!(ch.modes, "+k");
+        assert_eq!(ch.mode_parameters.get(&'k').map(String::as_str), Some("newkey"));
     }
 
     #[test]
