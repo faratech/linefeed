@@ -373,7 +373,13 @@ impl eframe::App for LinefeedApp {
         }
 
         // Adaptive repaint interval based on activity level
-        if self.app.connected || self.app.connecting {
+        if self.app.connected
+            || self.app.connecting
+            // While waiting out the reconnect backoff nothing else wakes the
+            // event loop: without a scheduled repaint the frame would never
+            // re-run to observe the retry deadline passing.
+            || self.app.awaiting_reconnect()
+        {
             let interval = if self.app.channel_list_loading {
                 // High-traffic mode during /list - fast polling for UI responsiveness
                 std::time::Duration::from_millis(16)

@@ -1520,35 +1520,35 @@ impl IrcApp {
     }
 }
 
+/// Recognize an authentication or channel service target: canonical names,
+/// common shorthands (/msg NS ...), and network-qualified nicks
+/// (NickServ@services.example). These services take account passwords and
+/// channel keys, so anything sent to them is treated as sensitive; the
+/// keyword gate below keeps false positives negligible for same-named users.
+fn is_auth_service_target(raw_target: &str) -> bool {
+    matches!(
+        raw_target
+            .trim_start_matches(['~', '&', '@', '%', '+'])
+            .split('@')
+            .next()
+            .unwrap_or(raw_target)
+            .to_ascii_lowercase()
+            .as_str(),
+        "nickserv" | "ns" | "authserv" | "as" | "chanserv" | "cs"
+    )
+}
+
 pub(super) fn service_message_contains_credentials(target: &str, message: &str) -> bool {
     // IRC permits comma-separated message targets and network-qualified nicks
     // (NickServ@services.example). Treat a command as sensitive if any target
-    // is an authentication service.
-    let is_nickserv = target.split(',').any(|target| {
-        target
-            .trim_start_matches(['~', '&', '@', '%', '+'])
-            .split('@')
-            .next()
-            .unwrap_or(target)
-            .eq_ignore_ascii_case("NickServ")
-    });
-    let is_authserv = target.split(',').any(|target| {
-        target
-            .trim_start_matches(['~', '&', '@', '%', '+'])
-            .split('@')
-            .next()
-            .unwrap_or(target)
-            .eq_ignore_ascii_case("AuthServ")
-    });
-    if !is_nickserv && !is_authserv {
+    // is an authentication or channel service (ChanServ IDENTIFY/REGISTER
+    // carries channel keys and passwords too).
+    if !target.split(',').any(is_auth_service_target) {
         return false;
     }
 
     let mut words = message.trim_start_matches(':').split_whitespace();
     let command = words.next().unwrap_or("").to_ascii_uppercase();
-    if is_authserv && matches!(command.as_str(), "AUTH" | "LOGIN" | "IDENTIFY" | "ID") {
-        return true;
-    }
     if matches!(
         command.as_str(),
         "IDENTIFY"
@@ -1581,6 +1581,8 @@ pub(super) fn command_line_contains_credentials(line: &str) -> bool {
     match command.to_ascii_uppercase().as_str() {
         "PASS" | "AUTHENTICATE" | "OPER" => true,
         "NS" | "NICKSERV" => service_message_contains_credentials("NickServ", args),
+        "CS" | "CHANSERV" => service_message_contains_credentials("ChanServ", args),
+        "AS" | "AUTHSERV" => service_message_contains_credentials("AuthServ", args),
         "MSG" | "PRIVMSG" | "QUERY" | "Q" | "NOTICE" | "N" => {
             let mut message = args.splitn(2, char::is_whitespace);
             let target = message.next().unwrap_or("");
@@ -1839,6 +1841,16 @@ mod tests {
             "/notice NickServ identify hunter2",
             "/msg NickServ@services.example identify hunter2",
             "/msg NickServ,alice identify hunter2",
+            // Service shorthands and ChanServ must be recognized too: a
+            // channel key sent to ChanServ is as sensitive as a NickServ
+            // password.
+            "/msg NS identify hunter2",
+            "/query NS id hunter2",
+            "/notice NS identify hunter2",
+            "/msg CS identify #chan key123",
+            "/msg ChanServ identify #chan key123",
+            "/cs identify #chan key123",
+            "/as login account hunter2",
             "/perform /ns identify hunter2",
             "/raw PASS hunter2",
             "/quote AUTHENTICATE hunter2",
@@ -1850,6 +1862,11 @@ mod tests {
         assert!(!ordinary.no_log);
         assert_eq!(ordinary.content, "INFO alice");
         assert!(!command_line_contains_credentials("/join #rust"));
+
+        // A user who happens to be named like a service is only treated as
+        // sensitive when the payload looks like an auth command.
+        assert!(!service_message_contains_credentials("NS", "hello there"));
+        assert!(service_message_contains_credentials("CS", "IDENTIFY #chan key123"));
     }
 
     #[test]

@@ -623,12 +623,7 @@ impl IrcApp {
 
     /// Check if we should attempt reconnection now
     pub fn should_reconnect(&self) -> bool {
-        if !self.auto_reconnect || !self.connection_lost || self.connecting {
-            return false;
-        }
-
-        // Check if we've exceeded max attempts
-        if self.reconnect_attempts >= self.max_reconnect_attempts {
+        if !self.awaiting_reconnect() {
             return false;
         }
 
@@ -639,6 +634,17 @@ impl IrcApp {
         } else {
             true
         }
+    }
+
+    /// Whether an auto-reconnect retry is still pending (regardless of whether
+    /// its backoff deadline has passed). The event loop must keep polling while
+    /// this is true: on an idle visible window nothing else wakes the frame to
+    /// observe the deadline.
+    pub fn awaiting_reconnect(&self) -> bool {
+        self.auto_reconnect
+            && self.connection_lost
+            && !self.connecting
+            && self.reconnect_attempts < self.max_reconnect_attempts
     }
 
     /// Reset reconnection state (called on successful connect)
@@ -2978,7 +2984,12 @@ impl IrcApp {
                     " ".to_string(),
                 )
             } else {
-                let start = input.rfind(char::is_whitespace).map_or(0, |idx| idx + 1);
+                // Advance past the whole whitespace character: multi-byte
+                // whitespace (U+00A0, U+3000, ...) would otherwise leave `idx + 1`
+                // mid-character and the slicing below would panic.
+                let start = input.rfind(char::is_whitespace).map_or(0, |idx| {
+                    idx + input[idx..].chars().next().map_or(1, char::len_utf8)
+                });
                 let prefix = input[start..].to_string();
                 let suffix = if start == 0 { ": " } else { " " };
                 (
@@ -4141,6 +4152,25 @@ mod tests {
     }
 
     #[test]
+    fn tab_completion_survives_multi_byte_whitespace() {
+        let mut app = test_app();
+        let mut channel = Channel::new();
+        channel.add_user("Alice", UserMode::Normal);
+        app.channels.insert("#chan".to_string(), channel);
+        app.current_channel = Some("#chan".to_string());
+
+        // A multi-byte whitespace char before the word must not panic on
+        // byte-offset slicing (rfind returns the char's start offset).
+        for ws in ['\u{a0}', '\u{2003}', '\u{3000}'] {
+            app.reset_tab_completion();
+            app.input_text = format!("hi{ws}Al");
+            app.handle_tab_completion();
+            let expected_base = format!("hi{ws}");
+            assert_eq!(app.input_text, format!("{expected_base}Alice "));
+        }
+    }
+
+    #[test]
     fn ctrl_tab_navigation_wraps_in_both_directions() {
         let mut app = test_app();
         app.channels.insert("#b".to_string(), Channel::new());
@@ -4808,6 +4838,31 @@ mod tests {
 
         assert!(!app.channel_list_loading);
         assert!(app.connection_lost);
+    }
+
+    #[test]
+    fn awaiting_reconnect_covers_the_whole_backoff_window() {
+        let mut app = test_app();
+        app.auto_reconnect = true;
+        assert!(!app.awaiting_reconnect(), "nothing pending before a loss");
+
+        app.mark_connection_lost();
+        // The backoff deadline has not passed yet (should_reconnect is still
+        // false), but the event loop must already keep polling or the frame
+        // would never re-run to observe it on an idle window.
+        assert!(app.awaiting_reconnect());
+        assert!(!app.should_reconnect());
+
+        app.reconnect_attempts = app.max_reconnect_attempts;
+        assert!(!app.awaiting_reconnect(), "attempts exhausted");
+
+        app.reconnect_attempts = 0;
+        app.connecting = true;
+        assert!(!app.awaiting_reconnect(), "a retry is already in flight");
+
+        app.connecting = false;
+        app.auto_reconnect = false;
+        assert!(!app.awaiting_reconnect(), "setting disabled");
     }
 
     #[test]
