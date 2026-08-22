@@ -249,6 +249,15 @@ fn write_settings_file(tmp: &std::path::Path, data: &str) -> std::io::Result<()>
     std::fs::write(tmp, data)
 }
 
+/// Cached scrollback row height for one message, valid for one layout key
+/// (a hash of the content width and font sizes). A zero height means "never
+/// measured".
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct RowHeightEntry {
+    pub key: u64,
+    pub height: f32,
+}
+
 /// A chat message with metadata
 #[derive(Debug, Clone)]
 pub struct ChatMessage {
@@ -265,6 +274,9 @@ pub struct ChatMessage {
     /// Parsed formatting + URL segments, computed lazily on first render.
     /// Content never changes after construction, so the cache never invalidates.
     pub render_cache: OnceCell<Vec<RenderSegment>>,
+    /// Measured scrollback row height, lazily filled by the virtualized
+    /// message list and invalidated whenever the layout key changes.
+    pub row_height: Cell<RowHeightEntry>,
 }
 
 impl ChatMessage {
@@ -307,6 +319,7 @@ impl ChatMessage {
             is_highlight: false,
             no_log: false,
             render_cache: OnceCell::new(),
+            row_height: Cell::default(),
         }
     }
 
@@ -324,6 +337,7 @@ impl ChatMessage {
             is_highlight: false,
             no_log: false,
             render_cache: OnceCell::new(),
+            row_height: Cell::default(),
         }
     }
 
@@ -337,6 +351,7 @@ impl ChatMessage {
             is_highlight: false,
             no_log: false,
             render_cache: OnceCell::new(),
+            row_height: Cell::default(),
         }
     }
 
@@ -350,6 +365,7 @@ impl ChatMessage {
             is_highlight: true,
             no_log: false,
             render_cache: OnceCell::new(),
+            row_height: Cell::default(),
         }
     }
 
@@ -363,6 +379,7 @@ impl ChatMessage {
             is_highlight: true,
             no_log: false,
             render_cache: OnceCell::new(),
+            row_height: Cell::default(),
         }
     }
 

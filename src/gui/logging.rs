@@ -3,6 +3,7 @@
 use super::helpers::days_to_ymd;
 use super::types::ChatMessage;
 use std::fs::{self, File, OpenOptions};
+use std::cell::Cell;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::PathBuf;
 
@@ -492,6 +493,7 @@ fn parse_log_line(line: &str) -> Option<ChatMessage> {
             is_highlight: false,
             no_log: false,
             render_cache: Default::default(),
+            row_height: Cell::default(),
         })
     } else if let Some(action_rest) = rest.strip_prefix("* ") {
         // Action message: "* nick does something"
@@ -506,6 +508,7 @@ fn parse_log_line(line: &str) -> Option<ChatMessage> {
                 is_highlight: false,
                 no_log: false,
                 render_cache: Default::default(),
+                row_height: Cell::default(),
             })
         } else {
             None
@@ -524,6 +527,7 @@ fn parse_log_line(line: &str) -> Option<ChatMessage> {
                 is_highlight: false,
                 no_log: false,
                 render_cache: Default::default(),
+                row_height: Cell::default(),
             })
         } else {
             None
@@ -639,6 +643,7 @@ mod tests {
             is_highlight: false,
             no_log: false,
             render_cache: Default::default(),
+            row_height: Cell::default(),
         }
     }
 

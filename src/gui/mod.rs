@@ -16,7 +16,7 @@ use formatting::{nick_color, render_irc_text, render_segments};
 use helpers::{epoch_time_formatted, format_timestamp, mask_matches, truncate_chars};
 pub use types::{
     BanEntry, CaseMapping, Channel, ChannelListEntry, ChannelListSort, ChatMessage, NetworkSupport,
-    ServerFavorite, Settings, SortDirection, TabCompletion, UserMode,
+    RowHeightEntry, ServerFavorite, Settings, SortDirection, TabCompletion, UserMode,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1051,6 +1051,128 @@ fn ident_contains(haystack_key: &str, needle_key: &str) -> bool {
         let after = haystack_key[end..].chars().next();
         !before.is_some_and(is_irc_nick_char) && !after.is_some_and(is_irc_nick_char)
     })
+}
+
+/// Hash of every input that shapes a scrollback row's height: the content
+/// width and the two font sizes used by message rows. A change in any of them
+/// invalidates all cached row heights.
+fn row_layout_key(ui: &egui::Ui, content_width: f32) -> u64 {
+    let body = ui.style().text_styles[&egui::TextStyle::Body].size.to_bits();
+    let mono = ui.style().text_styles[&egui::TextStyle::Monospace].size.to_bits();
+    (content_width.to_bits() as u64)
+        ^ (body as u64).rotate_left(32)
+        ^ (mono as u64).rotate_left(17)
+}
+
+/// How far below the scroll area's clip rect scratch measurement rows are
+/// parked: far enough that nothing they paint can ever be visible.
+const SCRATCH_MEASURE_OFFSET: f32 = 100_000.0;
+
+/// The row's cached advance, measuring it first if the cache is cold or was
+/// invalidated by a layout change (width/font size).
+///
+/// Measurement lays the row out for real inside a scratch Ui far below the
+/// clip rect: nothing paints, but egui runs the full widget layout, so the
+/// cached height is exactly what drawing will occupy - including egui's
+/// trailing item_spacing inside the row's horizontal layout. Metric-based
+/// estimation cannot stay in lockstep with widget rendering; this can.
+fn row_height(
+    ui: &mut egui::Ui,
+    msg: &ChatMessage,
+    my_nick: &str,
+    content_width: f32,
+    layout_key: u64,
+    stats: &mut ScrollbackStats,
+) -> f32 {
+    let cached = msg.row_height.get();
+    if cached.key == layout_key && cached.height > 0.0 {
+        return cached.height;
+    }
+    stats.measured += 1;
+    let scratch_origin = egui::pos2(
+        ui.max_rect().left(),
+        ui.max_rect().bottom() + SCRATCH_MEASURE_OFFSET,
+    );
+    let scratch_rect =
+        egui::Rect::from_min_size(scratch_origin, egui::vec2(content_width, 0.0));
+    let h = ui
+        .scope_builder(egui::UiBuilder::new().max_rect(scratch_rect), |scratch| {
+            draw_chat_row(scratch, msg, my_nick);
+            scratch.min_rect().height()
+        })
+        .inner;
+    msg.row_height.set(RowHeightEntry { key: layout_key, height: h });
+    h
+}
+
+/// Draw one scrollback row: timestamp, optional indicator, nick, body.
+fn draw_chat_row(ui: &mut egui::Ui, msg: &ChatMessage, my_nick: &str) {
+    let is_own_msg = !msg.is_system && msg.sender.eq_ignore_ascii_case(my_nick);
+
+    let render_row = |ui: &mut egui::Ui| {
+        ui.horizontal(|ui| {
+            if msg.is_highlight {
+                ui.label(RichText::new("*").color(Color32::YELLOW).strong());
+            }
+
+            ui.label(RichText::new(&msg.timestamp).color(Color32::GRAY).monospace());
+
+            if msg.is_system {
+                render_segments(ui, msg.render_segments(), Color32::GRAY);
+            } else if msg.is_action {
+                let action_color = if msg.is_highlight {
+                    Color32::YELLOW
+                } else if is_own_msg {
+                    Color32::from_rgb(100, 180, 220)
+                } else {
+                    Color32::from_rgb(150, 100, 200)
+                };
+                ui.label(RichText::new(format!("* {} ", msg.sender)).color(action_color));
+                render_segments(ui, msg.render_segments(), action_color);
+            } else {
+                let nick_style = if is_own_msg {
+                    RichText::new(format!("<{}>", msg.sender)).color(Color32::from_rgb(100, 200, 255))
+                } else {
+                    RichText::new(format!("<{}>", msg.sender)).color(nick_color(&msg.sender))
+                };
+                ui.label(nick_style);
+
+                let text_color = if msg.is_highlight {
+                    Color32::YELLOW
+                } else if is_own_msg {
+                    Color32::from_rgb(200, 210, 220)
+                } else {
+                    Color32::WHITE
+                };
+                render_segments(ui, msg.render_segments(), text_color);
+            }
+        });
+    };
+
+    // Only highlighted/own rows pay for a Frame (a nested Ui with its own
+    // layout pass); plain rows - the overwhelming majority - are laid out
+    // directly. Frame::NONE adds no margin, so heights match measurement.
+    if msg.is_highlight {
+        egui::Frame::NONE
+            .fill(Color32::from_rgb(60, 40, 20))
+            .show(ui, render_row);
+    } else if is_own_msg {
+        egui::Frame::NONE
+            .fill(Color32::from_rgb(25, 35, 45))
+            .show(ui, render_row);
+    } else {
+        render_row(ui);
+    }
+}
+
+/// Statistics from one virtualized scrollback pass.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ScrollbackStats {
+    /// Rows actually laid out this frame (visible band plus straddlers).
+    pub drawn: usize,
+    /// Heights that had to be measured fresh (cold cache or layout change).
+    pub measured: usize,
+    pub total_rows: usize,
 }
 
 #[cfg(unix)]
@@ -3063,6 +3185,102 @@ impl IrcApp {
         self.tab_completion = None;
     }
 
+    /// Draw the active view's message scrollback, virtualized: only the rows
+    /// intersecting the viewport (plus one straddler below) are laid out
+    /// visibly each frame. Row heights are cached per message and invalidated
+    /// as a whole whenever the content width or font size changes.
+    ///
+    /// Heights are not estimated from font metrics: a never-measured row is
+    /// laid out once inside a scratch Ui parked far below the clip rect (so it
+    /// paints nothing) and its real laid-out advance is cached. Measurement
+    /// and drawing therefore cannot disagree, which keeps cumulative offsets,
+    /// the scrollbar range, and stick-to-bottom exact.
+    pub fn draw_scrollback(&self, ui: &mut egui::Ui, available_height: f32) -> ScrollbackStats {
+        let messages = if let Some(channel_name) = &self.current_channel {
+            self.channels.get(channel_name).map(|c| &c.messages)
+        } else {
+            Some(&self.server_messages)
+        };
+        let Some(msgs) = messages else {
+            return ScrollbackStats { drawn: 0, measured: 0, total_rows: 0 };
+        };
+        let my_nick = self.my_nick.clone();
+        let stick = self.scroll_to_bottom;
+        let mut stats = ScrollbackStats { drawn: 0, measured: 0, total_rows: msgs.len() };
+
+        ScrollArea::vertical()
+            .auto_shrink([false; 2])
+            .max_height(available_height)
+            .stick_to_bottom(stick)
+            .show_viewport(ui, |ui, viewport| {
+                if msgs.is_empty() {
+                    return;
+                }
+                let content_width = ui.available_width();
+                let spacing = ui.spacing().item_spacing;
+                let layout_key = row_layout_key(ui, content_width);
+
+                // Pass 1 (arithmetic on warm cache): cumulative offsets to
+                // find the first row intersecting the viewport top and the
+                // total content height. Rows above the viewport are never
+                // drawn. Offsets are in content coordinates (0 = top of the
+                // scrolled content), matching `viewport`.
+                let mut y = 0.0f32;
+                let mut first_idx = msgs.len();
+                let mut first_y = 0.0f32;
+                for (i, msg) in msgs.iter().enumerate() {
+                    let bottom =
+                        y + row_height(ui, msg, &my_nick, content_width, layout_key, &mut stats);
+                    if first_idx == msgs.len() && bottom >= viewport.min.y {
+                        first_idx = i;
+                        first_y = y;
+                    }
+                    y = bottom + spacing.y;
+                }
+                ui.set_height((y - spacing.y).max(0.0));
+                if first_idx == msgs.len() {
+                    return; // viewport is below all rows (e.g. mid-scroll)
+                }
+
+                // Pass 2: lay out only the visible band, flowing naturally
+                // from the first visible row - the same trick egui's own
+                // show_rows uses for uniform rows, adapted to variable ones.
+                // The row straddling the viewport's bottom edge is included,
+                // so partial rows never flicker in from below.
+                //
+                // `viewport` is content space while UiBuilder rects are in
+                // the parent's screen space (shifted up by the scroll
+                // offset), so the band origin must be translated by
+                // ui.max_rect().top() - exactly what egui's show_rows does.
+                let top = ui.max_rect().top();
+                let x_range = ui.max_rect().x_range();
+                let band_top = top + first_y;
+                if band_top > ui.max_rect().bottom() {
+                    return; // degenerate mid-scroll frame; nothing to draw
+                }
+                let band =
+                    egui::Rect::from_x_y_ranges(x_range, band_top..=ui.max_rect().bottom());
+                let mut drawn = 0usize;
+                // Track the band cursor in content space ourselves: the child
+                // Ui's cursor is in screen space and must not be compared to
+                // the content-space viewport.
+                let mut cy = first_y;
+                ui.scope_builder(egui::UiBuilder::new().max_rect(band), |rows_ui| {
+                    for msg in msgs.iter().skip(first_idx) {
+                        if cy > viewport.max.y {
+                            break;
+                        }
+                        // Warm cache at this point: pass 1 measured everything.
+                        cy += msg.row_height.get().height + spacing.y;
+                        draw_chat_row(rows_ui, msg, &my_nick);
+                        drawn += 1;
+                    }
+                });
+                stats.drawn = drawn;
+            });
+        stats
+    }
+
     fn ordered_tabs(&self) -> Vec<Option<String>> {
         let mut tabs = vec![None];
         let mut names: Vec<_> = self.channels.keys().cloned().collect();
@@ -3843,99 +4061,7 @@ impl eframe::App for IrcApp {
 
             // Messages area
             let available_height = ui.available_height() - 30.0;
-            ScrollArea::vertical()
-                .auto_shrink([false; 2])
-                .max_height(available_height)
-                .stick_to_bottom(self.scroll_to_bottom)
-                .show(ui, |ui| {
-                    let messages = if let Some(channel_name) = &self.current_channel {
-                        self.channels.get(channel_name).map(|c| &c.messages)
-                    } else {
-                        Some(&self.server_messages)
-                    };
-
-                    if let Some(msgs) = messages {
-                        for msg in msgs {
-                            // Check if message is from self
-                            let is_own_msg =
-                                !msg.is_system && msg.sender.eq_ignore_ascii_case(&self.my_nick);
-
-                            // Render one row: timestamp, optional indicator, nick, body.
-                            let render_row = |ui: &mut egui::Ui| {
-                                ui.horizontal(|ui| {
-                                    // Highlight indicator
-                                    if msg.is_highlight {
-                                        ui.label(
-                                            RichText::new("*").color(Color32::YELLOW).strong(),
-                                        );
-                                    }
-
-                                    ui.label(
-                                        RichText::new(&msg.timestamp)
-                                            .color(Color32::GRAY)
-                                            .monospace(),
-                                    );
-
-                                    if msg.is_system {
-                                        // System messages with IRC color support
-                                        render_segments(ui, msg.render_segments(), Color32::GRAY);
-                                    } else if msg.is_action {
-                                        // Action messages - highlighted actions use yellow, own use cyan
-                                        let action_color = if msg.is_highlight {
-                                            Color32::YELLOW
-                                        } else if is_own_msg {
-                                            Color32::from_rgb(100, 180, 220)
-                                        } else {
-                                            Color32::from_rgb(150, 100, 200)
-                                        };
-                                        ui.label(
-                                            RichText::new(format!("* {} ", msg.sender))
-                                                .color(action_color),
-                                        );
-                                        render_segments(ui, msg.render_segments(), action_color);
-                                    } else {
-                                        // Regular messages
-                                        // Own messages use cyan nick, others use computed color
-                                        let nick_style = if is_own_msg {
-                                            RichText::new(format!("<{}>", msg.sender))
-                                                .color(Color32::from_rgb(100, 200, 255))
-                                        } else {
-                                            RichText::new(format!("<{}>", msg.sender))
-                                                .color(nick_color(&msg.sender))
-                                        };
-                                        ui.label(nick_style);
-
-                                        // Text color: yellow for highlights, light gray for own, white for others
-                                        let text_color = if msg.is_highlight {
-                                            Color32::YELLOW
-                                        } else if is_own_msg {
-                                            Color32::from_rgb(200, 210, 220)
-                                        } else {
-                                            Color32::WHITE
-                                        };
-                                        render_segments(ui, msg.render_segments(), text_color);
-                                    }
-                                });
-                            };
-
-                            // Only highlighted/own rows pay for a Frame (a
-                            // nested Ui with its own layout pass); plain rows -
-                            // the overwhelming majority of scrollback - are laid
-                            // out directly.
-                            if msg.is_highlight {
-                                egui::Frame::NONE
-                                    .fill(Color32::from_rgb(60, 40, 20))
-                                    .show(ui, render_row);
-                            } else if is_own_msg {
-                                egui::Frame::NONE
-                                    .fill(Color32::from_rgb(25, 35, 45))
-                                    .show(ui, render_row);
-                            } else {
-                                render_row(ui);
-                            }
-                        }
-                    }
-                });
+            self.draw_scrollback(ui, available_height);
 
             // Input area
             ui.separator();
@@ -4209,6 +4335,142 @@ mod tests {
             let expected_base = format!("hi{ws}");
             assert_eq!(app.input_text, format!("{expected_base}Alice "));
         }
+    }
+
+    #[test]
+    fn scrollback_virtualizes_large_history() {
+        let mut app = test_app();
+        let mut channel = Channel::new();
+        for i in 0..2000 {
+            channel
+                .messages
+                .push_back(ChatMessage::system(&format!("message {i}: some channel chatter")));
+        }
+        app.channels.insert("#chan".to_string(), channel);
+        app.current_channel = Some("#chan".to_string());
+
+        // Headless egui pass: no renderer needed, real layout runs.
+        let ctx = egui::Context::default();
+        let mut first_stats = None;
+        let _ = ctx.run_ui(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                first_stats = Some(app.draw_scrollback(ui, 400.0));
+            });
+        });
+        let stats = first_stats.expect("panel ran");
+        assert_eq!(stats.total_rows, 2000);
+        assert!(
+            stats.drawn < 300,
+            "virtualization failed: drew {} of 2000 rows",
+            stats.drawn
+        );
+        // Cold cache: the first pass measures every height once so it can
+        // compute cumulative offsets - that is the one-time cost, paid
+        // instead of re-laying out every widget on every future frame.
+        assert_eq!(stats.measured, 2000);
+
+        // Second identical frame: everything cached, nothing re-measured,
+        // and still only the visible band drawn.
+        let mut second_stats = None;
+        let _ = ctx.run_ui(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                second_stats = Some(app.draw_scrollback(ui, 400.0));
+            });
+        });
+        let stats2 = second_stats.expect("second panel ran");
+        assert_eq!(stats2.measured, 0, "heights must stay cached across frames");
+        assert!(
+            stats2.drawn < 300,
+            "virtualization failed on warm cache: drew {} of 2000",
+            stats2.drawn
+        );
+
+        // Scrolling up into older history keeps the work bounded.
+        let scrolled_input = egui::RawInput {
+            events: vec![egui::Event::MouseWheel {
+                unit: egui::MouseWheelUnit::Line,
+                // Positive Y moves content down, revealing older rows above.
+                delta: egui::vec2(0.0, 80.0),
+                phase: egui::TouchPhase::Move,
+                modifiers: egui::Modifiers::default(),
+            }],
+            ..Default::default()
+        };
+        let mut scrolled_stats = None;
+        let _ = ctx.run_ui(scrolled_input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                scrolled_stats = Some(app.draw_scrollback(ui, 400.0));
+            });
+        });
+        let stats3 = scrolled_stats.expect("scrolled panel ran");
+        assert!(
+            stats3.drawn < 300,
+            "post-scroll draw count exploded: {}",
+            stats3.drawn
+        );
+    }
+
+    #[test]
+    fn row_measurement_tracks_wrapping_heights() {
+        let ctx = egui::Context::default();
+        let short_msg = ChatMessage::system("hi");
+        let long_msg = ChatMessage::system(
+            "a very long system message that will certainly need to wrap across \
+             several lines when the available width is small enough for wrapping",
+        );
+        let mut heights = None;
+        let _ = ctx.run_ui(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let width = 120.0;
+                let key = row_layout_key(ui, width);
+                let mut stats = ScrollbackStats { drawn: 0, measured: 0, total_rows: 2 };
+                // Narrow width forces the long message to wrap over lines;
+                // the measured advance must reflect that.
+                let h_short =
+                    row_height(ui, &short_msg, "me", width, key, &mut stats);
+                let h_long =
+                    row_height(ui, &long_msg, "me", width, key, &mut stats);
+                heights = Some((h_short, h_long));
+            });
+        });
+        let (h_short, h_long) = heights.expect("panel ran");
+        assert!(h_long > h_short * 1.5, "{h_long} vs {h_short}");
+    }
+
+    #[test]
+    fn virtualized_rows_paint_inside_the_scroll_clip() {
+        // Count-based assertions cannot see coordinate bugs: rows could be
+        // laid out invisibly outside the clip rect. Inspect the painted
+        // shapes instead - message text must land inside the panel area.
+        let mut app = test_app();
+        let mut channel = Channel::new();
+        for i in 0..500 {
+            channel
+                .messages
+                .push_back(ChatMessage::system(&format!("row {i} of history")));
+        }
+        app.channels.insert("#chan".to_string(), channel);
+        app.current_channel = Some("#chan".to_string());
+
+        let ctx = egui::Context::default();
+        let output = ctx.run_ui(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                app.draw_scrollback(ui, ui.max_rect().height() - 30.0);
+            });
+        });
+        let mut visible_text = 0usize;
+        for clipped in &output.shapes {
+            if let egui::Shape::Text(text) = &clipped.shape {
+                let bounds = egui::Rect::from_min_size(text.pos, text.galley.rect.size());
+                if clipped.clip_rect.intersects(bounds) && !text.galley.is_empty() {
+                    visible_text += 1;
+                }
+            }
+        }
+        assert!(
+            visible_text >= 5,
+            "expected visible message text in painted shapes, got {visible_text}"
+        );
     }
 
     #[test]
