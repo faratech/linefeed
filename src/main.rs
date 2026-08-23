@@ -3,6 +3,7 @@
 mod gui;
 mod icon_data;
 mod irc;
+mod opener;
 
 #[cfg(windows)]
 mod systray;
@@ -375,6 +376,23 @@ impl eframe::App for LinefeedApp {
 
         // Main UI update
         self.app.ui(ui, frame);
+
+        // Hyperlink clicks queue OpenUrl commands that eframe's native
+        // backends ignore (only its web backend acts on them), so open them
+        // here ourselves. Draining keeps the queue from growing unbounded if
+        // the opener fails.
+        let mut urls: Vec<String> = Vec::new();
+        ctx.output_mut(|output| {
+            for command in &output.commands {
+                if let egui::OutputCommand::OpenUrl(open) = command {
+                    urls.push(open.url.clone());
+                }
+            }
+            output.commands.retain(|command| !matches!(command, egui::OutputCommand::OpenUrl(_)));
+        });
+        for url in urls {
+            opener::open_in_browser(&url);
+        }
 
         // Track when we last received messages for adaptive repaint intervals
         if self.app.had_messages_this_frame {
