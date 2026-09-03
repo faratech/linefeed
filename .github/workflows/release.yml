@@ -23,6 +23,7 @@ jobs:
   linux-x64:
     # ubuntu-22.04 keeps the glibc requirement low (2.35) for wider compatibility
     runs-on: ubuntu-22.04
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - name: Install build dependencies
@@ -45,6 +46,7 @@ jobs:
 
   macos:
     runs-on: macos-latest
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
       - name: Install Rust
@@ -69,6 +71,7 @@ jobs:
   attach-to-release:
     needs: [linux-x64, macos]
     runs-on: ubuntu-22.04
+    timeout-minutes: 10
     steps:
       - uses: actions/download-artifact@v4
         with:
