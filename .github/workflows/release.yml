@@ -39,7 +39,7 @@ jobs:
         run: |
           cp target/dist/linefeed linefeed_linux_x64
           upx --best -q linefeed_linux_x64
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: linefeed_linux_x64
           path: linefeed_linux_x64
@@ -63,7 +63,7 @@ jobs:
             target/aarch64-apple-darwin/dist/linefeed \
             target/x86_64-apple-darwin/dist/linefeed
           lipo -info linefeed_macos
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: linefeed_macos
           path: linefeed_macos
