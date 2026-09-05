@@ -32,7 +32,7 @@ jobs:
           Write-Host "Found $($files.Count) executable(s) to sign."
 
       - name: Sign executables with Azure Trusted Signing
-        uses: azure/trusted-signing-action@v0.4.1
+        uses: Azure/trusted-signing-action@v2.0.0
         with:
           azure-tenant-id: ${{ secrets.AZURE_TENANT_ID }}
           azure-client-id: ${{ secrets.AZURE_CLIENT_ID }}
@@ -40,10 +40,10 @@ jobs:
           endpoint: 'https://eus.codesigning.azure.net/'
           trusted-signing-account-name: 'fara-codesigning'
           certificate-profile-name: 'MikeFara'
-          files: |
-            binaries/*.exe
+          files-folder: '${{ github.workspace }}\binaries'
+          files-folder-filter: '*.exe'
 
-      - name: Re-upload signed executables to release
+      - name: Verify and re-upload signed executables to release
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ inputs.tag }}
