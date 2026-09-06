@@ -21,6 +21,10 @@ permissions:
   id-token: write
   attestations: write
 
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   linux-x64:
     # ubuntu-22.04 keeps the glibc requirement low (2.35) for wider compatibility

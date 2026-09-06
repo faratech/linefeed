@@ -12,10 +12,16 @@ permissions:
   id-token: write
   attestations: write
 
+concurrency:
+  group: sign-release-${{ github.ref }}-${{ inputs.tag }}
+  cancel-in-progress: false
+
 jobs:
   sign-windows-binaries:
     runs-on: windows-latest
     timeout-minutes: 15
+    env:
+      __COMPAT_LAYER: RunAsInvoker
     steps:
       - uses: actions/checkout@v4
 
