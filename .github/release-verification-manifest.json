@@ -1,0 +1,23 @@
+{
+  "repository": "faratech/linefeed",
+  "releases": {
+    "v0.0.5": [
+      {
+        "name": "linefeed_arm64.exe",
+        "sha256": "98c33fa3f94db6232366b0806f87db304fd103dad645f7031f9db3780aa68771"
+      },
+      {
+        "name": "linefeed_x64.exe",
+        "sha256": "84e9d0b3e758105700b3dfbf636c31460b5ad97a396ea12e4bf38186c064516b"
+      },
+      {
+        "name": "linefeed_x86.exe",
+        "sha256": "617b85f66cd4296fd98246ec8acddd7975e66914d17eade365219a0bf31feb71"
+      },
+      {
+        "name": "SHA256SUMS",
+        "sha256": "b66571bc4e898d1935439ebd89d77ce3df2a3dbcca2fd5f51c018cd624a81503"
+      }
+    ]
+  }
+}
