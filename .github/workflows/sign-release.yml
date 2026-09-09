@@ -98,6 +98,23 @@ jobs:
           TAG: ${{ inputs.tag }}
         shell: pwsh
         run: |
-          $signedFiles = Get-ChildItem -Path "binaries" -Filter "*.exe" | ForEach-Object { $_.FullName }
-          gh release upload "$env:TAG" @signedFiles --clobber --repo "$env:GITHUB_REPOSITORY"
-          Write-Host "Successfully uploaded signed binaries to $env:TAG"
+          $ErrorActionPreference = 'Stop'
+          $signedFiles = @(Get-ChildItem -Path 'binaries' -Filter '*.exe' -File)
+          gh release download "$env:TAG" --pattern 'SHA256SUMS' --dir binaries --clobber --repo "$env:GITHUB_REPOSITORY"
+          if ($LASTEXITCODE -ne 0) { throw 'Could not download the release checksum manifest' }
+          $checksumPath = Join-Path 'binaries' 'SHA256SUMS'
+          $checksums = @(Get-Content -LiteralPath $checksumPath)
+          foreach ($file in $signedFiles) {
+            $pattern = '^[0-9a-fA-F]{64}\s+\*?' + [regex]::Escape($file.Name) + '$'
+            $checksumIndexes = @(for ($i = 0; $i -lt $checksums.Count; $i++) {
+              if ($checksums[$i] -match $pattern) { $i }
+            })
+            if ($checksumIndexes.Count -ne 1) { throw "Expected one checksum entry for $($file.Name)" }
+            $hash = (Get-FileHash -LiteralPath $file.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+            $checksums[$checksumIndexes[0]] = "$hash  $($file.Name)"
+          }
+          Set-Content -LiteralPath $checksumPath -Value $checksums -Encoding utf8NoBOM
+          $uploads = @($signedFiles.FullName) + @($checksumPath)
+          gh release upload "$env:TAG" @uploads --clobber --repo "$env:GITHUB_REPOSITORY"
+          if ($LASTEXITCODE -ne 0) { throw 'Failed to upload signed binaries and checksums' }
+          Write-Host "Successfully uploaded signed binaries and checksums to $env:TAG"
