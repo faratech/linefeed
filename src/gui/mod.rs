@@ -5097,11 +5097,14 @@ impl IrcApp {
             total_rows: msgs.len(),
         };
 
-        ScrollArea::vertical()
+        let mut painted_offset = 0.0;
+        let output = ScrollArea::vertical()
+            .id_salt(("chat_scrollback", &self.current_channel))
             .auto_shrink([false; 2])
             .max_height(available_height)
             .stick_to_bottom(stick)
             .show_viewport(ui, |ui, viewport| {
+                painted_offset = viewport.min.y;
                 if msgs.is_empty() {
                     return;
                 }
@@ -5182,6 +5185,24 @@ impl IrcApp {
                 });
                 stats.drawn = drawn;
             });
+        // egui adjusts a sticky/clamped offset after the content is drawn.
+        // A history prepend therefore paints one frame at the old offset,
+        // then jumps back on the next frame. Redo that layout before painting
+        // it on screen, using the corrected state already stored by egui.
+        // Only redo content-size changes: ordinary wheel/drag scrolling must
+        // not replay input or trigger extra layout passes.
+        let size_id = output.id.with("last_content_size");
+        let previous_size = ui.ctx().data_mut(|data| {
+            let previous = data.get_temp::<egui::Vec2>(size_id);
+            data.insert_temp(size_id, output.content_size);
+            previous
+        });
+        if previous_size != Some(output.content_size)
+            && (output.state.offset.y - painted_offset).abs() > 0.5
+        {
+            ui.ctx()
+                .request_discard("history changed the scrollback extent");
+        }
         stats
     }
 
@@ -6242,6 +6263,72 @@ mod tests {
     }
 
     #[test]
+    fn history_pages_keep_visible_tail_stationary() {
+        let mut app = test_app();
+        let mut channel = Channel::new();
+        for i in 0..100 {
+            channel.messages.push_back(ChatMessage::new_fmt(
+                "alice",
+                &format!("history {i}: {}", "wrapped words ".repeat(12)),
+                "short",
+            ));
+        }
+        app.channels.insert("#history".into(), channel);
+        app.current_channel = Some("#history".into());
+        let ctx = egui::Context::default();
+        let mut positions = Vec::new();
+        for frame in 0..30 {
+            if frame >= 20 && frame % 2 == 0 {
+                app.channels
+                    .get_mut("#history")
+                    .unwrap()
+                    .messages
+                    .push_front(ChatMessage::new_fmt(
+                        "bob",
+                        "another page of older history",
+                        "short",
+                    ));
+            }
+            let mut output = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(600.0, 400.0),
+                    )),
+                    time: Some(frame as f64 / 60.0),
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        app.draw_scrollback(ui, 350.0);
+                    });
+                },
+            );
+            let visible: Vec<_> = output
+                .shapes
+                .iter()
+                .filter_map(|clipped| {
+                    if let egui::Shape::Text(text) = &clipped.shape {
+                        let bounds = egui::Rect::from_min_size(text.pos, text.galley.rect.size());
+                        if clipped.clip_rect.intersects(bounds) {
+                            return Some((text.galley.text().to_string(), text.pos.y));
+                        }
+                    }
+                    None
+                })
+                .collect();
+            output.textures_delta.clear();
+            if frame >= 20 {
+                assert!(!visible.is_empty(), "history must remain visible");
+                positions.push(visible);
+            }
+        }
+        for frames in positions.windows(2) {
+            assert_eq!(frames[0], frames[1], "idle history viewport keeps moving");
+        }
+    }
+
+    #[test]
     fn scrollback_virtualizes_large_history() {
         let mut app = test_app();
         let mut channel = Channel::new();
@@ -6256,9 +6343,12 @@ mod tests {
         // Headless egui pass: no renderer needed, real layout runs.
         let ctx = egui::Context::default();
         let mut first_stats = None;
+        let mut first_frame_measured = 0;
         ctx.run_ui(egui::RawInput::default(), |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {
-                first_stats = Some(app.draw_scrollback(ui, 400.0));
+                let stats = app.draw_scrollback(ui, 400.0);
+                first_frame_measured += stats.measured;
+                first_stats = Some(stats);
             });
         })
         .textures_delta
@@ -6273,7 +6363,9 @@ mod tests {
         // Cold cache: the first pass measures every height once so it can
         // compute cumulative offsets - that is the one-time cost, paid
         // instead of re-laying out every widget on every future frame.
-        assert_eq!(stats.measured, 2000);
+        // Include the corrective layout pass used to settle the initial
+        // bottom offset before painting; it must reuse those measurements.
+        assert_eq!(first_frame_measured, 2000);
 
         // Second identical frame: everything cached, nothing re-measured,
         // and still only the visible band drawn.
