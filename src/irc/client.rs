@@ -718,13 +718,14 @@ impl IrcClient {
 
         // IRCv3 capabilities we want to request
         const DESIRED_CAPS: &[&str] = &[
-            "multi-prefix",   // Preserve all channel membership prefixes in NAMES
-            "away-notify",    // Get notified when users go away/back
-            "account-notify", // Get notified when users log in/out
-            "extended-join",  // Get account and realname on JOIN
-            "server-time",    // Timestamps from server (for bouncers)
-            "batch",          // Grouped messages
-            "chghost",        // Host change notifications
+            "multi-prefix",      // Preserve all channel membership prefixes in NAMES
+            "away-notify",       // Get notified when users go away/back
+            "account-notify",    // Get notified when users log in/out
+            "extended-join",     // Get account and realname on JOIN
+            "server-time",       // Timestamps from server (for bouncers)
+            "batch",             // Grouped messages
+            "draft/chathistory", // Server-backed channel history (including Nefarious +H)
+            "chghost",           // Host change notifications
         ];
 
         // CAP LS and NICK/USER have already been sent together. Read the CAP
@@ -1310,16 +1311,20 @@ mod tests {
                 assert!(read_wire_line(&mut reader).await.starts_with("USER "));
 
                 write_half
-                    .write_all(b":srv CAP * LS :multi-prefix away-notify\r\n")
+                    .write_all(
+                        b":srv CAP * LS :multi-prefix away-notify draft/chathistory=limit=100\r\n",
+                    )
                     .await
                     .unwrap();
 
                 assert_eq!(
                     read_wire_line(&mut reader).await,
-                    "CAP REQ :multi-prefix away-notify"
+                    "CAP REQ :multi-prefix away-notify draft/chathistory"
                 );
                 write_half
-                    .write_all(b":srv CAP * ACK :multi-prefix away-notify\r\n")
+                    .write_all(
+                        b":srv CAP * ACK :multi-prefix away-notify draft/chathistory\r\n",
+                    )
                     .await
                     .unwrap();
 

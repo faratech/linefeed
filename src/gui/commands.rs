@@ -325,6 +325,55 @@ impl IrcApp {
                 self.send_command(IrcCommand::Raw(args.to_string()));
             }
 
+            "HISTORY" | "CHATHISTORY" => {
+                let parts: Vec<&str> = args.split_whitespace().collect();
+                let (target, requested_limit) = match parts.as_slice() {
+                    [] => (self.current_channel.clone(), None),
+                    [limit] if limit.chars().all(|c| c.is_ascii_digit()) => {
+                        match limit.parse::<usize>() {
+                            Ok(limit) if limit > 0 => (self.current_channel.clone(), Some(limit)),
+                            _ => {
+                                self.add_message_to_current(ChatMessage::system(
+                                    "Usage: /history [#channel] [limit]",
+                                ));
+                                return;
+                            }
+                        }
+                    }
+                    [target] => (Some(self.normalize_channel_name(target)), None),
+                    [target, limit] => match limit.parse::<usize>() {
+                        Ok(limit) if limit > 0 => {
+                            (Some(self.normalize_channel_name(target)), Some(limit))
+                        }
+                        _ => {
+                            self.add_message_to_current(ChatMessage::system(
+                                "Usage: /history [#channel] [limit]",
+                            ));
+                            return;
+                        }
+                    },
+                    _ => {
+                        self.add_message_to_current(ChatMessage::system(
+                            "Usage: /history [#channel] [limit]",
+                        ));
+                        return;
+                    }
+                };
+                let Some(target) = target.filter(|target| self.is_channel_name(target)) else {
+                    self.add_message_to_current(ChatMessage::system(
+                        "Usage: /history [#channel] [limit]",
+                    ));
+                    return;
+                };
+                if self.request_latest_history(&target, requested_limit) {
+                    self.prepare_history_target(&target);
+                } else {
+                    self.add_message_to_current(ChatMessage::system(
+                        "Server history is unavailable on this connection",
+                    ));
+                }
+            }
+
             "CTCP" => {
                 // /ctcp <nick> <command> [args]
                 let parts: Vec<&str> = args.splitn(3, ' ').collect();
@@ -1488,6 +1537,7 @@ impl IrcApp {
                 vec![
                     "/clear              - Clear window",
                     "/lastlog <pattern>  - Search messages",
+                    "/history [#c] [n]  - Load server channel history",
                     "/ignore [mask]      - List or add to ignore list",
                     "/unignore <mask>    - Remove from ignore list",
                     "/perform [cmd]      - View/add auto-perform",
@@ -1807,6 +1857,25 @@ mod tests {
             rx.try_recv().unwrap(),
             IrcCommand::Mode("#room".into(), Some("+m".into()), Vec::new())
         );
+    }
+
+    #[test]
+    fn history_command_uses_negotiated_server_limit_and_opens_public_channel() {
+        let (mut app, mut rx) = connected_command_app();
+        app.handle_cap_message(
+            "LS",
+            &["draft/chathistory=limit=50,retention=30d".into()],
+        );
+        app.handle_cap_message("ACK", &["draft/chathistory".into()]);
+
+        app.process_command("/history #public 500");
+
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            IrcCommand::ChathistoryLatest("#public".into(), 50)
+        );
+        assert_eq!(app.current_channel.as_deref(), Some("#public"));
+        assert!(!app.channels["#public"].joined);
     }
 
     #[test]

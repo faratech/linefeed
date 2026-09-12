@@ -58,6 +58,7 @@ A lightweight, cross-platform IRC client written in Rust with a native GUI.
 
 ### Logging
 - Persistent chat history in irssi-compatible format
+- IRCv3 server-backed channel history, including public Nefarious `+H` channels
 - Configurable history line count
 - Automatic log loading on channel join
 
@@ -151,6 +152,7 @@ python3 -m py_compile build.py tools/update-deps.py
 | `/list [pattern]` | List channels matching pattern |
 | `/invite <nick>` | Invite user to current channel |
 | `/knock <channel>` | Request invite to channel |
+| `/history [#channel] [limit]` | Load IRCv3 server history; public `+H` channels do not require joining |
 
 ### Messaging
 | Command | Description |

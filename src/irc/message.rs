@@ -50,6 +50,10 @@ pub enum IrcCommand {
     // IRCv3 batch: start/end of a batch
     Batch(String, Option<String>, Option<String>), // (+/-reference, type, params)
 
+    // IRCv3 draft/chathistory. Linefeed currently requests the latest page;
+    // keeping it typed prevents targets from being spliced into a raw command.
+    ChathistoryLatest(String, usize), // (target, limit)
+
     // Server info
     Time(Option<String>),
     Motd(Option<String>),
@@ -555,6 +559,9 @@ impl fmt::Display for IrcCommand {
                 (Some(t), None) => write!(f, "BATCH {} {}", reference, t),
                 _ => write!(f, "BATCH {}", reference),
             },
+            IrcCommand::ChathistoryLatest(target, limit) => {
+                write!(f, "CHATHISTORY LATEST {} * {}", target, limit)
+            }
             IrcCommand::Numeric(num, params) => {
                 write!(f, "{:03} {}", num, params.join(" "))
             }
@@ -722,5 +729,13 @@ mod tests {
             }
             other => panic!("expected Mode, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn chathistory_latest_formats_wire_command() {
+        assert_eq!(
+            IrcCommand::ChathistoryLatest("#history".into(), 100).to_string(),
+            "CHATHISTORY LATEST #history * 100"
+        );
     }
 }

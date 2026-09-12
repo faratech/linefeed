@@ -45,6 +45,11 @@ struct SessionConfig {
     set_invisible: bool,
 }
 
+struct ChatHistoryBatch {
+    target: String,
+    messages: Vec<ChatMessage>,
+}
+
 impl SessionConfig {
     fn endpoint_key(&self) -> EndpointKey {
         EndpointKey {
@@ -98,6 +103,7 @@ const COMMAND_COMPLETIONS: &[&str] = &[
     "/echo",
     "/grep",
     "/halfop",
+    "/history",
     "/hop",
     "/hostserv",
     "/ignore",
@@ -321,6 +327,9 @@ pub struct IrcApp {
 
     // Server-advertised protocol support
     pub network_support: NetworkSupport,
+    chathistory_enabled: bool,
+    chathistory_limit: Option<usize>,
+    chathistory_batches: HashMap<String, ChatHistoryBatch>,
 
     // Cached lowercase versions for efficient comparison (updated when source changes)
     my_nick_lower: String,
@@ -501,6 +510,9 @@ impl IrcApp {
             // Highlights
             highlight_words: settings.highlight_words.clone(),
             network_support,
+            chathistory_enabled: false,
+            chathistory_limit: None,
+            chathistory_batches: HashMap::new(),
 
             // Reconnect settings
             reconnect_delay_secs: settings.reconnect_delay_secs,
@@ -908,7 +920,110 @@ impl IrcApp {
 
     fn reset_connection_support(&mut self) {
         self.network_support = NetworkSupport::default();
+        self.chathistory_enabled = false;
+        self.chathistory_limit = None;
+        self.chathistory_batches.clear();
         self.nick_retry_attempts = 0;
+    }
+
+    fn handle_cap_message(&mut self, subcommand: &str, params: &[String]) {
+        let Some(caps) = params.last() else {
+            return;
+        };
+        for raw_token in caps.split_whitespace() {
+            let removing = raw_token.starts_with('-');
+            let token = raw_token.trim_start_matches(['-', '~', '=']);
+            let (name, value) = token
+                .split_once('=')
+                .map_or((token, None), |(name, value)| (name, Some(value)));
+            if !name.eq_ignore_ascii_case("draft/chathistory") {
+                continue;
+            }
+
+            if let Some(value) = value {
+                self.chathistory_limit = value.split(',').find_map(|item| {
+                    item.strip_prefix("limit=")
+                        .and_then(|limit| limit.parse::<usize>().ok())
+                        .filter(|limit| *limit > 0)
+                });
+            }
+
+            if subcommand.eq_ignore_ascii_case("ACK") {
+                self.chathistory_enabled = !removing;
+            } else if subcommand.eq_ignore_ascii_case("DEL")
+                || subcommand.eq_ignore_ascii_case("NAK")
+            {
+                self.chathistory_enabled = false;
+            }
+        }
+    }
+
+    fn history_request_limit(&self, requested: Option<usize>) -> usize {
+        let requested = requested.unwrap_or(self.logging_history_lines);
+        requested
+            .min(self.chathistory_limit.unwrap_or(100))
+            .min(self.max_scrollback)
+            .max(1)
+    }
+
+    fn request_latest_history(&mut self, target: &str, requested: Option<usize>) -> bool {
+        if !self.chathistory_enabled {
+            return false;
+        }
+        let limit = self.history_request_limit(requested);
+        self.send_command(IrcCommand::ChathistoryLatest(target.to_string(), limit))
+    }
+
+    fn prepare_history_target(&mut self, target: &str) {
+        let key = if let Some(key) = self.channel_key(target) {
+            key
+        } else {
+            let mut channel = Channel::new();
+            channel.set_case_mapping(self.network_support.case_mapping);
+            self.channels.insert(target.to_string(), channel);
+            target.to_string()
+        };
+        self.current_channel = Some(key);
+    }
+
+    fn queue_chathistory_message(&mut self, batch_id: &str, message: ChatMessage) {
+        if let Some(batch) = self.chathistory_batches.get_mut(batch_id)
+            && batch.messages.len() < self.max_scrollback
+        {
+            batch.messages.push(message);
+        }
+    }
+
+    fn finish_chathistory_batch(&mut self, batch_id: &str) {
+        let Some(batch) = self.chathistory_batches.remove(batch_id) else {
+            return;
+        };
+        let key = if let Some(key) = self.channel_key(&batch.target) {
+            key
+        } else {
+            let mut channel = Channel::new();
+            channel.set_case_mapping(self.network_support.case_mapping);
+            self.channels.insert(batch.target.clone(), channel);
+            batch.target.clone()
+        };
+        let count = batch.messages.len();
+        let mut history = VecDeque::with_capacity(count.saturating_add(1));
+        let status = match count {
+            0 => "--- No server history available ---".to_string(),
+            1 => "--- 1 line of server history loaded ---".to_string(),
+            _ => format!("--- {count} lines of server history loaded ---"),
+        };
+        history
+            .push_back(ChatMessage::system_fmt(&status, &self.timestamp_format).without_logging());
+        history.extend(batch.messages);
+
+        if let Some(channel) = self.channels.get_mut(&key) {
+            history.append(&mut channel.messages);
+            channel.messages = history;
+            while channel.messages.len() > self.max_scrollback {
+                channel.messages.pop_front();
+            }
+        }
     }
 
     /// Clamp a QUIT reason so the resulting line always fits in one IRC line.
@@ -1402,7 +1517,9 @@ impl IrcApp {
 
     pub fn handle_incoming_message(&mut self, msg: IrcMessage) {
         let _ = msg.get_account();
-        let _ = msg.get_batch();
+        let history_batch = msg
+            .get_batch()
+            .filter(|batch_id| self.chathistory_batches.contains_key(batch_id));
         match &msg.command {
             IrcCommand::Privmsg(target, content) => {
                 let sender = msg.get_sender_nick().unwrap_or_else(|| "???".to_string());
@@ -1414,7 +1531,7 @@ impl IrcApp {
                 }
 
                 // Handle CTCP requests (except ACTION which is displayed as a message)
-                if self.handle_ctcp_request(&sender, content) {
+                if history_batch.is_none() && self.handle_ctcp_request(&sender, content) {
                     return; // CTCP was handled, don't display as regular message
                 }
 
@@ -1448,6 +1565,12 @@ impl IrcApp {
                 } else {
                     ChatMessage::new_fmt(&sender, content, fmt).with_server_time(server_time)
                 };
+
+                if let Some(batch_id) = &history_batch {
+                    self.queue_chathistory_message(batch_id, chat_msg.without_logging());
+                    self.scroll_to_bottom = true;
+                    return;
+                }
 
                 // Determine target channel/query
                 let is_pm =
@@ -1498,6 +1621,21 @@ impl IrcApp {
                 // Check if sender is ignored (but not server notices)
                 if msg.prefix.is_some() && self.is_ignored(&sender, msg.prefix.as_deref()) {
                     tracing::debug!("Ignoring notice from {}", sender);
+                    return;
+                }
+
+                if let Some(batch_id) = &history_batch {
+                    let server_time = msg
+                        .get_server_time()
+                        .map(|epoch| epoch_time_formatted(epoch, &self.timestamp_format));
+                    let replayed = ChatMessage::system_fmt(
+                        &format!("-{sender}- {content}"),
+                        &self.timestamp_format,
+                    )
+                    .with_server_time(server_time)
+                    .without_logging();
+                    self.queue_chathistory_message(batch_id, replayed);
+                    self.scroll_to_bottom = true;
                     return;
                 }
 
@@ -1562,6 +1700,7 @@ impl IrcApp {
                 if self.identifiers_equal(&sender, &self.my_nick) {
                     // We joined a channel
                     let existing_key = self.channel_key(channel);
+                    let is_new_channel = existing_key.is_none();
                     if existing_key.is_none() {
                         let mut new_channel = Channel::new();
                         new_channel.set_case_mapping(self.network_support.case_mapping);
@@ -1572,8 +1711,11 @@ impl IrcApp {
                         {
                             new_channel.key = Some(key);
                         }
-                        // Load chat history from log file
-                        if self.logging_load_history
+                        // Prefer server-backed history when negotiated. It has
+                        // authoritative server-time and, on Nefarious +H
+                        // channels, is also available without membership.
+                        if !self.chathistory_enabled
+                            && self.logging_load_history
                             && let Some((network, legacy_host, allow_legacy)) =
                                 self.active_log_context()
                         {
@@ -1602,6 +1744,9 @@ impl IrcApp {
                     self.current_channel = Some(existing_key.unwrap_or_else(|| channel.clone()));
                     let sys_msg = ChatMessage::system(&format!("Now talking in {}", channel));
                     self.add_message_to_channel(channel, sys_msg);
+                    if is_new_channel && self.chathistory_enabled && self.logging_load_history {
+                        self.request_latest_history(channel, None);
+                    }
                 } else {
                     if !self.hide_join_part {
                         // Include account info if available (IRCv3 extended-join)
@@ -1888,16 +2033,33 @@ impl IrcApp {
                 }
             }
 
-            // IRCv3 batch: grouped messages (we just log start/end for now)
-            IrcCommand::Batch(reference, batch_type, _params) => {
-                if reference.starts_with('+') {
-                    // Batch start
+            IrcCommand::Cap(_target, subcommand, params) => {
+                self.handle_cap_message(subcommand, params);
+            }
+
+            // Collect chathistory rows until the batch closes so they can be
+            // inserted before live traffic as one chronological block.
+            IrcCommand::Batch(reference, batch_type, params) => {
+                if let Some(batch_id) = reference.strip_prefix('+') {
                     tracing::debug!("Batch started: {} type={:?}", reference, batch_type);
-                } else if reference.starts_with('-') {
-                    // Batch end
+                    if batch_type
+                        .as_deref()
+                        .is_some_and(|kind| kind.eq_ignore_ascii_case("chathistory"))
+                        && let Some(target) = params
+                        && self.chathistory_batches.len() < 32
+                    {
+                        self.chathistory_batches.insert(
+                            batch_id.to_string(),
+                            ChatHistoryBatch {
+                                target: target.clone(),
+                                messages: Vec::new(),
+                            },
+                        );
+                    }
+                } else if let Some(batch_id) = reference.strip_prefix('-') {
                     tracing::debug!("Batch ended: {}", reference);
+                    self.finish_chathistory_batch(batch_id);
                 }
-                // Messages within batches have @batch=reference tag, handled normally
             }
 
             _ => {
@@ -5378,5 +5540,64 @@ mod tests {
             assert!(format!("PRIVMSG #chan :{}", chunk).len() <= IRC_MAX_LINE_BYTES);
             assert!(chunk.is_char_boundary(chunk.len()));
         }
+    }
+
+    #[test]
+    fn joining_with_chathistory_requests_server_backlog() {
+        let (mut app, mut rx) = test_app_connected();
+        app.set_my_nick("me".into());
+        app.handle_incoming_message(
+            IrcMessage::parse(":srv CAP me ACK :draft/chathistory").unwrap(),
+        );
+
+        app.handle_incoming_message(IrcMessage::parse(":me!u@h JOIN #room").unwrap());
+
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            IrcCommand::ChathistoryLatest("#room".into(), 100)
+        );
+        assert!(app.channels["#room"].joined);
+    }
+
+    #[test]
+    fn chathistory_batch_is_prepended_without_unread_or_logging() {
+        let mut app = test_app();
+        app.max_scrollback = 20;
+        app.prepare_history_target("#public");
+        app.channels
+            .get_mut("#public")
+            .unwrap()
+            .messages
+            .push_back(ChatMessage::system("live row"));
+
+        app.handle_incoming_message(
+            IrcMessage::parse(":srv BATCH +hist chathistory #public").unwrap(),
+        );
+        app.handle_incoming_message(
+            IrcMessage::parse(
+                "@batch=hist;time=2026-09-12T12:00:00.000Z :alice!u@h PRIVMSG #public :old row",
+            )
+            .unwrap(),
+        );
+        assert_eq!(app.channels["#public"].messages.len(), 1);
+
+        app.handle_incoming_message(IrcMessage::parse(":srv BATCH -hist").unwrap());
+
+        let channel = &app.channels["#public"];
+        let contents: Vec<&str> = channel
+            .messages
+            .iter()
+            .map(|message| message.content.as_str())
+            .collect();
+        assert_eq!(
+            contents,
+            [
+                "--- 1 line of server history loaded ---",
+                "old row",
+                "live row"
+            ]
+        );
+        assert!(channel.messages[1].no_log);
+        assert_eq!(channel.unread, 0);
     }
 }
