@@ -26,12 +26,8 @@ impl IrcApp {
                     return;
                 }
                 let channel = self.normalize_channel_name(channel_arg);
-                let sent = self.send_command(IrcCommand::Join(
-                    channel.clone(),
-                    key.clone(),
-                    None,
-                    None,
-                ));
+                let sent =
+                    self.send_command(IrcCommand::Join(channel.clone(), key.clone(), None, None));
                 if !sent {
                     self.add_message_to_current(ChatMessage::system_fmt(
                         &format!("Not connected - join {channel} not sent"),
@@ -321,12 +317,324 @@ impl IrcApp {
                 }
             }
 
+            "SETNAME" => {
+                if args.is_empty() {
+                    self.add_message_to_current(ChatMessage::system("Usage: /setname <realname>"));
+                } else {
+                    self.send_command(IrcCommand::Setname(args.to_string()));
+                }
+            }
+
+            "REPLY" => {
+                let mut parts = args.splitn(2, ' ');
+                let msgid = parts.next().unwrap_or("");
+                let content = parts.next().unwrap_or("");
+                if let Some(target) = self.current_channel.clone()
+                    && self.enabled_caps.contains("message-tags")
+                    && valid_message_reference(msgid)
+                    && !content.is_empty()
+                {
+                    let tag = escape_message_tag_value(msgid);
+                    let command =
+                        IrcCommand::Raw(format!("@+reply={tag} PRIVMSG {target} :{content}"));
+                    if self.send_command(command) {
+                        self.add_message_to_channel(
+                            &target,
+                            ChatMessage::new_fmt(&self.my_nick, content, &self.timestamp_format)
+                                .with_reply_to(Some(msgid.to_string())),
+                        );
+                    }
+                } else {
+                    self.add_message_to_current(ChatMessage::system(
+                        "Usage: /reply <msgid> <message>",
+                    ));
+                }
+            }
+
+            "REACT" => {
+                let mut parts = args.splitn(2, ' ');
+                let msgid = parts.next().unwrap_or("");
+                let reaction = parts.next().unwrap_or("");
+                if let Some(target) = self.current_channel.clone()
+                    && self.enabled_caps.contains("message-tags")
+                    && valid_message_reference(msgid)
+                    && !reaction.is_empty()
+                {
+                    let msgid = escape_message_tag_value(msgid);
+                    let reaction = escape_message_tag_value(reaction);
+                    self.send_command(IrcCommand::Raw(format!(
+                        "@+draft/react={reaction};+reply={msgid} TAGMSG {target}"
+                    )));
+                } else {
+                    self.add_message_to_current(ChatMessage::system(
+                        "Usage: /react <msgid> <reaction>",
+                    ));
+                }
+            }
+
+            "TYPING" => {
+                let state = args.to_ascii_lowercase();
+                if let Some(target) = self.current_channel.clone()
+                    && self.enabled_caps.contains("message-tags")
+                    && matches!(state.as_str(), "active" | "paused" | "done")
+                {
+                    self.send_command(IrcCommand::Raw(format!("@+typing={state} TAGMSG {target}")));
+                } else {
+                    self.add_message_to_current(ChatMessage::system(
+                        "Usage: /typing active|paused|done",
+                    ));
+                }
+            }
+
+            "LABEL" => {
+                let mut parts = args.splitn(2, ' ');
+                let label = parts.next().unwrap_or("");
+                let command = parts.next().unwrap_or("");
+                if self.enabled_caps.contains("labeled-response")
+                    && valid_message_reference(label)
+                    && !command.is_empty()
+                {
+                    self.send_command(IrcCommand::Raw(format!(
+                        "@label={} {command}",
+                        escape_message_tag_value(label)
+                    )));
+                } else {
+                    self.add_message_to_current(ChatMessage::system(
+                        "Usage: /label <label> <IRC command>",
+                    ));
+                }
+            }
+
+            "MARKREAD" => {
+                let mut parts = args.split_whitespace();
+                let explicit_target = parts.next();
+                let (target, timestamp) = match explicit_target {
+                    Some(target)
+                        if self.is_channel_name(target) || self.channel_key(target).is_some() =>
+                    {
+                        (Some(target.to_string()), parts.next().map(str::to_string))
+                    }
+                    Some(timestamp) if timestamp.starts_with("timestamp=") => {
+                        (self.current_channel.clone(), Some(timestamp.to_string()))
+                    }
+                    Some("*") => (self.current_channel.clone(), Some("*".to_string())),
+                    Some(_) => (None, None),
+                    None => {
+                        let target = self.current_channel.clone();
+                        let timestamp = target
+                            .as_deref()
+                            .and_then(|target| self.channel_key(target))
+                            .and_then(|key| self.channels.get(&key))
+                            .and_then(|channel| {
+                                channel.messages.iter().rev().find_map(|message| {
+                                    message
+                                        .server_time
+                                        .as_ref()
+                                        .map(|time| format!("timestamp={time}"))
+                                })
+                            });
+                        (target, timestamp)
+                    }
+                };
+                if let Some(target) = target {
+                    self.send_command(IrcCommand::Markread(target, timestamp));
+                } else {
+                    self.add_message_to_current(ChatMessage::system(
+                        "Usage: /markread [target] [timestamp=<ISO8601>]",
+                    ));
+                }
+            }
+
+            "REDACT" => {
+                let mut parts = args.splitn(3, ' ');
+                let first = parts.next().unwrap_or("");
+                let (target, msgid, reason) = if self.is_channel_name(first) {
+                    (
+                        Some(first.to_string()),
+                        parts.next().unwrap_or("").to_string(),
+                        parts.next().map(str::to_string),
+                    )
+                } else {
+                    (
+                        self.current_channel.clone(),
+                        first.to_string(),
+                        parts.next().map(str::to_string),
+                    )
+                };
+                if let Some(target) = target
+                    && !msgid.is_empty()
+                {
+                    self.send_command(IrcCommand::Redact(target, msgid, reason));
+                } else {
+                    self.add_message_to_current(ChatMessage::system(
+                        "Usage: /redact [#channel] <msgid> [reason]",
+                    ));
+                }
+            }
+
+            "RENAME" => {
+                let mut parts = args.splitn(2, ' ');
+                let new_name = parts.next().unwrap_or("");
+                if let Some(old_name) = self.current_channel.clone()
+                    && self.is_channel_name(&old_name)
+                    && self.is_channel_name(new_name)
+                {
+                    self.send_command(IrcCommand::Rename(
+                        old_name,
+                        new_name.to_string(),
+                        parts.next().map(str::to_string),
+                    ));
+                } else {
+                    self.add_message_to_current(ChatMessage::system(
+                        "Usage: /rename <#new-channel> [reason]",
+                    ));
+                }
+            }
+
+            "RELOCATE" => {
+                let mut parts = args.splitn(2, ' ');
+                let new_name = parts.next().unwrap_or("");
+                if let Some(old_name) = self.current_channel.clone()
+                    && self.is_channel_name(&old_name)
+                    && self.is_channel_name(new_name)
+                {
+                    self.send_command(IrcCommand::Relocate(
+                        old_name,
+                        new_name.to_string(),
+                        parts.next().map(str::to_string),
+                    ));
+                } else {
+                    self.add_message_to_current(ChatMessage::system(
+                        "Usage: /relocate <#new-channel> [reason]",
+                    ));
+                }
+            }
+
+            "BOUNCER" | "PERSISTENCE" | "METADATA" | "WEBPUSH" | "REGISTER" | "VERIFY"
+            | "TOKEN" => {
+                if args.is_empty() {
+                    self.add_message_to_current(ChatMessage::system(&format!(
+                        "Usage: /{} <subcommand or arguments>",
+                        cmd.to_ascii_lowercase()
+                    )));
+                } else {
+                    self.send_command(IrcCommand::Raw(format!("{cmd} {args}")));
+                }
+            }
+
             "RAW" | "QUOTE" => {
                 self.send_command(IrcCommand::Raw(args.to_string()));
             }
 
             "HISTORY" | "CHATHISTORY" => {
                 let parts: Vec<&str> = args.split_whitespace().collect();
+                let subcommand = parts.first().map(|part| part.to_ascii_uppercase());
+                if matches!(
+                    subcommand.as_deref(),
+                    Some("BEFORE" | "AFTER" | "AROUND" | "BETWEEN" | "TARGETS")
+                ) {
+                    let parsed_limit = |value: Option<&&str>, fallback: usize| {
+                        value
+                            .and_then(|value| value.parse::<usize>().ok())
+                            .filter(|limit| *limit > 0)
+                            .unwrap_or(fallback)
+                    };
+                    let fallback = self.total_history_limit(None);
+                    let command = match (subcommand.as_deref(), parts.as_slice()) {
+                        (Some("BEFORE"), [_, target, reference, rest @ ..]) => {
+                            let total = self
+                                .total_history_limit(Some(parsed_limit(rest.first(), fallback)));
+                            let page = self.history_page_limit(total);
+                            Some((
+                                Some(*target),
+                                IrcCommand::ChathistoryBefore(
+                                    (*target).to_string(),
+                                    (*reference).to_string(),
+                                    page,
+                                ),
+                                Some(super::PendingHistoryRequest {
+                                    placement: super::HistoryPlacement::Prepend,
+                                    direction: super::HistoryDirection::Before,
+                                    remaining: total,
+                                    loaded: 0,
+                                    page_limit: page,
+                                }),
+                            ))
+                        }
+                        (Some("AFTER"), [_, target, reference, rest @ ..]) => {
+                            let total = self
+                                .total_history_limit(Some(parsed_limit(rest.first(), fallback)));
+                            let page = self.history_page_limit(total);
+                            Some((
+                                Some(*target),
+                                IrcCommand::ChathistoryAfter(
+                                    (*target).to_string(),
+                                    (*reference).to_string(),
+                                    page,
+                                ),
+                                Some(super::PendingHistoryRequest {
+                                    placement: super::HistoryPlacement::Append,
+                                    direction: super::HistoryDirection::After,
+                                    remaining: total,
+                                    loaded: 0,
+                                    page_limit: page,
+                                }),
+                            ))
+                        }
+                        (Some("AROUND"), [_, target, reference, rest @ ..]) => Some((
+                            Some(*target),
+                            IrcCommand::ChathistoryAround(
+                                (*target).to_string(),
+                                (*reference).to_string(),
+                                self.history_page_limit(parsed_limit(rest.first(), fallback)),
+                            ),
+                            None,
+                        )),
+                        (Some("BETWEEN"), [_, target, first, second, rest @ ..]) => Some((
+                            Some(*target),
+                            IrcCommand::ChathistoryBetween(
+                                (*target).to_string(),
+                                (*first).to_string(),
+                                (*second).to_string(),
+                                self.history_page_limit(parsed_limit(rest.first(), fallback)),
+                            ),
+                            None,
+                        )),
+                        (Some("TARGETS"), [_, first, second, rest @ ..]) => Some((
+                            None,
+                            IrcCommand::ChathistoryTargets(
+                                (*first).to_string(),
+                                (*second).to_string(),
+                                self.history_page_limit(parsed_limit(rest.first(), fallback)),
+                            ),
+                            None,
+                        )),
+                        _ => None,
+                    };
+                    if let Some((target, command, pending)) = command {
+                        if self.chathistory_enabled {
+                            if let Some(target) = target {
+                                self.prepare_history_target(target);
+                                if let Some(pending) = pending {
+                                    self.queue_history_request(target, command, pending);
+                                } else {
+                                    self.send_command(command);
+                                }
+                            } else {
+                                self.send_command(command);
+                            }
+                        } else {
+                            self.add_message_to_current(ChatMessage::system(
+                                "Server history is unavailable on this connection",
+                            ));
+                        }
+                    } else {
+                        self.add_message_to_current(ChatMessage::system(
+                            "Usage: /history before|after|around <target> <reference> [limit]; /history between <target> <first> <second> [limit]; /history targets <first> <second> [limit]",
+                        ));
+                    }
+                    return;
+                }
                 let (target, requested_limit) = match parts.as_slice() {
                     [] => (self.current_channel.clone(), None),
                     [limit] if limit.chars().all(|c| c.is_ascii_digit()) => {
@@ -365,7 +673,11 @@ impl IrcApp {
                     ));
                     return;
                 };
-                if self.request_latest_history(&target, requested_limit) {
+                if self.request_latest_history(
+                    &target,
+                    requested_limit,
+                    super::HistoryPlacement::Prepend,
+                ) {
                     self.prepare_history_target(&target);
                 } else {
                     self.add_message_to_current(ChatMessage::system(
@@ -737,8 +1049,7 @@ impl IrcApp {
                         .current_channel
                         .as_deref()
                         .filter(|name| self.network_support.is_channel(name));
-                    if let Some((target, mode, params)) =
-                        mode_command_args(args, shorthand_target)
+                    if let Some((target, mode, params)) = mode_command_args(args, shorthand_target)
                     {
                         self.send_command(IrcCommand::Mode(target, mode, params));
                     } else {
@@ -1448,6 +1759,8 @@ impl IrcApp {
         self.sasl_password.clear();
         self.auto_join_channels.clear();
         self.auto_perform.clear();
+        self.pre_away_message.clear();
+        self.persistence_profile.clear();
         self.pending_auto_perform = None;
         self.accept_invalid_certs = false;
     }
@@ -1537,7 +1850,7 @@ impl IrcApp {
                 vec![
                     "/clear              - Clear window",
                     "/lastlog <pattern>  - Search messages",
-                    "/history [#c] [n]  - Load server channel history",
+                    "/history [#c] [n]  - Load/paginate server history",
                     "/ignore [mask]      - List or add to ignore list",
                     "/unignore <mask>    - Remove from ignore list",
                     "/perform [cmd]      - View/add auto-perform",
@@ -1568,6 +1881,30 @@ impl IrcApp {
                 ],
             ),
             (
+                "=== IRCv3 / Nefarious ===",
+                vec![
+                    "/history before|after|around <target> <ref> [n]",
+                    "/history between <target> <ref1> <ref2> [n]",
+                    "/history targets <ref1> <ref2> [n]",
+                    "/markread [target] [timestamp=<time>|*]",
+                    "/redact [target] <msgid> [reason]",
+                    "/rename <#new-channel> [reason]",
+                    "/relocate <#new-channel> [reason]",
+                    "/setname <real name>",
+                    "/reply <msgid> <message>",
+                    "/react <msgid> <reaction>",
+                    "/typing active|paused|done",
+                    "/label <label> <IRC command>",
+                    "/bouncer <subcommand> ...",
+                    "/persistence <subcommand> ...",
+                    "/metadata <subcommand> ...",
+                    "/webpush <subcommand> ...",
+                    "/register <account> <email|*> <password>",
+                    "/verify <account> <code>",
+                    "/token servicelist|generate|validate ...",
+                ],
+            ),
+            (
                 "=== Shortcuts ===",
                 vec![
                     "Alt+1-9             - Switch tabs",
@@ -1586,6 +1923,29 @@ impl IrcApp {
             }
         }
     }
+}
+
+fn valid_message_reference(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && !value
+            .bytes()
+            .any(|byte| byte.is_ascii_whitespace() || matches!(byte, b';' | b'\0'))
+}
+
+fn escape_message_tag_value(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for character in value.chars() {
+        match character {
+            ';' => escaped.push_str("\\:"),
+            ' ' => escaped.push_str("\\s"),
+            '\\' => escaped.push_str("\\\\"),
+            '\r' => escaped.push_str("\\r"),
+            '\n' => escaped.push_str("\\n"),
+            other => escaped.push(other),
+        }
+    }
+    escaped
 }
 
 /// Recognize an authentication or channel service target: canonical names,
@@ -1647,7 +2007,12 @@ pub(super) fn command_line_contains_credentials(line: &str) -> bool {
     let command = parts.next().unwrap_or("");
     let args = parts.next().unwrap_or("").trim_start();
     match command.to_ascii_uppercase().as_str() {
-        "PASS" | "AUTHENTICATE" | "OPER" => true,
+        "PASS" | "AUTHENTICATE" | "OPER" | "REGISTER" | "VERIFY" | "WEBPUSH" | "AUTHTOKEN"
+        | "BOUNCER" => true,
+        "TOKEN" => args
+            .split_whitespace()
+            .next()
+            .is_some_and(|subcommand| subcommand.eq_ignore_ascii_case("VALIDATE")),
         "NS" | "NICKSERV" => service_message_contains_credentials("NickServ", args),
         "CS" | "CHANSERV" => service_message_contains_credentials("ChanServ", args),
         "AS" | "AUTHSERV" => service_message_contains_credentials("AuthServ", args),
@@ -1658,6 +2023,13 @@ pub(super) fn command_line_contains_credentials(line: &str) -> bool {
             service_message_contains_credentials(target, content)
         }
         "RAW" | "QUOTE" => command_line_contains_credentials(args),
+        "LABEL" => {
+            let nested = args
+                .split_once(char::is_whitespace)
+                .map(|(_, command)| command)
+                .unwrap_or("");
+            command_line_contains_credentials(nested)
+        }
         "PERFORM" if !args.eq_ignore_ascii_case("clear") => command_line_contains_credentials(args),
         _ => false,
     }
@@ -1862,20 +2234,41 @@ mod tests {
     #[test]
     fn history_command_uses_negotiated_server_limit_and_opens_public_channel() {
         let (mut app, mut rx) = connected_command_app();
-        app.handle_cap_message(
-            "LS",
-            &["draft/chathistory=limit=50,retention=30d".into()],
-        );
+        app.handle_cap_message("LS", &["draft/chathistory=limit=50,retention=30d".into()]);
         app.handle_cap_message("ACK", &["draft/chathistory".into()]);
 
         app.process_command("/history #public 500");
 
         assert_eq!(
             rx.try_recv().unwrap(),
-            IrcCommand::ChathistoryLatest("#public".into(), 50)
+            IrcCommand::ChathistoryLatest("#public".into(), "*".into(), 50)
         );
         assert_eq!(app.current_channel.as_deref(), Some("#public"));
         assert!(!app.channels["#public"].joined);
+    }
+
+    #[test]
+    fn reply_reaction_and_typing_use_client_only_tags() {
+        let (mut app, mut rx) = connected_command_app();
+        app.current_channel = Some("#room".into());
+        app.channels.insert("#room".into(), Channel::new());
+        app.handle_cap_message("ACK", &["message-tags".into()]);
+
+        app.process_command("/reply abc hello there");
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            IrcCommand::Raw("@+reply=abc PRIVMSG #room :hello there".into())
+        );
+        app.process_command("/react abc 👍");
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            IrcCommand::Raw("@+draft/react=👍;+reply=abc TAGMSG #room".into())
+        );
+        app.process_command("/typing active");
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            IrcCommand::Raw("@+typing=active TAGMSG #room".into())
+        );
     }
 
     #[test]
@@ -1953,7 +2346,10 @@ mod tests {
         // A user who happens to be named like a service is only treated as
         // sensitive when the payload looks like an auth command.
         assert!(!service_message_contains_credentials("NS", "hello there"));
-        assert!(service_message_contains_credentials("CS", "IDENTIFY #chan key123"));
+        assert!(service_message_contains_credentials(
+            "CS",
+            "IDENTIFY #chan key123"
+        ));
     }
 
     #[test]

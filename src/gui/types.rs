@@ -55,6 +55,12 @@ pub struct ServerFavorite {
     pub realname: String,
     #[serde(default)]
     pub accept_invalid_certs: bool,
+    /// IRCv3 draft/pre-away value sent before registration completes.
+    #[serde(default)]
+    pub pre_away_message: String,
+    /// Nefarious draft/persistence profile attached during registration.
+    #[serde(default)]
+    pub persistence_profile: String,
 }
 
 /// Persistent settings
@@ -77,6 +83,8 @@ pub struct Settings {
     pub ignore_list: Vec<String>,
     pub server_favorites: Vec<ServerFavorite>,
     pub auto_perform: String,
+    pub pre_away_message: String,
+    pub persistence_profile: String,
     // Auto-away settings
     pub auto_away_enabled: bool,
     pub auto_away_minutes: u32,
@@ -126,6 +134,8 @@ impl Default for Settings {
             ignore_list: Vec::new(),
             server_favorites: Vec::new(),
             auto_perform: String::new(),
+            pre_away_message: String::new(),
+            persistence_profile: String::new(),
             auto_away_enabled: false,
             auto_away_minutes: 10,
             auto_away_message: "Auto-away".to_string(),
@@ -262,6 +272,16 @@ pub struct RowHeightEntry {
 #[derive(Debug, Clone)]
 pub struct ChatMessage {
     pub timestamp: String,
+    /// Canonical IRCv3 `time` tag retained for ordering and MARKREAD.
+    pub server_time: Option<String>,
+    /// Stable IRCv3 message identity retained for replay deduplication and REDACT.
+    pub msgid: Option<String>,
+    /// Authenticated sender identity from the IRCv3 `account` tag.
+    pub account: Option<String>,
+    /// Operator name from Nefarious `draft/oper-tag`.
+    pub oper: Option<String>,
+    /// Referenced message ID from `+reply` / legacy `+draft/reply`.
+    pub reply_to: Option<String>,
     pub sender: String,
     pub content: String,
     pub is_action: bool,
@@ -312,6 +332,11 @@ impl ChatMessage {
     pub fn new_fmt(sender: &str, content: &str, format: &str) -> Self {
         Self {
             timestamp: current_time_formatted(format),
+            server_time: None,
+            msgid: None,
+            account: None,
+            oper: None,
+            reply_to: None,
             sender: sender.to_string(),
             content: content.to_string(),
             is_action: false,
@@ -330,6 +355,11 @@ impl ChatMessage {
     pub fn system_fmt(content: &str, format: &str) -> Self {
         Self {
             timestamp: current_time_formatted(format),
+            server_time: None,
+            msgid: None,
+            account: None,
+            oper: None,
+            reply_to: None,
             sender: "*".to_string(),
             content: content.to_string(),
             is_action: false,
@@ -344,6 +374,11 @@ impl ChatMessage {
     pub fn action_fmt(sender: &str, content: &str, format: &str) -> Self {
         Self {
             timestamp: current_time_formatted(format),
+            server_time: None,
+            msgid: None,
+            account: None,
+            oper: None,
+            reply_to: None,
             sender: sender.to_string(),
             content: content.to_string(),
             is_action: true,
@@ -358,6 +393,11 @@ impl ChatMessage {
     pub fn highlighted_fmt(sender: &str, content: &str, format: &str) -> Self {
         Self {
             timestamp: current_time_formatted(format),
+            server_time: None,
+            msgid: None,
+            account: None,
+            oper: None,
+            reply_to: None,
             sender: sender.to_string(),
             content: content.to_string(),
             is_action: false,
@@ -372,6 +412,11 @@ impl ChatMessage {
     pub fn action_highlighted_fmt(sender: &str, content: &str, format: &str) -> Self {
         Self {
             timestamp: current_time_formatted(format),
+            server_time: None,
+            msgid: None,
+            account: None,
+            oper: None,
+            reply_to: None,
             sender: sender.to_string(),
             content: content.to_string(),
             is_action: true,
@@ -389,6 +434,28 @@ impl ChatMessage {
         if let Some(time) = server_time {
             self.timestamp = time;
         }
+        self
+    }
+
+    pub fn with_irc_metadata(
+        mut self,
+        server_time: Option<String>,
+        msgid: Option<String>,
+        account: Option<String>,
+    ) -> Self {
+        self.server_time = server_time;
+        self.msgid = msgid;
+        self.account = account;
+        self
+    }
+
+    pub fn with_oper(mut self, oper: Option<String>) -> Self {
+        self.oper = oper;
+        self
+    }
+
+    pub fn with_reply_to(mut self, reply_to: Option<String>) -> Self {
+        self.reply_to = reply_to;
         self
     }
 }
@@ -487,6 +554,20 @@ pub struct NetworkSupport {
     pub chanmodes_a: String,
     pub chanmodes_b: String,
     pub chanmodes_c: String,
+    pub status_prefixes: String,
+    pub history_reference_types: String,
+    pub history_limit: Option<usize>,
+    pub history_retention_secs: Option<u64>,
+    pub nick_len: Option<usize>,
+    pub channel_len: Option<usize>,
+    pub topic_len: Option<usize>,
+    pub away_len: Option<usize>,
+    pub kick_len: Option<usize>,
+    pub monitor_limit: Option<usize>,
+    pub utf8_only: bool,
+    pub account_required: bool,
+    pub multiline_max_bytes: Option<usize>,
+    pub multiline_max_lines: Option<usize>,
 }
 
 impl Default for NetworkSupport {
@@ -499,6 +580,20 @@ impl Default for NetworkSupport {
             chanmodes_a: "beI".to_string(),
             chanmodes_b: "k".to_string(),
             chanmodes_c: "l".to_string(),
+            status_prefixes: "@%+".to_string(),
+            history_reference_types: String::new(),
+            history_limit: None,
+            history_retention_secs: None,
+            nick_len: None,
+            channel_len: None,
+            topic_len: None,
+            away_len: None,
+            kick_len: None,
+            monitor_limit: None,
+            utf8_only: false,
+            account_required: false,
+            multiline_max_bytes: None,
+            multiline_max_lines: None,
         }
     }
 }
@@ -562,6 +657,7 @@ pub struct ChannelUser {
     mode_bits: u8,
     pub away: Option<String>, // None = not away, Some(msg) = away with message
     pub account: Option<String>, // IRCv3 account name
+    pub realname: Option<String>, // IRCv3 extended-join / setname value
 }
 
 impl ChannelUser {
@@ -572,6 +668,7 @@ impl ChannelUser {
             mode_bits: mode.bit(),
             away: None,
             account: None,
+            realname: None,
         }
     }
 
@@ -626,6 +723,7 @@ pub struct Channel {
     pub key: Option<String>, // Channel key for auto-rejoin
     pub bans: Vec<BanEntry>,
     pub ban_list_complete: bool,
+    pub read_marker: Option<String>,
     /// Whether the local user is currently a member. Query windows are not
     /// channels and therefore leave this false without affecting sends.
     pub joined: bool,
@@ -653,6 +751,7 @@ impl Channel {
             key: None,
             bans: Vec::new(),
             ban_list_complete: false,
+            read_marker: None,
             joined: false,
             case_mapping: CaseMapping::Rfc1459,
             names_snapshot: None,
@@ -711,9 +810,7 @@ impl Channel {
         // fresh rather than appending to it (which would resurrect ghost
         // users when the new burst completes).
         const BURST_GAP: std::time::Duration = std::time::Duration::from_secs(5);
-        let stale = self
-            .burst_activity
-            .is_some_and(|t| t.elapsed() > BURST_GAP);
+        let stale = self.burst_activity.is_some_and(|t| t.elapsed() > BURST_GAP);
         if self.names_snapshot.is_none() || stale {
             self.names_snapshot = Some(Vec::new());
         }
@@ -746,7 +843,7 @@ impl Channel {
     }
 
     /// Atomically replace membership with the authoritative NAMES snapshot,
-    /// preserving away/account metadata for users who are still present.
+    /// preserving IRCv3 metadata for users who are still present.
     pub fn finish_user_burst(&mut self) {
         self.burst_activity = None;
         let Some(mut snapshot) = self.names_snapshot.take() else {
@@ -760,6 +857,7 @@ impl Channel {
             {
                 fresh.away = previous.away.clone();
                 fresh.account = previous.account.clone();
+                fresh.realname = previous.realname.clone();
             }
         }
         self.users = snapshot;
@@ -920,12 +1018,26 @@ impl Channel {
     /// Used by callers that push directly to `messages` (e.g. Quit/Nick loops
     /// over all channels) so they respect the same cap as add_message_to_channel.
     pub fn push_trimmed(&mut self, msg: ChatMessage, max: usize) {
+        if msg.msgid.as_ref().is_some_and(|msgid| {
+            self.messages
+                .iter()
+                .any(|existing| existing.msgid.as_ref() == Some(msgid))
+        }) {
+            return;
+        }
         self.messages.push_back(msg);
         if max > 0 {
             while self.messages.len() > max {
                 self.messages.pop_front();
             }
         }
+    }
+
+    pub fn redact_message(&mut self, msgid: &str) -> bool {
+        let previous_len = self.messages.len();
+        self.messages
+            .retain(|message| message.msgid.as_deref() != Some(msgid));
+        self.messages.len() != previous_len
     }
 
     pub fn has_user(&self, nick: &str) -> bool {
@@ -983,6 +1095,19 @@ impl Channel {
             && let Some(user) = snapshot.iter_mut().find(|u| mapping.eq(&u.nick, nick))
         {
             user.account = account;
+        }
+    }
+
+    /// IRCv3 extended-join / setname: retain the user's current real name.
+    pub fn set_user_realname(&mut self, nick: &str, realname: Option<String>) {
+        if let Some(user) = self.get_user_mut(nick) {
+            user.realname = realname.clone();
+        }
+        let mapping = self.case_mapping;
+        if let Some(snapshot) = &mut self.names_snapshot
+            && let Some(user) = snapshot.iter_mut().find(|u| mapping.eq(&u.nick, nick))
+        {
+            user.realname = realname;
         }
     }
 
@@ -1074,6 +1199,7 @@ mod tests {
         ch.add_user("alice", UserMode::Op);
         ch.add_user("bob", UserMode::Voice);
         ch.set_user_account("alice", Some("account".to_string()));
+        ch.set_user_realname("alice", Some("Alice Example".to_string()));
 
         ch.begin_user_burst();
         ch.add_user_burst_modes("Alice", &[UserMode::Voice]);
@@ -1083,6 +1209,7 @@ mod tests {
         let alice = ch.get_user("ALICE").unwrap();
         assert_eq!(alice.mode, UserMode::Voice);
         assert_eq!(alice.account.as_deref(), Some("account"));
+        assert_eq!(alice.realname.as_deref(), Some("Alice Example"));
         assert!(!ch.has_user("bob"));
     }
 
@@ -1168,9 +1295,16 @@ mod tests {
 
         // Removing a ban consumes its parameter too; without type-A handling
         // the mask would be misattributed to a later mode or dropped.
-        ch.set_channel_modes_from_reply("-b+k", &["*!gone@host".to_string(), "newkey".to_string()], &support);
+        ch.set_channel_modes_from_reply(
+            "-b+k",
+            &["*!gone@host".to_string(), "newkey".to_string()],
+            &support,
+        );
         assert_eq!(ch.modes, "+k");
-        assert_eq!(ch.mode_parameters.get(&'k').map(String::as_str), Some("newkey"));
+        assert_eq!(
+            ch.mode_parameters.get(&'k').map(String::as_str),
+            Some("newkey")
+        );
     }
 
     #[test]

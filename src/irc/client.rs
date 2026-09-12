@@ -20,6 +20,40 @@ const HANDSHAKE_STEP_TIMEOUT: Duration = Duration::from_secs(15);
 const MAX_CAP_BYTES: usize = 256 * 1024;
 const MAX_CAP_TOKENS: usize = 4096;
 const MAX_CAP_LINES: usize = 64;
+const IRC_WIRE_LINE_BYTES: usize = 512;
+
+fn cap_request_lines(caps: &[&str]) -> Vec<String> {
+    const PREFIX: &str = "CAP REQ :";
+    const SUFFIX: &str = "\r\n";
+    let mut lines = Vec::new();
+    let mut current = String::new();
+    for cap in caps {
+        let separator = usize::from(!current.is_empty());
+        if PREFIX.len() + current.len() + separator + cap.len() + SUFFIX.len() > IRC_WIRE_LINE_BYTES
+            && !current.is_empty()
+        {
+            lines.push(format!("{PREFIX}{current}{SUFFIX}"));
+            current.clear();
+        }
+        if !current.is_empty() {
+            current.push(' ');
+        }
+        current.push_str(cap);
+    }
+    if !current.is_empty() {
+        lines.push(format!("{PREFIX}{current}{SUFFIX}"));
+    }
+    lines
+}
+
+fn cap_token_name(token: &str) -> String {
+    let token = token.trim_start_matches(['-', '~', '=']);
+    token
+        .split_once('=')
+        .map_or(token, |(name, _)| name)
+        .to_ascii_lowercase()
+}
+
 /// Overall deadline for the whole registration handshake (CAP + SASL + NICK/USER).
 /// The per-step timeout resets on every received line, so without this a server
 /// that drips unrelated lines could keep the handshake running forever.
@@ -293,6 +327,8 @@ pub struct ServerConfig {
     // SASL authentication
     pub sasl_username: Option<String>,
     pub sasl_password: Option<String>,
+    pub pre_away_message: Option<String>,
+    pub persistence_profile: Option<String>,
 }
 
 impl Default for ServerConfig {
@@ -308,6 +344,8 @@ impl Default for ServerConfig {
             password: None,
             sasl_username: None,
             sasl_password: None,
+            pre_away_message: None,
+            persistence_profile: None,
         }
     }
 }
@@ -316,6 +354,44 @@ pub struct IrcClient {
     config: ServerConfig,
     tx: Option<mpsc::Sender<String>>,
 }
+
+/// Capabilities whose semantics Linefeed implements safely. Keep this list
+/// shared with post-registration CAP NEW handling in the GUI.
+pub const DESIRED_CAPS: &[&str] = &[
+    "multi-prefix",
+    "userhost-in-names",
+    "away-notify",
+    "account-notify",
+    "extended-join",
+    "server-time",
+    "echo-message",
+    "batch",
+    "message-tags",
+    "account-tag",
+    "standard-replies",
+    "cap-notify",
+    "labeled-response",
+    "no-implicit-names",
+    "draft/chathistory",
+    "draft/multiline",
+    "draft/event-playback",
+    "draft/read-marker",
+    "draft/message-redaction",
+    "draft/channel-rename",
+    "evilnet/channel-relocate",
+    "draft/extended-isupport",
+    "draft/pre-away",
+    "draft/bouncer",
+    "draft/persistence",
+    "draft/authtoken",
+    "draft/metadata-2",
+    "draft/webpush",
+    "draft/account-registration",
+    "setname",
+    "invite-notify",
+    "draft/oper-tag",
+    "chghost",
+];
 
 impl IrcClient {
     pub fn new(config: ServerConfig) -> Self {
@@ -327,6 +403,33 @@ impl IrcClient {
         incoming_tx: mpsc::Sender<IrcMessage>,
         mut outgoing_rx: mpsc::UnboundedReceiver<IrcCommand>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        if self
+            .config
+            .pre_away_message
+            .as_ref()
+            .is_some_and(|message| {
+                message.len() > 300
+                    || message
+                        .bytes()
+                        .any(|byte| matches!(byte, b'\r' | b'\n' | 0))
+            })
+        {
+            return Err("Pre-away message must be one IRC line of at most 300 bytes".into());
+        }
+        if self
+            .config
+            .persistence_profile
+            .as_ref()
+            .is_some_and(|profile| {
+                profile.is_empty()
+                    || profile.len() > 32
+                    || !profile
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+            })
+        {
+            return Err("Persistence profile must be 1-32 letters, digits, '_' or '-'".into());
+        }
         let mut pending_commands = VecDeque::new();
         let addr = format_server_addr(&self.config.host, self.config.port);
         tracing::info!("Connecting to {} (TLS: {})", addr, self.config.use_tls);
@@ -716,18 +819,6 @@ impl IrcClient {
         let config = &self.config;
         let want_sasl = config.sasl_username.is_some() && config.sasl_password.is_some();
 
-        // IRCv3 capabilities we want to request
-        const DESIRED_CAPS: &[&str] = &[
-            "multi-prefix",      // Preserve all channel membership prefixes in NAMES
-            "away-notify",       // Get notified when users go away/back
-            "account-notify",    // Get notified when users log in/out
-            "extended-join",     // Get account and realname on JOIN
-            "server-time",       // Timestamps from server (for bouncers)
-            "batch",             // Grouped messages
-            "draft/chathistory", // Server-backed channel history (including Nefarious +H)
-            "chghost",           // Host change notifications
-        ];
-
         // CAP LS and NICK/USER have already been sent together. Read the CAP
         // response while registration completion remains suspended.
         let mut buf = Vec::with_capacity(512);
@@ -849,14 +940,18 @@ impl IrcClient {
         }
 
         // Step 4: Request capabilities
-        let cap_req = format!("CAP REQ :{}\r\n", caps_to_request.join(" "));
-        tracing::debug!("> {}", cap_req.trim());
-        writer.write_all(cap_req.as_bytes()).await?;
+        let cap_reqs = cap_request_lines(&caps_to_request);
+        for cap_req in &cap_reqs {
+            tracing::debug!("> {}", cap_req.trim());
+            writer.write_all(cap_req.as_bytes()).await?;
+        }
         writer.flush().await?;
 
         // Step 5: Wait for CAP ACK/NAK
         let mut acked_caps = String::new();
         let mut rejected_caps = Vec::new();
+        let mut pending_caps: std::collections::HashSet<String> =
+            caps_to_request.iter().map(|cap| cap.to_string()).collect();
         loop {
             let Some(msg) = read_handshake_msg_timed(writer, reader, &mut buf, incoming_tx).await?
             else {
@@ -881,47 +976,45 @@ impl IrcClient {
             }
 
             if let IrcCommand::Cap(_target, subcmd, rest) = &msg.command {
-                let more = rest.first().is_some_and(|token| token == "*");
-                match subcmd.as_str() {
-                    "ACK" => {
-                        // The trailing element is the acked cap list (after any "*" marker).
-                        if let Some(caps) = rest.last() {
-                            cap_budget.observe(caps)?;
-                            if !acked_caps.is_empty() {
-                                acked_caps.push(' ');
-                            }
-                            acked_caps.push_str(caps);
+                if subcmd.eq_ignore_ascii_case("ACK") {
+                    // The trailing element is the acked cap list (after any "*" marker).
+                    if let Some(caps) = rest.last() {
+                        cap_budget.observe(caps)?;
+                        if !acked_caps.is_empty() {
+                            acked_caps.push(' ');
                         }
-                        if !more {
-                            break;
+                        acked_caps.push_str(caps);
+                        for cap in caps.split_whitespace() {
+                            pending_caps.remove(&cap_token_name(cap));
                         }
                     }
-                    "NAK" => {
-                        // The trailing element is the rejected cap list (after any "*" marker).
-                        if let Some(caps) = rest.last() {
-                            cap_budget.observe(caps)?;
-                            rejected_caps.push(caps.clone());
-                        }
-                        if !more {
-                            let mut message = "Server rejected some capabilities".to_string();
-                            if !rejected_caps.is_empty() {
-                                message = format!(
-                                    "Server rejected capabilities: {}",
-                                    rejected_caps.join(" ")
-                                );
-                            }
-                            let _ = incoming_tx.try_send(IrcMessage {
-                                tags: None,
-                                prefix: None,
-                                command: IrcCommand::Notice("*".to_string(), message),
-                                raw: String::new(),
-                            });
-                            break;
+                    if pending_caps.is_empty() {
+                        break;
+                    }
+                } else if subcmd.eq_ignore_ascii_case("NAK") {
+                    // The trailing element is the rejected cap list (after any "*" marker).
+                    if let Some(caps) = rest.last() {
+                        cap_budget.observe(caps)?;
+                        rejected_caps.push(caps.clone());
+                        for cap in caps.split_whitespace() {
+                            pending_caps.remove(&cap_token_name(cap));
                         }
                     }
-                    _ => {}
+                    if pending_caps.is_empty() {
+                        break;
+                    }
                 }
             }
+        }
+
+        if !rejected_caps.is_empty() {
+            let message = format!("Server rejected capabilities: {}", rejected_caps.join(" "));
+            let _ = incoming_tx.try_send(IrcMessage {
+                tags: None,
+                prefix: None,
+                command: IrcCommand::Notice("*".to_string(), message),
+                raw: String::new(),
+            });
         }
 
         let acked_tokens: std::collections::HashSet<String> = acked_caps
@@ -949,6 +1042,31 @@ impl IrcClient {
         } else {
             false
         };
+
+        // Registration-only extensions run after their CAP ACK. Persistence
+        // profiles also need the SASL account established, and both commands
+        // must precede CAP END.
+        if acked_tokens.contains("draft/persistence")
+            && let Some(profile) = config
+                .persistence_profile
+                .as_deref()
+                .filter(|profile| !profile.is_empty())
+        {
+            let line = format!("PERSISTENCE ATTACH {}\r\n", profile);
+            tracing::debug!("> PERSISTENCE ATTACH {}", profile);
+            writer.write_all(line.as_bytes()).await?;
+        }
+        if acked_tokens.contains("draft/pre-away")
+            && let Some(message) = config.pre_away_message.as_deref()
+        {
+            let line = if message.is_empty() {
+                "AWAY\r\n".to_string()
+            } else {
+                format!("AWAY :{}\r\n", message)
+            };
+            tracing::debug!("> AWAY :<pre-connect status>");
+            writer.write_all(line.as_bytes()).await?;
+        }
 
         // Report enabled capabilities
         let enabled: Vec<&str> = DESIRED_CAPS
@@ -1279,6 +1397,78 @@ mod tests {
     use super::*;
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 
+    #[test]
+    fn complete_nefarious_cap_request_is_split_within_irc_line_limit() {
+        let mut caps = DESIRED_CAPS.to_vec();
+        caps.push("sasl");
+        let lines = cap_request_lines(&caps);
+        assert!(lines.len() > 1);
+        assert!(lines.iter().all(|line| line.len() <= IRC_WIRE_LINE_BYTES));
+
+        let requested: Vec<&str> = lines
+            .iter()
+            .flat_map(|line| {
+                line.trim_end_matches("\r\n")
+                    .strip_prefix("CAP REQ :")
+                    .unwrap()
+                    .split_whitespace()
+            })
+            .collect();
+        assert_eq!(requested, caps);
+    }
+
+    #[test]
+    fn split_cap_requests_wait_for_every_ack() {
+        test_runtime().block_on(async {
+            let expected_requests = cap_request_lines(DESIRED_CAPS).len();
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                let (read_half, mut write_half) = stream.into_split();
+                let mut reader = tokio::io::BufReader::new(read_half);
+                assert_eq!(read_wire_line(&mut reader).await, "CAP LS 302");
+                assert_eq!(read_wire_line(&mut reader).await, "NICK tester");
+                assert!(read_wire_line(&mut reader).await.starts_with("USER "));
+                write_half
+                    .write_all(format!(":srv CAP * LS :{}\r\n", DESIRED_CAPS.join(" ")).as_bytes())
+                    .await
+                    .unwrap();
+
+                for _ in 0..expected_requests {
+                    let request = read_wire_line(&mut reader).await;
+                    assert!(request.len() + 2 <= IRC_WIRE_LINE_BYTES);
+                    let caps = request.strip_prefix("CAP REQ :").unwrap();
+                    write_half
+                        .write_all(format!(":srv CAP * ACK :{caps}\r\n").as_bytes())
+                        .await
+                        .unwrap();
+                }
+                assert_eq!(read_wire_line(&mut reader).await, "CAP END");
+                write_half
+                    .write_all(b":srv 001 tester :Welcome\r\n")
+                    .await
+                    .unwrap();
+            });
+
+            let config = ServerConfig {
+                host: "127.0.0.1".into(),
+                port: addr.port(),
+                use_tls: false,
+                nick: "tester".into(),
+                ..Default::default()
+            };
+            let (msg_tx, _msg_rx) = mpsc::channel(100);
+            let (_cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+            let mut client = IrcClient::new(config);
+            timeout(Duration::from_secs(1), client.connect(msg_tx, cmd_rx))
+                .await
+                .expect("split CAP negotiation timed out")
+                .unwrap();
+            server.await.unwrap();
+        });
+    }
+
     fn test_runtime() -> tokio::runtime::Runtime {
         tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -1397,6 +1587,30 @@ mod tests {
 
             server.abort();
             client_task.abort();
+        });
+    }
+
+    #[test]
+    fn registration_extensions_reject_invalid_wire_values_before_connecting() {
+        test_runtime().block_on(async {
+            for config in [
+                ServerConfig {
+                    pre_away_message: Some("away\r\nOPER root password".into()),
+                    ..Default::default()
+                },
+                ServerConfig {
+                    persistence_profile: Some("bad profile".into()),
+                    ..Default::default()
+                },
+            ] {
+                let (msg_tx, _msg_rx) = mpsc::channel(1);
+                let (_cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+                let error = IrcClient::new(config)
+                    .connect(msg_tx, cmd_rx)
+                    .await
+                    .expect_err("invalid registration extension must be rejected");
+                assert!(error.to_string().contains("must be"));
+            }
         });
     }
 
@@ -1719,6 +1933,75 @@ mod tests {
             timeout(Duration::from_secs(1), client.connect(msg_tx, cmd_rx))
                 .await
                 .expect("SASL registration timed out")
+                .unwrap();
+            server.await.unwrap();
+        });
+    }
+
+    #[test]
+    fn nefarious_registration_only_commands_precede_cap_end() {
+        test_runtime().block_on(async {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                let (read_half, mut write_half) = stream.into_split();
+                let mut reader = BufReader::new(read_half);
+                assert_eq!(read_wire_line(&mut reader).await, "CAP LS 302");
+                assert_eq!(read_wire_line(&mut reader).await, "NICK tester");
+                assert!(read_wire_line(&mut reader).await.starts_with("USER "));
+                write_half
+                    .write_all(b":srv CAP * LS :draft/pre-away draft/persistence sasl=PLAIN\r\n")
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    read_wire_line(&mut reader).await,
+                    "CAP REQ :draft/pre-away draft/persistence sasl"
+                );
+                write_half
+                    .write_all(b":srv CAP * ACK :draft/pre-away draft/persistence sasl\r\n")
+                    .await
+                    .unwrap();
+                assert_eq!(read_wire_line(&mut reader).await, "AUTHENTICATE PLAIN");
+                write_half.write_all(b"AUTHENTICATE +\r\n").await.unwrap();
+                let expected = BASE64_STANDARD.encode(b"\0user\0password");
+                assert_eq!(
+                    read_wire_line(&mut reader).await,
+                    format!("AUTHENTICATE {expected}")
+                );
+                write_half
+                    .write_all(b":srv 903 tester :SASL successful\r\n")
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    read_wire_line(&mut reader).await,
+                    "PERSISTENCE ATTACH mobile"
+                );
+                assert_eq!(read_wire_line(&mut reader).await, "AWAY :syncing");
+                assert_eq!(read_wire_line(&mut reader).await, "CAP END");
+                write_half
+                    .write_all(b":srv 001 tester :Welcome\r\n")
+                    .await
+                    .unwrap();
+            });
+
+            let config = ServerConfig {
+                host: "127.0.0.1".into(),
+                port: addr.port(),
+                use_tls: false,
+                nick: "tester".into(),
+                sasl_username: Some("user".into()),
+                sasl_password: Some("password".into()),
+                pre_away_message: Some("syncing".into()),
+                persistence_profile: Some("mobile".into()),
+                ..Default::default()
+            };
+            let (msg_tx, _msg_rx) = mpsc::channel(100);
+            let (_cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+            let mut client = IrcClient::new(config);
+            timeout(Duration::from_secs(1), client.connect(msg_tx, cmd_rx))
+                .await
+                .expect("registration-only commands timed out")
                 .unwrap();
             server.await.unwrap();
         });

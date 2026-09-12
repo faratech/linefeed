@@ -71,6 +71,19 @@ pub const RPL_MONLIST: u16 = 732;
 pub const RPL_ENDOFMONLIST: u16 = 733;
 pub const ERR_MONLISTFULL: u16 = 734;
 
+// IRCv3 metadata and Nefarious bouncer administration
+pub const RPL_WHOISKEYVALUE: u16 = 760;
+pub const RPL_KEYVALUE: u16 = 761;
+pub const RPL_METADATAEND: u16 = 762;
+pub const RPL_KEYNOTSET: u16 = 766;
+pub const RPL_METADATASUBOK: u16 = 770;
+pub const RPL_METADATAUNSUBOK: u16 = 771;
+pub const RPL_METADATASUBS: u16 = 772;
+pub const RPL_METADATASYNCLATER: u16 = 774;
+pub const RPL_BOUNCERSESSION: u16 = 780;
+pub const RPL_BOUNCETOKEN: u16 = 781;
+pub const RPL_BOUNCERSETTINGS: u16 = 782;
+
 // STARTTLS
 pub const RPL_STARTTLS: u16 = 670;
 pub const ERR_STARTTLS: u16 = 691;

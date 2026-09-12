@@ -5,7 +5,10 @@ pub enum IrcCommand {
     // Connection
     Pass(String),
     Nick(String),
-    User { username: String, realname: String },
+    User {
+        username: String,
+        realname: String,
+    },
     Quit(Option<String>),
     Away(Option<String>),
 
@@ -24,6 +27,10 @@ pub enum IrcCommand {
     Privmsg(String, String),
     Notice(String, String),
     Wallops(String),
+    /// Nefarious targeted channel messages. The char is the minimum status
+    /// prefix advertised in STATUSMSG (`@`, `%`, or `+`).
+    StatusMessage(char, String, String),
+    Tagmsg(String),
 
     // Server queries
     Ping(String),
@@ -46,13 +53,36 @@ pub enum IrcCommand {
 
     // IRCv3 CHGHOST: user changed their host
     Chghost(String, String), // (new_user, new_host)
+    Setname(String),
 
     // IRCv3 batch: start/end of a batch
     Batch(String, Option<String>, Option<String>), // (+/-reference, type, params)
 
     // IRCv3 draft/chathistory. Linefeed currently requests the latest page;
     // keeping it typed prevents targets from being spliced into a raw command.
-    ChathistoryLatest(String, usize), // (target, limit)
+    ChathistoryLatest(String, String, usize), // (target, reference or *, limit)
+    ChathistoryBefore(String, String, usize),
+    ChathistoryAfter(String, String, usize),
+    ChathistoryAround(String, String, usize),
+    ChathistoryBetween(String, String, String, usize),
+    ChathistoryTargets(String, String, usize),
+    ChathistoryTarget(String, String),
+
+    // IRCv3 and Nefarious client-facing extensions.
+    StandardReply {
+        kind: String,
+        command: String,
+        code: String,
+        context: Vec<String>,
+        description: String,
+    },
+    Markread(String, Option<String>),
+    Redact(String, String, Option<String>),
+    Rename(String, String, Option<String>),
+    Relocate(String, String, Option<String>),
+    /// Informational extension responses that should remain structured rather
+    /// than falling through to raw IRC framing in the server buffer.
+    Extension(String, Vec<String>),
 
     // Server info
     Time(Option<String>),
@@ -181,6 +211,22 @@ impl IrcMessage {
                 params.first().cloned().unwrap_or_default(),
                 params.get(1).cloned().unwrap_or_default(),
             ),
+            "WALLCHOPS" => IrcCommand::StatusMessage(
+                '@',
+                params.first().cloned().unwrap_or_default(),
+                params.get(1).cloned().unwrap_or_default(),
+            ),
+            "WALLHOPS" => IrcCommand::StatusMessage(
+                '%',
+                params.first().cloned().unwrap_or_default(),
+                params.get(1).cloned().unwrap_or_default(),
+            ),
+            "WALLVOICES" => IrcCommand::StatusMessage(
+                '+',
+                params.first().cloned().unwrap_or_default(),
+                params.get(1).cloned().unwrap_or_default(),
+            ),
+            "TAGMSG" => IrcCommand::Tagmsg(params.first().cloned().unwrap_or_default()),
             "JOIN" => {
                 // Standard JOIN: channel only
                 // Extended-join (IRCv3): channel, account, realname
@@ -229,6 +275,55 @@ impl IrcMessage {
                 params.first().cloned().unwrap_or_default(),
                 params.get(1).cloned().unwrap_or_default(),
             ),
+            "SETNAME" => IrcCommand::Setname(params.first().cloned().unwrap_or_default()),
+            "CHATHISTORY"
+                if params
+                    .first()
+                    .is_some_and(|p| p.eq_ignore_ascii_case("TARGETS")) =>
+            {
+                IrcCommand::ChathistoryTarget(
+                    params.get(1).cloned().unwrap_or_default(),
+                    params.get(2).cloned().unwrap_or_default(),
+                )
+            }
+            "FAIL" | "WARN" | "NOTE" => {
+                let command = params.first().cloned().unwrap_or_default();
+                let code = params.get(1).cloned().unwrap_or_default();
+                let description = params.last().cloned().unwrap_or_default();
+                let context = if params.len() > 3 {
+                    params[2..params.len() - 1].to_vec()
+                } else {
+                    Vec::new()
+                };
+                IrcCommand::StandardReply {
+                    kind: cmd.to_string(),
+                    command,
+                    code,
+                    context,
+                    description,
+                }
+            }
+            "MARKREAD" => IrcCommand::Markread(
+                params.first().cloned().unwrap_or_default(),
+                params.get(1).cloned(),
+            ),
+            "REDACT" => IrcCommand::Redact(
+                params.first().cloned().unwrap_or_default(),
+                params.get(1).cloned().unwrap_or_default(),
+                params.get(2).cloned(),
+            ),
+            "RENAME" => IrcCommand::Rename(
+                params.first().cloned().unwrap_or_default(),
+                params.get(1).cloned().unwrap_or_default(),
+                params.get(2).cloned(),
+            ),
+            "RELOCATE" => IrcCommand::Relocate(
+                params.first().cloned().unwrap_or_default(),
+                params.get(1).cloned().unwrap_or_default(),
+                params.get(2).cloned(),
+            ),
+            "METADATA" | "WEBPUSH" | "BOUNCER" | "PERSISTENCE" | "REGISTER" | "VERIFY"
+            | "AUTHTOKEN" | "TOKEN" => IrcCommand::Extension(cmd.to_string(), params),
             // IRCv3 batch
             "BATCH" => IrcCommand::Batch(
                 params.first().cloned().unwrap_or_default(),
@@ -283,6 +378,37 @@ impl IrcMessage {
     /// Get account name from tags (IRCv3 account tag)
     pub fn get_account(&self) -> Option<String> {
         self.get_tag("account")
+    }
+
+    /// Nefarious draft/oper-tag. An empty value still identifies a displayed
+    /// operator; deployments may optionally include the oper name.
+    pub fn get_oper(&self) -> Option<String> {
+        self.get_tag("draft/oper").map(|name| {
+            if name.is_empty() {
+                "operator".into()
+            } else {
+                name
+            }
+        })
+    }
+
+    /// Reply relation. Nefarious accepts the ratified `+reply` spelling and
+    /// the older `+draft/reply` spelling for client compatibility.
+    pub fn get_reply(&self) -> Option<String> {
+        self.get_tag("+reply")
+            .or_else(|| self.get_tag("+draft/reply"))
+            .filter(|value| !value.is_empty())
+    }
+
+    /// Stable server-assigned identity used for replay merging and redaction.
+    pub fn get_msgid(&self) -> Option<String> {
+        self.get_tag("msgid").filter(|value| !value.is_empty())
+    }
+
+    /// Preserve the canonical wire timestamp as well as its display rendering.
+    pub fn get_server_time_raw(&self) -> Option<String> {
+        self.get_tag("time")
+            .filter(|value| parse_iso8601_utc(value).is_some())
     }
 
     /// Get batch reference from tags (IRCv3 batch)
@@ -437,6 +563,16 @@ impl fmt::Display for IrcCommand {
             }
             IrcCommand::Privmsg(target, msg) => write!(f, "PRIVMSG {} :{}", target, msg),
             IrcCommand::Notice(target, msg) => write!(f, "NOTICE {} :{}", target, msg),
+            IrcCommand::StatusMessage(status, target, msg) => {
+                let command = match status {
+                    '@' => "WALLCHOPS",
+                    '%' => "WALLHOPS",
+                    '+' => "WALLVOICES",
+                    _ => "WALLCHOPS",
+                };
+                write!(f, "{} {} :{}", command, target, msg)
+            }
+            IrcCommand::Tagmsg(target) => write!(f, "TAGMSG {}", target),
             IrcCommand::Ping(server) => write!(f, "PING :{}", server),
             IrcCommand::Pong(server) => write!(f, "PONG :{}", server),
             IrcCommand::Topic(channel, topic) => {
@@ -554,13 +690,70 @@ impl fmt::Display for IrcCommand {
             IrcCommand::Authenticate(data) => write!(f, "AUTHENTICATE {}", data),
             IrcCommand::Account(account) => write!(f, "ACCOUNT {}", account),
             IrcCommand::Chghost(user, host) => write!(f, "CHGHOST {} {}", user, host),
+            IrcCommand::Setname(realname) => write!(f, "SETNAME :{}", realname),
             IrcCommand::Batch(reference, batch_type, params) => match (batch_type, params) {
                 (Some(t), Some(p)) => write!(f, "BATCH {} {} {}", reference, t, p),
                 (Some(t), None) => write!(f, "BATCH {} {}", reference, t),
                 _ => write!(f, "BATCH {}", reference),
             },
-            IrcCommand::ChathistoryLatest(target, limit) => {
-                write!(f, "CHATHISTORY LATEST {} * {}", target, limit)
+            IrcCommand::ChathistoryLatest(target, reference, limit) => {
+                write!(f, "CHATHISTORY LATEST {} {} {}", target, reference, limit)
+            }
+            IrcCommand::ChathistoryBefore(target, reference, limit) => {
+                write!(f, "CHATHISTORY BEFORE {} {} {}", target, reference, limit)
+            }
+            IrcCommand::ChathistoryAfter(target, reference, limit) => {
+                write!(f, "CHATHISTORY AFTER {} {} {}", target, reference, limit)
+            }
+            IrcCommand::ChathistoryAround(target, reference, limit) => {
+                write!(f, "CHATHISTORY AROUND {} {} {}", target, reference, limit)
+            }
+            IrcCommand::ChathistoryBetween(target, first, second, limit) => write!(
+                f,
+                "CHATHISTORY BETWEEN {} {} {} {}",
+                target, first, second, limit
+            ),
+            IrcCommand::ChathistoryTargets(first, second, limit) => {
+                write!(f, "CHATHISTORY TARGETS {} {} {}", first, second, limit)
+            }
+            IrcCommand::ChathistoryTarget(target, timestamp) => {
+                write!(f, "CHATHISTORY TARGETS {} {}", target, timestamp)
+            }
+            IrcCommand::StandardReply {
+                kind,
+                command,
+                code,
+                context,
+                description,
+            } => {
+                write!(f, "{} {} {}", kind, command, code)?;
+                for item in context {
+                    write!(f, " {}", item)?;
+                }
+                write!(f, " :{}", description)
+            }
+            IrcCommand::Markread(target, timestamp) => match timestamp {
+                Some(timestamp) => write!(f, "MARKREAD {} {}", target, timestamp),
+                None => write!(f, "MARKREAD {}", target),
+            },
+            IrcCommand::Redact(target, msgid, reason) => match reason {
+                Some(reason) => write!(f, "REDACT {} {} :{}", target, msgid, reason),
+                None => write!(f, "REDACT {} {}", target, msgid),
+            },
+            IrcCommand::Rename(old, new, reason) => match reason {
+                Some(reason) => write!(f, "RENAME {} {} :{}", old, new, reason),
+                None => write!(f, "RENAME {} {}", old, new),
+            },
+            IrcCommand::Relocate(old, new, reason) => match reason {
+                Some(reason) => write!(f, "RELOCATE {} {} :{}", old, new, reason),
+                None => write!(f, "RELOCATE {} {}", old, new),
+            },
+            IrcCommand::Extension(name, params) => {
+                write!(f, "{}", name)?;
+                for param in params {
+                    write!(f, " {}", param)?;
+                }
+                Ok(())
             }
             IrcCommand::Numeric(num, params) => {
                 write!(f, "{:03} {}", num, params.join(" "))
@@ -734,8 +927,48 @@ mod tests {
     #[test]
     fn chathistory_latest_formats_wire_command() {
         assert_eq!(
-            IrcCommand::ChathistoryLatest("#history".into(), 100).to_string(),
+            IrcCommand::ChathistoryLatest("#history".into(), "*".into(), 100).to_string(),
             "CHATHISTORY LATEST #history * 100"
         );
+    }
+
+    #[test]
+    fn parses_nefarious_standard_replies_and_status_messages() {
+        let fail = IrcMessage::parse(
+            ":srv FAIL CHATHISTORY INVALID_TARGET LATEST #secret :No access to target",
+        )
+        .unwrap();
+        assert_eq!(
+            fail.command,
+            IrcCommand::StandardReply {
+                kind: "FAIL".into(),
+                command: "CHATHISTORY".into(),
+                code: "INVALID_TARGET".into(),
+                context: vec!["LATEST".into(), "#secret".into()],
+                description: "No access to target".into(),
+            }
+        );
+
+        let wall = IrcMessage::parse(":alice!u@h WALLHOPS #chat :% staff message").unwrap();
+        assert_eq!(
+            wall.command,
+            IrcCommand::StatusMessage('%', "#chat".into(), "% staff message".into())
+        );
+    }
+
+    #[test]
+    fn preserves_message_identity_tags() {
+        let message = IrcMessage::parse(
+            "@time=2026-09-12T12:00:00.123Z;msgid=42-A;account=alice;draft/oper=netadmin;+reply=prior :a PRIVMSG #c :hi",
+        )
+        .unwrap();
+        assert_eq!(message.get_msgid().as_deref(), Some("42-A"));
+        assert_eq!(
+            message.get_server_time_raw().as_deref(),
+            Some("2026-09-12T12:00:00.123Z")
+        );
+        assert_eq!(message.get_account().as_deref(), Some("alice"));
+        assert_eq!(message.get_oper().as_deref(), Some("netadmin"));
+        assert_eq!(message.get_reply().as_deref(), Some("prior"));
     }
 }

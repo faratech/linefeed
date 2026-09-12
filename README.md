@@ -2,6 +2,9 @@
 
 A lightweight, cross-platform IRC client written in Rust with a native GUI.
 
+See the [Nefarious IRCv3 compatibility matrix](docs/nefarious-compatibility.md)
+for the supported `ircv3.2-upgrade` protocol surface.
+
 ## Features
 
 ### Core
@@ -29,6 +32,8 @@ A lightweight, cross-platform IRC client written in Rust with a native GUI.
 
 ### Messaging
 - Private messages (queries)
+- IRCv3 multiline send/replay, echo reconciliation, replies, reactions, and typing tags
+- Message redaction, read markers, and stable message IDs
 - CTCP support (VERSION, TIME, PING, FINGER, CLIENTINFO)
 - IRC formatting rendering, including mIRC colors and reverse video
 - Outbound message splitting at IRC line-length limits
@@ -58,7 +63,8 @@ A lightweight, cross-platform IRC client written in Rust with a native GUI.
 
 ### Logging
 - Persistent chat history in irssi-compatible format
-- IRCv3 server-backed channel history, including public Nefarious `+H` channels
+- Paged IRCv3 server-backed history, including reconnect catch-up and public Nefarious `+H` channels
+- Historical JOIN/PART/QUIT/KICK/MODE/TOPIC/NICK/REDACT and multiline playback
 - Configurable history line count
 - Automatic log loading on channel join
 
@@ -152,7 +158,14 @@ python3 -m py_compile build.py tools/update-deps.py
 | `/list [pattern]` | List channels matching pattern |
 | `/invite <nick>` | Invite user to current channel |
 | `/knock <channel>` | Request invite to channel |
-| `/history [#channel] [limit]` | Load IRCv3 server history; public `+H` channels do not require joining |
+| `/history [#channel] [limit]` | Load paged IRCv3 server history; public `+H` channels do not require joining |
+| `/history before\|after\|around <target> <ref> [limit]` | Query history relative to a timestamp or msgid |
+| `/history between <target> <ref1> <ref2> [limit]` | Query history between two references |
+| `/history targets <ref1> <ref2> [limit]` | List targets with history in a time range |
+| `/markread [target] [timestamp=<time>\|*]` | Get or update an IRCv3 read marker |
+| `/redact [target] <msgid> [reason]` | Redact a message by IRCv3 message ID |
+| `/rename <#new-channel> [reason]` | Rename the current channel |
+| `/relocate <#new-channel> [reason]` | Relocate the current channel |
 
 ### Messaging
 | Command | Description |
@@ -164,11 +177,16 @@ python3 -m py_compile build.py tools/update-deps.py
 | `/amsg <text>` | Message all joined channels |
 | `/ame <action>` | Action to all joined channels |
 | `/onotice <text>` | Notice to channel operators |
+| `/reply <msgid> <text>` | Reply to a message using its IRCv3 ID |
+| `/react <msgid> <reaction>` | React to a message |
+| `/typing active\|paused\|done` | Send an IRCv3 typing state |
+| `/label <label> <IRC command>` | Send a command using IRCv3 labeled-response |
 
 ### User Management
 | Command | Description |
 |---------|-------------|
 | `/nick <newnick>` | Change your nickname |
+| `/setname <real name>` | Change your IRCv3 real name |
 | `/whois <nick>` | Get user information |
 | `/whowas <nick>` | Get info on offline user |
 | `/who <mask>` | Query matching users |
@@ -228,6 +246,21 @@ python3 -m py_compile build.py tools/update-deps.py
 | `/monitor l` | List monitored nicks |
 | `/monitor c` | Clear monitor list |
 | `/monitor s` | Show online monitored nicks |
+
+### Nefarious IRCv3 Extensions
+| Command | Description |
+|---------|-------------|
+| `/bouncer <subcommand> ...` | Manage Nefarious bouncer sessions and settings |
+| `/persistence <subcommand> ...` | Manage persistence, replay, and profiles |
+| `/metadata <subcommand> ...` | Query, set, clear, and subscribe to metadata |
+| `/webpush <subcommand> ...` | Register or remove a web push endpoint |
+| `/register <account> <email\|*> <password>` | Register an account |
+| `/verify <account> <code>` | Verify an account when supported by server policy |
+| `/token servicelist\|generate\|validate ...` | Use Nefarious external-service auth tokens |
+
+The Connect and Automation settings include pre-connect away status and a
+Nefarious persistence profile. These are sent during registration, before
+`CAP END`, as required by the corresponding drafts.
 
 ### Utility
 | Command | Description |

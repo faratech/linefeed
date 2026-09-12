@@ -2,8 +2,8 @@
 
 use super::helpers::days_to_ymd;
 use super::types::ChatMessage;
-use std::fs::{self, File, OpenOptions};
 use std::cell::Cell;
+use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::PathBuf;
 
@@ -308,8 +308,7 @@ impl LogManager {
             // truncate history at that point (irssi logs carry raw wire bytes).
             if file.read_to_string(&mut raw).is_err() {
                 let mut bytes = Vec::with_capacity(file_size as usize);
-                if file.seek(SeekFrom::Start(0)).is_err() || file.read_to_end(&mut bytes).is_err()
-                {
+                if file.seek(SeekFrom::Start(0)).is_err() || file.read_to_end(&mut bytes).is_err() {
                     return Vec::new();
                 }
                 raw = String::from_utf8_lossy(&bytes).into_owned();
@@ -486,6 +485,11 @@ fn parse_log_line(line: &str) -> Option<ChatMessage> {
         // System message
         Some(ChatMessage {
             timestamp,
+            server_time: None,
+            msgid: None,
+            account: None,
+            oper: None,
+            reply_to: None,
             sender: "*".to_string(),
             content: system_rest.to_string(),
             is_action: false,
@@ -501,6 +505,11 @@ fn parse_log_line(line: &str) -> Option<ChatMessage> {
         if action_parts.len() >= 2 {
             Some(ChatMessage {
                 timestamp,
+                server_time: None,
+                msgid: None,
+                account: None,
+                oper: None,
+                reply_to: None,
                 sender: action_parts[0].to_string(),
                 content: action_parts[1].to_string(),
                 is_action: true,
@@ -520,6 +529,11 @@ fn parse_log_line(line: &str) -> Option<ChatMessage> {
             let content = rest[end + 1..].trim_start();
             Some(ChatMessage {
                 timestamp,
+                server_time: None,
+                msgid: None,
+                account: None,
+                oper: None,
+                reply_to: None,
                 sender: nick.to_string(),
                 content: content.to_string(),
                 is_action: false,
@@ -636,6 +650,11 @@ mod tests {
     fn msg(ts: &str, sender: &str, content: &str, system: bool, action: bool) -> ChatMessage {
         ChatMessage {
             timestamp: ts.to_string(),
+            server_time: None,
+            msgid: None,
+            account: None,
+            oper: None,
+            reply_to: None,
             sender: sender.to_string(),
             content: content.to_string(),
             is_action: action,

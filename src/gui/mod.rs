@@ -9,7 +9,7 @@ use egui::{Color32, RichText, ScrollArea, TextEdit};
 use std::collections::{HashMap, VecDeque};
 use tokio::sync::mpsc;
 
-use crate::irc::client::ServerConfig;
+use crate::irc::client::{DESIRED_CAPS, ServerConfig};
 use crate::irc::numerics::*;
 use crate::irc::{IrcCommand, IrcMessage};
 use formatting::{nick_color, render_irc_text, render_segments};
@@ -45,9 +45,52 @@ struct SessionConfig {
     set_invisible: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HistoryPlacement {
+    Prepend,
+    Append,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HistoryDirection {
+    Before,
+    After,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PendingHistoryRequest {
+    placement: HistoryPlacement,
+    direction: HistoryDirection,
+    remaining: usize,
+    loaded: usize,
+    page_limit: usize,
+}
+
 struct ChatHistoryBatch {
     target: String,
     messages: Vec<ChatMessage>,
+    request: PendingHistoryRequest,
+    complete: bool,
+    partial: bool,
+}
+
+struct MultilineBatch {
+    target: String,
+    sender: String,
+    content: String,
+    has_lines: bool,
+    is_notice: bool,
+    parent_history: Option<String>,
+    server_time: Option<String>,
+    msgid: Option<String>,
+    account: Option<String>,
+    oper: Option<String>,
+    reply_to: Option<String>,
+}
+
+struct AuthtokenBatch {
+    service: String,
+    token: String,
 }
 
 impl SessionConfig {
@@ -89,6 +132,7 @@ const COMMAND_COMPLETIONS: &[&str] = &[
     "/away",
     "/back",
     "/ban",
+    "/bouncer",
     "/botserv",
     "/chanserv",
     "/clear",
@@ -113,12 +157,15 @@ const COMMAND_COMPLETIONS: &[&str] = &[
     "/join",
     "/kick",
     "/kickban",
+    "/label",
     "/knock",
     "/lastlog",
     "/links",
     "/list",
     "/lusers",
     "/me",
+    "/markread",
+    "/metadata",
     "/memoserv",
     "/mode",
     "/monitor",
@@ -132,17 +179,25 @@ const COMMAND_COMPLETIONS: &[&str] = &[
     "/op",
     "/operserv",
     "/part",
+    "/persistence",
     "/perform",
     "/ping",
     "/query",
     "/quote",
     "/quit",
     "/raw",
+    "/react",
+    "/redact",
+    "/register",
+    "/relocate",
+    "/rename",
     "/reconnect",
     "/rejoin",
+    "/reply",
     "/say",
     "/search",
     "/server",
+    "/setname",
     "/settings",
     "/silence",
     "/slap",
@@ -150,12 +205,16 @@ const COMMAND_COMPLETIONS: &[&str] = &[
     "/sversion",
     "/time",
     "/topic",
+    "/token",
     "/trace",
+    "/typing",
     "/umode",
     "/unban",
     "/unignore",
     "/userhost",
     "/version",
+    "/verify",
+    "/webpush",
     "/voice",
     "/wallops",
     "/who",
@@ -278,6 +337,8 @@ pub struct IrcApp {
 
     // Auto-perform commands (newline-separated)
     pub auto_perform: String,
+    pub pre_away_message: String,
+    pub persistence_profile: String,
 
     // Pending auto-perform (to execute after connect)
     pub pending_auto_perform: Option<Vec<String>>,
@@ -327,9 +388,14 @@ pub struct IrcApp {
 
     // Server-advertised protocol support
     pub network_support: NetworkSupport,
+    enabled_caps: std::collections::HashSet<String>,
     chathistory_enabled: bool,
     chathistory_limit: Option<usize>,
     chathistory_batches: HashMap<String, ChatHistoryBatch>,
+    batch_parents: HashMap<String, String>,
+    multiline_batches: HashMap<String, MultilineBatch>,
+    authtoken_batches: HashMap<String, AuthtokenBatch>,
+    pending_history_requests: HashMap<String, VecDeque<PendingHistoryRequest>>,
 
     // Cached lowercase versions for efficient comparison (updated when source changes)
     my_nick_lower: String,
@@ -474,6 +540,8 @@ impl IrcApp {
             ignore_list: settings.ignore_list,
             server_favorites: settings.server_favorites,
             auto_perform: settings.auto_perform,
+            pre_away_message: settings.pre_away_message,
+            persistence_profile: settings.persistence_profile,
             pending_auto_perform: None,
 
             // Server favorites UI state
@@ -510,9 +578,14 @@ impl IrcApp {
             // Highlights
             highlight_words: settings.highlight_words.clone(),
             network_support,
+            enabled_caps: std::collections::HashSet::new(),
             chathistory_enabled: false,
             chathistory_limit: None,
             chathistory_batches: HashMap::new(),
+            batch_parents: HashMap::new(),
+            multiline_batches: HashMap::new(),
+            authtoken_batches: HashMap::new(),
+            pending_history_requests: HashMap::new(),
 
             // Reconnect settings
             reconnect_delay_secs: settings.reconnect_delay_secs,
@@ -565,6 +638,8 @@ impl IrcApp {
             ignore_list: self.ignore_list.clone(),
             server_favorites: self.server_favorites.clone(),
             auto_perform: self.auto_perform.clone(),
+            pre_away_message: self.pre_away_message.clone(),
+            persistence_profile: self.persistence_profile.clone(),
             auto_away_enabled: self.auto_away_enabled,
             auto_away_minutes: self.auto_away_minutes,
             auto_away_message: self.auto_away_message.clone(),
@@ -816,6 +891,22 @@ impl IrcApp {
         self.network_support.is_channel(name)
     }
 
+    fn strip_status_prefix<'a>(&self, target: &'a str) -> &'a str {
+        if self.is_channel_name(target) {
+            return target;
+        }
+        let mut chars = target.char_indices();
+        let Some((_, prefix)) = chars.next() else {
+            return target;
+        };
+        let rest = &target[chars.next().map_or(target.len(), |(index, _)| index)..];
+        if self.network_support.status_prefixes.contains(prefix) && self.is_channel_name(rest) {
+            rest
+        } else {
+            target
+        }
+    }
+
     pub fn normalize_channel_name(&self, name: &str) -> String {
         if self.is_channel_name(name) {
             name.to_string()
@@ -882,6 +973,34 @@ impl IrcApp {
             .is_some_and(|current| self.identifiers_equal(current, target))
     }
 
+    fn mark_target_read(&mut self, target: &str) {
+        if !self.connected || !self.enabled_caps.contains("draft/read-marker") {
+            return;
+        }
+        let Some(key) = self.channel_key(target) else {
+            return;
+        };
+        let timestamp = self.channels.get(&key).and_then(|channel| {
+            channel
+                .messages
+                .iter()
+                .rev()
+                .find_map(|message| message.server_time.clone())
+        });
+        let Some(timestamp) = timestamp else {
+            return;
+        };
+        let marker = format!("timestamp={timestamp}");
+        if self.channels[&key].read_marker.as_deref() == Some(marker.as_str()) {
+            return;
+        }
+        if self.send_command(IrcCommand::Markread(key.clone(), Some(marker.clone())))
+            && let Some(channel) = self.channels.get_mut(&key)
+        {
+            channel.read_marker = Some(marker);
+        }
+    }
+
     fn mark_channel_tabs_unjoined(&mut self) {
         for channel in self.channels.values_mut() {
             channel.joined = false;
@@ -920,58 +1039,202 @@ impl IrcApp {
 
     fn reset_connection_support(&mut self) {
         self.network_support = NetworkSupport::default();
+        self.enabled_caps.clear();
         self.chathistory_enabled = false;
         self.chathistory_limit = None;
         self.chathistory_batches.clear();
+        self.batch_parents.clear();
+        self.multiline_batches.clear();
+        self.authtoken_batches.clear();
+        self.pending_history_requests.clear();
         self.nick_retry_attempts = 0;
+    }
+
+    fn request_capabilities(&mut self, caps: Vec<String>) {
+        const CAP_REQ_OVERHEAD: usize = "CAP REQ :".len();
+        let mut chunk: Vec<String> = Vec::new();
+        let mut chunk_len = CAP_REQ_OVERHEAD;
+        for cap in caps {
+            let added = usize::from(!chunk.is_empty()) + cap.len();
+            if chunk_len + added > IRC_MAX_LINE_BYTES && !chunk.is_empty() {
+                self.send_command(IrcCommand::Cap(
+                    String::new(),
+                    "REQ".to_string(),
+                    vec![chunk.join(" ")],
+                ));
+                chunk.clear();
+                chunk_len = CAP_REQ_OVERHEAD;
+            }
+            chunk_len += usize::from(!chunk.is_empty()) + cap.len();
+            chunk.push(cap);
+        }
+        if !chunk.is_empty() {
+            self.send_command(IrcCommand::Cap(
+                String::new(),
+                "REQ".to_string(),
+                vec![chunk.join(" ")],
+            ));
+        }
     }
 
     fn handle_cap_message(&mut self, subcommand: &str, params: &[String]) {
         let Some(caps) = params.last() else {
             return;
         };
+        let mut newly_available = Vec::new();
         for raw_token in caps.split_whitespace() {
             let removing = raw_token.starts_with('-');
             let token = raw_token.trim_start_matches(['-', '~', '=']);
             let (name, value) = token
                 .split_once('=')
                 .map_or((token, None), |(name, value)| (name, Some(value)));
-            if !name.eq_ignore_ascii_case("draft/chathistory") {
-                continue;
-            }
+            let canonical_name = name.to_ascii_lowercase();
 
-            if let Some(value) = value {
-                self.chathistory_limit = value.split(',').find_map(|item| {
-                    item.strip_prefix("limit=")
-                        .and_then(|limit| limit.parse::<usize>().ok())
-                        .filter(|limit| *limit > 0)
-                });
+            if subcommand.eq_ignore_ascii_case("NEW")
+                && DESIRED_CAPS.contains(&canonical_name.as_str())
+                && !self.enabled_caps.contains(&canonical_name)
+            {
+                newly_available.push(canonical_name.clone());
             }
 
             if subcommand.eq_ignore_ascii_case("ACK") {
-                self.chathistory_enabled = !removing;
+                if removing {
+                    self.enabled_caps.remove(&canonical_name);
+                } else {
+                    self.enabled_caps.insert(canonical_name.clone());
+                }
             } else if subcommand.eq_ignore_ascii_case("DEL")
                 || subcommand.eq_ignore_ascii_case("NAK")
             {
-                self.chathistory_enabled = false;
+                self.enabled_caps.remove(&canonical_name);
             }
+
+            if name.eq_ignore_ascii_case("draft/chathistory") {
+                if let Some(value) = value {
+                    self.chathistory_limit = value
+                        .parse::<usize>()
+                        .ok()
+                        .filter(|limit| *limit > 0)
+                        .or_else(|| {
+                            value.split(',').find_map(|item| {
+                                item.strip_prefix("limit=")
+                                    .and_then(|limit| limit.parse::<usize>().ok())
+                                    .filter(|limit| *limit > 0)
+                            })
+                        });
+                }
+
+                if subcommand.eq_ignore_ascii_case("ACK") {
+                    self.chathistory_enabled = !removing;
+                } else if subcommand.eq_ignore_ascii_case("DEL")
+                    || subcommand.eq_ignore_ascii_case("NAK")
+                {
+                    self.chathistory_enabled = false;
+                }
+            } else if name.eq_ignore_ascii_case("draft/multiline")
+                && let Some(value) = value
+            {
+                for item in value.split(',') {
+                    if let Some(value) = item.strip_prefix("max-bytes=") {
+                        self.network_support.multiline_max_bytes = value.parse().ok();
+                    } else if let Some(value) = item.strip_prefix("max-lines=") {
+                        self.network_support.multiline_max_lines = value.parse().ok();
+                    }
+                }
+            }
+        }
+        if !newly_available.is_empty() {
+            self.request_capabilities(newly_available);
         }
     }
 
-    fn history_request_limit(&self, requested: Option<usize>) -> usize {
-        let requested = requested.unwrap_or(self.logging_history_lines);
+    fn total_history_limit(&self, requested: Option<usize>) -> usize {
         requested
-            .min(self.chathistory_limit.unwrap_or(100))
+            .unwrap_or(self.logging_history_lines)
             .min(self.max_scrollback)
             .max(1)
     }
 
-    fn request_latest_history(&mut self, target: &str, requested: Option<usize>) -> bool {
+    fn history_page_limit(&self, remaining: usize) -> usize {
+        remaining.min(self.chathistory_limit.unwrap_or(100)).max(1)
+    }
+
+    fn message_reference(message: &ChatMessage) -> Option<String> {
+        message
+            .msgid
+            .as_ref()
+            .map(|msgid| format!("msgid={msgid}"))
+            .or_else(|| {
+                message
+                    .server_time
+                    .as_ref()
+                    .map(|time| format!("timestamp={time}"))
+            })
+    }
+
+    fn queue_history_request(
+        &mut self,
+        target: &str,
+        command: IrcCommand,
+        request: PendingHistoryRequest,
+    ) -> bool {
+        if !self.send_command(command) {
+            return false;
+        }
+        self.pending_history_requests
+            .entry(self.network_support.canonicalize(target))
+            .or_default()
+            .push_back(request);
+        true
+    }
+
+    fn request_latest_history(
+        &mut self,
+        target: &str,
+        requested: Option<usize>,
+        placement: HistoryPlacement,
+    ) -> bool {
         if !self.chathistory_enabled {
             return false;
         }
-        let limit = self.history_request_limit(requested);
-        self.send_command(IrcCommand::ChathistoryLatest(target.to_string(), limit))
+        let total = self.total_history_limit(requested);
+        let limit = self.history_page_limit(total);
+        let reference = if placement == HistoryPlacement::Append {
+            self.channel_key(target)
+                .and_then(|key| self.channels.get(&key))
+                .and_then(|channel| {
+                    channel
+                        .messages
+                        .iter()
+                        .rev()
+                        .find_map(Self::message_reference)
+                })
+                .unwrap_or_else(|| "*".to_string())
+        } else {
+            "*".to_string()
+        };
+        let (direction, command) = if placement == HistoryPlacement::Append && reference != "*" {
+            (
+                HistoryDirection::After,
+                IrcCommand::ChathistoryAfter(target.to_string(), reference, limit),
+            )
+        } else {
+            (
+                HistoryDirection::Before,
+                IrcCommand::ChathistoryLatest(target.to_string(), reference, limit),
+            )
+        };
+        self.queue_history_request(
+            target,
+            command,
+            PendingHistoryRequest {
+                placement,
+                direction,
+                remaining: total,
+                loaded: 0,
+                page_limit: limit,
+            },
+        )
     }
 
     fn prepare_history_target(&mut self, target: &str) {
@@ -994,6 +1257,227 @@ impl IrcApp {
         }
     }
 
+    fn containing_history_batch(&self, batch_id: &str) -> Option<String> {
+        let mut current = batch_id;
+        for _ in 0..32 {
+            if self.chathistory_batches.contains_key(current) {
+                return Some(current.to_string());
+            }
+            current = self.batch_parents.get(current)?;
+        }
+        None
+    }
+
+    fn collect_multiline_line(&mut self, msg: &IrcMessage) -> bool {
+        let Some(batch_id) = msg.get_batch() else {
+            return false;
+        };
+        let Some(batch) = self.multiline_batches.get_mut(&batch_id) else {
+            return false;
+        };
+        let (content, is_notice) = match &msg.command {
+            IrcCommand::Privmsg(_, content) => (content, false),
+            IrcCommand::Notice(_, content) => (content, true),
+            _ => return false,
+        };
+        let concat = msg.get_tag("draft/multiline-concat").is_some();
+        if batch.has_lines && !concat {
+            batch.content.push('\n');
+        }
+        batch.content.push_str(content);
+        batch.has_lines = true;
+        batch.is_notice = is_notice;
+        true
+    }
+
+    fn collect_authtoken_line(&mut self, msg: &IrcMessage) -> bool {
+        let Some(batch_id) = msg.get_batch() else {
+            return false;
+        };
+        let Some(batch) = self.authtoken_batches.get_mut(&batch_id) else {
+            return false;
+        };
+        let IrcCommand::Extension(name, params) = &msg.command else {
+            return false;
+        };
+        if !name.eq_ignore_ascii_case("TOKEN")
+            || !params
+                .first()
+                .is_some_and(|subcommand| subcommand.eq_ignore_ascii_case("GENERATE"))
+        {
+            return false;
+        }
+        if let Some(chunk) = params.get(2) {
+            batch.token.push_str(chunk);
+        }
+        true
+    }
+
+    fn finish_authtoken_batch(&mut self, batch_id: &str) {
+        let Some(batch) = self.authtoken_batches.remove(batch_id) else {
+            return;
+        };
+        if batch.token.is_empty() {
+            return;
+        }
+        self.add_server_message(
+            ChatMessage::system_fmt(
+                &format!("[TOKEN GENERATE {}] {}", batch.service, batch.token),
+                &self.timestamp_format,
+            )
+            .without_logging(),
+        );
+    }
+
+    fn finish_multiline_batch(&mut self, batch_id: &str) {
+        let Some(batch) = self.multiline_batches.remove(batch_id) else {
+            return;
+        };
+        let is_action = batch.content.starts_with("\x01ACTION ") && batch.content.ends_with('\x01');
+        let content = if is_action {
+            batch
+                .content
+                .strip_prefix("\x01ACTION ")
+                .and_then(|content| content.strip_suffix('\x01'))
+                .unwrap_or(&batch.content)
+        } else {
+            &batch.content
+        };
+        let message = if batch.is_notice {
+            ChatMessage::system_fmt(
+                &format!("-{}- {}", batch.sender, content),
+                &self.timestamp_format,
+            )
+        } else if is_action {
+            ChatMessage::action_fmt(&batch.sender, content, &self.timestamp_format)
+        } else {
+            ChatMessage::new_fmt(&batch.sender, content, &self.timestamp_format)
+        }
+        .with_irc_metadata(batch.server_time, batch.msgid, batch.account)
+        .with_oper(batch.oper)
+        .with_reply_to(batch.reply_to);
+
+        if let Some(history_batch) = batch.parent_history {
+            self.queue_chathistory_message(&history_batch, message.without_logging());
+            return;
+        }
+
+        let target = self.strip_status_prefix(&batch.target).to_string();
+        let target =
+            if !self.is_channel_name(&target) && self.identifiers_equal(&target, &self.my_nick) {
+                batch.sender
+            } else {
+                target
+            };
+        if !self.merge_server_echo(&target, &message) {
+            self.add_message_to_channel(&target, message);
+        }
+    }
+
+    /// Reconcile an `echo-message` response with the optimistic local row.
+    /// The server supplies the authoritative timestamp, msgid, and account;
+    /// retaining one row avoids duplicate messages while making that identity
+    /// available to REDACT, reconnect history cursors, and MARKREAD.
+    fn merge_server_echo(&mut self, target: &str, echoed: &ChatMessage) -> bool {
+        if !self.enabled_caps.contains("echo-message")
+            || !self.identifiers_equal(&echoed.sender, &self.my_nick)
+            || echoed.is_system
+        {
+            return false;
+        }
+        let Some(channel) = self.channel_mut(target) else {
+            return false;
+        };
+        let Some(local) = channel
+            .messages
+            .iter_mut()
+            .rev()
+            .take(32)
+            .find(|candidate| {
+                !candidate.is_system
+                    && candidate.msgid.is_none()
+                    && candidate.server_time.is_none()
+                    && candidate.sender.eq_ignore_ascii_case(&echoed.sender)
+                    && candidate.content == echoed.content
+                    && candidate.is_action == echoed.is_action
+            })
+        else {
+            return false;
+        };
+        local.timestamp.clone_from(&echoed.timestamp);
+        local.server_time.clone_from(&echoed.server_time);
+        local.msgid.clone_from(&echoed.msgid);
+        local.account.clone_from(&echoed.account);
+        local.oper.clone_from(&echoed.oper);
+        local.reply_to.clone_from(&echoed.reply_to);
+        true
+    }
+
+    fn history_event_message(&self, msg: &IrcMessage) -> Option<ChatMessage> {
+        let sender = msg
+            .get_sender_nick()
+            .unwrap_or_else(|| "Server".to_string());
+        let content = match &msg.command {
+            IrcCommand::Join(channel, _, account, _) => account.as_ref().map_or_else(
+                || format!("{sender} joined {channel}"),
+                |account| format!("{sender} [{account}] joined {channel}"),
+            ),
+            IrcCommand::Part(channel, reason) => format!(
+                "{sender} left {channel}{}",
+                reason
+                    .as_ref()
+                    .map(|reason| format!(": {reason}"))
+                    .unwrap_or_default()
+            ),
+            IrcCommand::Quit(reason) => format!(
+                "{sender} quit{}",
+                reason
+                    .as_ref()
+                    .map(|reason| format!(": {reason}"))
+                    .unwrap_or_default()
+            ),
+            IrcCommand::Kick(channel, nick, reason) => format!(
+                "{nick} was kicked from {channel} by {sender}{}",
+                reason
+                    .as_ref()
+                    .map(|reason| format!(": {reason}"))
+                    .unwrap_or_default()
+            ),
+            IrcCommand::Mode(target, modes, params) => format!(
+                "{sender} set mode {} {} {}",
+                target,
+                modes.as_deref().unwrap_or_default(),
+                params.join(" ")
+            ),
+            IrcCommand::Topic(channel, topic) => format!(
+                "{sender} changed the topic in {channel} to: {}",
+                topic.as_deref().unwrap_or_default()
+            ),
+            IrcCommand::Nick(new_nick) => format!("{sender} is now known as {new_nick}"),
+            IrcCommand::Setname(realname) => {
+                format!("{sender} changed their realname to {realname}")
+            }
+            IrcCommand::Redact(target, _, reason) => format!(
+                "A message in {target} was redacted{}",
+                reason
+                    .as_deref()
+                    .filter(|reason| !reason.is_empty())
+                    .map(|reason| format!(": {reason}"))
+                    .unwrap_or_default()
+            ),
+            _ => return None,
+        };
+        Some(
+            ChatMessage::system_fmt(&content, &self.timestamp_format)
+                .with_irc_metadata(
+                    msg.get_server_time_raw(),
+                    msg.get_msgid(),
+                    msg.get_account(),
+                )
+                .without_logging(),
+        )
+    }
+
     fn finish_chathistory_batch(&mut self, batch_id: &str) {
         let Some(batch) = self.chathistory_batches.remove(batch_id) else {
             return;
@@ -1006,23 +1490,83 @@ impl IrcApp {
             self.channels.insert(batch.target.clone(), channel);
             batch.target.clone()
         };
-        let count = batch.messages.len();
-        let mut history = VecDeque::with_capacity(count.saturating_add(1));
-        let status = match count {
-            0 => "--- No server history available ---".to_string(),
-            1 => "--- 1 line of server history loaded ---".to_string(),
-            _ => format!("--- {count} lines of server history loaded ---"),
+        let mut messages = batch.messages;
+        let page_count = messages.len();
+        let remaining = batch.request.remaining.saturating_sub(page_count);
+        let loaded = batch.request.loaded.saturating_add(page_count);
+        let complete = batch.complete || page_count < batch.request.page_limit;
+        let next_reference = match batch.request.direction {
+            HistoryDirection::Before => messages.first().and_then(Self::message_reference),
+            HistoryDirection::After => messages.last().and_then(Self::message_reference),
         };
-        history
-            .push_back(ChatMessage::system_fmt(&status, &self.timestamp_format).without_logging());
-        history.extend(batch.messages);
+        let next = if !batch.partial && !complete && remaining > 0 {
+            next_reference.map(|reference| {
+                let limit = self.history_page_limit(remaining);
+                let command = match batch.request.direction {
+                    HistoryDirection::Before => {
+                        IrcCommand::ChathistoryBefore(batch.target.clone(), reference, limit)
+                    }
+                    HistoryDirection::After => {
+                        IrcCommand::ChathistoryAfter(batch.target.clone(), reference, limit)
+                    }
+                };
+                (
+                    command,
+                    PendingHistoryRequest {
+                        remaining,
+                        loaded,
+                        page_limit: limit,
+                        ..batch.request
+                    },
+                )
+            })
+        } else {
+            None
+        };
+        let mut history = VecDeque::with_capacity(page_count.saturating_add(1));
+        if next.is_none() {
+            let mut status = match loaded {
+                0 => "--- No server history available ---".to_string(),
+                1 => "--- 1 line of server history loaded ---".to_string(),
+                count => format!("--- {count} lines of server history loaded ---"),
+            };
+            if batch.partial {
+                status.push_str(" (server reports a partial result)");
+            } else if !complete && remaining > 0 {
+                status.push_str(" (more history is available)");
+            }
+            history.push_back(
+                ChatMessage::system_fmt(&status, &self.timestamp_format).without_logging(),
+            );
+        }
+        history.extend(messages.drain(..));
 
         if let Some(channel) = self.channels.get_mut(&key) {
-            history.append(&mut channel.messages);
-            channel.messages = history;
+            let existing_ids: std::collections::HashSet<String> = channel
+                .messages
+                .iter()
+                .filter_map(|message| message.msgid.clone())
+                .collect();
+            history.retain(|message| {
+                message
+                    .msgid
+                    .as_ref()
+                    .is_none_or(|msgid| !existing_ids.contains(msgid))
+            });
+            if batch.request.placement == HistoryPlacement::Prepend {
+                history.append(&mut channel.messages);
+                channel.messages = history;
+            } else {
+                channel.messages.append(&mut history);
+            }
             while channel.messages.len() > self.max_scrollback {
                 channel.messages.pop_front();
             }
+        }
+        if let Some((command, request)) = next {
+            self.queue_history_request(&batch.target, command, request);
+        } else if self.current_target_is(&batch.target) && self.window_focused {
+            self.mark_target_read(&batch.target);
         }
     }
 
@@ -1120,6 +1664,8 @@ impl IrcApp {
         }
         self.auto_join_channels = fav.auto_join.clone();
         self.auto_perform = fav.auto_perform.clone();
+        self.pre_away_message = fav.pre_away_message.clone();
+        self.persistence_profile = fav.persistence_profile.clone();
         self.sasl_username = fav.sasl_username.clone();
         self.sasl_password = fav.sasl_password.clone();
         // Restore the previously-dropped connection details. username/realname are
@@ -1172,11 +1718,13 @@ fn ident_contains(haystack_key: &str, needle_key: &str) -> bool {
 /// width and the two font sizes used by message rows. A change in any of them
 /// invalidates all cached row heights.
 fn row_layout_key(ui: &egui::Ui, content_width: f32) -> u64 {
-    let body = ui.style().text_styles[&egui::TextStyle::Body].size.to_bits();
-    let mono = ui.style().text_styles[&egui::TextStyle::Monospace].size.to_bits();
-    (content_width.to_bits() as u64)
-        ^ (body as u64).rotate_left(32)
-        ^ (mono as u64).rotate_left(17)
+    let body = ui.style().text_styles[&egui::TextStyle::Body]
+        .size
+        .to_bits();
+    let mono = ui.style().text_styles[&egui::TextStyle::Monospace]
+        .size
+        .to_bits();
+    (content_width.to_bits() as u64) ^ (body as u64).rotate_left(32) ^ (mono as u64).rotate_left(17)
 }
 
 /// How far below the scroll area's clip rect scratch measurement rows are
@@ -1214,12 +1762,14 @@ fn row_height(
         ui.max_rect().left(),
         ui.max_rect().bottom() + SCRATCH_MEASURE_OFFSET,
     );
-    let scratch_rect =
-        egui::Rect::from_min_size(scratch_origin, egui::vec2(content_width, 0.0));
+    let scratch_rect = egui::Rect::from_min_size(scratch_origin, egui::vec2(content_width, 0.0));
     let mut scratch = ui.new_child(egui::UiBuilder::new().max_rect(scratch_rect));
     draw_chat_row(&mut scratch, msg, my_nick);
     let h = scratch.min_rect().height();
-    msg.row_height.set(RowHeightEntry { key: layout_key, height: h });
+    msg.row_height.set(RowHeightEntry {
+        key: layout_key,
+        height: h,
+    });
     h
 }
 
@@ -1233,7 +1783,11 @@ fn draw_chat_row(ui: &mut egui::Ui, msg: &ChatMessage, my_nick: &str) {
                 ui.label(RichText::new("*").color(Color32::YELLOW).strong());
             }
 
-            ui.label(RichText::new(&msg.timestamp).color(Color32::GRAY).monospace());
+            ui.label(
+                RichText::new(&msg.timestamp)
+                    .color(Color32::GRAY)
+                    .monospace(),
+            );
 
             if msg.is_system {
                 render_segments(ui, msg.render_segments(), Color32::GRAY);
@@ -1245,15 +1799,38 @@ fn draw_chat_row(ui: &mut egui::Ui, msg: &ChatMessage, my_nick: &str) {
                 } else {
                     Color32::from_rgb(150, 100, 200)
                 };
-                ui.label(RichText::new(format!("* {} ", msg.sender)).color(action_color));
+                let sender = msg.oper.as_ref().map_or_else(
+                    || msg.sender.clone(),
+                    |oper| format!("{} [{}]", msg.sender, oper),
+                );
+                ui.label(RichText::new(format!("* {sender} ")).color(action_color));
+                if let Some(reply_to) = &msg.reply_to {
+                    ui.label(
+                        RichText::new(format!("↪ {reply_to}"))
+                            .small()
+                            .color(Color32::GRAY),
+                    );
+                }
                 render_segments(ui, msg.render_segments(), action_color);
             } else {
+                let sender = msg.oper.as_ref().map_or_else(
+                    || msg.sender.clone(),
+                    |oper| format!("{} [{}]", msg.sender, oper),
+                );
                 let nick_style = if is_own_msg {
-                    RichText::new(format!("<{}>", msg.sender)).color(Color32::from_rgb(100, 200, 255))
+                    RichText::new(format!("<{sender}>")).color(Color32::from_rgb(100, 200, 255))
                 } else {
-                    RichText::new(format!("<{}>", msg.sender)).color(nick_color(&msg.sender))
+                    RichText::new(format!("<{sender}>")).color(nick_color(&msg.sender))
                 };
                 ui.label(nick_style);
+
+                if let Some(reply_to) = &msg.reply_to {
+                    ui.label(
+                        RichText::new(format!("↪ {reply_to}"))
+                            .small()
+                            .color(Color32::GRAY),
+                    );
+                }
 
                 let text_color = if msg.is_highlight {
                     Color32::YELLOW
@@ -1319,6 +1896,18 @@ impl IrcApp {
             return Err("Server host cannot be empty".to_string());
         }
         let port = commands::parse_server_port(&self.server_port)?;
+        if self.pre_away_message.contains(['\r', '\n']) || self.pre_away_message.len() > 300 {
+            return Err("Pre-away message must be one IRC line of at most 300 bytes".to_string());
+        }
+        let persistence_profile = self.persistence_profile.trim();
+        if !persistence_profile.is_empty()
+            && (persistence_profile.len() > 32
+                || !persistence_profile
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-')))
+        {
+            return Err("Persistence profile must be 1-32 letters, digits, '_' or '-'".to_string());
+        }
 
         Ok(SessionConfig {
             server: ServerConfig {
@@ -1343,6 +1932,16 @@ impl IrcApp {
                     None
                 } else {
                     Some(self.sasl_password.clone())
+                },
+                pre_away_message: if self.pre_away_message.is_empty() {
+                    None
+                } else {
+                    Some(self.pre_away_message.clone())
+                },
+                persistence_profile: if persistence_profile.is_empty() {
+                    None
+                } else {
+                    Some(persistence_profile.to_string())
                 },
             },
             auto_join_channels: self.auto_join_channels.clone(),
@@ -1516,13 +2115,28 @@ impl IrcApp {
     }
 
     pub fn handle_incoming_message(&mut self, msg: IrcMessage) {
-        let _ = msg.get_account();
+        if self.collect_multiline_line(&msg) {
+            self.scroll_to_bottom = true;
+            return;
+        }
+        if self.collect_authtoken_line(&msg) {
+            self.scroll_to_bottom = true;
+            return;
+        }
         let history_batch = msg
             .get_batch()
-            .filter(|batch_id| self.chathistory_batches.contains_key(batch_id));
+            .and_then(|batch_id| self.containing_history_batch(&batch_id));
+        if let Some(batch_id) = history_batch.as_deref()
+            && let Some(event) = self.history_event_message(&msg)
+        {
+            self.queue_chathistory_message(batch_id, event);
+            self.scroll_to_bottom = true;
+            return;
+        }
         match &msg.command {
             IrcCommand::Privmsg(target, content) => {
                 let sender = msg.get_sender_nick().unwrap_or_else(|| "???".to_string());
+                let routed_target = self.strip_status_prefix(target).to_string();
 
                 // Check if sender is ignored
                 if self.is_ignored(&sender, msg.prefix.as_deref()) {
@@ -1545,9 +2159,14 @@ impl IrcApp {
                 let server_time = msg
                     .get_server_time()
                     .map(|epoch| epoch_time_formatted(epoch, &self.timestamp_format));
+                let server_time_raw = msg.get_server_time_raw();
+                let msgid = msg.get_msgid();
+                let account = msg.get_account();
 
                 let fmt = &self.timestamp_format;
-                let chat_msg = if is_action {
+                let chat_msg = if msg.get_tag("+evilnet.github.io/chathistory-gap").is_some() {
+                    ChatMessage::system_fmt(content, fmt).with_server_time(server_time)
+                } else if is_action {
                     let action_text = content
                         .strip_prefix("\x01ACTION ")
                         .and_then(|s| s.strip_suffix('\x01'))
@@ -1564,7 +2183,10 @@ impl IrcApp {
                         .with_server_time(server_time)
                 } else {
                     ChatMessage::new_fmt(&sender, content, fmt).with_server_time(server_time)
-                };
+                }
+                .with_irc_metadata(server_time_raw, msgid, account)
+                .with_oper(msg.get_oper())
+                .with_reply_to(msg.get_reply());
 
                 if let Some(batch_id) = &history_batch {
                     self.queue_chathistory_message(batch_id, chat_msg.without_logging());
@@ -1573,10 +2195,10 @@ impl IrcApp {
                 }
 
                 // Determine target channel/query
-                let is_pm =
-                    !self.is_channel_name(target) && self.identifiers_equal(target, &self.my_nick);
-                let target_name = if self.is_channel_name(target) {
-                    target.clone()
+                let is_pm = !self.is_channel_name(&routed_target)
+                    && self.identifiers_equal(&routed_target, &self.my_nick);
+                let target_name = if self.is_channel_name(&routed_target) {
+                    routed_target
                 } else if is_pm {
                     // Private message to us - use sender as channel
                     sender.clone()
@@ -1610,13 +2232,25 @@ impl IrcApp {
                     );
                 }
 
-                self.add_message_to_channel(&target_name, chat_msg);
+                if !is_from_self || !self.merge_server_echo(&target_name, &chat_msg) {
+                    self.add_message_to_channel(&target_name, chat_msg);
+                }
             }
 
             IrcCommand::Notice(target, content) => {
                 let sender = msg
                     .get_sender_nick()
                     .unwrap_or_else(|| "Server".to_string());
+                let routed_target = self.strip_status_prefix(target).to_string();
+
+                // NOTICE uses a decorated local confirmation row rather than a
+                // normal chat row, so its server echo cannot be merged by
+                // identity. Suppress only our own negotiated echo.
+                if self.enabled_caps.contains("echo-message")
+                    && self.identifiers_equal(&sender, &self.my_nick)
+                {
+                    return;
+                }
 
                 // Check if sender is ignored (but not server notices)
                 if msg.prefix.is_some() && self.is_ignored(&sender, msg.prefix.as_deref()) {
@@ -1633,6 +2267,11 @@ impl IrcApp {
                         &self.timestamp_format,
                     )
                     .with_server_time(server_time)
+                    .with_irc_metadata(
+                        msg.get_server_time_raw(),
+                        msg.get_msgid(),
+                        msg.get_account(),
+                    )
                     .without_logging();
                     self.queue_chathistory_message(batch_id, replayed);
                     self.scroll_to_bottom = true;
@@ -1677,22 +2316,270 @@ impl IrcApp {
                     return;
                 }
 
-                let chat_msg = ChatMessage::system(&format!("-{}- {}", sender, content));
+                let chat_msg = ChatMessage::system(&format!("-{}- {}", sender, content))
+                    .with_irc_metadata(
+                        msg.get_server_time_raw(),
+                        msg.get_msgid(),
+                        msg.get_account(),
+                    );
 
-                if target == "*" || !self.connected {
+                if routed_target == "*" || !self.connected {
                     self.add_server_message(chat_msg);
                 } else {
                     // For private notices (target is our nick), route to sender's window
                     // This handles NickServ, X3, and other service responses
-                    let is_private = !self.is_channel_name(target)
-                        && self.identifiers_equal(target, &self.my_nick);
+                    let is_private = !self.is_channel_name(&routed_target)
+                        && self.identifiers_equal(&routed_target, &self.my_nick);
                     let target_name = if is_private {
                         sender.clone() // Route to sender's query window
                     } else {
-                        target.clone()
+                        routed_target
                     };
                     self.add_message_to_channel(&target_name, chat_msg);
                 }
+            }
+
+            IrcCommand::StatusMessage(status, target, content) => {
+                let sender = msg
+                    .get_sender_nick()
+                    .unwrap_or_else(|| "Server".to_string());
+                let target = self.strip_status_prefix(target).to_string();
+                let label = match status {
+                    '@' => "ops",
+                    '%' => "halfops",
+                    '+' => "voices",
+                    _ => "members",
+                };
+                let chat_msg = ChatMessage::system_fmt(
+                    &format!("-{sender}/{label}- {content}"),
+                    &self.timestamp_format,
+                )
+                .with_irc_metadata(
+                    msg.get_server_time_raw(),
+                    msg.get_msgid(),
+                    msg.get_account(),
+                );
+                self.add_message_to_channel(&target, chat_msg);
+            }
+
+            IrcCommand::Tagmsg(target) => {
+                // Typing notifications are transient UI state; until a typing
+                // indicator is visible, consuming them silently is preferable
+                // to printing protocol noise into the conversation.
+                if let Some(reaction) = msg.get_tag("+draft/react") {
+                    let sender = msg.get_sender_nick().unwrap_or_else(|| "???".to_string());
+                    let reply_to = msg
+                        .get_reply()
+                        .map(|id| format!(" to {id}"))
+                        .unwrap_or_default();
+                    let target = self.strip_status_prefix(target).to_string();
+                    let target = if !self.is_channel_name(&target)
+                        && self.identifiers_equal(&target, &self.my_nick)
+                    {
+                        sender.clone()
+                    } else {
+                        target
+                    };
+                    let reaction_message = ChatMessage::system_fmt(
+                        &format!("{sender} reacted {reaction}{reply_to}"),
+                        &self.timestamp_format,
+                    )
+                    .with_irc_metadata(
+                        msg.get_server_time_raw(),
+                        msg.get_msgid(),
+                        msg.get_account(),
+                    );
+                    if let Some(batch_id) = history_batch.as_deref() {
+                        self.queue_chathistory_message(
+                            batch_id,
+                            reaction_message.without_logging(),
+                        );
+                    } else {
+                        self.add_message_to_channel(&target, reaction_message);
+                    }
+                }
+            }
+
+            IrcCommand::StandardReply {
+                kind,
+                command,
+                code,
+                context,
+                description,
+            } => {
+                let context_text = context.join(" ");
+                let text = if context_text.is_empty() {
+                    format!("[{kind} {command}/{code}] {description}")
+                } else {
+                    format!("[{kind} {command}/{code}] {context_text}: {description}")
+                };
+                let target = context
+                    .iter()
+                    .flat_map(|value| value.split_whitespace())
+                    .find(|value| self.is_channel_name(value))
+                    .map(str::to_string);
+                let message = ChatMessage::system_fmt(&text, &self.timestamp_format)
+                    .with_irc_metadata(msg.get_server_time_raw(), None, None);
+                if let Some(target) = target {
+                    self.add_message_to_channel(&target, message);
+                } else {
+                    self.add_server_message(message);
+                }
+            }
+
+            IrcCommand::Markread(target, timestamp) => {
+                if let Some(key) = self.channel_key(target)
+                    && let Some(channel) = self.channels.get_mut(&key)
+                {
+                    channel.read_marker = timestamp.clone();
+                }
+            }
+
+            IrcCommand::Redact(target, msgid, reason) => {
+                if let Some(key) = self.channel_key(target)
+                    && let Some(channel) = self.channels.get_mut(&key)
+                {
+                    let removed = channel.redact_message(msgid);
+                    let reason = reason
+                        .as_deref()
+                        .filter(|reason| !reason.is_empty())
+                        .map(|reason| format!(": {reason}"))
+                        .unwrap_or_default();
+                    channel.push_trimmed(
+                        ChatMessage::system_fmt(
+                            &if removed {
+                                format!("A message was redacted{reason}")
+                            } else {
+                                format!("Message {msgid} was redacted{reason}")
+                            },
+                            &self.timestamp_format,
+                        )
+                        .without_logging(),
+                        self.max_scrollback,
+                    );
+                }
+            }
+
+            IrcCommand::Rename(old, new, reason) => {
+                if let Some(old_key) = self.channel_key(old)
+                    && let Some(mut channel) = self.channels.remove(&old_key)
+                {
+                    let destination_was_current = self.current_target_is(new);
+                    if let Some(existing_key) = self.channel_key(new)
+                        && let Some(mut existing) = self.channels.remove(&existing_key)
+                    {
+                        // A public-history tab for the destination may already
+                        // exist. Preserve it and deduplicate any overlap before
+                        // turning the renamed live channel into that tab.
+                        while let Some(message) = existing.messages.pop_back() {
+                            let duplicate = message.msgid.as_ref().is_some_and(|msgid| {
+                                channel
+                                    .messages
+                                    .iter()
+                                    .any(|row| row.msgid.as_deref() == Some(msgid.as_str()))
+                            });
+                            if !duplicate {
+                                channel.messages.push_front(message);
+                            }
+                        }
+                        channel.unread = channel.unread.saturating_add(existing.unread);
+                        while channel.messages.len() > self.max_scrollback {
+                            channel.messages.pop_front();
+                        }
+                    }
+                    channel.push_trimmed(
+                        ChatMessage::system_fmt(
+                            &format!(
+                                "Channel renamed from {old} to {new}{}",
+                                reason
+                                    .as_deref()
+                                    .filter(|reason| !reason.is_empty())
+                                    .map(|reason| format!(": {reason}"))
+                                    .unwrap_or_default()
+                            ),
+                            &self.timestamp_format,
+                        ),
+                        self.max_scrollback,
+                    );
+                    if self.current_target_is(&old_key) || destination_was_current {
+                        self.current_channel = Some(new.clone());
+                    }
+                    self.channels.insert(new.clone(), channel);
+                    let old_pending = self.network_support.canonicalize(old);
+                    let new_pending = self.network_support.canonicalize(new);
+                    if let Some(requests) = self.pending_history_requests.remove(&old_pending) {
+                        self.pending_history_requests
+                            .entry(new_pending)
+                            .or_default()
+                            .extend(requests);
+                    }
+                }
+            }
+
+            IrcCommand::Relocate(old, new, reason) => {
+                let reason = reason
+                    .as_deref()
+                    .filter(|reason| !reason.is_empty())
+                    .map(|reason| format!(": {reason}"))
+                    .unwrap_or_default();
+                self.add_message_to_channel(
+                    old,
+                    ChatMessage::system_fmt(
+                        &format!("Channel has moved to {new}{reason}; use /join {new} to follow"),
+                        &self.timestamp_format,
+                    ),
+                );
+            }
+
+            IrcCommand::Setname(realname) => {
+                let sender = msg.get_sender_nick().unwrap_or_else(|| "???".to_string());
+                let notice = ChatMessage::system_fmt(
+                    &format!("{sender} changed their realname to {realname}"),
+                    &self.timestamp_format,
+                );
+                let max = self.max_scrollback;
+                for channel in self.channels.values_mut() {
+                    if channel.has_user(&sender) {
+                        channel.set_user_realname(&sender, Some(realname.clone()));
+                        channel.push_trimmed(notice.clone(), max);
+                    }
+                }
+            }
+
+            IrcCommand::Extension(name, params) => {
+                let text = if name.eq_ignore_ascii_case("TOKEN")
+                    && params
+                        .first()
+                        .is_some_and(|subcommand| subcommand.eq_ignore_ascii_case("SERVICE"))
+                {
+                    let key = params.get(1).map(String::as_str).unwrap_or("?");
+                    let url = params.get(2).map(String::as_str).unwrap_or("");
+                    let description = params.get(3).map(String::as_str).unwrap_or("");
+                    format!("Token service {key} ({url}): {description}")
+                } else if name.eq_ignore_ascii_case("TOKEN")
+                    && params
+                        .first()
+                        .is_some_and(|subcommand| subcommand.eq_ignore_ascii_case("GENERATE"))
+                {
+                    let service = params.get(1).map(String::as_str).unwrap_or("?");
+                    let token = params.get(2).map(String::as_str).unwrap_or("");
+                    format!("[TOKEN GENERATE {service}] {token}")
+                } else {
+                    format!("[{name}] {}", params.join(" "))
+                };
+                self.add_server_message(
+                    ChatMessage::system_fmt(&text, &self.timestamp_format).without_logging(),
+                );
+            }
+
+            IrcCommand::ChathistoryTarget(target, timestamp) => {
+                self.add_server_message(
+                    ChatMessage::system_fmt(
+                        &format!("History target {target}: last activity {timestamp}"),
+                        &self.timestamp_format,
+                    )
+                    .without_logging(),
+                );
             }
 
             IrcCommand::Join(channel, _key, account, realname) => {
@@ -1741,11 +2628,22 @@ impl IrcApp {
                     if let Some(joined_channel) = self.channel_mut(channel) {
                         joined_channel.joined = true;
                     }
+                    if self.enabled_caps.contains("no-implicit-names") {
+                        self.send_command(IrcCommand::Names(Some(channel.clone())));
+                    }
                     self.current_channel = Some(existing_key.unwrap_or_else(|| channel.clone()));
                     let sys_msg = ChatMessage::system(&format!("Now talking in {}", channel));
                     self.add_message_to_channel(channel, sys_msg);
-                    if is_new_channel && self.chathistory_enabled && self.logging_load_history {
-                        self.request_latest_history(channel, None);
+                    if self.chathistory_enabled && self.logging_load_history {
+                        self.request_latest_history(
+                            channel,
+                            None,
+                            if is_new_channel {
+                                HistoryPlacement::Prepend
+                            } else {
+                                HistoryPlacement::Append
+                            },
+                        );
                     }
                 } else {
                     if !self.hide_join_part {
@@ -1771,6 +2669,8 @@ impl IrcApp {
                     }
                     if let Some(ch) = self.channel_mut(channel) {
                         ch.add_user(&sender, UserMode::Normal);
+                        ch.set_user_account(&sender, account.clone());
+                        ch.set_user_realname(&sender, realname.clone());
                     }
                 }
             }
@@ -1909,10 +2809,20 @@ impl IrcApp {
                 }
             }
 
-            IrcCommand::Invite(_target, channel) => {
+            IrcCommand::Invite(target, channel) => {
                 let sender = msg
                     .get_sender_nick()
                     .unwrap_or_else(|| "Someone".to_string());
+                if !self.identifiers_equal(target, &self.my_nick) {
+                    self.add_message_to_channel(
+                        channel,
+                        ChatMessage::system_fmt(
+                            &format!("{sender} invited {target} to {channel}"),
+                            &self.timestamp_format,
+                        ),
+                    );
+                    return;
+                }
                 // Store the invite, bounding the queue so unsolicited INVITE spam
                 // cannot grow it without limit (drop the oldest when full).
                 const MAX_PENDING_INVITES: usize = 64;
@@ -2042,23 +2952,92 @@ impl IrcApp {
             IrcCommand::Batch(reference, batch_type, params) => {
                 if let Some(batch_id) = reference.strip_prefix('+') {
                     tracing::debug!("Batch started: {} type={:?}", reference, batch_type);
+                    if let Some(parent) = msg.get_batch() {
+                        self.batch_parents.insert(batch_id.to_string(), parent);
+                    }
+                    if batch_type
+                        .as_deref()
+                        .is_some_and(|kind| kind.eq_ignore_ascii_case("draft/multiline"))
+                        && let Some(target) = params
+                        && self.multiline_batches.len() < 32
+                    {
+                        let parent_history = msg
+                            .get_batch()
+                            .and_then(|parent| self.containing_history_batch(&parent));
+                        self.multiline_batches.insert(
+                            batch_id.to_string(),
+                            MultilineBatch {
+                                target: target.clone(),
+                                sender: msg.get_sender_nick().unwrap_or_else(|| "???".to_string()),
+                                content: String::new(),
+                                has_lines: false,
+                                is_notice: false,
+                                parent_history,
+                                server_time: msg.get_server_time_raw(),
+                                msgid: msg.get_msgid(),
+                                account: msg.get_account(),
+                                oper: msg.get_oper(),
+                                reply_to: msg.get_reply(),
+                            },
+                        );
+                    }
+                    if batch_type
+                        .as_deref()
+                        .is_some_and(|kind| kind.eq_ignore_ascii_case("draft/authtoken"))
+                        && self.authtoken_batches.len() < 32
+                    {
+                        self.authtoken_batches.insert(
+                            batch_id.to_string(),
+                            AuthtokenBatch {
+                                service: params.clone().unwrap_or_else(|| "*".to_string()),
+                                token: String::new(),
+                            },
+                        );
+                    }
                     if batch_type
                         .as_deref()
                         .is_some_and(|kind| kind.eq_ignore_ascii_case("chathistory"))
                         && let Some(target) = params
                         && self.chathistory_batches.len() < 32
                     {
+                        let target_key = self.network_support.canonicalize(target);
+                        let request = self
+                            .pending_history_requests
+                            .get_mut(&target_key)
+                            .and_then(VecDeque::pop_front)
+                            .unwrap_or(PendingHistoryRequest {
+                                placement: HistoryPlacement::Prepend,
+                                direction: HistoryDirection::Before,
+                                remaining: 0,
+                                loaded: 0,
+                                page_limit: self.max_scrollback.max(1),
+                            });
+                        if self
+                            .pending_history_requests
+                            .get(&target_key)
+                            .is_some_and(VecDeque::is_empty)
+                        {
+                            self.pending_history_requests.remove(&target_key);
+                        }
                         self.chathistory_batches.insert(
                             batch_id.to_string(),
                             ChatHistoryBatch {
                                 target: target.clone(),
                                 messages: Vec::new(),
+                                request,
+                                complete: msg.get_tag("draft/chathistory-end").is_some(),
+                                partial: msg
+                                    .get_tag("evilnet.github.io/chathistory-partial")
+                                    .is_some(),
                             },
                         );
                     }
                 } else if let Some(batch_id) = reference.strip_prefix('-') {
                     tracing::debug!("Batch ended: {}", reference);
+                    self.finish_multiline_batch(batch_id);
+                    self.finish_authtoken_batch(batch_id);
                     self.finish_chathistory_batch(batch_id);
+                    self.batch_parents.remove(batch_id);
                 }
             }
 
@@ -2111,6 +3090,35 @@ impl IrcApp {
                     self.network_support.chanmodes_b = b.to_string();
                     self.network_support.chanmodes_c = c.to_string();
                 }
+            } else if let Some(value) = token.strip_prefix("STATUSMSG=") {
+                self.network_support.status_prefixes = value.to_string();
+            } else if let Some(value) = token.strip_prefix("CHATHISTORY=") {
+                if let Ok(limit) = value.parse::<usize>()
+                    && limit > 0
+                {
+                    self.network_support.history_limit = Some(limit);
+                    self.chathistory_limit = Some(limit);
+                }
+            } else if let Some(value) = token.strip_prefix("MSGREFTYPES=") {
+                self.network_support.history_reference_types = value.to_string();
+            } else if let Some(value) = token.strip_prefix("evilnet/CHATHISTORYRETENTION=") {
+                self.network_support.history_retention_secs = value.parse().ok();
+            } else if let Some(value) = token.strip_prefix("NICKLEN=") {
+                self.network_support.nick_len = value.parse().ok();
+            } else if let Some(value) = token.strip_prefix("CHANNELLEN=") {
+                self.network_support.channel_len = value.parse().ok();
+            } else if let Some(value) = token.strip_prefix("TOPICLEN=") {
+                self.network_support.topic_len = value.parse().ok();
+            } else if let Some(value) = token.strip_prefix("AWAYLEN=") {
+                self.network_support.away_len = value.parse().ok();
+            } else if let Some(value) = token.strip_prefix("KICKLEN=") {
+                self.network_support.kick_len = value.parse().ok();
+            } else if let Some(value) = token.strip_prefix("MONITOR=") {
+                self.network_support.monitor_limit = value.parse().ok();
+            } else if token.eq_ignore_ascii_case("UTF8ONLY") {
+                self.network_support.utf8_only = true;
+            } else if token.eq_ignore_ascii_case("draft/ACCOUNTREQUIRED") {
+                self.network_support.account_required = true;
             }
         }
         if self.network_support.case_mapping != previous_case_mapping {
@@ -2266,6 +3274,29 @@ impl IrcApp {
                     }
                 }
 
+                // Nefarious suppresses its legacy bouncer replay for clients
+                // that negotiated CHATHISTORY. Channel tabs catch up after
+                // their JOIN acknowledgement; retained query tabs have no
+                // JOIN event, so request their missed messages here.
+                if self.chathistory_enabled && self.logging_load_history {
+                    let query_targets: Vec<String> = self
+                        .channels
+                        .iter()
+                        .filter(|(target, channel)| {
+                            !self.is_channel_name(target)
+                                && channel
+                                    .messages
+                                    .iter()
+                                    .rev()
+                                    .any(|message| Self::message_reference(message).is_some())
+                        })
+                        .map(|(target, _)| target.clone())
+                        .collect();
+                    for target in query_targets {
+                        self.request_latest_history(&target, None, HistoryPlacement::Append);
+                    }
+                }
+
                 // Queue auto-perform commands for execution
                 if !auto_perform.is_empty() {
                     let commands: Vec<String> = auto_perform
@@ -2355,7 +3386,11 @@ impl IrcApp {
                     if let Some(ch) = self.channel_mut(channel) {
                         ch.begin_user_burst();
                         for name in names.split_whitespace() {
-                            let (nick, modes) = support.parse_prefixed_nick(name);
+                            // `userhost-in-names` appends `!user@host` after the
+                            // nickname. Membership identity remains the nick;
+                            // WHO supplies richer user state separately.
+                            let nick_token = name.split_once('!').map_or(name, |(nick, _)| nick);
+                            let (nick, modes) = support.parse_prefixed_nick(nick_token);
                             ch.add_user_burst_modes(nick, &modes);
                         }
                     }
@@ -2489,7 +3524,9 @@ impl IrcApp {
                     return;
                 }
 
-                let channel_idx = params.iter().position(|p| p.starts_with('#') || p.starts_with('&'));
+                let channel_idx = params
+                    .iter()
+                    .position(|p| p.starts_with('#') || p.starts_with('&'));
 
                 let parsed = channel_idx.and_then(|ci| {
                     if ci + 1 >= params.len() {
@@ -2497,7 +3534,8 @@ impl IrcApp {
                     }
                     fn parse_count(p: &str) -> Option<usize> {
                         let clean = p.replace(',', "");
-                        if !clean.is_empty() && clean.chars().all(|c| c.is_ascii_digit() || c == '+')
+                        if !clean.is_empty()
+                            && clean.chars().all(|c| c.is_ascii_digit() || c == '+')
                         {
                             clean.trim_start_matches('+').parse().ok()
                         } else {
@@ -2912,6 +3950,29 @@ impl IrcApp {
                 }
             }
 
+            RPL_WHOISKEYVALUE
+            | RPL_KEYVALUE
+            | RPL_METADATAEND
+            | RPL_KEYNOTSET
+            | RPL_METADATASUBOK
+            | RPL_METADATAUNSUBOK
+            | RPL_METADATASUBS
+            | RPL_METADATASYNCLATER => {
+                let text = params.iter().skip(1).cloned().collect::<Vec<_>>().join(" ");
+                self.add_server_message(ChatMessage::system_fmt(
+                    &format!("[METADATA {num}] {text}"),
+                    &self.timestamp_format,
+                ));
+            }
+
+            RPL_BOUNCERSESSION | RPL_BOUNCETOKEN | RPL_BOUNCERSETTINGS => {
+                let text = params.iter().skip(1).cloned().collect::<Vec<_>>().join(" ");
+                self.add_server_message(ChatMessage::system_fmt(
+                    &format!("[BOUNCER {num}] {text}"),
+                    &self.timestamp_format,
+                ));
+            }
+
             _ => {
                 // Show other numerics in current window for visibility
                 let text = params.iter().skip(1).cloned().collect::<Vec<_>>().join(" ");
@@ -2984,6 +4045,16 @@ impl IrcApp {
             }
             self.channels.insert(key.clone(), new_channel);
         }
+        if msg.msgid.as_ref().is_some_and(|msgid| {
+            self.channels.get(&key).is_some_and(|channel| {
+                channel
+                    .messages
+                    .iter()
+                    .any(|existing| existing.msgid.as_ref() == Some(msgid))
+            })
+        }) {
+            return;
+        }
         // Log message to disk (display-only messages like /lastlog output are
         // excluded so search results don't pollute the persistent history).
         // Always use the display-preserving resolved key: CASEMAPPING-equivalent
@@ -3000,6 +4071,9 @@ impl IrcApp {
             if !is_current {
                 ch.unread += 1;
             }
+        }
+        if is_current && self.window_focused {
+            self.mark_target_read(&key);
         }
     }
 
@@ -3032,7 +4106,9 @@ impl IrcApp {
     }
 
     fn command_fits_irc_line(cmd: &IrcCommand) -> bool {
-        format!("{}", cmd).as_bytes().len() <= IRC_MAX_LINE_BYTES
+        let line = format!("{}", cmd);
+        line.len() <= IRC_MAX_LINE_BYTES
+            && !line.bytes().any(|byte| matches!(byte, b'\r' | b'\n' | 0))
     }
 
     fn split_irc_text_payload(
@@ -3076,54 +4152,129 @@ impl IrcApp {
         Some(chunks)
     }
 
+    fn send_text_command(
+        &mut self,
+        command: &str,
+        target: &str,
+        text: &str,
+        wrapper_prefix: &str,
+        wrapper_suffix: &str,
+    ) -> bool {
+        let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
+        let mut chunks = Vec::new();
+        for logical_line in normalized.split('\n') {
+            let Some(mut line_chunks) = Self::split_irc_text_payload(
+                command,
+                target,
+                logical_line,
+                wrapper_prefix,
+                wrapper_suffix,
+            ) else {
+                self.add_message_to_current(ChatMessage::system_fmt(
+                    "Message not sent - target name leaves no room for text",
+                    &self.timestamp_format,
+                ));
+                return false;
+            };
+            chunks.append(&mut line_chunks);
+        }
+
+        let full_text = format!("{wrapper_prefix}{normalized}{wrapper_suffix}");
+        let use_multiline = self.enabled_caps.contains("draft/multiline")
+            && (normalized.contains('\n') || chunks.len() > 1)
+            && self
+                .network_support
+                .multiline_max_bytes
+                .is_none_or(|max| full_text.len() <= max);
+        if !use_multiline {
+            return chunks.into_iter().all(|chunk| match command {
+                "NOTICE" => self.send_command(IrcCommand::Notice(target.to_string(), chunk)),
+                _ => self.send_command(IrcCommand::Privmsg(target.to_string(), chunk)),
+            });
+        }
+
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT_BATCH: AtomicU64 = AtomicU64::new(1);
+        let batch_id = format!("lf{}", NEXT_BATCH.fetch_add(1, Ordering::Relaxed));
+        let concat_overhead =
+            format!("@batch={batch_id};draft/multiline-concat {command} {target} :").len();
+        if concat_overhead >= IRC_MAX_LINE_BYTES {
+            return false;
+        }
+        let max_payload = IRC_MAX_LINE_BYTES - concat_overhead;
+        let mut lines: Vec<(String, bool)> = Vec::new();
+        for logical_line in full_text.split('\n') {
+            if logical_line.is_empty() {
+                lines.push((String::new(), false));
+                continue;
+            }
+            let mut rest = logical_line;
+            let mut first = true;
+            while !rest.is_empty() {
+                let mut end = rest.len().min(max_payload);
+                while end > 0 && !rest.is_char_boundary(end) {
+                    end -= 1;
+                }
+                if end == 0 {
+                    return false;
+                }
+                lines.push((rest[..end].to_string(), !first));
+                first = false;
+                rest = &rest[end..];
+            }
+        }
+        if self
+            .network_support
+            .multiline_max_lines
+            .is_some_and(|max| lines.len() > max)
+        {
+            return chunks.into_iter().all(|chunk| match command {
+                "NOTICE" => self.send_command(IrcCommand::Notice(target.to_string(), chunk)),
+                _ => self.send_command(IrcCommand::Privmsg(target.to_string(), chunk)),
+            });
+        }
+
+        if !self.send_command(IrcCommand::Batch(
+            format!("+{batch_id}"),
+            Some("draft/multiline".to_string()),
+            Some(target.to_string()),
+        )) {
+            return false;
+        }
+        let mut success = true;
+        for (line, concat) in lines {
+            let concat_tag = if concat {
+                ";draft/multiline-concat"
+            } else {
+                ""
+            };
+            success &= self.send_command(IrcCommand::Raw(format!(
+                "@batch={batch_id}{concat_tag} {command} {target} :{line}"
+            )));
+        }
+        success &= self.send_command(IrcCommand::Batch(format!("-{batch_id}"), None, None));
+        success
+    }
+
     pub fn send_privmsg_text(&mut self, target: &str, text: &str) -> bool {
         if !self.can_send_to_target(target) {
             return false;
         }
-        let Some(chunks) = Self::split_irc_text_payload("PRIVMSG", target, text, "", "") else {
-            self.add_message_to_current(ChatMessage::system_fmt(
-                "Message not sent - target name leaves no room for text",
-                &self.timestamp_format,
-            ));
-            return false;
-        };
-        chunks
-            .into_iter()
-            .all(|chunk| self.send_command(IrcCommand::Privmsg(target.to_string(), chunk)))
+        self.send_text_command("PRIVMSG", target, text, "", "")
     }
 
     pub fn send_notice_text(&mut self, target: &str, text: &str) -> bool {
         if !self.can_send_to_target(target) {
             return false;
         }
-        let Some(chunks) = Self::split_irc_text_payload("NOTICE", target, text, "", "") else {
-            self.add_message_to_current(ChatMessage::system_fmt(
-                "Notice not sent - target name leaves no room for text",
-                &self.timestamp_format,
-            ));
-            return false;
-        };
-        chunks
-            .into_iter()
-            .all(|chunk| self.send_command(IrcCommand::Notice(target.to_string(), chunk)))
+        self.send_text_command("NOTICE", target, text, "", "")
     }
 
     pub fn send_action_text(&mut self, target: &str, text: &str) -> bool {
         if !self.can_send_to_target(target) {
             return false;
         }
-        let Some(chunks) =
-            Self::split_irc_text_payload("PRIVMSG", target, text, "\x01ACTION ", "\x01")
-        else {
-            self.add_message_to_current(ChatMessage::system_fmt(
-                "Action not sent - target name leaves no room for text",
-                &self.timestamp_format,
-            ));
-            return false;
-        };
-        chunks
-            .into_iter()
-            .all(|chunk| self.send_command(IrcCommand::Privmsg(target.to_string(), chunk)))
+        self.send_text_command("PRIVMSG", target, text, "\x01ACTION ", "\x01")
     }
 
     pub fn send_command(&mut self, cmd: IrcCommand) -> bool {
@@ -3367,11 +4518,19 @@ impl IrcApp {
             Some(&self.server_messages)
         };
         let Some(msgs) = messages else {
-            return ScrollbackStats { drawn: 0, measured: 0, total_rows: 0 };
+            return ScrollbackStats {
+                drawn: 0,
+                measured: 0,
+                total_rows: 0,
+            };
         };
         let my_nick = self.my_nick.clone();
         let stick = self.scroll_to_bottom;
-        let mut stats = ScrollbackStats { drawn: 0, measured: 0, total_rows: msgs.len() };
+        let mut stats = ScrollbackStats {
+            drawn: 0,
+            measured: 0,
+            total_rows: msgs.len(),
+        };
 
         ScrollArea::vertical()
             .auto_shrink([false; 2])
@@ -3411,14 +4570,8 @@ impl IrcApp {
                     // an empty area; egui re-clamps the offset next frame.
                     let mut yy = viewport.max.y;
                     for msg in msgs.iter().rev() {
-                        let h = row_height(
-                            ui,
-                            msg,
-                            &my_nick,
-                            content_width,
-                            layout_key,
-                            &mut stats,
-                        );
+                        let h =
+                            row_height(ui, msg, &my_nick, content_width, layout_key, &mut stats);
                         let top = yy - h;
                         first_idx -= 1;
                         first_y = top;
@@ -3445,8 +4598,7 @@ impl IrcApp {
                 if band_top > ui.max_rect().bottom() {
                     return; // degenerate mid-scroll frame; nothing to draw
                 }
-                let band =
-                    egui::Rect::from_x_y_ranges(x_range, band_top..=ui.max_rect().bottom());
+                let band = egui::Rect::from_x_y_ranges(x_range, band_top..=ui.max_rect().bottom());
                 let mut drawn = 0usize;
                 // Track the band cursor in content space ourselves: the child
                 // Ui's cursor is in screen space and must not be compared to
@@ -3485,6 +4637,9 @@ impl IrcApp {
             }
         } else {
             self.server_unread = 0;
+        }
+        if let Some(target) = self.current_channel.clone() {
+            self.mark_target_read(&target);
         }
     }
 
@@ -3992,11 +5147,7 @@ impl eframe::App for IrcApp {
 
                         let response = ui.selectable_label(is_selected, text);
                         if response.clicked() {
-                            self.current_channel = Some(channel_name.clone());
-                            self.selected_user = None; // Clear user selection when switching channels
-                            if let Some(ch) = self.channels.get_mut(&channel_name) {
-                                ch.unread = 0;
-                            }
+                            self.select_tab(Some(channel_name.clone()));
                         }
 
                         // Double-click to open channel info
@@ -4529,9 +5680,9 @@ mod tests {
         let mut app = test_app();
         let mut channel = Channel::new();
         for i in 0..2000 {
-            channel
-                .messages
-                .push_back(ChatMessage::system(&format!("message {i}: some channel chatter")));
+            channel.messages.push_back(ChatMessage::system(&format!(
+                "message {i}: some channel chatter"
+            )));
         }
         app.channels.insert("#chan".to_string(), channel);
         app.current_channel = Some("#chan".to_string());
@@ -4616,13 +5767,15 @@ mod tests {
             egui::CentralPanel::default().show(ctx, |ui| {
                 let width = 120.0;
                 let key = row_layout_key(ui, width);
-                let mut stats = ScrollbackStats { drawn: 0, measured: 0, total_rows: 2 };
+                let mut stats = ScrollbackStats {
+                    drawn: 0,
+                    measured: 0,
+                    total_rows: 2,
+                };
                 // Narrow width forces the long message to wrap over lines;
                 // the measured advance must reflect that.
-                let h_short =
-                    row_height(ui, &short_msg, "me", width, key, &mut stats);
-                let h_long =
-                    row_height(ui, &long_msg, "me", width, key, &mut stats);
+                let h_short = row_height(ui, &short_msg, "me", width, key, &mut stats);
+                let h_long = row_height(ui, &long_msg, "me", width, key, &mut stats);
                 heights = Some((h_short, h_long));
             });
         })
@@ -4903,6 +6056,8 @@ mod tests {
             username: "ident".into(),
             realname: "Favorite User".into(),
             accept_invalid_certs: true,
+            pre_away_message: "syncing".into(),
+            persistence_profile: "mobile".into(),
         };
         app.load_favorite(&favorite);
         assert!(app.start_session_from_form());
@@ -4913,6 +6068,8 @@ mod tests {
         assert_eq!(config.password.as_deref(), Some("server-pass"));
         assert_eq!(config.sasl_username.as_deref(), Some("account"));
         assert_eq!(config.sasl_password.as_deref(), Some("sasl-pass"));
+        assert_eq!(config.pre_away_message.as_deref(), Some("syncing"));
+        assert_eq!(config.persistence_profile.as_deref(), Some("mobile"));
         assert!(config.accept_invalid_certs);
         assert_eq!(
             app.active_session.as_ref().unwrap().auto_join_channels,
@@ -5168,6 +6325,214 @@ mod tests {
         assert!(alice.has_mode(UserMode::Op));
         assert!(alice.has_mode(UserMode::Voice));
         assert_eq!(alice.mode, UserMode::Op);
+    }
+
+    #[test]
+    fn userhost_in_names_keeps_only_the_membership_nickname() {
+        let mut app = test_app();
+        app.channels.insert("#chan".into(), Channel::new());
+        app.handle_numeric(
+            RPL_NAMREPLY,
+            &[
+                "me".into(),
+                "=".into(),
+                "#chan".into(),
+                "@+Alice!user@example.test bob!ident@host".into(),
+            ],
+        );
+        app.handle_numeric(RPL_ENDOFNAMES, &["me".into(), "#chan".into()]);
+
+        let channel = &app.channels["#chan"];
+        assert!(channel.has_user("Alice"));
+        assert!(channel.has_user("bob"));
+        assert!(!channel.has_user("Alice!user@example.test"));
+    }
+
+    #[test]
+    fn extended_join_and_setname_retain_member_identity() {
+        let mut app = test_app();
+        app.set_my_nick("me".into());
+        app.channels.insert("#room".into(), Channel::new());
+
+        app.handle_incoming_message(
+            IrcMessage::parse(":alice!u@h JOIN #room alice-account :Alice Example").unwrap(),
+        );
+        let alice = app.channels["#room"].get_user("alice").unwrap();
+        assert_eq!(alice.account.as_deref(), Some("alice-account"));
+        assert_eq!(alice.realname.as_deref(), Some("Alice Example"));
+
+        app.handle_incoming_message(
+            IrcMessage::parse(":alice!u@h SETNAME :Alice Updated").unwrap(),
+        );
+        assert_eq!(
+            app.channels["#room"]
+                .get_user("alice")
+                .unwrap()
+                .realname
+                .as_deref(),
+            Some("Alice Updated")
+        );
+    }
+
+    #[test]
+    fn private_reaction_routes_to_the_senders_query() {
+        let mut app = test_app();
+        app.set_my_nick("me".into());
+        app.handle_incoming_message(
+            IrcMessage::parse("@+draft/react=👍;+reply=abc :alice!u@h TAGMSG me").unwrap(),
+        );
+
+        assert!(app.channels.contains_key("alice"));
+        assert!(!app.channels.contains_key("me"));
+        assert!(
+            app.channels["alice"].messages[0]
+                .content
+                .contains("reacted 👍 to abc")
+        );
+    }
+
+    #[test]
+    fn no_implicit_names_requests_membership_after_join() {
+        let (mut app, mut rx) = test_app_connected();
+        app.set_my_nick("me".into());
+        app.handle_incoming_message(
+            IrcMessage::parse(":srv CAP me ACK :no-implicit-names").unwrap(),
+        );
+        app.handle_incoming_message(IrcMessage::parse(":me!u@h JOIN #room").unwrap());
+
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            IrcCommand::Names(Some("#room".into()))
+        );
+    }
+
+    #[test]
+    fn echo_message_enriches_the_local_row_without_duplication() {
+        let (mut app, _rx) = test_app_connected();
+        app.set_my_nick("me".into());
+        app.handle_incoming_message(IrcMessage::parse(":srv CAP me ACK :echo-message").unwrap());
+        app.add_message_to_channel("#room", ChatMessage::new_fmt("me", "hello", "short"));
+
+        app.handle_incoming_message(
+            IrcMessage::parse(
+                "@time=2026-09-12T12:00:00.000Z;msgid=abc;account=acct;+reply=prior :me!u@h PRIVMSG #room :hello",
+            )
+            .unwrap(),
+        );
+
+        let channel = &app.channels["#room"];
+        assert_eq!(channel.messages.len(), 1);
+        assert_eq!(channel.messages[0].msgid.as_deref(), Some("abc"));
+        assert_eq!(channel.messages[0].account.as_deref(), Some("acct"));
+        assert_eq!(channel.messages[0].reply_to.as_deref(), Some("prior"));
+    }
+
+    #[test]
+    fn selected_live_message_advances_the_server_read_marker() {
+        let (mut app, mut rx) = test_app_connected();
+        app.set_my_nick("me".into());
+        app.current_channel = Some("#room".into());
+        app.channels.insert("#room".into(), Channel::new());
+        app.handle_incoming_message(
+            IrcMessage::parse(":srv CAP me ACK :draft/read-marker").unwrap(),
+        );
+
+        app.handle_incoming_message(
+            IrcMessage::parse(
+                "@time=2026-09-12T12:00:00.000Z;msgid=abc :alice!u@h PRIVMSG #room :hello",
+            )
+            .unwrap(),
+        );
+
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            IrcCommand::Markread(
+                "#room".into(),
+                Some("timestamp=2026-09-12T12:00:00.000Z".into())
+            )
+        );
+    }
+
+    #[test]
+    fn standard_reply_uses_its_channel_context() {
+        let mut app = test_app();
+        app.channels.insert("#room".into(), Channel::new());
+        app.handle_incoming_message(
+            IrcMessage::parse(":srv FAIL CHATHISTORY INVALID_TARGET #room :No history").unwrap(),
+        );
+        assert!(
+            app.channels["#room"]
+                .messages
+                .iter()
+                .any(|message| message.content.contains("INVALID_TARGET"))
+        );
+        assert!(app.server_messages.is_empty());
+    }
+
+    #[test]
+    fn live_redaction_removes_the_identified_message() {
+        let mut app = test_app();
+        let mut channel = Channel::new();
+        channel.messages.push_back(
+            ChatMessage::new_fmt("alice", "remove me", "short").with_irc_metadata(
+                None,
+                Some("gone".into()),
+                None,
+            ),
+        );
+        app.channels.insert("#room".into(), channel);
+
+        app.handle_incoming_message(
+            IrcMessage::parse(":alice!u@h REDACT #room gone :cleanup").unwrap(),
+        );
+
+        assert!(
+            app.channels["#room"]
+                .messages
+                .iter()
+                .all(|message| message.msgid.as_deref() != Some("gone"))
+        );
+        assert!(
+            app.channels["#room"]
+                .messages
+                .iter()
+                .any(|message| message.content == "A message was redacted: cleanup")
+        );
+    }
+
+    #[test]
+    fn cap_new_requests_newly_available_nefarious_features() {
+        let (mut app, mut rx) = test_app_connected();
+        app.handle_incoming_message(
+            IrcMessage::parse(":srv CAP me NEW :draft/chathistory=20 draft/webpush=vapid-key")
+                .unwrap(),
+        );
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            IrcCommand::Cap(
+                String::new(),
+                "REQ".into(),
+                vec!["draft/chathistory draft/webpush".into()]
+            )
+        );
+        assert_eq!(app.chathistory_limit, Some(20));
+    }
+
+    #[test]
+    fn cap_new_splits_the_full_supported_set_into_valid_lines() {
+        let (mut app, mut rx) = test_app_connected();
+        app.handle_cap_message("NEW", &[DESIRED_CAPS.join(" ")]);
+
+        let mut requested = Vec::new();
+        while let Ok(command) = rx.try_recv() {
+            assert!(IrcApp::command_fits_irc_line(&command));
+            let IrcCommand::Cap(_, subcommand, params) = command else {
+                panic!("expected CAP REQ");
+            };
+            assert_eq!(subcommand, "REQ");
+            requested.extend(params.join(" ").split_whitespace().map(str::to_string));
+        }
+        assert_eq!(requested, DESIRED_CAPS);
     }
 
     #[test]
@@ -5554,9 +6919,70 @@ mod tests {
 
         assert_eq!(
             rx.try_recv().unwrap(),
-            IrcCommand::ChathistoryLatest("#room".into(), 100)
+            IrcCommand::ChathistoryLatest("#room".into(), "*".into(), 100)
         );
         assert!(app.channels["#room"].joined);
+    }
+
+    #[test]
+    fn reconnect_requests_history_after_last_seen_msgid() {
+        let (mut app, mut rx) = test_app_connected();
+        app.set_my_nick("me".into());
+        app.handle_incoming_message(
+            IrcMessage::parse(":srv CAP me ACK :draft/chathistory").unwrap(),
+        );
+        let mut channel = Channel::new();
+        channel.messages.push_back(
+            ChatMessage::new_fmt("alice", "last seen", "short").with_irc_metadata(
+                Some("2026-09-12T12:00:00.000Z".into()),
+                Some("42-last".into()),
+                Some("alice".into()),
+            ),
+        );
+        app.channels.insert("#room".into(), channel);
+
+        app.handle_incoming_message(IrcMessage::parse(":me!u@h JOIN #room").unwrap());
+
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            IrcCommand::ChathistoryAfter("#room".into(), "msgid=42-last".into(), 100)
+        );
+    }
+
+    #[test]
+    fn reconnect_requests_history_for_retained_queries_after_welcome() {
+        let (mut app, mut rx) = test_app_connected();
+        app.logging_load_history = true;
+        app.set_invisible = false;
+        app.handle_incoming_message(
+            IrcMessage::parse(":srv CAP me ACK :draft/chathistory").unwrap(),
+        );
+        let mut query = Channel::new();
+        query.messages.push_back(
+            ChatMessage::new_fmt("alice", "last message", "short").with_irc_metadata(
+                Some("2026-09-12T12:00:00.000Z".into()),
+                Some("query-last".into()),
+                None,
+            ),
+        );
+        app.channels.insert("alice".into(), query);
+
+        app.handle_numeric(RPL_WELCOME, &["me".into(), "welcome".into()]);
+
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            IrcCommand::ChathistoryAfter("alice".into(), "msgid=query-last".into(), 100)
+        );
+        assert_eq!(rx.try_recv().unwrap(), IrcCommand::Ping("LAG".into()));
+    }
+
+    #[test]
+    fn nefarious_bare_chathistory_cap_value_sets_page_limit() {
+        let (mut app, _rx) = test_app_connected();
+        app.handle_incoming_message(
+            IrcMessage::parse(":srv CAP me LS :draft/chathistory=37").unwrap(),
+        );
+        assert_eq!(app.chathistory_limit, Some(37));
     }
 
     #[test]
@@ -5571,7 +6997,8 @@ mod tests {
             .push_back(ChatMessage::system("live row"));
 
         app.handle_incoming_message(
-            IrcMessage::parse(":srv BATCH +hist chathistory #public").unwrap(),
+            IrcMessage::parse("@draft/chathistory-end :srv BATCH +hist chathistory #public")
+                .unwrap(),
         );
         app.handle_incoming_message(
             IrcMessage::parse(
@@ -5599,5 +7026,178 @@ mod tests {
         );
         assert!(channel.messages[1].no_log);
         assert_eq!(channel.unread, 0);
+    }
+
+    #[test]
+    fn chathistory_pages_backward_until_requested_limit() {
+        let (mut app, mut rx) = test_app_connected();
+        app.set_my_nick("me".into());
+        app.max_scrollback = 5;
+        app.handle_incoming_message(
+            IrcMessage::parse(":srv CAP me LS :draft/chathistory=2").unwrap(),
+        );
+        app.handle_incoming_message(
+            IrcMessage::parse(":srv CAP me ACK :draft/chathistory").unwrap(),
+        );
+        app.handle_incoming_message(IrcMessage::parse(":me!u@h JOIN #room").unwrap());
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            IrcCommand::ChathistoryLatest("#room".into(), "*".into(), 2)
+        );
+
+        app.handle_incoming_message(
+            IrcMessage::parse(":srv BATCH +page chathistory #room").unwrap(),
+        );
+        app.handle_incoming_message(
+            IrcMessage::parse(
+                "@batch=page;time=2026-09-12T12:00:00.000Z;msgid=old :a PRIVMSG #room :old",
+            )
+            .unwrap(),
+        );
+        app.handle_incoming_message(
+            IrcMessage::parse(
+                "@batch=page;time=2026-09-12T12:01:00.000Z;msgid=new :b PRIVMSG #room :new",
+            )
+            .unwrap(),
+        );
+        app.handle_incoming_message(IrcMessage::parse(":srv BATCH -page").unwrap());
+
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            IrcCommand::ChathistoryBefore("#room".into(), "msgid=old".into(), 2)
+        );
+    }
+
+    #[test]
+    fn multiline_batches_preserve_newline_and_concat_semantics() {
+        let mut app = test_app();
+        app.handle_incoming_message(
+            IrcMessage::parse(
+                "@time=2026-09-12T12:00:00.000Z;msgid=ml1 :alice!u@h BATCH +ml draft/multiline #room",
+            )
+            .unwrap(),
+        );
+        app.handle_incoming_message(
+            IrcMessage::parse("@batch=ml :alice!u@h PRIVMSG #room :one").unwrap(),
+        );
+        app.handle_incoming_message(
+            IrcMessage::parse("@batch=ml;draft/multiline-concat :alice!u@h PRIVMSG #room :two")
+                .unwrap(),
+        );
+        app.handle_incoming_message(
+            IrcMessage::parse("@batch=ml :alice!u@h PRIVMSG #room :three").unwrap(),
+        );
+        app.handle_incoming_message(IrcMessage::parse(":alice BATCH -ml").unwrap());
+
+        let message = app.channels["#room"].messages.back().unwrap();
+        assert_eq!(message.content, "onetwo\nthree");
+        assert_eq!(message.msgid.as_deref(), Some("ml1"));
+        assert_eq!(
+            message.server_time.as_deref(),
+            Some("2026-09-12T12:00:00.000Z")
+        );
+    }
+
+    #[test]
+    fn authtoken_chunks_are_joined_into_one_usable_token() {
+        let mut app = test_app();
+        app.handle_incoming_message(
+            IrcMessage::parse(":srv BATCH +tok draft/authtoken web-api").unwrap(),
+        );
+        app.handle_incoming_message(
+            IrcMessage::parse("@batch=tok :srv TOKEN GENERATE * :abc").unwrap(),
+        );
+        app.handle_incoming_message(
+            IrcMessage::parse("@batch=tok :srv TOKEN GENERATE * :def").unwrap(),
+        );
+        app.handle_incoming_message(IrcMessage::parse(":srv BATCH -tok").unwrap());
+
+        assert_eq!(app.server_messages.len(), 1);
+        assert_eq!(
+            app.server_messages[0].content,
+            "[TOKEN GENERATE web-api] abcdef"
+        );
+        assert!(app.server_messages[0].no_log);
+    }
+
+    #[test]
+    fn chathistory_gap_is_rendered_as_a_system_marker() {
+        let mut app = test_app();
+        app.prepare_history_target("#room");
+        app.handle_incoming_message(
+            IrcMessage::parse("@draft/chathistory-end :srv BATCH +hist chathistory #room").unwrap(),
+        );
+        app.handle_incoming_message(
+            IrcMessage::parse(
+                "@batch=hist;+evilnet.github.io/chathistory-gap;msgid=gap1 :srv PRIVMSG #room :[2 messages not stored]",
+            )
+            .unwrap(),
+        );
+        app.handle_incoming_message(IrcMessage::parse(":srv BATCH -hist").unwrap());
+
+        let gap = app.channels["#room"]
+            .messages
+            .iter()
+            .find(|message| message.msgid.as_deref() == Some("gap1"))
+            .unwrap();
+        assert!(gap.is_system);
+        assert_eq!(gap.content, "[2 messages not stored]");
+    }
+
+    #[test]
+    fn historical_events_are_displayed_without_mutating_live_membership() {
+        let mut app = test_app();
+        app.prepare_history_target("#room");
+        app.channels
+            .get_mut("#room")
+            .unwrap()
+            .add_user("present", UserMode::Normal);
+        app.handle_incoming_message(
+            IrcMessage::parse("@draft/chathistory-end :srv BATCH +hist chathistory #room").unwrap(),
+        );
+        app.handle_incoming_message(
+            IrcMessage::parse(
+                "@batch=hist;time=2026-09-12T12:00:00.000Z;msgid=j1 :gone!u@h JOIN #room",
+            )
+            .unwrap(),
+        );
+        app.handle_incoming_message(IrcMessage::parse(":srv BATCH -hist").unwrap());
+
+        let channel = &app.channels["#room"];
+        assert!(channel.has_user("present"));
+        assert!(!channel.has_user("gone"));
+        assert!(
+            channel
+                .messages
+                .iter()
+                .any(|message| message.content == "gone joined #room")
+        );
+    }
+
+    #[test]
+    fn outbound_multiline_uses_a_tagged_batch() {
+        let (mut app, mut rx) = test_app_connected();
+        app.handle_incoming_message(IrcMessage::parse(":srv CAP me ACK :draft/multiline").unwrap());
+        assert!(app.send_privmsg_text("#room", "one\ntwo"));
+
+        let IrcCommand::Batch(open, Some(kind), Some(target)) = rx.try_recv().unwrap() else {
+            panic!("expected multiline batch opener");
+        };
+        assert!(open.starts_with("+lf"));
+        assert_eq!(kind, "draft/multiline");
+        assert_eq!(target, "#room");
+        let batch_id = open.trim_start_matches('+');
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            IrcCommand::Raw(format!("@batch={batch_id} PRIVMSG #room :one"))
+        );
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            IrcCommand::Raw(format!("@batch={batch_id} PRIVMSG #room :two"))
+        );
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            IrcCommand::Batch(format!("-{batch_id}"), None, None)
+        );
     }
 }

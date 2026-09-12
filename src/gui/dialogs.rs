@@ -208,6 +208,22 @@ impl IrcApp {
                 ui.horizontal(|ui| {
                     ui.checkbox(&mut self.set_invisible, "Set invisible (+i)");
                 });
+                ui.horizontal(|ui| {
+                    ui.label("Pre-away:");
+                    ui.add(
+                        TextEdit::singleline(&mut self.pre_away_message)
+                            .desired_width(200.0)
+                            .hint_text("optional IRCv3 status"),
+                    );
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Persistence profile:");
+                    ui.add(
+                        TextEdit::singleline(&mut self.persistence_profile)
+                            .desired_width(160.0)
+                            .hint_text("optional Nefarious profile"),
+                    );
+                });
                 ui.checkbox(&mut self.auto_reconnect, "Auto-reconnect on disconnect");
 
                 ui.separator();
@@ -235,6 +251,8 @@ impl IrcApp {
                                 username: self.username.clone(),
                                 realname: self.realname.clone(),
                                 accept_invalid_certs: self.accept_invalid_certs,
+                                pre_away_message: self.pre_away_message.clone(),
+                                persistence_profile: self.persistence_profile.clone(),
                             };
                             self.server_favorites.push(new_fav);
                             self.selected_favorite = Some(self.server_favorites.len() - 1);
@@ -488,6 +506,15 @@ impl IrcApp {
         });
 
         ui.checkbox(&mut self.set_invisible, "Set invisible (+i)");
+
+        ui.horizontal(|ui| {
+            ui.label("Pre-connect away:");
+            ui.add(TextEdit::singleline(&mut self.pre_away_message).desired_width(220.0));
+        });
+        ui.horizontal(|ui| {
+            ui.label("Persistence profile:");
+            ui.add(TextEdit::singleline(&mut self.persistence_profile).desired_width(180.0));
+        });
 
         ui.add_space(8.0);
         ui.label("Auto-perform (one command per line):");
