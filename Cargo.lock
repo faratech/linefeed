@@ -1284,7 +1284,7 @@ checksum = "d4a5ff6bcca6c4867b1c4fd4ef63e4db7436ef363e0ad7531d1558856bae64f4"
 
 [[package]]
 name = "linefeed"
-version = "0.0.5"
+version = "0.0.6"
 dependencies = [
  "base64",
  "dirs",
