@@ -1,5 +1,11 @@
 use base64::prelude::*;
+use hmac::{Hmac, KeyInit, Mac};
+use pbkdf2::pbkdf2_hmac;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use std::collections::HashMap;
 use std::collections::VecDeque;
+use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
@@ -14,6 +20,7 @@ use super::numerics::*;
 /// our read buffer past this bound.
 const MAX_LINE_LEN: usize = 16 * 1024;
 const HANDSHAKE_STEP_TIMEOUT: Duration = Duration::from_secs(15);
+const STS_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 /// Aggregate CAP responses are bounded separately from individual IRC lines.
 /// This permits large, legitimate capability lists without allowing a server
 /// to grow negotiation state until the registration deadline expires.
@@ -210,14 +217,25 @@ fn redact_for_log(line: &str) -> std::borrow::Cow<'_, str> {
     if upper.starts_with("PASS ") {
         return "PASS <redacted>".into();
     }
+    if upper.starts_with("AUTH ") || upper.starts_with("LOGIN ") || upper.starts_with("OPER ") {
+        return format!(
+            "{} <redacted>",
+            trimmed.split_whitespace().next().unwrap_or("AUTH")
+        )
+        .into();
+    }
     if let Some(arg) = trimmed.strip_prefix("AUTHENTICATE ")
         && arg != "+"
         && !arg.eq_ignore_ascii_case("PLAIN")
     {
         return "AUTHENTICATE <redacted>".into();
     }
-    if (upper.starts_with("PRIVMSG NICKSERV") || upper.starts_with("NICKSERV"))
-        && ["IDENTIFY", "GHOST", "REGAIN", "RECOVER"]
+    let service_auth = upper.starts_with("PRIVMSG NICKSERV")
+        || upper.starts_with("NICKSERV")
+        || upper.starts_with("PRIVMSG Q@")
+        || upper.starts_with("PRIVMSG X@");
+    if service_auth
+        && ["IDENTIFY", "AUTH", "LOGIN", "GHOST", "REGAIN", "RECOVER"]
             .iter()
             .any(|w| upper.contains(w))
     {
@@ -314,6 +332,207 @@ where
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum SaslMechanism {
+    #[default]
+    Auto,
+    Plain,
+    External,
+    ScramSha256,
+}
+
+impl SaslMechanism {
+    fn wire_name(self) -> Option<&'static str> {
+        match self {
+            Self::Auto => None,
+            Self::Plain => Some("PLAIN"),
+            Self::External => Some("EXTERNAL"),
+            Self::ScramSha256 => Some("SCRAM-SHA-256"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SaslAttemptOutcome {
+    Success,
+    Failed,
+    Welcome,
+}
+
+enum SaslServerEvent {
+    Challenge(String),
+    Success,
+    Failed,
+    Welcome,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct StsPolicy {
+    port: u16,
+    duration_secs: u64,
+    expires_at: u64,
+}
+
+fn sts_store_path() -> Option<std::path::PathBuf> {
+    dirs::config_dir().map(|path| path.join("linefeed").join("sts_policies.json"))
+}
+
+fn load_sts_policies() -> HashMap<String, StsPolicy> {
+    let Some(path) = sts_store_path() else {
+        return HashMap::new();
+    };
+    std::fs::read(path)
+        .ok()
+        .and_then(|data| serde_json::from_slice(&data).ok())
+        .unwrap_or_default()
+}
+
+fn save_sts_policies(policies: &HashMap<String, StsPolicy>) -> std::io::Result<()> {
+    let Some(path) = sts_store_path() else {
+        return Ok(());
+    };
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let temporary = path.with_extension("json.tmp");
+    std::fs::write(&temporary, serde_json::to_vec_pretty(policies)?)?;
+    std::fs::rename(temporary, path)
+}
+
+fn unix_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+fn parse_sts_value(value: &str) -> (Option<u16>, Option<u64>) {
+    let mut port = None;
+    let mut duration = None;
+    for token in value.split(',') {
+        if let Some(value) = token.strip_prefix("port=") {
+            port = value.parse::<u16>().ok().filter(|port| *port > 0);
+        } else if let Some(value) = token.strip_prefix("duration=") {
+            duration = value.parse().ok();
+        }
+    }
+    (port, duration)
+}
+
+fn update_sts_policy(host: &str, port: u16, duration: u64) {
+    let mut policies = load_sts_policies();
+    let key = host.to_ascii_lowercase();
+    if duration == 0 {
+        policies.remove(&key);
+    } else {
+        policies.insert(
+            key,
+            StsPolicy {
+                port,
+                duration_secs: duration,
+                expires_at: unix_now().saturating_add(duration),
+            },
+        );
+    }
+    if let Err(error) = save_sts_policies(&policies) {
+        tracing::warn!("Failed to save STS policy: {error}");
+    }
+}
+
+fn active_sts_policy(host: &str) -> Option<StsPolicy> {
+    let mut policies = load_sts_policies();
+    let key = host.to_ascii_lowercase();
+    let policy = policies
+        .get(&key)
+        .filter(|policy| policy.expires_at > unix_now())
+        .cloned();
+    if policy.is_none() && policies.remove(&key).is_some() {
+        let _ = save_sts_policies(&policies);
+    }
+    policy
+}
+
+fn hmac_sha256(key: &[u8], data: &[u8]) -> Vec<u8> {
+    let mut mac = Hmac::<Sha256>::new_from_slice(key).expect("HMAC accepts any key size");
+    mac.update(data);
+    mac.finalize().into_bytes().to_vec()
+}
+
+fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+    left.iter()
+        .zip(right)
+        .fold(0u8, |diff, (left, right)| diff | (left ^ right))
+        == 0
+}
+
+fn scram_sha256_response(
+    password: &str,
+    client_nonce: &str,
+    client_first_bare: &str,
+    server_first: &str,
+) -> Result<(String, Vec<u8>), Box<dyn std::error::Error + Send + Sync>> {
+    let mut nonce = None;
+    let mut salt = None;
+    let mut iterations = None;
+    for attribute in server_first.split(',') {
+        if let Some(value) = attribute.strip_prefix("r=") {
+            if nonce.replace(value).is_some() {
+                return Err("Duplicate SCRAM nonce".into());
+            }
+        } else if let Some(value) = attribute.strip_prefix("s=") {
+            if salt.replace(value).is_some() {
+                return Err("Duplicate SCRAM salt".into());
+            }
+        } else if let Some(value) = attribute.strip_prefix("i=") {
+            if iterations.replace(value).is_some() {
+                return Err("Duplicate SCRAM iteration count".into());
+            }
+        } else if attribute.starts_with("m=") {
+            return Err("Unsupported mandatory SCRAM extension".into());
+        }
+    }
+    let nonce = nonce.ok_or("SCRAM challenge omitted nonce")?;
+    if nonce.len() <= client_nonce.len() || !nonce.starts_with(client_nonce) {
+        return Err("SCRAM server nonce does not extend client nonce".into());
+    }
+    let salt = BASE64_STANDARD
+        .decode(salt.ok_or("SCRAM challenge omitted salt")?.as_bytes())
+        .map_err(|_| "Invalid SCRAM salt")?;
+    let iterations: u32 = iterations
+        .ok_or("SCRAM challenge omitted iteration count")?
+        .parse()
+        .map_err(|_| "Invalid SCRAM iteration count")?;
+    if !(4096..=1_000_000).contains(&iterations) {
+        return Err("Unsafe SCRAM iteration count".into());
+    }
+
+    let client_final_without_proof = format!("c=biws,r={nonce}");
+    let auth_message = format!("{client_first_bare},{server_first},{client_final_without_proof}");
+    let mut salted_password = [0u8; 32];
+    pbkdf2_hmac::<Sha256>(password.as_bytes(), &salt, iterations, &mut salted_password);
+    let client_key = hmac_sha256(&salted_password, b"Client Key");
+    let stored_key = Sha256::digest(&client_key);
+    let client_signature = hmac_sha256(&stored_key, auth_message.as_bytes());
+    let proof: Vec<u8> = client_key
+        .iter()
+        .zip(client_signature)
+        .map(|(key, signature)| key ^ signature)
+        .collect();
+    let server_key = hmac_sha256(&salted_password, b"Server Key");
+    let server_signature = hmac_sha256(&server_key, auth_message.as_bytes());
+    Ok((
+        format!(
+            "{client_final_without_proof},p={}",
+            BASE64_STANDARD.encode(proof)
+        ),
+        server_signature,
+    ))
+}
+
 #[derive(Debug, Clone)]
 pub struct ServerConfig {
     pub host: String,
@@ -327,6 +546,10 @@ pub struct ServerConfig {
     // SASL authentication
     pub sasl_username: Option<String>,
     pub sasl_password: Option<String>,
+    pub sasl_mechanism: SaslMechanism,
+    pub sasl_required: bool,
+    pub tls_client_cert_path: Option<String>,
+    pub tls_client_key_path: Option<String>,
     pub pre_away_message: Option<String>,
     pub persistence_profile: Option<String>,
 }
@@ -344,6 +567,10 @@ impl Default for ServerConfig {
             password: None,
             sasl_username: None,
             sasl_password: None,
+            sasl_mechanism: SaslMechanism::Auto,
+            sasl_required: false,
+            tls_client_cert_path: None,
+            tls_client_key_path: None,
             pre_away_message: None,
             persistence_profile: None,
         }
@@ -391,6 +618,7 @@ pub const DESIRED_CAPS: &[&str] = &[
     "invite-notify",
     "draft/oper-tag",
     "chghost",
+    "extended-monitor",
 ];
 
 impl IrcClient {
@@ -403,6 +631,39 @@ impl IrcClient {
         incoming_tx: mpsc::Sender<IrcMessage>,
         mut outgoing_rx: mpsc::UnboundedReceiver<IrcCommand>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let mut pending_commands = VecDeque::new();
+        // The loopback protocol tests use one-shot listeners and do not model
+        // the preliminary STS connection. Keep policy I/O out of those tests;
+        // STS parsing and probing have focused unit coverage below.
+        if !cfg!(test) {
+            if let Some(policy) = active_sts_policy(&self.config.host) {
+                self.config.use_tls = true;
+                self.config.accept_invalid_certs = false;
+                self.config.port = policy.port;
+            } else if !self.config.use_tls
+                && let Some(port) = Self::probe_sts_upgrade(
+                    &self.config.host,
+                    self.config.port,
+                    &incoming_tx,
+                    &mut outgoing_rx,
+                    &mut pending_commands,
+                )
+                .await?
+            {
+                let _ = incoming_tx.try_send(IrcMessage {
+                    tags: None,
+                    prefix: None,
+                    command: IrcCommand::Notice(
+                        "*".to_string(),
+                        format!("Server requested STS; reconnecting securely on port {port}"),
+                    ),
+                    raw: String::new(),
+                });
+                self.config.use_tls = true;
+                self.config.accept_invalid_certs = false;
+                self.config.port = port;
+            }
+        }
         if self
             .config
             .pre_away_message
@@ -430,7 +691,6 @@ impl IrcClient {
         {
             return Err("Persistence profile must be 1-32 letters, digits, '_' or '-'".into());
         }
-        let mut pending_commands = VecDeque::new();
         let addr = format_server_addr(&self.config.host, self.config.port);
         tracing::info!("Connecting to {} (TLS: {})", addr, self.config.use_tls);
 
@@ -495,6 +755,85 @@ impl IrcClient {
         }
     }
 
+    async fn probe_sts_upgrade(
+        host: &str,
+        port: u16,
+        incoming_tx: &mpsc::Sender<IrcMessage>,
+        outgoing_rx: &mut mpsc::UnboundedReceiver<IrcCommand>,
+        pending_commands: &mut VecDeque<IrcCommand>,
+    ) -> Result<Option<u16>, Box<dyn std::error::Error + Send + Sync>> {
+        let stream = tokio::select! {
+            biased;
+            _ = incoming_tx.closed() => return Err("Connection cancelled during STS probe".into()),
+            _ = wait_for_disconnect(outgoing_rx, pending_commands) => {
+                return Err("Connection cancelled during STS probe".into());
+            }
+            result = timeout(STS_PROBE_TIMEOUT, TcpStream::connect((host, port))) => {
+                match result {
+                    Ok(Ok(stream)) => stream,
+                    _ => return Ok(None),
+                }
+            }
+        };
+        let (reader, mut writer) = tokio::io::split(stream);
+        let mut reader = BufReader::new(reader);
+        writer.write_all(b"CAP LS 302\r\n").await?;
+        writer.flush().await?;
+        let mut buf = Vec::with_capacity(512);
+        for _ in 0..MAX_CAP_LINES {
+            buf.clear();
+            let read = tokio::select! {
+                biased;
+                _ = incoming_tx.closed() => {
+                    return Err("Connection cancelled during STS probe".into());
+                }
+                _ = wait_for_disconnect(outgoing_rx, pending_commands) => {
+                    return Err("Connection cancelled during STS probe".into());
+                }
+                result = timeout(
+                    STS_PROBE_TIMEOUT,
+                    read_until_lf_bounded(&mut reader, &mut buf, MAX_LINE_LEN),
+                ) => result,
+            };
+            let Ok(Ok(count)) = read else {
+                return Ok(None);
+            };
+            if count == 0 {
+                return Ok(None);
+            }
+            let line = String::from_utf8_lossy(&buf);
+            let Some(message) = IrcMessage::parse(&line) else {
+                continue;
+            };
+            if let IrcCommand::Ping(token) = message.command {
+                writer
+                    .write_all(format!("PONG :{token}\r\n").as_bytes())
+                    .await?;
+                writer.flush().await?;
+                continue;
+            }
+            if let IrcCommand::Cap(_, subcommand, params) = message.command
+                && subcommand.eq_ignore_ascii_case("LS")
+            {
+                if let Some(port) = params
+                    .last()
+                    .into_iter()
+                    .flat_map(|caps| caps.split_whitespace())
+                    .find_map(|cap| {
+                        cap.strip_prefix("sts=")
+                            .and_then(|value| parse_sts_value(value).0)
+                    })
+                {
+                    return Ok(Some(port));
+                }
+                if params.first().is_none_or(|value| value != "*") {
+                    return Ok(None);
+                }
+            }
+        }
+        Ok(None)
+    }
+
     async fn handle_tls_connection(
         &mut self,
         stream: TcpStream,
@@ -509,6 +848,21 @@ impl IrcClient {
             tracing::warn!("Accepting invalid certificates (insecure!)");
             tls_builder.danger_accept_invalid_certs(true);
             tls_builder.danger_accept_invalid_hostnames(true);
+        }
+
+        if let Some(cert_path) = self.config.tls_client_cert_path.as_deref() {
+            let cert = std::fs::read(cert_path)
+                .map_err(|e| format!("Failed to read TLS client certificate {cert_path:?}: {e}"))?;
+            let key_path = self
+                .config
+                .tls_client_key_path
+                .as_deref()
+                .unwrap_or(cert_path);
+            let key = std::fs::read(key_path)
+                .map_err(|e| format!("Failed to read TLS client key {key_path:?}: {e}"))?;
+            let identity = native_tls::Identity::from_pkcs8(&cert, &key)
+                .map_err(|e| format!("Invalid TLS client certificate/key: {e}"))?;
+            tls_builder.identity(identity);
         }
 
         let tls_connector = tls_builder
@@ -817,7 +1171,13 @@ impl IrcClient {
         R: tokio::io::AsyncBufRead + Unpin,
     {
         let config = &self.config;
-        let want_sasl = config.sasl_username.is_some() && config.sasl_password.is_some();
+        let has_password = config.sasl_username.is_some() && config.sasl_password.is_some();
+        let has_external = config.tls_client_cert_path.is_some();
+        let want_sasl = match config.sasl_mechanism {
+            SaslMechanism::Auto => has_password || has_external,
+            SaslMechanism::Plain | SaslMechanism::ScramSha256 => has_password,
+            SaslMechanism::External => has_external,
+        };
 
         // CAP LS and NICK/USER have already been sent together. Read the CAP
         // response while registration completion remains suspended.
@@ -828,6 +1188,9 @@ impl IrcClient {
         loop {
             let Some(msg) = read_handshake_msg_timed(writer, reader, &mut buf, incoming_tx).await?
             else {
+                if config.sasl_required {
+                    return Err("Required SASL authentication could not be negotiated".into());
+                }
                 let _ = incoming_tx.try_send(IrcMessage {
                     tags: None,
                     prefix: None,
@@ -849,6 +1212,9 @@ impl IrcClient {
             // The welcome was already forwarded to the GUI, so do not consume it
             // and then wait forever for a second copy.
             if matches!(&msg.command, IrcCommand::Numeric(RPL_WELCOME, _)) {
+                if config.sasl_required {
+                    return Err("Server completed registration without required SASL".into());
+                }
                 return Ok(true);
             }
 
@@ -874,6 +1240,9 @@ impl IrcClient {
             } else if let IrcCommand::Numeric(ERR_UNKNOWNCOMMAND, params) = &msg.command
                 && params.iter().any(|p| p.eq_ignore_ascii_case("CAP"))
             {
+                if config.sasl_required {
+                    return Err("Server does not support CAP required for SASL".into());
+                }
                 let _ = incoming_tx.try_send(IrcMessage {
                     tags: None,
                     prefix: None,
@@ -901,6 +1270,13 @@ impl IrcClient {
             })
             .collect();
         tracing::info!("Server capabilities: {}", available_caps.trim());
+        if config.use_tls
+            && !config.accept_invalid_certs
+            && let Some(Some(sts)) = available_tokens.get("sts")
+            && let Some(duration) = parse_sts_value(sts).1
+        {
+            update_sts_policy(&config.host, config.port, duration);
+        }
 
         // Step 3: Build list of capabilities to request
         let mut caps_to_request: Vec<&str> = Vec::new();
@@ -913,16 +1289,48 @@ impl IrcClient {
 
         // Add SASL if available and we want it
         let sasl_available = available_tokens.contains_key("sasl");
-        let sasl_plain_available = match available_tokens.get("sasl") {
-            Some(Some(mechs)) => mechs.split(',').any(|m| m.eq_ignore_ascii_case("PLAIN")),
-            Some(None) => true,
-            None => false,
+        let offered_sasl: Option<Vec<String>> = available_tokens
+            .get("sasl")
+            .and_then(|value| value.as_ref())
+            .map(|value| {
+                value
+                    .split(',')
+                    .map(|mech| mech.to_ascii_uppercase())
+                    .collect()
+            });
+        let offered = |mechanism: SaslMechanism| {
+            offered_sasl.as_ref().is_none_or(|offered| {
+                mechanism
+                    .wire_name()
+                    .is_some_and(|name| offered.iter().any(|item| item == name))
+            })
         };
-        if want_sasl && sasl_plain_available {
+        let mut sasl_mechanisms = Vec::new();
+        match config.sasl_mechanism {
+            SaslMechanism::Auto => {
+                if has_external && offered(SaslMechanism::External) {
+                    sasl_mechanisms.push(SaslMechanism::External);
+                }
+                // Do not probe SCRAM on servers that omit the mechanism list;
+                // older services commonly support only PLAIN.
+                if has_password && offered_sasl.is_some() && offered(SaslMechanism::ScramSha256) {
+                    sasl_mechanisms.push(SaslMechanism::ScramSha256);
+                }
+                if has_password && offered(SaslMechanism::Plain) {
+                    sasl_mechanisms.push(SaslMechanism::Plain);
+                }
+            }
+            mechanism if offered(mechanism) => sasl_mechanisms.push(mechanism),
+            _ => {}
+        }
+        if want_sasl && !sasl_mechanisms.is_empty() {
             caps_to_request.push("sasl");
         }
 
         if caps_to_request.is_empty() {
+            if config.sasl_required {
+                return Err("Server does not offer the required SASL mechanism".into());
+            }
             let _ = incoming_tx.try_send(IrcMessage {
                 tags: None,
                 prefix: None,
@@ -955,6 +1363,9 @@ impl IrcClient {
         loop {
             let Some(msg) = read_handshake_msg_timed(writer, reader, &mut buf, incoming_tx).await?
             else {
+                if config.sasl_required && pending_caps.contains("sasl") {
+                    return Err("Required SASL capability was not acknowledged".into());
+                }
                 let _ = incoming_tx.try_send(IrcMessage {
                     tags: None,
                     prefix: None,
@@ -968,6 +1379,9 @@ impl IrcClient {
             };
 
             if matches!(&msg.command, IrcCommand::Numeric(RPL_WELCOME, _)) {
+                if config.sasl_required {
+                    return Err("Server completed registration without required SASL".into());
+                }
                 let cap_end = "CAP END\r\n";
                 tracing::debug!("> {}", cap_end.trim());
                 writer.write_all(cap_end.as_bytes()).await?;
@@ -1024,24 +1438,30 @@ impl IrcClient {
         tracing::info!("Enabled capabilities: {}", acked_caps);
 
         // Step 6: If SASL was ACKed and we want it, do SASL authentication
-        let welcome_received = if want_sasl && acked_tokens.contains("sasl") {
-            self.do_sasl_auth_inner(writer, reader, incoming_tx).await?
-        } else if want_sasl {
-            let message = if !sasl_available {
-                "Server does not support SASL"
+        let (welcome_received, sasl_authenticated) =
+            if want_sasl && acked_tokens.contains("sasl") && !sasl_mechanisms.is_empty() {
+                self.do_sasl_auth_inner(writer, reader, incoming_tx, &sasl_mechanisms)
+                    .await?
+            } else if want_sasl {
+                let message = if !sasl_available {
+                    "Server does not support SASL"
+                } else {
+                    "Server does not offer a configured SASL mechanism"
+                };
+                let _ = incoming_tx.try_send(IrcMessage {
+                    tags: None,
+                    prefix: None,
+                    command: IrcCommand::Notice("*".to_string(), message.to_string()),
+                    raw: String::new(),
+                });
+                (false, false)
             } else {
-                "Server does not offer SASL PLAIN"
+                (false, false)
             };
-            let _ = incoming_tx.try_send(IrcMessage {
-                tags: None,
-                prefix: None,
-                command: IrcCommand::Notice("*".to_string(), message.to_string()),
-                raw: String::new(),
-            });
-            false
-        } else {
-            false
-        };
+
+        if config.sasl_required && !sasl_authenticated {
+            return Err("Required SASL authentication did not succeed".into());
+        }
 
         // Registration-only extensions run after their CAP ACK. Persistence
         // profiles also need the SASL account established, and both commands
@@ -1095,161 +1515,230 @@ impl IrcClient {
         Ok(welcome_received)
     }
 
-    /// Perform SASL PLAIN authentication (called after CAP REQ sasl is ACKed)
+    /// Try configured SASL mechanisms in preference order. A failed
+    /// mechanism may be followed by another attempt without ending CAP.
     async fn do_sasl_auth_inner<W, R>(
         &self,
         writer: &mut W,
         reader: &mut R,
         incoming_tx: &mpsc::Sender<IrcMessage>,
-    ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>>
+        mechanisms: &[SaslMechanism],
+    ) -> Result<(bool, bool), Box<dyn std::error::Error + Send + Sync>>
     where
         W: tokio::io::AsyncWrite + Unpin,
         R: tokio::io::AsyncBufRead + Unpin,
     {
-        let config = &self.config;
-        let sasl_user = config.sasl_username.as_ref().unwrap();
-        let sasl_pass = config.sasl_password.as_ref().unwrap();
         let mut buf = Vec::with_capacity(512);
-
+        for mechanism in mechanisms {
+            let name = mechanism.wire_name().expect("Auto is never attempted");
+            let _ = incoming_tx.try_send(IrcMessage {
+                tags: None,
+                prefix: None,
+                command: IrcCommand::Notice(
+                    "*".to_string(),
+                    format!("Starting SASL {name} authentication..."),
+                ),
+                raw: String::new(),
+            });
+            match self
+                .do_sasl_attempt(writer, reader, incoming_tx, &mut buf, *mechanism)
+                .await?
+            {
+                SaslAttemptOutcome::Success => return Ok((false, true)),
+                SaslAttemptOutcome::Welcome => return Ok((true, false)),
+                SaslAttemptOutcome::Failed => continue,
+            }
+        }
         let _ = incoming_tx.try_send(IrcMessage {
             tags: None,
             prefix: None,
             command: IrcCommand::Notice(
                 "*".to_string(),
-                "Starting SASL authentication...".to_string(),
+                "SASL authentication failed for every configured mechanism".to_string(),
             ),
             raw: String::new(),
         });
+        Ok((false, false))
+    }
 
-        // Start SASL PLAIN
-        let auth_plain = "AUTHENTICATE PLAIN\r\n";
-        tracing::debug!("> {}", auth_plain.trim());
-        writer.write_all(auth_plain.as_bytes()).await?;
+    async fn do_sasl_attempt<W, R>(
+        &self,
+        writer: &mut W,
+        reader: &mut R,
+        incoming_tx: &mpsc::Sender<IrcMessage>,
+        buf: &mut Vec<u8>,
+        mechanism: SaslMechanism,
+    ) -> Result<SaslAttemptOutcome, Box<dyn std::error::Error + Send + Sync>>
+    where
+        W: tokio::io::AsyncWrite + Unpin,
+        R: tokio::io::AsyncBufRead + Unpin,
+    {
+        let name = mechanism.wire_name().expect("Auto is never attempted");
+        writer
+            .write_all(format!("AUTHENTICATE {name}\r\n").as_bytes())
+            .await?;
         writer.flush().await?;
 
-        // Wait for AUTHENTICATE +
-        loop {
-            let Some(msg) = read_handshake_msg_timed(writer, reader, &mut buf, incoming_tx).await?
-            else {
-                let _ = incoming_tx.try_send(IrcMessage {
-                    tags: None,
-                    prefix: None,
-                    command: IrcCommand::Notice(
-                        "*".to_string(),
-                        "SASL challenge timed out; continuing without SASL".to_string(),
-                    ),
-                    raw: String::new(),
-                });
-                return Ok(false);
-            };
-            if matches!(&msg.command, IrcCommand::Numeric(RPL_WELCOME, _)) {
-                return Ok(true);
-            }
-            if let IrcCommand::Authenticate(data) = &msg.command {
-                if data == "+" {
-                    break;
-                }
-            } else if let IrcCommand::Numeric(
-                RPL_NICKLOCKED | ERR_SASLFAIL | ERR_SASLTOOLONG | ERR_SASLABORTED | ERR_SASLALREADY
-                | RPL_SASLMECHS,
-                params,
-            ) = &msg.command
-            {
-                let detail = params.last().cloned().unwrap_or_default();
-                let _ = incoming_tx.try_send(IrcMessage {
-                    tags: None,
-                    prefix: None,
-                    command: IrcCommand::Notice(
-                        "*".to_string(),
-                        format!("SASL authentication failed: {}", detail),
-                    ),
-                    raw: String::new(),
-                });
-                return Ok(false);
-            }
+        match self
+            .read_sasl_event(writer, reader, incoming_tx, buf)
+            .await?
+        {
+            SaslServerEvent::Challenge(challenge) if challenge == "+" => {}
+            SaslServerEvent::Success => return Ok(SaslAttemptOutcome::Success),
+            SaslServerEvent::Welcome => return Ok(SaslAttemptOutcome::Welcome),
+            _ => return Ok(SaslAttemptOutcome::Failed),
         }
 
-        // Send credentials (base64 of \0username\0password), split into <=400-byte
-        // AUTHENTICATE lines per the SASL-over-IRC spec. A payload whose length is an
-        // exact multiple of 400 is terminated with an empty `AUTHENTICATE +`.
-        let credentials = format!("\0{}\0{}", sasl_user, sasl_pass);
-        let encoded = BASE64_STANDARD.encode(credentials.as_bytes());
+        let mut expected_server_signature: Option<Vec<u8>> = None;
+        match mechanism {
+            SaslMechanism::Plain => {
+                let user = self.config.sasl_username.as_deref().unwrap_or_default();
+                let password = self.config.sasl_password.as_deref().unwrap_or_default();
+                let payload = format!("\0{user}\0{password}");
+                Self::write_sasl_payload(writer, payload.as_bytes()).await?;
+            }
+            SaslMechanism::External => {
+                // Empty authzid asks services to use the identity from the TLS
+                // client certificate.
+                Self::write_sasl_payload(writer, b"").await?;
+            }
+            SaslMechanism::ScramSha256 => {
+                let user = self.config.sasl_username.as_deref().unwrap_or_default();
+                let password = self.config.sasl_password.as_deref().unwrap_or_default();
+                let mut random = [0u8; 18];
+                getrandom::fill(&mut random).map_err(|e| format!("OS randomness failed: {e}"))?;
+                let nonce = BASE64_STANDARD.encode(random).replace('=', "");
+                let escaped_user = user.replace('=', "=3D").replace(',', "=2C");
+                let client_first_bare = format!("n={escaped_user},r={nonce}");
+                let client_first = format!("n,,{client_first_bare}");
+                Self::write_sasl_payload(writer, client_first.as_bytes()).await?;
+
+                let server_first = match self
+                    .read_sasl_event(writer, reader, incoming_tx, buf)
+                    .await?
+                {
+                    SaslServerEvent::Challenge(challenge) => String::from_utf8(
+                        BASE64_STANDARD
+                            .decode(challenge.as_bytes())
+                            .map_err(|_| "Invalid base64 SCRAM challenge")?,
+                    )
+                    .map_err(|_| "Non-UTF-8 SCRAM challenge")?,
+                    SaslServerEvent::Welcome => return Ok(SaslAttemptOutcome::Welcome),
+                    _ => return Ok(SaslAttemptOutcome::Failed),
+                };
+                let (client_final, signature) =
+                    scram_sha256_response(password, &nonce, &client_first_bare, &server_first)?;
+                expected_server_signature = Some(signature);
+                Self::write_sasl_payload(writer, client_final.as_bytes()).await?;
+            }
+            SaslMechanism::Auto => unreachable!(),
+        }
+
+        let mut server_verified = expected_server_signature.is_none();
+        loop {
+            match self
+                .read_sasl_event(writer, reader, incoming_tx, buf)
+                .await?
+            {
+                SaslServerEvent::Challenge(challenge) => {
+                    let Some(expected) = expected_server_signature.as_deref() else {
+                        return Ok(SaslAttemptOutcome::Failed);
+                    };
+                    let decoded = BASE64_STANDARD
+                        .decode(challenge.as_bytes())
+                        .ok()
+                        .and_then(|bytes| String::from_utf8(bytes).ok());
+                    let supplied = decoded
+                        .as_deref()
+                        .and_then(|value| value.split(',').find_map(|part| part.strip_prefix("v=")))
+                        .and_then(|value| BASE64_STANDARD.decode(value.as_bytes()).ok());
+                    server_verified = supplied
+                        .as_deref()
+                        .is_some_and(|actual| constant_time_eq(actual, expected));
+                    if !server_verified {
+                        writer.write_all(b"AUTHENTICATE *\r\n").await?;
+                        writer.flush().await?;
+                        return Ok(SaslAttemptOutcome::Failed);
+                    }
+                }
+                SaslServerEvent::Success if server_verified => {
+                    let _ = incoming_tx.try_send(IrcMessage {
+                        tags: None,
+                        prefix: None,
+                        command: IrcCommand::Notice(
+                            "*".to_string(),
+                            format!("SASL {name} authentication successful"),
+                        ),
+                        raw: String::new(),
+                    });
+                    return Ok(SaslAttemptOutcome::Success);
+                }
+                SaslServerEvent::Success | SaslServerEvent::Failed => {
+                    return Ok(SaslAttemptOutcome::Failed);
+                }
+                SaslServerEvent::Welcome => return Ok(SaslAttemptOutcome::Welcome),
+            }
+        }
+    }
+
+    async fn read_sasl_event<W, R>(
+        &self,
+        writer: &mut W,
+        reader: &mut R,
+        incoming_tx: &mpsc::Sender<IrcMessage>,
+        buf: &mut Vec<u8>,
+    ) -> Result<SaslServerEvent, Box<dyn std::error::Error + Send + Sync>>
+    where
+        W: tokio::io::AsyncWrite + Unpin,
+        R: tokio::io::AsyncBufRead + Unpin,
+    {
+        loop {
+            let Some(msg) = read_handshake_msg_timed(writer, reader, buf, incoming_tx).await?
+            else {
+                return Ok(SaslServerEvent::Failed);
+            };
+            match &msg.command {
+                IrcCommand::Authenticate(data) => {
+                    return Ok(SaslServerEvent::Challenge(data.clone()));
+                }
+                IrcCommand::Numeric(RPL_WELCOME, _) => return Ok(SaslServerEvent::Welcome),
+                IrcCommand::Numeric(RPL_SASLSUCCESS, _) => return Ok(SaslServerEvent::Success),
+                IrcCommand::Numeric(
+                    RPL_NICKLOCKED | ERR_SASLFAIL | ERR_SASLTOOLONG | ERR_SASLABORTED
+                    | ERR_SASLALREADY,
+                    _,
+                ) => return Ok(SaslServerEvent::Failed),
+                // 908 advertises the mechanisms supported by the server. It
+                // can accompany a failed attempt and is not itself terminal.
+                IrcCommand::Numeric(RPL_LOGGEDIN | RPL_SASLMECHS, _) => continue,
+                _ => continue,
+            }
+        }
+    }
+
+    async fn write_sasl_payload<W>(
+        writer: &mut W,
+        payload: &[u8],
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
+    where
+        W: tokio::io::AsyncWrite + Unpin,
+    {
+        let encoded = BASE64_STANDARD.encode(payload);
         tracing::debug!("> AUTHENTICATE <credentials>");
-        let bytes = encoded.as_bytes();
-        if bytes.is_empty() {
+        if encoded.is_empty() {
             writer.write_all(b"AUTHENTICATE +\r\n").await?;
         } else {
-            let mut pos = 0;
-            loop {
-                let end = (pos + 400).min(bytes.len());
-                let chunk = &bytes[pos..end];
+            for chunk in encoded.as_bytes().chunks(400) {
                 writer.write_all(b"AUTHENTICATE ").await?;
                 writer.write_all(chunk).await?;
                 writer.write_all(b"\r\n").await?;
-                pos = end;
-                if chunk.len() < 400 {
-                    break;
-                }
-                if pos == bytes.len() {
-                    writer.write_all(b"AUTHENTICATE +\r\n").await?;
-                    break;
-                }
+            }
+            if encoded.len().is_multiple_of(400) {
+                writer.write_all(b"AUTHENTICATE +\r\n").await?;
             }
         }
         writer.flush().await?;
-
-        // Wait for 903 (success) or 904/905/906 (failure)
-        loop {
-            let Some(msg) = read_handshake_msg_timed(writer, reader, &mut buf, incoming_tx).await?
-            else {
-                let _ = incoming_tx.try_send(IrcMessage {
-                    tags: None,
-                    prefix: None,
-                    command: IrcCommand::Notice(
-                        "*".to_string(),
-                        "SASL result timed out; continuing registration".to_string(),
-                    ),
-                    raw: String::new(),
-                });
-                return Ok(false);
-            };
-
-            if matches!(&msg.command, IrcCommand::Numeric(RPL_WELCOME, _)) {
-                return Ok(true);
-            }
-
-            if let IrcCommand::Numeric(num, _params) = &msg.command {
-                match *num {
-                    903 => {
-                        let _ = incoming_tx.try_send(IrcMessage {
-                            tags: None,
-                            prefix: None,
-                            command: IrcCommand::Notice(
-                                "*".to_string(),
-                                "SASL authentication successful!".to_string(),
-                            ),
-                            raw: String::new(),
-                        });
-                        return Ok(false);
-                    }
-                    RPL_NICKLOCKED | ERR_SASLFAIL | ERR_SASLTOOLONG | ERR_SASLABORTED
-                    | ERR_SASLALREADY | RPL_SASLMECHS => {
-                        let _ = incoming_tx.try_send(IrcMessage {
-                            tags: None,
-                            prefix: None,
-                            command: IrcCommand::Notice(
-                                "*".to_string(),
-                                "SASL authentication failed!".to_string(),
-                            ),
-                            raw: String::new(),
-                        });
-                        return Ok(false);
-                    }
-                    900 => continue, // RPL_LOGGEDIN
-                    _ => {}
-                }
-            }
-        }
+        Ok(())
     }
 
     async fn read_loop<R: tokio::io::AsyncBufRead + Unpin>(
@@ -1348,6 +1837,23 @@ impl IrcClient {
                         if !line.is_empty() {
                             tracing::debug!("< {}", line);
                             if let Some(msg) = IrcMessage::parse(&line) {
+                                if self.config.use_tls
+                                    && !self.config.accept_invalid_certs
+                                    && let IrcCommand::Cap(_, subcommand, params) = &msg.command
+                                    && subcommand.eq_ignore_ascii_case("NEW")
+                                    && let Some(sts) = params
+                                        .last()
+                                        .into_iter()
+                                        .flat_map(|caps| caps.split_whitespace())
+                                        .find_map(|cap| cap.strip_prefix("sts="))
+                                    && let Some(duration) = parse_sts_value(sts).1
+                                {
+                                    update_sts_policy(
+                                        &self.config.host,
+                                        self.config.port,
+                                        duration,
+                                    );
+                                }
                                 // Handle PING automatically. Awaiting the send
                                 // (instead of try_send) means a saturated writer
                                 // queue delays the PONG rather than silently
@@ -1396,6 +1902,77 @@ impl IrcClient {
 mod tests {
     use super::*;
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+
+    #[test]
+    fn scram_sha256_matches_rfc_7677_vector() {
+        let client_nonce = "rOprNGfwEbeRWgbNEkqO";
+        let client_first_bare = "n=user,r=rOprNGfwEbeRWgbNEkqO";
+        let server_first = concat!(
+            "r=rOprNGfwEbeRWgbNEkqO%hvYDpWUa2RaTCAfuxFIlj)hNlF$k0,",
+            "s=W22ZaJ0SNY7soEsUEjb6gQ==,i=4096"
+        );
+        let (client_final, server_signature) =
+            scram_sha256_response("pencil", client_nonce, client_first_bare, server_first).unwrap();
+
+        assert_eq!(
+            client_final,
+            concat!(
+                "c=biws,r=rOprNGfwEbeRWgbNEkqO%hvYDpWUa2RaTCAfuxFIlj)hNlF$k0,",
+                "p=dHzbZapWIk4jUhN+Ute9ytag9zjfMHgsqmmiz7AndVQ="
+            )
+        );
+        assert_eq!(
+            BASE64_STANDARD.encode(server_signature),
+            "6rriTRBi23WpRR/wtup+mMhUZUn/dB5nLTJRsjl95G4="
+        );
+    }
+
+    #[test]
+    fn sts_values_and_sensitive_commands_are_parsed_safely() {
+        assert_eq!(
+            parse_sts_value("port=6697,duration=86400"),
+            (Some(6697), Some(86400))
+        );
+        assert_eq!(parse_sts_value("port=0,duration=nope"), (None, None));
+        assert_eq!(redact_for_log("AUTH account secret\r\n"), "AUTH <redacted>");
+        assert_eq!(
+            redact_for_log("PRIVMSG Q@CServe.quakenet.org :AUTH account secret\r\n"),
+            "PRIVMSG NickServ :<redacted>"
+        );
+    }
+
+    #[test]
+    fn sts_probe_reads_the_advertised_tls_port_without_registering() {
+        test_runtime().block_on(async {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                let (read_half, mut write_half) = stream.into_split();
+                let mut reader = BufReader::new(read_half);
+                assert_eq!(read_wire_line(&mut reader).await, "CAP LS 302");
+                write_half
+                    .write_all(b":srv CAP * LS :sts=port=6697\r\n")
+                    .await
+                    .unwrap();
+            });
+            let (incoming_tx, _incoming_rx) = mpsc::channel(1);
+            let (_outgoing_tx, mut outgoing_rx) = mpsc::unbounded_channel();
+            let mut pending = VecDeque::new();
+            let port = IrcClient::probe_sts_upgrade(
+                "127.0.0.1",
+                address.port(),
+                &incoming_tx,
+                &mut outgoing_rx,
+                &mut pending,
+            )
+            .await
+            .unwrap();
+            assert_eq!(port, Some(6697));
+            assert!(pending.is_empty());
+            server.await.unwrap();
+        });
+    }
 
     #[test]
     fn complete_nefarious_cap_request_is_split_within_irc_line_limit() {
@@ -1810,6 +2387,48 @@ mod tests {
                 std::iter::from_fn(|| msg_rx.try_recv().ok())
                     .any(|msg| matches!(msg.command, IrcCommand::Numeric(RPL_WELCOME, _)))
             );
+            server.await.unwrap();
+        });
+    }
+
+    #[test]
+    fn required_sasl_rejects_a_legacy_welcome() {
+        test_runtime().block_on(async {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                let (read_half, mut write_half) = stream.into_split();
+                let mut reader = BufReader::new(read_half);
+                assert_eq!(read_wire_line(&mut reader).await, "CAP LS 302");
+                assert_eq!(read_wire_line(&mut reader).await, "NICK tester");
+                assert!(read_wire_line(&mut reader).await.starts_with("USER "));
+                write_half
+                    .write_all(b":legacy 001 tester :Welcome\r\n")
+                    .await
+                    .unwrap();
+            });
+
+            let config = ServerConfig {
+                host: "127.0.0.1".into(),
+                port: addr.port(),
+                use_tls: false,
+                nick: "tester".into(),
+                sasl_username: Some("account".into()),
+                sasl_password: Some("secret".into()),
+                sasl_required: true,
+                ..Default::default()
+            };
+            let (msg_tx, _msg_rx) = mpsc::channel(100);
+            let (_cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+            let error = timeout(
+                Duration::from_secs(1),
+                IrcClient::new(config).connect(msg_tx, cmd_rx),
+            )
+            .await
+            .expect("required-SASL registration timed out")
+            .unwrap_err();
+            assert!(error.to_string().contains("required SASL"));
             server.await.unwrap();
         });
     }

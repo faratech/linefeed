@@ -71,6 +71,18 @@ pub const RPL_MONLIST: u16 = 732;
 pub const RPL_ENDOFMONLIST: u16 = 733;
 pub const ERR_MONLISTFULL: u16 = 734;
 
+// Legacy WATCH presence tracking (Bahamut, Plexus, UnrealIRCd).
+pub const RPL_LOGON: u16 = 600;
+pub const RPL_LOGOFF: u16 = 601;
+pub const RPL_WATCHOFF: u16 = 602;
+pub const RPL_WATCHSTAT: u16 = 603;
+pub const RPL_NOWON: u16 = 604;
+pub const RPL_NOWOFF: u16 = 605;
+pub const RPL_WATCHLIST: u16 = 606;
+pub const RPL_ENDOFWATCHLIST: u16 = 607;
+pub const RPL_CLEARWATCH: u16 = 608;
+pub const ERR_TOOMANYWATCH: u16 = 512;
+
 // IRCv3 metadata and Nefarious bouncer administration
 pub const RPL_WHOISKEYVALUE: u16 = 760;
 pub const RPL_KEYVALUE: u16 = 761;

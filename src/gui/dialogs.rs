@@ -3,6 +3,7 @@
 use super::helpers::format_timestamp;
 use super::{ChatMessage, IrcApp, ServerFavorite};
 use crate::irc::IrcCommand;
+use crate::irc::client::SaslMechanism;
 use egui::{Color32, RichText, ScrollArea, TextEdit, Vec2};
 
 /// Popular IRC network presets (alphabetical)
@@ -188,8 +189,35 @@ impl IrcApp {
                     ui.add(TextEdit::singleline(&mut self.sasl_password).password(true).desired_width(150.0));
                 });
 
+                ui.horizontal(|ui| {
+                    ui.label("Mechanism:");
+                    egui::ComboBox::from_id_salt("sasl_mechanism")
+                        .selected_text(match self.sasl_mechanism {
+                            SaslMechanism::Auto => "Auto",
+                            SaslMechanism::Plain => "PLAIN",
+                            SaslMechanism::External => "EXTERNAL",
+                            SaslMechanism::ScramSha256 => "SCRAM-SHA-256",
+                        })
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(&mut self.sasl_mechanism, SaslMechanism::Auto, "Auto");
+                            ui.selectable_value(&mut self.sasl_mechanism, SaslMechanism::Plain, "PLAIN");
+                            ui.selectable_value(&mut self.sasl_mechanism, SaslMechanism::External, "EXTERNAL");
+                            ui.selectable_value(&mut self.sasl_mechanism, SaslMechanism::ScramSha256, "SCRAM-SHA-256");
+                        });
+                    ui.checkbox(&mut self.sasl_required, "Require SASL");
+                });
+
+                ui.horizontal(|ui| {
+                    ui.label("Client cert:");
+                    ui.add(TextEdit::singleline(&mut self.tls_client_cert_path).desired_width(260.0).hint_text("combined PEM or certificate PEM"));
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Client key:");
+                    ui.add(TextEdit::singleline(&mut self.tls_client_key_path).desired_width(260.0).hint_text("optional; defaults to cert PEM"));
+                });
+
                 if !self.sasl_username.is_empty() || !self.sasl_password.is_empty() {
-                    ui.label(RichText::new("For Libera Chat, OFTC, etc. Uses SASL PLAIN.").small().color(Color32::GRAY));
+                    ui.label(RichText::new("Auto prefers SCRAM-SHA-256 when advertised, then PLAIN.").small().color(Color32::GRAY));
                 }
 
                 ui.separator();
@@ -248,6 +276,10 @@ impl IrcApp {
                                 auto_perform: self.auto_perform.clone(),
                                 sasl_username: self.sasl_username.clone(),
                                 sasl_password: self.sasl_password.clone(),
+                                sasl_mechanism: self.sasl_mechanism,
+                                sasl_required: self.sasl_required,
+                                tls_client_cert_path: self.tls_client_cert_path.clone(),
+                                tls_client_key_path: self.tls_client_key_path.clone(),
                                 username: self.username.clone(),
                                 realname: self.realname.clone(),
                                 accept_invalid_certs: self.accept_invalid_certs,
@@ -1043,12 +1075,14 @@ impl IrcApp {
             Some(name) => name.clone(),
             None => return,
         };
+        let list_modes: Vec<char> = self.network_support.chanmodes_a.chars().collect();
 
         let mut close = false;
         // Button actions are deferred to after the window closure so the channel
         // can be borrowed instead of deep-cloned (cloning the full scrollback,
         // user list, and bans every frame is several MB of allocation traffic).
         let mut load_ban_list = false;
+        let mut load_mode_lists = Vec::new();
         let mut refresh = false;
 
         egui::Window::new(format!("Channel Info: {}", channel_name))
@@ -1156,6 +1190,58 @@ impl IrcApp {
                             }
                         });
 
+                    for mode in list_modes.iter().copied().filter(|mode| *mode != 'b') {
+                        let entries = ch.mode_lists.get(&mode).map(Vec::as_slice).unwrap_or(&[]);
+                        let label = if Some(mode) == self.network_support.except_mode {
+                            "Exception List".to_string()
+                        } else if Some(mode) == self.network_support.invex_mode {
+                            "Invite Exception List".to_string()
+                        } else if mode == 'q' {
+                            "Quiet List".to_string()
+                        } else {
+                            format!("Mode +{mode} List")
+                        };
+                        egui::CollapsingHeader::new(format!("{} ({})", label, entries.len()))
+                            .id_salt(format!("channel_info_list_{mode}"))
+                            .show(ui, |ui| {
+                                if entries.is_empty() {
+                                    if ch.mode_lists_complete.contains(&mode) {
+                                        ui.label(
+                                            RichText::new("No entries")
+                                                .italics()
+                                                .color(Color32::GRAY),
+                                        );
+                                    } else if ui.button(format!("Load +{mode} List")).clicked() {
+                                        load_mode_lists.push(mode);
+                                    }
+                                } else {
+                                    ScrollArea::vertical().max_height(150.0).show(ui, |ui| {
+                                        for entry in entries {
+                                            ui.horizontal(|ui| {
+                                                ui.label(RichText::new(&entry.mask).monospace());
+                                                if !entry.set_by.is_empty() {
+                                                    let detail = if entry.set_time == 0 {
+                                                        format!("by {}", entry.set_by)
+                                                    } else {
+                                                        format!(
+                                                            "by {} on {}",
+                                                            entry.set_by,
+                                                            format_timestamp(entry.set_time)
+                                                        )
+                                                    };
+                                                    ui.label(
+                                                        RichText::new(detail)
+                                                            .small()
+                                                            .color(Color32::GRAY),
+                                                    );
+                                                }
+                                            });
+                                        }
+                                    });
+                                }
+                            });
+                    }
+
                     ui.separator();
 
                     // User list section (stable id_salt: see ban list above).
@@ -1165,12 +1251,14 @@ impl IrcApp {
                             ScrollArea::vertical().max_height(150.0).show(ui, |ui| {
                                 ui.horizontal_wrapped(|ui| {
                                     for user in &ch.users {
-                                        let prefix = user.mode.prefix();
-                                        let display = if user.is_away() {
-                                            format!("{}{} (away)", prefix, user.nick)
-                                        } else {
-                                            format!("{}{}", prefix, user.nick)
+                                        let prefix = user.prefix();
+                                        let state = match (user.is_away(), user.bot) {
+                                            (true, true) => " (away, bot)",
+                                            (true, false) => " (away)",
+                                            (false, true) => " (bot)",
+                                            (false, false) => "",
                                         };
+                                        let display = format!("{prefix}{}{state}", user.nick);
                                         ui.label(&display);
                                     }
                                 });
@@ -1198,20 +1286,33 @@ impl IrcApp {
                 Vec::new(),
             ));
         }
+        for mode in load_mode_lists {
+            self.send_command(IrcCommand::Mode(
+                channel_name.clone(),
+                Some(format!("+{mode}")),
+                Vec::new(),
+            ));
+        }
         if refresh {
-            // Clear displayed data only when both refresh requests were queued;
+            // Clear displayed data only when every refresh request was queued;
             // otherwise a disconnected click preserves the last snapshot.
             let modes_sent =
                 self.send_command(IrcCommand::Mode(channel_name.clone(), None, Vec::new()));
-            let bans_sent = self.send_command(IrcCommand::Mode(
-                channel_name.clone(),
-                Some("+b".to_string()),
-                Vec::new(),
-            ));
-            if modes_sent && bans_sent {
+            let mut lists_sent = true;
+            for mode in &list_modes {
+                let sent = self.send_command(IrcCommand::Mode(
+                    channel_name.clone(),
+                    Some(format!("+{mode}")),
+                    Vec::new(),
+                ));
+                lists_sent &= sent;
+            }
+            if modes_sent && lists_sent {
                 if let Some(ch) = self.channels.get_mut(&channel_name) {
                     ch.bans.clear();
                     ch.ban_list_complete = false;
+                    ch.mode_lists.clear();
+                    ch.mode_lists_complete.clear();
                 }
             } else {
                 self.add_server_message(super::types::ChatMessage::system_fmt(

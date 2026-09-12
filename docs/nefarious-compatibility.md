@@ -10,7 +10,7 @@ server advertises it and handles `CAP NEW`/`CAP DEL` changes after registration.
 | `userhost-in-names` | Accepts `nick!user@host` NAMES entries without corrupting membership nicknames. |
 | `extended-join` | Reads account and real-name data. |
 | `away-notify`, `account-notify`, `chghost` | Updates live user state across shared channels. |
-| `sasl` | Performs SASL PLAIN when credentials are configured and the server offers PLAIN. |
+| `sasl` | Selects from advertised SCRAM-SHA-256, EXTERNAL, and PLAIN mechanisms, retries alternatives in Auto mode, and can require successful authentication. |
 | `cap-notify` | Requests newly available supported capabilities and removes deleted ones. |
 | `server-time`, `message-tags`, `account-tag` | Retains canonical timestamps, msgids, and account identity. |
 | `echo-message` | Reconciles the authoritative server echo with the optimistic local row and keeps its msgid/time/account. |
@@ -39,7 +39,7 @@ server advertises it and handles `CAP NEW`/`CAP DEL` changes after registration.
 | `draft/oper-tag` | Shows the operator marker or configured oper name beside tagged senders. |
 | status messages | Routes `WALLCHOPS`, `WALLHOPS`, `WALLVOICES`, and STATUSMSG-prefixed targets to the underlying channel. |
 | reply/reaction/typing tags | `/reply`, `/react`, and `/typing` emit client-only tags; received reactions remain visible and typing updates stay transient. |
-| direct TLS | Uses OS-native TLS and validates certificates by default. Nefarious's prohibited `sts` token is not requested; users select TLS in the connection profile. |
+| direct TLS and `sts` | Uses OS-native TLS, validates certificates by default, supports client certificates, and persists valid IRCv3 STS policies. The advertisement-only `sts` token is never sent in `CAP REQ`. |
 
 The administrative extension commands intentionally pass their subcommand
 syntax through to the server. Nefarious can add subcommands without requiring a

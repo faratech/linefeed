@@ -804,12 +804,25 @@ impl IrcApp {
 
             "LIST" => {
                 self.show_channel_list = true;
+                self.channel_list_apply_min_filter = args.is_empty()
+                    && self.list_min_users >= 1
+                    && !self
+                        .network_support
+                        .elist
+                        .to_ascii_uppercase()
+                        .contains('U');
 
                 // Use configurable min users filter to avoid flooding on large networks
                 // Users can override with /list * or /list <filter>
                 let request = if args.is_empty() {
                     // >N means "more than N users", so for min 5, send >4
-                    if self.list_min_users >= 1 {
+                    if self.list_min_users >= 1
+                        && self
+                            .network_support
+                            .elist
+                            .to_ascii_uppercase()
+                            .contains('U')
+                    {
                         IrcCommand::List(Some(format!(
                             ">{}",
                             self.list_min_users.saturating_sub(1)
@@ -858,7 +871,7 @@ impl IrcApp {
                         && self.is_channel_name(channel)
                     {
                         // Convert nick to ban mask if it's just a nick
-                        let mask = nick_to_mask(args);
+                        let mask = self.ban_mask_for(args);
                         self.send_command(IrcCommand::Mode(
                             channel.clone(),
                             Some("+b".to_string()),
@@ -909,7 +922,7 @@ impl IrcApp {
                     // (blindly appending "!*@*" to a mask built a garbage ban).
                     let is_mask =
                         target.contains('!') || target.contains('@') || target.contains('*');
-                    let mask = nick_to_mask(target);
+                    let mask = self.ban_mask_for(target);
                     self.send_command(IrcCommand::Mode(
                         channel.clone(),
                         Some("+b".to_string()),
@@ -1087,8 +1100,9 @@ impl IrcApp {
                     // Add/remove silence entry
                     self.send_command(IrcCommand::Raw(format!("SILENCE {}", args)));
                 } else {
-                    // Assume adding
-                    self.send_command(IrcCommand::Raw(format!("SILENCE +{}", args)));
+                    // Bahamut/ircu define a bare nick as querying that user's
+                    // silence list. Adding is explicitly `+mask`.
+                    self.send_command(IrcCommand::Raw(format!("SILENCE {}", args)));
                 }
             }
 
@@ -1429,7 +1443,46 @@ impl IrcApp {
                     ));
                 } else {
                     let (subcmd, targets) = monitor_args(args);
-                    self.send_command(IrcCommand::Monitor(subcmd, targets));
+                    match subcmd.as_str() {
+                        "+" => {
+                            if let Some(targets) = &targets {
+                                for nick in targets.split(',').filter(|nick| !nick.is_empty()) {
+                                    self.monitored_users
+                                        .insert(self.network_support.canonicalize(nick));
+                                }
+                            }
+                        }
+                        "-" => {
+                            if let Some(targets) = &targets {
+                                for nick in targets.split(',') {
+                                    self.monitored_users
+                                        .remove(&self.network_support.canonicalize(nick));
+                                }
+                            }
+                        }
+                        "C" => self.monitored_users.clear(),
+                        _ => {}
+                    }
+                    if self.network_support.has_isupport("MONITOR")
+                        || !self.network_support.has_isupport("WATCH")
+                    {
+                        self.send_command(IrcCommand::Monitor(subcmd, targets));
+                    } else if self.network_support.has_isupport("WATCH") {
+                        let wire = match targets {
+                            Some(targets) if subcmd == "+" || subcmd == "-" => targets
+                                .split(',')
+                                .filter(|nick| !nick.is_empty())
+                                .map(|nick| format!("{subcmd}{nick}"))
+                                .collect::<Vec<_>>()
+                                .join(" "),
+                            _ => subcmd,
+                        };
+                        self.send_command(IrcCommand::Raw(format!("WATCH {wire}")));
+                    } else {
+                        self.add_message_to_current(ChatMessage::system(
+                            "Server supports neither MONITOR nor WATCH",
+                        ));
+                    }
                 }
             }
 
@@ -1720,15 +1773,69 @@ impl IrcApp {
                 self.show_settings = true;
             }
 
+            "CPRIVMSG" | "CNOTICE" => {
+                let mut parts = args.splitn(3, char::is_whitespace);
+                let target = parts.next().unwrap_or("");
+                let channel = parts.next().unwrap_or("");
+                let text = parts.next().unwrap_or("").trim_start();
+                if target.is_empty() || channel.is_empty() || text.is_empty() {
+                    self.add_message_to_current(ChatMessage::system(&format!(
+                        "Usage: /{} <nick> <channel> <message>",
+                        cmd.to_ascii_lowercase()
+                    )));
+                } else {
+                    self.send_command(IrcCommand::Raw(format!("{cmd} {target} {channel} :{text}")));
+                }
+            }
+
+            "WALLCHOPS" | "WALLVOICES" => {
+                let mut parts = args.splitn(2, char::is_whitespace);
+                let channel = parts.next().unwrap_or("");
+                let text = parts.next().unwrap_or("").trim_start();
+                if channel.is_empty() || text.is_empty() {
+                    self.add_message_to_current(ChatMessage::system(&format!(
+                        "Usage: /{} <channel> <message>",
+                        cmd.to_ascii_lowercase()
+                    )));
+                } else {
+                    self.send_command(IrcCommand::Raw(format!("{cmd} {channel} :{text}")));
+                }
+            }
+
+            "SHELP" => {
+                let line = if args.is_empty() {
+                    "HELP".to_string()
+                } else {
+                    format!("HELP {args}")
+                };
+                self.send_command(IrcCommand::Raw(line));
+            }
+
             "HELP" | "H" | "?" => {
                 self.show_help();
             }
 
             _ => {
-                self.add_message_to_current(ChatMessage::system(&format!(
-                    "Unknown command: {}. Type /help for list.",
-                    cmd
-                )));
+                if !cmd.is_empty()
+                    && cmd.bytes().all(|byte| byte.is_ascii_alphabetic())
+                    && !args.bytes().any(|byte| matches!(byte, b'\r' | b'\n' | 0))
+                {
+                    let line = if args.is_empty() {
+                        cmd.to_string()
+                    } else {
+                        format!("{cmd} {args}")
+                    };
+                    if !self.send_command(IrcCommand::Raw(line)) {
+                        self.add_message_to_current(ChatMessage::system(
+                            "Not connected - server command not sent",
+                        ));
+                    }
+                } else {
+                    self.add_message_to_current(ChatMessage::system(&format!(
+                        "Invalid command: {}. Type /help for list.",
+                        cmd
+                    )));
+                }
             }
         }
     }
@@ -1751,12 +1858,32 @@ impl IrcApp {
         }
     }
 
+    fn ban_mask_for(&self, value: &str) -> String {
+        if value.contains(['!', '@', '*']) {
+            return nick_to_mask(value);
+        }
+        self.current_channel
+            .as_deref()
+            .and_then(|channel| self.channel_key(channel))
+            .and_then(|channel| self.channels.get(&channel))
+            .and_then(|channel| channel.get_user(value))
+            .and_then(|user| match (&user.username, &user.hostname) {
+                (Some(username), Some(hostname)) => Some(format!("*!{username}@{hostname}")),
+                _ => None,
+            })
+            .unwrap_or_else(|| nick_to_mask(value))
+    }
+
     /// Secrets and automation belong to one configured network profile. An
     /// unprofiled endpoint change must never inherit them from the old server.
     pub(crate) fn clear_endpoint_credentials(&mut self) {
         self.password.clear();
         self.sasl_username.clear();
         self.sasl_password.clear();
+        self.sasl_mechanism = crate::irc::client::SaslMechanism::Auto;
+        self.sasl_required = false;
+        self.tls_client_cert_path.clear();
+        self.tls_client_key_path.clear();
         self.auto_join_channels.clear();
         self.auto_perform.clear();
         self.pre_away_message.clear();
@@ -1878,6 +2005,11 @@ impl IrcApp {
                     "/silence [+/-mask]  - Server-side ignore",
                     "/accept [nick]      - Callerid accept list",
                     "/monitor + nicks    - Track online status",
+                    "/cprivmsg <n> <c> <text> - Context private message",
+                    "/cnotice <n> <c> <text>  - Context notice",
+                    "/wallchops <c> <text>    - Message channel ops",
+                    "/wallvoices <c> <text>   - Message voiced users",
+                    "/shelp [topic]      - Request server help",
                 ],
             ),
             (
@@ -1962,7 +2094,7 @@ fn is_auth_service_target(raw_target: &str) -> bool {
             .unwrap_or(raw_target)
             .to_ascii_lowercase()
             .as_str(),
-        "nickserv" | "ns" | "authserv" | "as" | "chanserv" | "cs"
+        "nickserv" | "ns" | "authserv" | "as" | "chanserv" | "cs" | "q" | "x"
     )
 }
 
@@ -2007,8 +2139,8 @@ pub(super) fn command_line_contains_credentials(line: &str) -> bool {
     let command = parts.next().unwrap_or("");
     let args = parts.next().unwrap_or("").trim_start();
     match command.to_ascii_uppercase().as_str() {
-        "PASS" | "AUTHENTICATE" | "OPER" | "REGISTER" | "VERIFY" | "WEBPUSH" | "AUTHTOKEN"
-        | "BOUNCER" => true,
+        "PASS" | "AUTH" | "LOGIN" | "AUTHENTICATE" | "OPER" | "REGISTER" | "VERIFY" | "WEBPUSH"
+        | "AUTHTOKEN" | "BOUNCER" => true,
         "TOKEN" => args
             .split_whitespace()
             .next()
@@ -2268,6 +2400,33 @@ mod tests {
         assert_eq!(
             rx.try_recv().unwrap(),
             IrcCommand::Raw("@+typing=active TAGMSG #room".into())
+        );
+    }
+
+    #[test]
+    fn unknown_valid_commands_pass_through_without_allowing_line_injection() {
+        let (mut app, mut rx) = connected_command_app();
+        app.process_command("/map");
+        assert_eq!(rx.try_recv().unwrap(), IrcCommand::Raw("MAP".into()));
+        app.process_command("/vendorcmd one two");
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            IrcCommand::Raw("VENDORCMD one two".into())
+        );
+        app.process_command("/vendorcmd one\r\nOPER root secret");
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn monitor_uses_watch_on_legacy_networks() {
+        let (mut app, mut rx) = connected_command_app();
+        app.network_support
+            .isupport
+            .insert("WATCH".into(), Some("128".into()));
+        app.process_command("/monitor +alice,bob");
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            IrcCommand::Raw("WATCH +alice +bob".into())
         );
     }
 

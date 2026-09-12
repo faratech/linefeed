@@ -3,14 +3,16 @@
 A lightweight, cross-platform IRC client written in Rust with a native GUI.
 
 See the [Nefarious IRCv3 compatibility matrix](docs/nefarious-compatibility.md)
-for the supported `ircv3.2-upgrade` protocol surface.
+for the supported `ircv3.2-upgrade` protocol surface and the
+[general IRCd compatibility matrix](docs/ircd-compatibility.md) for common
+InspIRCd, UnrealIRCd, Solanum, Ergo, Bahamut, ircu, Hybrid, and Plexus features.
 
 ## Features
 
 ### Core
 - **Cross-platform**: Windows (ARM64, x64, x86), Linux (ARM64, x64), and macOS (universal)
 - **TLS encryption**: Native TLS via SChannel (Windows) or OpenSSL (Linux)
-- **SASL authentication**: PLAIN mechanism with timeout/error fallback
+- **SASL authentication**: SCRAM-SHA-256, EXTERNAL, and PLAIN with optional required-auth policy
 - **Modern UI**: Clean interface built with egui/eframe
 
 ### Connection
@@ -20,13 +22,15 @@ for the supported `ircv3.2-upgrade` protocol surface.
 - Server favorites with quick-connect
 - Server password support
 - Accept invalid TLS certificates (optional)
+- IRCv3 STS plaintext upgrade and persistent per-host strict-TLS policy
+- TLS client certificates for SASL EXTERNAL
 
 ### Channels
 - Multiple channel support with tabbed interface
 - Channel modes display (+nt, +k, etc.)
 - Server-aware channel/user prefix handling via ISUPPORT
 - Topic viewing and editing
-- Ban list management
+- Ban, exception, invite-exception, quiet, and server-defined mode-list management
 - Channel info dialog with creation date
 - User list with mode indicators (@, +, and server-provided prefixes)
 
@@ -54,6 +58,7 @@ for the supported `ircv3.2-upgrade` protocol surface.
 - Ignore list with wildcard mask support
 - CTCP reply toggle
 - Server-side silence support
+- MONITOR with legacy WATCH fallback
 
 ### Automation
 - Auto-join channels on connect
@@ -181,6 +186,10 @@ python3 -m py_compile build.py tools/update-deps.py
 | `/react <msgid> <reaction>` | React to a message |
 | `/typing active\|paused\|done` | Send an IRCv3 typing state |
 | `/label <label> <IRC command>` | Send a command using IRCv3 labeled-response |
+| `/cprivmsg <nick> <channel> <text>` | Send a channel-context private message |
+| `/cnotice <nick> <channel> <text>` | Send a channel-context notice |
+| `/wallchops <channel> <text>` | Message channel operators |
+| `/wallvoices <channel> <text>` | Message voiced channel members |
 
 ### User Management
 | Command | Description |
@@ -247,6 +256,10 @@ python3 -m py_compile build.py tools/update-deps.py
 | `/monitor c` | Clear monitor list |
 | `/monitor s` | Show online monitored nicks |
 
+If a slash command is not built in, Linefeed forwards a syntactically valid
+alphabetic command to the server. This keeps vendor commands usable without a
+client release; `/raw` remains available when exact wire syntax is needed.
+
 ### Nefarious IRCv3 Extensions
 | Command | Description |
 |---------|-------------|
@@ -268,6 +281,7 @@ Nefarious persistence profile. These are sent during registration, before
 | `/clear` | Clear current window |
 | `/lastlog <pattern>` | Search messages in current window |
 | `/settings` | Open settings dialog |
+| `/shelp [topic]` | Request the server's HELP command |
 | `/perform [command]` | View/add auto-perform commands |
 | `/raw <command>` | Send raw IRC command |
 | `/echo <text>` | Echo text to current window |
