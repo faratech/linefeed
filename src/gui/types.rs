@@ -838,6 +838,8 @@ pub struct Channel {
     pub mode_lists: HashMap<char, Vec<BanEntry>>,
     pub mode_lists_complete: HashSet<char>,
     pub read_marker: Option<String>,
+    /// Whether chat history (from server or local log) has been loaded for this target.
+    pub history_loaded: bool,
     /// Whether the local user is currently a member. Query windows are not
     /// channels and therefore leave this false without affecting sends.
     pub joined: bool,
@@ -870,6 +872,7 @@ impl Channel {
             mode_lists: HashMap::new(),
             mode_lists_complete: HashSet::new(),
             read_marker: None,
+            history_loaded: false,
             joined: false,
             case_mapping: CaseMapping::Rfc1459,
             prefix_modes: "qaohv".to_string(),

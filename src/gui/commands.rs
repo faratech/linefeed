@@ -557,6 +557,7 @@ impl IrcApp {
                                     direction: super::HistoryDirection::Before,
                                     remaining: total,
                                     loaded: 0,
+                                    shown: 0,
                                     page_limit: page,
                                 }),
                             ))
@@ -577,6 +578,7 @@ impl IrcApp {
                                     direction: super::HistoryDirection::After,
                                     remaining: total,
                                     loaded: 0,
+                                    shown: 0,
                                     page_limit: page,
                                 }),
                             ))

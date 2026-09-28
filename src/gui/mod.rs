@@ -64,6 +64,7 @@ struct PendingHistoryRequest {
     direction: HistoryDirection,
     remaining: usize,
     loaded: usize,
+    shown: usize,
     page_limit: usize,
 }
 
@@ -1205,6 +1206,14 @@ impl IrcApp {
             })
     }
 
+    fn same_history_row(left: &ChatMessage, right: &ChatMessage) -> bool {
+        left.timestamp == right.timestamp
+            && left.sender == right.sender
+            && left.content == right.content
+            && left.is_action == right.is_action
+            && left.is_system == right.is_system
+    }
+
     fn queue_history_request(
         &mut self,
         target: &str,
@@ -1265,6 +1274,7 @@ impl IrcApp {
                 direction,
                 remaining: total,
                 loaded: 0,
+                shown: 0,
                 page_limit: limit,
             },
         )
@@ -1284,6 +1294,59 @@ impl IrcApp {
             target.to_string()
         };
         self.current_channel = Some(key);
+    }
+
+    fn load_local_history_fallback(&mut self, target: &str) -> Option<VecDeque<ChatMessage>> {
+        if !self.logging_load_history
+            || self
+                .channel_key(target)
+                .and_then(|key| self.channels.get(&key))
+                .is_some_and(|channel| channel.history_loaded)
+        {
+            return None;
+        }
+        let (network, legacy_host, allow_legacy) = self.active_log_context()?;
+        let mut local = self.log_manager.load_history_with_legacy(
+            &network,
+            &legacy_host,
+            target,
+            self.logging_history_lines.saturating_add(1),
+            allow_legacy,
+        );
+        // The current JOIN has already written this marker to the log and
+        // placed it in the tab. Keep its live copy in the right position.
+        if local
+            .last()
+            .is_some_and(|message| message.content == format!("Now talking in {target}"))
+        {
+            local.pop();
+        }
+        if local.len() > self.logging_history_lines {
+            local.drain(..local.len() - self.logging_history_lines);
+        }
+        self.log_manager.log_session_start(&network, target);
+        if local.is_empty() {
+            return None;
+        }
+        let count = local.len();
+        let mut history = VecDeque::with_capacity(count + 1);
+        history.push_back(
+            ChatMessage::system_fmt(
+                &format!(
+                    "--- {count} line{} of history loaded ---",
+                    if count == 1 { "" } else { "s" }
+                ),
+                &self.timestamp_format,
+            )
+            .without_logging(),
+        );
+        history.extend(local);
+        if let Some(key) = self.channel_key(target)
+            && let Some(channel) = self.channels.get_mut(&key)
+        {
+            channel.history_loaded = true;
+        }
+        Some(history)
     }
 
     fn queue_chathistory_message(&mut self, batch_id: &str, message: ChatMessage) {
@@ -1550,6 +1613,18 @@ impl IrcApp {
             HistoryDirection::Before => messages.first().and_then(Self::message_reference),
             HistoryDirection::After => messages.last().and_then(Self::message_reference),
         };
+        let existing_ids: std::collections::HashSet<String> = self.channels[&key]
+            .messages
+            .iter()
+            .filter_map(|message| message.msgid.clone())
+            .collect();
+        messages.retain(|message| {
+            message
+                .msgid
+                .as_ref()
+                .is_none_or(|msgid| !existing_ids.contains(msgid))
+        });
+        let shown = batch.request.shown.saturating_add(messages.len());
         let next = if !batch.partial && !complete && remaining > 0 {
             next_reference.map(|reference| {
                 let limit = self.history_page_limit(remaining);
@@ -1566,6 +1641,7 @@ impl IrcApp {
                     PendingHistoryRequest {
                         remaining,
                         loaded,
+                        shown,
                         page_limit: limit,
                         ..batch.request
                     },
@@ -1576,34 +1652,86 @@ impl IrcApp {
         };
         let mut history = VecDeque::with_capacity(page_count.saturating_add(1));
         if next.is_none() {
-            let mut status = match loaded {
-                0 => "--- No server history available ---".to_string(),
-                1 => "--- 1 line of server history loaded ---".to_string(),
-                count => format!("--- {count} lines of server history loaded ---"),
-            };
-            if batch.partial {
-                status.push_str(" (server reports a partial result)");
-            } else if !complete && remaining > 0 {
-                status.push_str(" (more history is available)");
+            if loaded == 0 {
+                if let Some(local) = (batch.request.placement == HistoryPlacement::Prepend)
+                    .then(|| self.load_local_history_fallback(&batch.target))
+                    .flatten()
+                {
+                    history = local;
+                } else {
+                    let status = if batch.partial {
+                        "--- No server history available (server reports a partial result) ---"
+                    } else {
+                        "--- No server history available ---"
+                    };
+                    history.push_back(
+                        ChatMessage::system_fmt(status, &self.timestamp_format).without_logging(),
+                    );
+                }
+            } else {
+                let mut local_count = 0;
+                let mut local_history_loaded = false;
+                if batch.request.placement == HistoryPlacement::Prepend
+                    && loaded < batch.request.loaded.saturating_add(batch.request.remaining)
+                    && let Some(mut local) = self.load_local_history_fallback(&batch.target)
+                {
+                    local_history_loaded = true;
+                    local.pop_front(); // Replace the local-only status below.
+                    if let Some(channel) = self.channels.get(&key) {
+                        local.retain(|row| {
+                            !messages
+                                .iter()
+                                .any(|server| Self::same_history_row(row, server))
+                                && !channel
+                                    .messages
+                                    .iter()
+                                    .any(|live| Self::same_history_row(row, live))
+                        });
+                        let room = self.max_scrollback.saturating_sub(
+                            messages
+                                .len()
+                                .saturating_add(channel.messages.len())
+                                .saturating_add(1),
+                        );
+                        if local.len() > room {
+                            local.drain(..local.len() - room);
+                        }
+                    }
+                    local_count = local.len();
+                    history.extend(local);
+                }
+                let mut status = if local_count > 0 {
+                    format!(
+                        "--- History loaded: {local_count} local line{}, {shown} server line{} ---",
+                        if local_count == 1 { "" } else { "s" },
+                        if shown == 1 { "" } else { "s" }
+                    )
+                } else if shown == 0 {
+                    "--- No new server history available ---".to_string()
+                } else if shown == 1 {
+                    "--- 1 line of server history loaded ---".to_string()
+                } else {
+                    format!("--- {shown} lines of server history loaded ---")
+                };
+                if batch.partial {
+                    status.push_str(" (server reports a partial result)");
+                } else if !complete && remaining > 0 {
+                    status.push_str(" (more history is available)");
+                }
+                history.push_front(
+                    ChatMessage::system_fmt(&status, &self.timestamp_format).without_logging(),
+                );
+                if let Some(channel) = self.channels.get_mut(&key) {
+                    channel.history_loaded = true;
+                }
+                if !local_history_loaded && let Some((network, _, _)) = self.active_log_context() {
+                    self.log_manager.log_session_start(&network, &batch.target);
+                }
             }
-            history.push_back(
-                ChatMessage::system_fmt(&status, &self.timestamp_format).without_logging(),
-            );
         }
         history.extend(messages.drain(..));
 
         if let Some(channel) = self.channels.get_mut(&key) {
-            let existing_ids: std::collections::HashSet<String> = channel
-                .messages
-                .iter()
-                .filter_map(|message| message.msgid.clone())
-                .collect();
-            history.retain(|message| {
-                message
-                    .msgid
-                    .as_ref()
-                    .is_none_or(|msgid| !existing_ids.contains(msgid))
-            });
             if batch.request.placement == HistoryPlacement::Prepend {
                 history.append(&mut channel.messages);
                 channel.messages = history;
@@ -2504,12 +2632,40 @@ impl IrcApp {
                 let target = context
                     .iter()
                     .flat_map(|value| value.split_whitespace())
-                    .find(|value| self.is_channel_name(value))
+                    .find(|value| self.is_channel_name(value) || self.channel_key(value).is_some())
                     .map(str::to_string);
                 let message = ChatMessage::system_fmt(&text, &self.timestamp_format)
                     .with_irc_metadata(msg.get_server_time_raw(), None, None);
-                if let Some(target) = target {
-                    self.add_message_to_channel(&target, message);
+                if command.eq_ignore_ascii_case("CHATHISTORY")
+                    && kind.eq_ignore_ascii_case("FAIL")
+                    && let Some(target) = &target
+                {
+                    let target_key = self.network_support.canonicalize(target);
+                    let failed_request = self
+                        .pending_history_requests
+                        .get_mut(&target_key)
+                        .and_then(VecDeque::pop_front);
+                    if self
+                        .pending_history_requests
+                        .get(&target_key)
+                        .is_some_and(VecDeque::is_empty)
+                    {
+                        self.pending_history_requests.remove(&target_key);
+                    }
+                    if failed_request.is_some_and(|req| req.placement == HistoryPlacement::Prepend)
+                        && let Some(mut history) = self.load_local_history_fallback(target)
+                        && let Some(key) = self.channel_key(target)
+                        && let Some(channel) = self.channels.get_mut(&key)
+                    {
+                        history.append(&mut channel.messages);
+                        channel.messages = history;
+                        while channel.messages.len() > self.max_scrollback {
+                            channel.messages.pop_front();
+                        }
+                    }
+                }
+                if let Some(target) = &target {
+                    self.add_message_to_channel(target, message);
                 } else {
                     self.add_server_message(message);
                 }
@@ -2722,8 +2878,13 @@ impl IrcApp {
                                     history.len()
                                 )));
                                 new_channel.messages.extend(history);
+                                new_channel.history_loaded = true;
                             }
                             // Log session start
+                            self.log_manager.log_session_start(&network, channel);
+                        } else if (!self.chathistory_enabled || !self.logging_load_history)
+                            && let Some((network, _, _)) = self.active_log_context()
+                        {
                             self.log_manager.log_session_start(&network, channel);
                         }
                         self.channels.insert(channel.clone(), new_channel);
@@ -3144,6 +3305,7 @@ impl IrcApp {
                                 direction: HistoryDirection::Before,
                                 remaining: 0,
                                 loaded: 0,
+                                shown: 0,
                                 page_limit: self.max_scrollback.max(1),
                             });
                         if self
@@ -4450,6 +4612,7 @@ impl IrcApp {
                         history.len()
                     )));
                     new_channel.messages.extend(history);
+                    new_channel.history_loaded = true;
                 }
                 self.log_manager.log_session_start(&network, &key);
             }
@@ -7849,6 +8012,37 @@ mod tests {
     }
 
     #[test]
+    fn duplicate_server_history_is_not_reported_as_new_history() {
+        let mut app = test_app();
+        app.prepare_history_target("#room");
+        app.channels.get_mut("#room").unwrap().messages.push_back(
+            ChatMessage::new_fmt("alice", "already visible", "short").with_irc_metadata(
+                None,
+                Some("same-id".into()),
+                None,
+            ),
+        );
+        app.handle_incoming_message(
+            IrcMessage::parse("@draft/chathistory-end :srv BATCH +hist chathistory #room").unwrap(),
+        );
+        app.handle_incoming_message(
+            IrcMessage::parse("@batch=hist;msgid=same-id :alice PRIVMSG #room :already visible")
+                .unwrap(),
+        );
+        app.handle_incoming_message(IrcMessage::parse(":srv BATCH -hist").unwrap());
+
+        let contents: Vec<&str> = app.channels["#room"]
+            .messages
+            .iter()
+            .map(|message| message.content.as_str())
+            .collect();
+        assert_eq!(
+            contents,
+            ["--- No new server history available ---", "already visible"]
+        );
+    }
+
+    #[test]
     fn multiline_batches_preserve_newline_and_concat_semantics() {
         let mut app = test_app();
         app.handle_incoming_message(
@@ -7979,5 +8173,161 @@ mod tests {
             rx.try_recv().unwrap(),
             IrcCommand::Batch(format!("-{batch_id}"), None, None)
         );
+    }
+
+    #[test]
+    fn chathistory_empty_batch_falls_back_to_local_log_history() {
+        let dir = temporary_log_dir("chathistory-empty-fallback");
+        let (mut app, _rx) = test_app_connected();
+        app.log_manager = logging::LogManager::with_test_dir(dir.clone());
+        app.logging_enabled = true;
+        app.logging_load_history = true;
+        app.server_host = "irc.example".into();
+        app.server_port = "6697".into();
+        app.use_tls = true;
+        assert!(app.start_session_from_form());
+
+        let (network, _, _) = app.active_log_context().unwrap();
+        app.log_manager.log_message(
+            &network,
+            "#room",
+            &ChatMessage::new_fmt("alice", "local log message", "short"),
+        );
+        app.log_manager.flush_all();
+
+        app.set_my_nick("me".into());
+        app.handle_incoming_message(
+            IrcMessage::parse(":srv CAP me ACK :draft/chathistory").unwrap(),
+        );
+        app.handle_incoming_message(IrcMessage::parse(":me!u@h JOIN #room").unwrap());
+
+        app.handle_incoming_message(
+            IrcMessage::parse("@draft/chathistory-end :srv BATCH +hist chathistory #room").unwrap(),
+        );
+        app.handle_incoming_message(IrcMessage::parse(":srv BATCH -hist").unwrap());
+
+        let channel = &app.channels["#room"];
+        assert!(channel.history_loaded);
+        let contents: Vec<&str> = channel
+            .messages
+            .iter()
+            .map(|message| message.content.as_str())
+            .collect();
+        assert_eq!(
+            contents,
+            [
+                "--- 1 line of history loaded ---",
+                "local log message",
+                "Now talking in #room"
+            ]
+        );
+
+        drop(app);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn short_server_history_includes_saved_local_history() {
+        let dir = temporary_log_dir("chathistory-short-server");
+        let (mut app, _rx) = test_app_connected();
+        app.log_manager = logging::LogManager::with_test_dir(dir.clone());
+        app.logging_enabled = true;
+        app.logging_load_history = true;
+        app.server_host = "irc.example".into();
+        app.server_port = "6697".into();
+        app.use_tls = true;
+        assert!(app.start_session_from_form());
+
+        let (network, _, _) = app.active_log_context().unwrap();
+        app.log_manager.log_message(
+            &network,
+            "#room",
+            &ChatMessage::new_fmt("alice", "saved discussion", "short"),
+        );
+        app.log_manager.flush_all();
+
+        app.set_my_nick("me".into());
+        app.handle_incoming_message(
+            IrcMessage::parse(":srv CAP me ACK :draft/chathistory").unwrap(),
+        );
+        app.handle_incoming_message(IrcMessage::parse(":me!u@h JOIN #room").unwrap());
+        app.handle_incoming_message(
+            IrcMessage::parse("@draft/chathistory-end :srv BATCH +hist chathistory #room").unwrap(),
+        );
+        app.handle_incoming_message(
+            IrcMessage::parse("@batch=hist;time=2026-09-12T12:00:00.000Z;msgid=one :bob PRIVMSG #room :server row")
+                .unwrap(),
+        );
+        app.handle_incoming_message(IrcMessage::parse(":srv BATCH -hist").unwrap());
+
+        let contents: Vec<&str> = app.channels["#room"]
+            .messages
+            .iter()
+            .map(|message| message.content.as_str())
+            .collect();
+        assert_eq!(
+            contents,
+            [
+                "--- History loaded: 1 local line, 1 server line ---",
+                "saved discussion",
+                "server row",
+                "Now talking in #room"
+            ]
+        );
+
+        drop(app);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn chathistory_fail_reply_falls_back_to_local_log_history() {
+        let dir = temporary_log_dir("chathistory-fail-fallback");
+        let (mut app, _rx) = test_app_connected();
+        app.log_manager = logging::LogManager::with_test_dir(dir.clone());
+        app.logging_enabled = true;
+        app.logging_load_history = true;
+        app.server_host = "irc.example".into();
+        app.server_port = "6697".into();
+        app.use_tls = true;
+        assert!(app.start_session_from_form());
+
+        let (network, _, _) = app.active_log_context().unwrap();
+        app.log_manager.log_message(
+            &network,
+            "#room",
+            &ChatMessage::new_fmt("alice", "saved discussion", "short"),
+        );
+        app.log_manager.flush_all();
+
+        app.set_my_nick("me".into());
+        app.handle_incoming_message(
+            IrcMessage::parse(":srv CAP me ACK :draft/chathistory").unwrap(),
+        );
+        app.handle_incoming_message(IrcMessage::parse(":me!u@h JOIN #room").unwrap());
+
+        app.handle_incoming_message(
+            IrcMessage::parse(
+                ":srv FAIL CHATHISTORY INVALID_TARGET LATEST #room :No access to target",
+            )
+            .unwrap(),
+        );
+
+        let channel = &app.channels["#room"];
+        assert!(channel.history_loaded);
+        assert!(
+            channel
+                .messages
+                .iter()
+                .any(|m| m.content == "saved discussion")
+        );
+        assert!(
+            channel
+                .messages
+                .iter()
+                .any(|m| m.content == "--- 1 line of history loaded ---")
+        );
+
+        drop(app);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }
