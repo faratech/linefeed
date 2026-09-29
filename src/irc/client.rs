@@ -1620,38 +1620,13 @@ impl IrcClient {
             return Err("Required SASL authentication did not succeed".into());
         }
 
-        // Registration-only extensions run after their CAP ACK. Persistence
-        // profiles also need the SASL account established, and both commands
-        // must precede CAP END. All are skipped when a raced Welcome already
-        // completed registration — post-001 they are no-ops or errors
-        // (#179).
-        if welcome_received {
-            return Ok(true);
-        }
-        if acked_tokens.contains("draft/persistence")
-            && sasl_authenticated
-            && let Some(profile) = config
-                .persistence_profile
-                .as_deref()
-                .filter(|profile| !profile.is_empty())
-        {
-            let line = format!("PERSISTENCE ATTACH {}\r\n", profile);
-            tracing::debug!("> PERSISTENCE ATTACH {}", profile);
-            writer.write_all(line.as_bytes()).await?;
-        }
-        if acked_tokens.contains("draft/pre-away")
-            && let Some(message) = config.pre_away_message.as_deref()
-        {
-            let line = if message.is_empty() {
-                "AWAY\r\n".to_string()
-            } else {
-                format!("AWAY :{}\r\n", message)
-            };
-            tracing::debug!("> AWAY :<pre-connect status>");
-            writer.write_all(line.as_bytes()).await?;
-        }
-
-        // Report enabled capabilities
+        // Registration tail, unified for both exits: the capability notice
+        // and the pre-away AWAY always run (AWAY is an ordinary command and
+        // stays valid post-001); PERSISTENCE needs the SASL account
+        // established pre-001 and is skipped — with a Notice — when a raced
+        // Welcome completed registration first or SASL did not authenticate;
+        // CAP END is skipped post-001 (no-op or error depending on ircd)
+        // (#179/#182).
         let enabled: Vec<&str> = DESIRED_CAPS
             .iter()
             .filter(|cap| acked_tokens.contains(**cap))
@@ -1668,11 +1643,42 @@ impl IrcClient {
                 raw: String::new(),
             });
         }
-
-        // Step 7: Send CAP END — skipped when a raced Welcome already
-        // completed registration (CAP END post-001 is a no-op on most
-        // ircds but an error on some; the caller tracks registration via
-        // its own 001 handling) (#179).
+        if acked_tokens.contains("draft/persistence")
+            && let Some(profile) = config
+                .persistence_profile
+                .as_deref()
+                .filter(|profile| !profile.is_empty())
+        {
+            if sasl_authenticated {
+                let line = format!("PERSISTENCE ATTACH {}\r\n", profile);
+                tracing::debug!("> PERSISTENCE ATTACH {}", profile);
+                writer.write_all(line.as_bytes()).await?;
+            } else {
+                let _ = incoming_tx.try_send(IrcMessage {
+                    tags: None,
+                    prefix: None,
+                    command: IrcCommand::Notice(
+                        "*".to_string(),
+                        format!(
+                            "PERSISTENCE profile '{profile}' not attached: SASL \
+                             authentication required"
+                        ),
+                    ),
+                    raw: String::new(),
+                });
+            }
+        }
+        if acked_tokens.contains("draft/pre-away")
+            && let Some(message) = config.pre_away_message.as_deref()
+        {
+            let line = if message.is_empty() {
+                "AWAY\r\n".to_string()
+            } else {
+                format!("AWAY :{}\r\n", message)
+            };
+            tracing::debug!("> AWAY :<pre-connect status>");
+            writer.write_all(line.as_bytes()).await?;
+        }
         if !welcome_received {
             let cap_end = "CAP END\r\n";
             tracing::debug!("> {}", cap_end.trim());
