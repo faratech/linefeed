@@ -1159,8 +1159,7 @@ impl IrcClient {
             // for an unparseable line. Both are legal pre-welcome traffic —
             // bouncers PING unregistered clients — so keep waiting instead of
             // panicking. The outer REGISTRATION_TIMEOUT bounds the total wait.
-            let Some(msg) = read_handshake_msg(writer, reader, &mut buf, incoming_tx).await?
-            else {
+            let Some(msg) = read_handshake_msg(writer, reader, &mut buf, incoming_tx).await? else {
                 continue;
             };
             if matches!(msg.command, IrcCommand::Numeric(RPL_WELCOME, _)) {

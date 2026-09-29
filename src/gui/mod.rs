@@ -463,7 +463,8 @@ pub struct IrcApp {
     /// not be recorded as held when replaced (#167).
     nick_confirmed: bool,
     /// Canonicalized keys of my_nick + past_nicks, maintained on nick change
-    /// and CASEMAPPING refresh so sender_is_self is allocation-free per row.
+    /// and CASEMAPPING refresh so sender_is_self costs one canonicalize of
+    /// the incoming nick (the held-nick side is precomputed).
     self_nick_keys: Vec<String>,
 }
 
@@ -931,8 +932,20 @@ impl IrcApp {
             .collect();
     }
 
-    fn set_my_nick(&mut self, nick: String) {
-        if !self.my_nick.is_empty() && self.my_nick != nick {
+    /// The single nick-change choke point. `record_previous` remembers the
+    /// outgoing nick as held — pass true only when it was confirmed in use
+    /// on this connection lineage (an accepted NICK echo, or a prior
+    /// registration on a same-endpoint reconnect); pass false for nicks that
+    /// were never ours (session start, an ERR_NICKNAMEINUSE walkaway, a 001
+    /// rewrite of a speculative nick). `accepted` marks whether the incoming
+    /// nick is server-accepted on this path (true for 001 and NICK echoes;
+    /// false for activation and 433 walkaways, where confirmation must wait
+    /// for this connection's own 001 — #169).
+    fn set_session_nick(&mut self, nick: String, record_previous: bool, accepted: bool) {
+        if record_previous
+            && !self.my_nick.is_empty()
+            && !self.identifiers_equal(&self.my_nick, &nick)
+        {
             let already_held = self
                 .past_nicks
                 .iter()
@@ -944,22 +957,7 @@ impl IrcApp {
         }
         self.my_nick = nick;
         self.my_nick_lower = self.network_support.canonicalize(&self.my_nick);
-        self.nick_confirmed = true;
-        self.refresh_self_nick_keys();
-    }
-
-    /// Adopt a nick without recording the previous one as "held": the ERR_
-    /// NICKNAMEINUSE speculative retry pushes the *configured* nick that
-    /// someone else holds, a new session (activate_session) starts from the
-    /// previous session's nick, and RPL_WELCOME may report a rewritten or
-    /// truncated form of the nick we asked for — none of those were ever
-    /// held on this connection, so none may count as ours (#167). Held-nick
-    /// history itself must survive: a manual reconnect to the same endpoint
-    /// replays rows sent under earlier nicks.
-    fn adopt_nick_unrecorded(&mut self, nick: String) {
-        self.my_nick = nick;
-        self.my_nick_lower = self.network_support.canonicalize(&self.my_nick);
-        self.nick_confirmed = false;
+        self.nick_confirmed = accepted;
         self.refresh_self_nick_keys();
     }
 
@@ -979,8 +977,11 @@ impl IrcApp {
     }
 
     /// Whether a row's sender is us — the current nick or one we held
-    /// earlier this session (#163). One canonicalize of the incoming nick
-    /// per call; the held-nick keys are precomputed (#167).
+    /// earlier this session (#163). Over-matching held nicks is the safe
+    /// direction here: this gate feeds credential redaction and replay
+    /// drops, where a false positive only over-redacts. Lossy or
+    /// suppressive gates (echo merge, notification and echo suppression)
+    /// deliberately compare the current nick exactly.
     fn sender_is_self(&self, nick: &str) -> bool {
         let key = self.network_support.canonicalize(nick);
         self.self_nick_keys.contains(&key)
@@ -1558,8 +1559,14 @@ impl IrcApp {
     /// retaining one row avoids duplicate messages while making that identity
     /// available to REDACT, reconnect history cursors, and MARKREAD.
     fn merge_server_echo(&mut self, target: &str, echoed: &ChatMessage) -> bool {
+        // Current nick only: merging is lossy (stamps the local row with the
+        // server's msgid/server-time), so a peer squatting a nick we vacated
+        // must not qualify — a racing echo under a vacated nick costs at
+        // worst a duplicate row (#166/#169). sender_is_self stays on the
+        // redaction and replay-drop gates, where over-matching is the safe
+        // direction.
         if !self.enabled_caps.contains("echo-message")
-            || !self.sender_is_self(&echoed.sender)
+            || !self.identifiers_equal(&echoed.sender, &self.my_nick)
             || echoed.is_system
         {
             return false;
@@ -1730,9 +1737,8 @@ impl IrcApp {
                         .filter(|row| row.is_system)
                         .filter_map(|row| {
                             row.content.strip_prefix("-> -").and_then(|rest| {
-                                rest.split_once("- ").map(|(target, text)| {
-                                    (target.to_string(), text.to_string())
-                                })
+                                rest.split_once("- ")
+                                    .map(|(target, text)| (target.to_string(), text.to_string()))
                             })
                         })
                         .collect()
@@ -1773,8 +1779,7 @@ impl IrcApp {
                 }
                 !confirmations.iter().any(|(target, confirmed_text)| {
                     confirmed_text == text
-                        && self
-                            .identifiers_equal(self.strip_status_prefix(target), &routed_target)
+                        && self.identifiers_equal(self.strip_status_prefix(target), &routed_target)
                 })
             };
             messages.retain(keep_row);
@@ -2097,6 +2102,7 @@ fn row_height(
     ui: &mut egui::Ui,
     msg: &ChatMessage,
     my_nick: &str,
+    self_nick_keys: &[String],
     content_width: f32,
     layout_key: u64,
     stats: &mut ScrollbackStats,
@@ -2112,7 +2118,7 @@ fn row_height(
     );
     let scratch_rect = egui::Rect::from_min_size(scratch_origin, egui::vec2(content_width, 0.0));
     let mut scratch = ui.new_child(egui::UiBuilder::new().max_rect(scratch_rect));
-    draw_chat_row(&mut scratch, msg, my_nick);
+    draw_chat_row(&mut scratch, msg, my_nick, self_nick_keys);
     let h = scratch.min_rect().height();
     msg.row_height.set(RowHeightEntry {
         key: layout_key,
@@ -2122,8 +2128,15 @@ fn row_height(
 }
 
 /// Draw one scrollback row: timestamp, optional indicator, nick, body.
-fn draw_chat_row(ui: &mut egui::Ui, msg: &ChatMessage, my_nick: &str) {
-    let is_own_msg = !msg.is_system && msg.sender.eq_ignore_ascii_case(my_nick);
+fn draw_chat_row(ui: &mut egui::Ui, msg: &ChatMessage, my_nick: &str, self_nick_keys: &[String]) {
+    // Own-row styling covers held nicks too, so replayed rows sent under a
+    // former nick keep our emphasis; the casemapping-insensitive compare
+    // matches rfc1459 case-folding (bracket-form folds remain unstyled).
+    let is_own_msg = !msg.is_system
+        && (msg.sender.eq_ignore_ascii_case(my_nick)
+            || self_nick_keys
+                .iter()
+                .any(|key| key.eq_ignore_ascii_case(&msg.sender)));
 
     let render_row = |ui: &mut egui::Ui| {
         ui.horizontal(|ui| {
@@ -2347,12 +2360,11 @@ impl IrcApp {
         // nick history is dropped (reset_session_state) and the configured
         // nick is adopted unrecorded (#166). On a same-endpoint reconnect
         // the outgoing nick WAS ours on this connection lineage — record it
-        // so replay attribution survives (#168).
-        if endpoint_changed {
-            self.adopt_nick_unrecorded(session.server.nick.clone());
-        } else {
-            self.set_my_nick(session.server.nick.clone());
-        }
+        // so replay attribution survives (#168). Either way the configured
+        // nick is not yet confirmed: this connection's own 001 does that
+        // (#169).
+        let record_previous = !endpoint_changed && self.nick_confirmed;
+        self.set_session_nick(session.server.nick.clone(), record_previous, false);
         self.active_session = Some(session);
         self.pending_session = None;
         self.connection_error = None;
@@ -3219,7 +3231,9 @@ impl IrcApp {
             IrcCommand::Nick(new_nick) => {
                 let old_nick = msg.get_sender_nick().unwrap_or_default();
                 if self.identifiers_equal(&old_nick, &self.my_nick) {
-                    self.set_my_nick(new_nick.clone());
+                    // Accepted NICK change: the outgoing nick was confirmed
+                    // in use, so record it as held (#168).
+                    self.set_session_nick(new_nick.clone(), true, true);
                 }
                 let sys_msg =
                     ChatMessage::system(&format!("{} is now known as {}", old_nick, new_nick));
@@ -3792,17 +3806,14 @@ impl IrcApp {
                 // Clear any lag reading left over from a previous connection.
                 self.lag_ms = None;
                 if let Some(nick) = params.first() {
-                    // 001 may report a rewritten/truncated form of the nick we
-                    // asked for: a never-confirmed pre-registration nick is
-                    // adopted unrecorded (#167), while a nick confirmed in use
-                    // on this connection lineage is recorded as held so a
-                    // bouncer's replay attribution survives the reconnect
-                    // (#168).
-                    if self.nick_confirmed && !self.identifiers_equal(nick, &self.my_nick) {
-                        self.set_my_nick(nick.clone());
-                    } else if !self.identifiers_equal(nick, &self.my_nick) {
-                        self.adopt_nick_unrecorded(nick.clone());
-                    }
+                    // 001 accepts whatever nick it grants, confirmed or not;
+                    // a previously confirmed nick it replaces is recorded as
+                    // held so bouncer replay attribution survives (#168),
+                    // while a rewrite of a speculative pre-registration nick
+                    // records nothing (#167/#169).
+                    let record_previous =
+                        self.nick_confirmed && !self.identifiers_equal(nick, &self.my_nick);
+                    self.set_session_nick(nick.clone(), record_previous, true);
                 }
                 let msg = params
                     .get(1)
@@ -4122,10 +4133,13 @@ impl IrcApp {
                 }
                 self.nick_retry_attempts = self.nick_retry_attempts.saturating_add(1);
                 let new_nick = format!("{}_", self.my_nick);
-                // The rejected nick was never held on this connection (it is
-                // the configured nick someone else is using) — adopting the
-                // suffixed nick must not record it as ours (#166).
-                self.adopt_nick_unrecorded(new_nick.clone());
+                // The walkaway records the rejected nick only when it was
+                // confirmed in use on this lineage (an auto-reconnect that
+                // registered as a held nick before 433 hit): its replayed
+                // rows must stay attributed (#169). A pre-registration
+                // walkaway from the configured nick records nothing (#166).
+                let record_previous = self.nick_confirmed;
+                self.set_session_nick(new_nick.clone(), record_previous, false);
                 if let Some(tx) = &self.cmd_tx {
                     let _ = tx.send(IrcCommand::Nick(new_nick));
                 }
@@ -5104,10 +5118,13 @@ impl IrcApp {
                 wrapper_suffix,
                 line_limit,
             ) else {
-                self.add_message_to_current(ChatMessage::system_fmt(
-                    "Message not sent - target name leaves no room for text",
-                    &self.timestamp_format,
-                ));
+                self.add_message_to_current(
+                    ChatMessage::system_fmt(
+                        "Message not sent - target name leaves no room for text",
+                        &self.timestamp_format,
+                    )
+                    .without_logging(),
+                );
                 return false;
             };
             chunks.append(&mut line_chunks);
@@ -5236,8 +5253,11 @@ impl IrcApp {
         if !Self::command_fits_limits(&cmd, base_limit) {
             tracing::warn!("Outgoing command not sent (line too long): {:?}", cmd);
             self.add_message_to_current(
-                ChatMessage::system_fmt("Command not sent - IRC line is too long", &self.timestamp_format)
-                    .without_logging(),
+                ChatMessage::system_fmt(
+                    "Command not sent - IRC line is too long",
+                    &self.timestamp_format,
+                )
+                .without_logging(),
             );
             return false;
         }
@@ -5310,17 +5330,20 @@ impl IrcApp {
             // Don't echo a message we can't actually send: without a live
             // connection the command channel is gone and the line would be lost.
             if !self.connected || self.cmd_tx.is_none() {
-                self.add_message_to_current(ChatMessage::system(
-                    "Not connected - message not sent",
-                ));
+                self.add_message_to_current(
+                    ChatMessage::system("Not connected - message not sent").without_logging(),
+                );
                 return;
             }
 
             if !self.can_send_to_target(channel) {
-                self.add_message_to_current(ChatMessage::system_fmt(
-                    "You are not joined to this channel - message not sent",
-                    &self.timestamp_format,
-                ));
+                self.add_message_to_current(
+                    ChatMessage::system_fmt(
+                        "You are not joined to this channel - message not sent",
+                        &self.timestamp_format,
+                    )
+                    .without_logging(),
+                );
                 return;
             }
 
@@ -5342,10 +5365,10 @@ impl IrcApp {
                 let msg = ChatMessage::new_fmt(&self.my_nick, &input, &self.timestamp_format);
                 self.add_message_to_channel(channel, msg);
             } else {
-                self.add_message_to_current(ChatMessage::system_fmt(
-                    "Message not sent",
-                    &self.timestamp_format,
-                ));
+                self.add_message_to_current(
+                    ChatMessage::system_fmt("Message not sent", &self.timestamp_format)
+                        .without_logging(),
+                );
             }
         }
     }
@@ -5492,6 +5515,7 @@ impl IrcApp {
             };
         };
         let my_nick = self.my_nick.clone();
+        let self_nick_keys = self.self_nick_keys.clone();
         let stick = self.scroll_to_bottom;
         let mut stats = ScrollbackStats {
             drawn: 0,
@@ -5523,8 +5547,15 @@ impl IrcApp {
                 let mut first_idx = msgs.len();
                 let mut first_y = 0.0f32;
                 for (i, msg) in msgs.iter().enumerate() {
-                    let bottom =
-                        y + row_height(ui, msg, &my_nick, content_width, layout_key, &mut stats);
+                    let bottom = y + row_height(
+                        ui,
+                        msg,
+                        &my_nick,
+                        &self_nick_keys,
+                        content_width,
+                        layout_key,
+                        &mut stats,
+                    );
                     if first_idx == msgs.len() && bottom >= viewport.min.y {
                         first_idx = i;
                         first_y = y;
@@ -5540,8 +5571,15 @@ impl IrcApp {
                     // an empty area; egui re-clamps the offset next frame.
                     let mut yy = viewport.max.y;
                     for msg in msgs.iter().rev() {
-                        let h =
-                            row_height(ui, msg, &my_nick, content_width, layout_key, &mut stats);
+                        let h = row_height(
+                            ui,
+                            msg,
+                            &my_nick,
+                            &self_nick_keys,
+                            content_width,
+                            layout_key,
+                            &mut stats,
+                        );
                         let top = yy - h;
                         first_idx -= 1;
                         first_y = top;
@@ -5581,7 +5619,7 @@ impl IrcApp {
                         }
                         // Warm cache at this point: pass 1 measured everything.
                         cy += msg.row_height.get().height + spacing.y;
-                        draw_chat_row(rows_ui, msg, &my_nick);
+                        draw_chat_row(rows_ui, msg, &my_nick, &self_nick_keys);
                         drawn += 1;
                     }
                 });
@@ -6596,7 +6634,7 @@ mod tests {
     #[test]
     fn self_kick_marks_channel_unjoined_and_blocks_send_and_echo() {
         let (mut app, mut rx) = test_app_connected();
-        app.set_my_nick("me".to_string());
+        app.set_session_nick("me".to_string(), false, true);
         let mut channel = Channel::new();
         channel.joined = true;
         channel.add_user("me", UserMode::Normal);
@@ -6836,8 +6874,8 @@ mod tests {
                 };
                 // Narrow width forces the long message to wrap over lines;
                 // the measured advance must reflect that.
-                let h_short = row_height(ui, &short_msg, "me", width, key, &mut stats);
-                let h_long = row_height(ui, &long_msg, "me", width, key, &mut stats);
+                let h_short = row_height(ui, &short_msg, "me", &[], width, key, &mut stats);
+                let h_long = row_height(ui, &long_msg, "me", &[], width, key, &mut stats);
                 heights = Some((h_short, h_long));
             });
         })
@@ -7146,7 +7184,7 @@ mod tests {
     #[test]
     fn chathistory_replay_keeps_own_notice_rows() {
         let mut app = test_app();
-        app.set_my_nick("me".into());
+        app.set_session_nick("me".into(), false, true);
         app.handle_cap_message("ACK", &["echo-message".into()]);
 
         app.handle_incoming_message(
@@ -7159,8 +7197,7 @@ mod tests {
 
         let chan = app.channels.get("#chan").expect("batch creates the tab");
         assert!(
-            chan
-                .messages
+            chan.messages
                 .iter()
                 .any(|message| message.content.contains("my own notice")),
             "replayed own notices must not be dropped as echoes"
@@ -7179,7 +7216,7 @@ mod tests {
     #[test]
     fn credential_commands_never_enter_history_search_or_local_scrollback() {
         let (mut app, mut rx) = test_app_connected();
-        app.set_my_nick("me".into());
+        app.set_session_nick("me".into(), false, true);
         assert!(app.open_query("NickServ"));
 
         for input in [
@@ -7345,12 +7382,13 @@ mod tests {
     #[test]
     fn whox_fields_follow_the_requested_column_order() {
         let mut app = test_app();
-        app.set_my_nick("me".into());
+        app.set_session_nick("me".into(), false, true);
         let mut channel = Channel::new();
         channel.add_user("alice", UserMode::Normal);
         channel.add_user("bob", UserMode::Normal);
         app.channels.insert("#chan".to_string(), channel);
-        app.pending_whox.insert("7".to_string(), "#chan".to_string());
+        app.pending_whox
+            .insert("7".to_string(), "#chan".to_string());
 
         // Request is %tcuhnafr -> token, channel, user, host, nick,
         // account, flags, realname (WHOX returns fields in query order).
@@ -7399,11 +7437,8 @@ mod tests {
         // /notice actually went out (#152 — the disconnected branch never
         // creates the row and the dedup under test would not run).
         let (mut app, _rx) = test_app_connected();
-        app.set_my_nick("me".into());
-        app.handle_cap_message(
-            "ACK",
-            &["echo-message".into(), "draft/chathistory".into()],
-        );
+        app.set_session_nick("me".into(), false, true);
+        app.handle_cap_message("ACK", &["echo-message".into(), "draft/chathistory".into()]);
         let mut channel = Channel::new();
         channel.joined = true;
         app.channels.insert("#chan".to_string(), channel);
@@ -7438,7 +7473,7 @@ mod tests {
     #[test]
     fn replayed_own_credential_privmsg_is_not_displayed() {
         let (mut app, _rx) = test_app_connected();
-        app.set_my_nick("me".into());
+        app.set_session_nick("me".into(), false, true);
         app.handle_cap_message("ACK", &["draft/chathistory".into()]);
         let mut channel = Channel::new();
         channel.joined = true;
@@ -7466,7 +7501,7 @@ mod tests {
     #[test]
     fn status_prefixed_confirmation_still_suppresses_replay() {
         let (mut app, _rx) = test_app_connected();
-        app.set_my_nick("me".into());
+        app.set_session_nick("me".into(), false, true);
         app.handle_cap_message("ACK", &["echo-message".into()]);
         let mut channel = Channel::new();
         channel.joined = true;
@@ -7493,7 +7528,7 @@ mod tests {
     #[test]
     fn peer_chat_text_does_not_create_a_confirmation() {
         let (mut app, _rx) = test_app_connected();
-        app.set_my_nick("me".into());
+        app.set_session_nick("me".into(), false, true);
         app.handle_cap_message("ACK", &["echo-message".into()]);
         let mut channel = Channel::new();
         channel.joined = true;
@@ -7525,7 +7560,7 @@ mod tests {
     #[test]
     fn own_notice_starting_with_an_auth_keyword_is_dropped_from_replay() {
         let (mut app, _rx) = test_app_connected();
-        app.set_my_nick("me".into());
+        app.set_session_nick("me".into(), false, true);
         app.handle_cap_message("ACK", &["echo-message".into()]);
         let mut channel = Channel::new();
         channel.joined = true;
@@ -7558,7 +7593,8 @@ mod tests {
             "{rows:?}"
         );
         assert!(
-            rows.iter().any(|content| content.contains("see you at the vote")),
+            rows.iter()
+                .any(|content| content.contains("see you at the vote")),
             "{rows:?}"
         );
     }
@@ -7566,8 +7602,12 @@ mod tests {
     #[test]
     fn nick_in_use_retry_does_not_record_the_configured_nick() {
         let mut app = test_app();
-        app.set_my_nick("alice".into());
-        app.handle_numeric(ERR_NICKNAMEINUSE, &["me".into(), "alice".into(), "in use".into()]);
+        // Pre-registration: alice was configured but never confirmed here.
+        app.set_session_nick("alice".into(), false, false);
+        app.handle_numeric(
+            ERR_NICKNAMEINUSE,
+            &["me".into(), "alice".into(), "in use".into()],
+        );
         assert_eq!(app.my_nick, "alice_");
         assert!(
             !app.past_nicks.iter().any(|held| held == "alice"),
@@ -7578,8 +7618,8 @@ mod tests {
     #[test]
     fn session_reset_clears_past_nicks() {
         let mut app = test_app();
-        app.set_my_nick("alice".into());
-        app.set_my_nick("bob".into());
+        app.set_session_nick("alice".into(), false, true);
+        app.set_session_nick("bob".into(), true, true);
         assert!(!app.past_nicks.is_empty());
         app.reset_session_state();
         assert!(app.past_nicks.is_empty());
@@ -7587,9 +7627,17 @@ mod tests {
 
     #[test]
     fn pass_and_authenticate_are_credential_commands() {
-        assert!(commands::service_message_contains_credentials("NickServ", "PASS hunter2"));
-        assert!(commands::service_message_contains_credentials("NickServ", "AUTHENTICATE <b64>"));
-        assert!(commands::command_line_contains_credentials("/ns PASS hunter2"));
+        assert!(commands::service_message_contains_credentials(
+            "NickServ",
+            "PASS hunter2"
+        ));
+        assert!(commands::service_message_contains_credentials(
+            "NickServ",
+            "AUTHENTICATE <b64>"
+        ));
+        assert!(commands::command_line_contains_credentials(
+            "/ns PASS hunter2"
+        ));
     }
 
     #[test]
@@ -7609,8 +7657,8 @@ mod tests {
     #[test]
     fn live_credential_redaction_recovers_former_nicks() {
         let (mut app, _rx) = test_app_connected();
-        app.set_my_nick("Guest123".into());
-        app.set_my_nick("alice".into());
+        app.set_session_nick("Guest123".into(), false, true);
+        app.set_session_nick("alice".into(), true, true);
         app.add_message_to_channel(
             "NickServ",
             ChatMessage::new_fmt("Guest123", "IDENTIFY hunter16", "short"),
@@ -7629,7 +7677,7 @@ mod tests {
     #[test]
     fn replayed_own_non_credential_privmsg_survives() {
         let (mut app, _rx) = test_app_connected();
-        app.set_my_nick("me".into());
+        app.set_session_nick("me".into(), false, true);
         app.handle_cap_message("ACK", &["draft/chathistory".into()]);
         let mut channel = Channel::new();
         channel.joined = true;
@@ -7657,8 +7705,8 @@ mod tests {
     #[test]
     fn replayed_own_credential_row_is_dropped_for_multi_target_and_former_nick() {
         let (mut app, _rx) = test_app_connected();
-        app.set_my_nick("Guest123".into());
-        app.set_my_nick("alice".into()); // GHOST/REGAIN: Guest123 is a past nick
+        app.set_session_nick("Guest123".into(), false, true);
+        app.set_session_nick("alice".into(), true, true); // GHOST/REGAIN: Guest123 is a past nick
         app.handle_cap_message("ACK", &["draft/chathistory".into()]);
         let mut channel = Channel::new();
         channel.joined = true;
@@ -7675,7 +7723,8 @@ mod tests {
         );
         // A non-credential own row under the former nick must survive.
         app.handle_incoming_message(
-            IrcMessage::parse("@batch=r;msgid=n8 :Guest123!u@h PRIVMSG #chan :hello there").unwrap(),
+            IrcMessage::parse("@batch=r;msgid=n8 :Guest123!u@h PRIVMSG #chan :hello there")
+                .unwrap(),
         );
         app.handle_incoming_message(IrcMessage::parse(":srv BATCH -r").unwrap());
 
@@ -7700,14 +7749,20 @@ mod tests {
         app.use_tls = true;
         let session = app.session_from_form().unwrap();
         app.activate_session(session.clone());
+        // This connection's own 001 confirms the configured nick.
+        app.handle_numeric(RPL_WELCOME, &["alice".into(), "welcome".into()]);
+        assert!(app.nick_confirmed);
         // "/nick bob" accepted mid-session: alice recorded as held.
-        app.set_my_nick("bob".into());
+        app.set_session_nick("bob".into(), true, true);
         assert!(app.sender_is_self("alice"));
 
         // Reconnect to the SAME endpoint: bob was genuinely ours, and the
         // configured alice stays held (#168).
         app.activate_session(session);
-        assert!(app.sender_is_self("bob"), "held nick must survive reconnect");
+        assert!(
+            app.sender_is_self("bob"),
+            "held nick must survive reconnect"
+        );
         assert!(app.sender_is_self("alice"));
     }
 
@@ -7719,11 +7774,20 @@ mod tests {
         app.use_tls = true;
         let session = app.session_from_form().unwrap();
         app.activate_session(session.clone());
-        app.set_my_nick("bob".into());
+        app.handle_numeric(RPL_WELCOME, &["bob".into(), "welcome".into()]);
+        // The connection drops; the auto-reconnect re-registers as "bob"
+        // and the server 433s — bob was confirmed on this lineage.
+        app.mark_connection_lost();
 
-        // 433 walkaway: the rejected nick was never held (#167).
-        app.handle_numeric(ERR_NICKNAMEINUSE, &["me".into(), "bob".into(), "in use".into()]);
-        assert!(!app.sender_is_self("bob"));
+        app.handle_numeric(
+            ERR_NICKNAMEINUSE,
+            &["me".into(), "bob".into(), "in use".into()],
+        );
+        assert_eq!(app.my_nick, "bob_");
+        assert!(
+            app.sender_is_self("bob"),
+            "confirmed walkaway must be recorded"
+        );
 
         // Endpoint change drops the old lineage entirely.
         app.nickname = "other".into();
@@ -7731,7 +7795,7 @@ mod tests {
         let other = app.session_from_form().unwrap();
         app.activate_session(other);
         assert!(app.past_nicks.is_empty());
-        assert!(!app.sender_is_self("bob"));
+        assert!(!app.sender_is_self("bob_"));
         assert!(app.sender_is_self("other"));
     }
 
@@ -7740,7 +7804,7 @@ mod tests {
         let mut app = test_app();
         // Confirmed nick replaced by the server's 001 (bouncer rewrite):
         // the confirmed nick is recorded as held (#168).
-        app.set_my_nick("bob".into());
+        app.set_session_nick("bob".into(), false, true);
         // Real 001 shape: the granted nick is the first parameter.
         app.handle_numeric(RPL_WELCOME, &["alice".into(), "welcome".into()]);
         assert_eq!(app.my_nick, "alice");
@@ -7757,8 +7821,8 @@ mod tests {
     #[test]
     fn squatted_former_nick_notices_and_notifications_still_render() {
         let (mut app, _rx) = test_app_connected();
-        app.set_my_nick("alice".into());
-        app.set_my_nick("bob".into());
+        app.set_session_nick("alice".into(), false, true);
+        app.set_session_nick("bob".into(), false, true);
         app.handle_cap_message("ACK", &["echo-message".into()]);
         let mut channel = Channel::new();
         channel.joined = true;
@@ -7968,7 +8032,7 @@ mod tests {
     #[test]
     fn casemapped_incoming_query_reuses_existing_tab() {
         let mut app = test_app();
-        app.set_my_nick("me".to_string());
+        app.set_session_nick("me".to_string(), false, true);
         app.add_message_to_channel("Alice", ChatMessage::system("opened"));
 
         let msg = IrcMessage::parse(":alice!u@h PRIVMSG me :hello").unwrap();
@@ -7999,13 +8063,13 @@ mod tests {
     #[test]
     fn special_character_nicks_highlight_with_identifier_boundaries() {
         let mut app = test_app();
-        app.set_my_nick("foo-bar".to_string());
+        app.set_session_nick("foo-bar".to_string(), false, true);
         assert!(app.check_nick_mention("hello foo-bar!"));
         assert!(app.check_nick_mention("(FOO-BAR), ping"));
         assert!(!app.check_nick_mention("xfoo-bar"));
         assert!(!app.check_nick_mention("foo-barry"));
 
-        app.set_my_nick("[alice]".to_string());
+        app.set_session_nick("[alice]".to_string(), false, true);
         assert!(app.check_nick_mention("hi {ALICE},"));
         assert!(!app.check_nick_mention("x[alice]"));
     }
@@ -8116,7 +8180,7 @@ mod tests {
     #[test]
     fn extended_join_and_setname_retain_member_identity() {
         let mut app = test_app();
-        app.set_my_nick("me".into());
+        app.set_session_nick("me".into(), false, true);
         app.channels.insert("#room".into(), Channel::new());
 
         app.handle_incoming_message(
@@ -8142,7 +8206,7 @@ mod tests {
     #[test]
     fn private_reaction_routes_to_the_senders_query() {
         let mut app = test_app();
-        app.set_my_nick("me".into());
+        app.set_session_nick("me".into(), false, true);
         app.handle_incoming_message(
             IrcMessage::parse("@+draft/react=👍;+reply=abc :alice!u@h TAGMSG me").unwrap(),
         );
@@ -8159,7 +8223,7 @@ mod tests {
     #[test]
     fn no_implicit_names_requests_membership_after_join() {
         let (mut app, mut rx) = test_app_connected();
-        app.set_my_nick("me".into());
+        app.set_session_nick("me".into(), false, true);
         app.handle_incoming_message(
             IrcMessage::parse(":srv CAP me ACK :no-implicit-names").unwrap(),
         );
@@ -8174,7 +8238,7 @@ mod tests {
     #[test]
     fn echo_message_enriches_the_local_row_without_duplication() {
         let (mut app, _rx) = test_app_connected();
-        app.set_my_nick("me".into());
+        app.set_session_nick("me".into(), false, true);
         app.handle_incoming_message(IrcMessage::parse(":srv CAP me ACK :echo-message").unwrap());
         app.add_message_to_channel("#room", ChatMessage::new_fmt("me", "hello", "short"));
 
@@ -8195,7 +8259,7 @@ mod tests {
     #[test]
     fn selected_live_message_advances_the_server_read_marker() {
         let (mut app, mut rx) = test_app_connected();
-        app.set_my_nick("me".into());
+        app.set_session_nick("me".into(), false, true);
         app.current_channel = Some("#room".into());
         app.channels.insert("#room".into(), Channel::new());
         app.handle_incoming_message(
@@ -8438,7 +8502,7 @@ mod tests {
     #[test]
     fn incoming_self_kick_clears_users_but_keeps_tab() {
         let mut app = test_app();
-        app.set_my_nick("me".to_string());
+        app.set_session_nick("me".to_string(), false, true);
         let mut channel = Channel::new();
         channel.add_user("me", UserMode::Normal);
         channel.add_user("bob", UserMode::Normal);
@@ -8459,7 +8523,7 @@ mod tests {
     #[test]
     fn nick_in_use_while_connected_reports_without_renaming() {
         let mut app = test_app();
-        app.set_my_nick("mike".to_string());
+        app.set_session_nick("mike".to_string(), false, true);
         app.connected = true;
         app.handle_numeric(
             ERR_NICKNAMEINUSE,
@@ -8480,7 +8544,7 @@ mod tests {
     #[test]
     fn nick_in_use_during_registration_retries_with_suffix() {
         let mut app = test_app();
-        app.set_my_nick("mike".to_string());
+        app.set_session_nick("mike".to_string(), false, true);
         app.connected = false;
         app.handle_numeric(
             ERR_NICKNAMEINUSE,
@@ -8675,7 +8739,7 @@ mod tests {
     #[test]
     fn joining_with_chathistory_requests_server_backlog() {
         let (mut app, mut rx) = test_app_connected();
-        app.set_my_nick("me".into());
+        app.set_session_nick("me".into(), false, true);
         app.handle_incoming_message(
             IrcMessage::parse(":srv CAP me ACK :draft/chathistory").unwrap(),
         );
@@ -8692,7 +8756,7 @@ mod tests {
     #[test]
     fn reconnect_requests_history_after_last_seen_msgid() {
         let (mut app, mut rx) = test_app_connected();
-        app.set_my_nick("me".into());
+        app.set_session_nick("me".into(), false, true);
         app.handle_incoming_message(
             IrcMessage::parse(":srv CAP me ACK :draft/chathistory").unwrap(),
         );
@@ -8796,7 +8860,7 @@ mod tests {
     #[test]
     fn chathistory_pages_backward_until_requested_limit() {
         let (mut app, mut rx) = test_app_connected();
-        app.set_my_nick("me".into());
+        app.set_session_nick("me".into(), false, true);
         app.max_scrollback = 5;
         app.handle_incoming_message(
             IrcMessage::parse(":srv CAP me LS :draft/chathistory=2").unwrap(),
@@ -9017,7 +9081,7 @@ mod tests {
         );
         app.log_manager.flush_all();
 
-        app.set_my_nick("me".into());
+        app.set_session_nick("me".into(), false, true);
         app.handle_incoming_message(
             IrcMessage::parse(":srv CAP me ACK :draft/chathistory").unwrap(),
         );
@@ -9068,7 +9132,7 @@ mod tests {
         );
         app.log_manager.flush_all();
 
-        app.set_my_nick("me".into());
+        app.set_session_nick("me".into(), false, true);
         app.handle_incoming_message(
             IrcMessage::parse(":srv CAP me ACK :draft/chathistory").unwrap(),
         );
@@ -9121,7 +9185,7 @@ mod tests {
         );
         app.log_manager.flush_all();
 
-        app.set_my_nick("me".into());
+        app.set_session_nick("me".into(), false, true);
         app.handle_incoming_message(
             IrcMessage::parse(":srv CAP me ACK :draft/chathistory").unwrap(),
         );
