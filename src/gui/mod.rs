@@ -7431,6 +7431,34 @@ mod tests {
     }
 
     #[test]
+    fn replayed_own_non_credential_privmsg_survives() {
+        let (mut app, _rx) = test_app_connected();
+        app.set_my_nick("me".into());
+        app.handle_cap_message("ACK", &["draft/chathistory".into()]);
+        let mut channel = Channel::new();
+        channel.joined = true;
+        app.channels.insert("NickServ".to_string(), channel);
+        app.current_channel = Some("NickServ".to_string());
+
+        // Own row to an auth service but NOT a credential command: replay
+        // must keep it (#158 drops only the credential shape).
+        app.handle_incoming_message(
+            IrcMessage::parse(":srv BATCH +r chathistory NickServ").unwrap(),
+        );
+        app.handle_incoming_message(
+            IrcMessage::parse("@batch=r;msgid=n6 :me!u@h PRIVMSG NickServ :INFO alice").unwrap(),
+        );
+        app.handle_incoming_message(IrcMessage::parse(":srv BATCH -r").unwrap());
+
+        assert!(
+            app.channels["NickServ"]
+                .messages
+                .iter()
+                .any(|message| message.content == "INFO alice")
+        );
+    }
+
+    #[test]
     fn batch_parents_is_capped_against_hostile_opens() {
         let mut app = test_app();
         for i in 0..5000 {
