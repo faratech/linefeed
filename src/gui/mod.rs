@@ -125,14 +125,12 @@ impl SessionConfig {
     /// lineage (#172). Held-nick attribution does not carry across a change
     /// of this key.
     fn services_identity_key(&self) -> (Option<String>, Option<String>) {
+        let cert = self.server.tls_client_cert_path.as_deref().map(str::trim);
         match self.server.sasl_mechanism {
-            SaslMechanism::External => (
-                None,
-                self.server
-                    .tls_client_cert_path
-                    .as_deref()
-                    .map(|path| path.trim().to_ascii_lowercase()),
-            ),
+            // Auto authenticates via EXTERNAL first whenever a certificate
+            // is configured, so the certificate is the identity there too.
+            SaslMechanism::External => (None, cert.map(str::to_string)),
+            SaslMechanism::Auto if cert.is_some() => (None, cert.map(str::to_string)),
             _ => (
                 self.server
                     .sasl_username
@@ -838,6 +836,10 @@ impl IrcApp {
     /// Prepare for reconnection attempt
     pub fn start_reconnect(&mut self) {
         self.reconnect_attempts += 1;
+        // Every fresh registration gets a fresh 433 walkaway budget; the
+        // auto-reconnect path never re-enters activate_session, so the
+        // reset cannot live only there (#173).
+        self.nick_retry_attempts = 0;
         self.connecting = true;
         self.connection_lost = false;
         let delay = self.get_reconnect_delay();
@@ -2571,6 +2573,52 @@ impl IrcApp {
         self.session_from_form().map(|session| session.server)
     }
 
+    /// Rename bookkeeping for every NICK (self or peer): per-channel user
+    /// renames with a notice, known-user/monitor re-keying, and query-tab
+    /// re-keying (#173).
+    fn apply_nick_change(&mut self, old_nick: &str, new_nick: &str) {
+        let sys_msg = ChatMessage::system(&format!("{} is now known as {}", old_nick, new_nick));
+        let max = self.max_scrollback;
+        for channel in self.channels.values_mut() {
+            if channel.has_user(old_nick) {
+                channel.push_trimmed(sys_msg.clone(), max);
+                channel.rename_user(old_nick, new_nick);
+            }
+        }
+        let old_identity_key = self.network_support.canonicalize(old_nick);
+        if let Some(mut identity) = self.known_users.remove(&old_identity_key) {
+            identity.nick = new_nick.to_string();
+            self.known_users
+                .insert(self.network_support.canonicalize(new_nick), identity);
+        }
+        if self.monitored_users.remove(&old_identity_key) {
+            self.monitored_users
+                .insert(self.network_support.canonicalize(new_nick));
+        }
+        // Re-key an open query (PM) window so the conversation follows
+        // the rename: otherwise new messages open a second tab under
+        // the new nick and replies in the stale tab go to the old nick.
+        let query_key = self
+            .channels
+            .keys()
+            .find(|k| !self.is_channel_name(k) && self.identifiers_equal(k, old_nick))
+            .cloned();
+        if let Some(key) = query_key
+            && !self
+                .channels
+                .keys()
+                .any(|k| self.identifiers_equal(k, new_nick))
+            && let Some(mut ch) = self.channels.remove(&key)
+        {
+            ch.push_trimmed(sys_msg, max);
+            let was_current = self.current_channel.as_deref() == Some(key.as_str());
+            self.channels.insert(new_nick.to_string(), ch);
+            if was_current {
+                self.current_channel = Some(new_nick.to_string());
+            }
+        }
+    }
+
     pub fn handle_incoming_message(&mut self, msg: IrcMessage) {
         if self.collect_multiline_line(&msg) {
             self.scroll_to_bottom = true;
@@ -3290,47 +3338,10 @@ impl IrcApp {
                     // in use, so record it as held (#168).
                     self.set_session_nick(new_nick.clone(), true);
                 }
-                let sys_msg =
-                    ChatMessage::system(&format!("{} is now known as {}", old_nick, new_nick));
-                let max = self.max_scrollback;
-                for channel in self.channels.values_mut() {
-                    if channel.has_user(&old_nick) {
-                        channel.push_trimmed(sys_msg.clone(), max);
-                        channel.rename_user(&old_nick, new_nick);
-                    }
-                }
-                let old_identity_key = self.network_support.canonicalize(&old_nick);
-                if let Some(mut identity) = self.known_users.remove(&old_identity_key) {
-                    identity.nick = new_nick.clone();
-                    self.known_users
-                        .insert(self.network_support.canonicalize(new_nick), identity);
-                }
-                if self.monitored_users.remove(&old_identity_key) {
-                    self.monitored_users
-                        .insert(self.network_support.canonicalize(new_nick));
-                }
-                // Re-key an open query (PM) window so the conversation follows
-                // the rename: otherwise new messages open a second tab under
-                // the new nick and replies in the stale tab go to the old nick.
-                let query_key = self
-                    .channels
-                    .keys()
-                    .find(|k| !self.is_channel_name(k) && self.identifiers_equal(k, &old_nick))
-                    .cloned();
-                if let Some(key) = query_key
-                    && !self
-                        .channels
-                        .keys()
-                        .any(|k| self.identifiers_equal(k, new_nick))
-                    && let Some(mut ch) = self.channels.remove(&key)
-                {
-                    ch.push_trimmed(sys_msg, max);
-                    let was_current = self.current_channel.as_deref() == Some(key.as_str());
-                    self.channels.insert(new_nick.clone(), ch);
-                    if was_current {
-                        self.current_channel = Some(new_nick.clone());
-                    }
-                }
+                // Rename bookkeeping applies to every NICK (channel user
+                // lists, identity/monitor re-keying, query-tab re-keying);
+                // only the self-attribution above is gated (#173).
+                self.apply_nick_change(&old_nick, new_nick);
             }
 
             IrcCommand::Topic(channel, topic) => {
@@ -3855,9 +3866,17 @@ impl IrcApp {
             RPL_SAVENICK => {
                 // ircu/IRCnet/Undernet force a rename on nick collision; the
                 // granted nick is server-accepted and the outgoing one was
-                // ours, so both route through the choke point (#172).
-                if let Some(new_nick) = params.get(1) {
+                // ours, so both route through the choke point (#172). Unlike
+                // an accepted NICK echo, the rename is announced explicitly:
+                // pre-registration renames have no other visible trace.
+                if let Some(new_nick) = params.get(1).filter(|nick| !nick.is_empty()) {
+                    let old_nick = self.my_nick.clone();
                     self.set_session_nick(new_nick.clone(), true);
+                    self.apply_nick_change(&old_nick, new_nick);
+                    self.add_server_message(ChatMessage::system(&format!(
+                        "Server forced nick change to {}",
+                        new_nick
+                    )));
                 }
             }
 
@@ -4203,7 +4222,15 @@ impl IrcApp {
                         base.pop();
                     }
                 }
-                let new_nick = format!("{base}_");
+                let mut new_nick = format!("{base}_");
+                // Progress guard: a clamp that regenerates the identical
+                // just-rejected nick (e.g. my_nick already ends with '_' at
+                // the limit) would burn the budget on guaranteed retries
+                // (#173).
+                while new_nick == self.my_nick && !base.is_empty() {
+                    base.pop();
+                    new_nick = format!("{base}_");
+                }
                 // The walkaway records the rejected nick only when it was
                 // confirmed in use on this lineage (an auto-reconnect that
                 // registered as a held nick before 433 hit): its replayed
@@ -8036,6 +8063,61 @@ mod tests {
         );
         assert_eq!(app.my_nick, "mich_");
         assert!(app.my_nick.chars().count() <= 5);
+    }
+
+    #[test]
+    fn clamp_progresses_past_an_identical_rejected_nick() {
+        let mut app = test_app();
+        app.network_support.nick_len = Some(6);
+        app.set_session_nick("alice_".into(), false);
+        app.handle_numeric(
+            ERR_NICKNAMEINUSE,
+            &["me".into(), "alice_".into(), "in use".into()],
+        );
+        assert_eq!(
+            app.my_nick, "alic_",
+            "the clamp must not regenerate the just-rejected nick (#173)"
+        );
+    }
+
+    #[test]
+    fn auto_reconnect_resets_the_walkaway_budget() {
+        let mut app = test_app();
+        app.nick_retry_attempts = 3;
+        app.connection_lost = true;
+        app.auto_reconnect = true;
+        app.last_disconnect_time = Some(std::time::Instant::now());
+        app.start_reconnect();
+        assert_eq!(
+            app.nick_retry_attempts, 0,
+            "#173: fresh registration, fresh budget"
+        );
+    }
+
+    #[test]
+    fn forced_rename_applies_bookkeeping_and_is_announced() {
+        let mut app = test_app();
+        app.set_session_nick("mine".into(), true);
+        let mut channel = Channel::new();
+        channel.add_user("mine", crate::gui::UserMode::Normal);
+        app.channels.insert("#chan".into(), channel);
+        app.handle_numeric(RPL_SAVENICK, &["me".into(), "forced2".into()]);
+        assert_eq!(app.my_nick, "forced2");
+        assert!(app.sender_is_self("mine"), "forced-away nick stays ours");
+        let chan = &app.channels["#chan"];
+        assert!(chan.get_user("forced2").is_some(), "user list renamed");
+        assert!(
+            chan.messages
+                .iter()
+                .any(|message| message.content.contains("is now known as")),
+            "the rename bookkeeping ran"
+        );
+        assert!(
+            app.server_messages
+                .iter()
+                .any(|message| message.content.contains("Server forced nick change")),
+            "the forced rename is announced in the server window"
+        );
     }
 
     #[test]
