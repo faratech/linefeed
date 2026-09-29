@@ -333,6 +333,37 @@ impl LogManager {
         messages
     }
 
+    /// Load history through the casemapped log key, falling back to the
+    /// pre-canonicalization raw-spelling file so logs written before the key
+    /// was casemapped stay reachable (issue #142).
+    pub fn load_history_casemapped(
+        &self,
+        network: &str,
+        legacy_network: &str,
+        channel_canonical: &str,
+        channel_raw: &str,
+        max_lines: usize,
+        allow_legacy_migration: bool,
+    ) -> Vec<ChatMessage> {
+        let mut messages = self.load_history_with_legacy(
+            network,
+            legacy_network,
+            channel_canonical,
+            max_lines,
+            allow_legacy_migration,
+        );
+        if messages.is_empty() && channel_raw != channel_canonical {
+            messages = self.load_history_with_legacy(
+                network,
+                legacy_network,
+                channel_raw,
+                max_lines,
+                false,
+            );
+        }
+        messages
+    }
+
     #[cfg(test)]
     pub(super) fn with_test_dir(log_dir: PathBuf) -> Self {
         Self {

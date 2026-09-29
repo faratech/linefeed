@@ -1155,9 +1155,14 @@ impl IrcClient {
     {
         let mut buf = Vec::with_capacity(512);
         loop {
-            let msg = read_handshake_msg(writer, reader, &mut buf, incoming_tx)
-                .await?
-                .expect("non-PING handshake message");
+            // read_handshake_msg returns None for a PING (answered inline) and
+            // for an unparseable line. Both are legal pre-welcome traffic —
+            // bouncers PING unregistered clients — so keep waiting instead of
+            // panicking. The outer REGISTRATION_TIMEOUT bounds the total wait.
+            let Some(msg) = read_handshake_msg(writer, reader, &mut buf, incoming_tx).await?
+            else {
+                continue;
+            };
             if matches!(msg.command, IrcCommand::Numeric(RPL_WELCOME, _)) {
                 return Ok(());
             }
@@ -2383,6 +2388,57 @@ mod tests {
             drop(msg_tx);
             server.abort();
             drain.await.unwrap();
+        });
+    }
+
+    #[test]
+    fn welcome_wait_survives_pings_and_junk_lines() {
+        test_runtime().block_on(async {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                let (read_half, mut write_half) = stream.into_split();
+                let mut reader = BufReader::new(read_half);
+                assert_eq!(read_wire_line(&mut reader).await, "CAP LS 302");
+                assert_eq!(read_wire_line(&mut reader).await, "NICK legacy");
+                assert!(read_wire_line(&mut reader).await.starts_with("USER "));
+                // Empty LS -> client sends CAP END and waits for welcome.
+                write_half.write_all(b":srv CAP * LS :\r\n").await.unwrap();
+                assert_eq!(read_wire_line(&mut reader).await, "CAP END");
+                // Both legal pre-welcome lines used to reach the `.expect`:
+                // a bouncer-style PING (answered inline, returns None) and a
+                // line that parses to None.
+                write_half.write_all(b":srv PING :ka\r\n").await.unwrap();
+                assert_eq!(read_wire_line(&mut reader).await, "PONG :ka");
+                write_half.write_all(b"   \r\n").await.unwrap();
+                write_half
+                    .write_all(b":legacy 001 legacy :Welcome\r\n")
+                    .await
+                    .unwrap();
+                // Hold the socket open long enough for the client to read.
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            });
+
+            let config = ServerConfig {
+                host: "127.0.0.1".into(),
+                port: addr.port(),
+                use_tls: false,
+                nick: "legacy".into(),
+                ..Default::default()
+            };
+            let (msg_tx, mut msg_rx) = mpsc::channel(100);
+            let (_cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+            let mut client = IrcClient::new(config);
+            timeout(Duration::from_secs(1), client.connect(msg_tx, cmd_rx))
+                .await
+                .expect("registration did not survive pre-welcome PING/junk")
+                .unwrap();
+            assert!(
+                std::iter::from_fn(|| msg_rx.try_recv().ok())
+                    .any(|msg| matches!(msg.command, IrcCommand::Numeric(RPL_WELCOME, _)))
+            );
+            server.await.unwrap();
         });
     }
 

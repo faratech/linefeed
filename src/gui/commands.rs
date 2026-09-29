@@ -2238,6 +2238,14 @@ pub(super) fn command_line_contains_credentials(line: &str) -> bool {
             let content = message.next().unwrap_or("").trim_start();
             service_message_contains_credentials(target, content)
         }
+        "DESCRIBE" => {
+            // Same shape as /msg: first word is the target, rest is the text
+            // (sent as a CTCP ACTION).
+            let mut message = args.splitn(2, char::is_whitespace);
+            let target = message.next().unwrap_or("");
+            let content = message.next().unwrap_or("").trim_start();
+            service_message_contains_credentials(target, content)
+        }
         "RAW" | "QUOTE" => command_line_contains_credentials(args),
         "LABEL" => {
             let nested = args
@@ -2662,6 +2670,30 @@ mod tests {
             "CS",
             "IDENTIFY #chan key123"
         ));
+    }
+
+    #[test]
+    fn action_and_describe_credential_lines_never_enter_history() {
+        let (mut app, mut rx) = connected_command_app();
+        app.set_my_nick("me".into());
+        assert!(app.open_query("NickServ"));
+
+        for input in ["/me IDENTIFY hunter8", "/describe NickServ IDENTIFY hunter9"] {
+            app.input_text = input.into();
+            app.process_input();
+        }
+        assert!(app.command_history.is_empty(), "{:?}", app.command_history);
+        // The scrollback redaction (defense in depth) still applies.
+        let query = &app.channels["NickServ"];
+        for secret in ["hunter8", "hunter9"] {
+            assert!(
+                query
+                    .messages
+                    .iter()
+                    .all(|message| !message.content.contains(secret))
+            );
+        }
+        while rx.try_recv().is_ok() {}
     }
 
     #[test]

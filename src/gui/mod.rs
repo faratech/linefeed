@@ -574,7 +574,11 @@ impl IrcApp {
             last_activity: std::time::Instant::now(),
             auto_away_triggered: false,
             auto_away_enabled: settings.auto_away_enabled,
-            auto_away_minutes: settings.auto_away_minutes,
+            // Values from settings.json are clamped to the same floors the
+            // settings dialog enforces: an out-of-range persisted value (hand
+            // edit / older version) must not disable a safety floor (see #144:
+            // 0 would empty the server buffer, storm reconnects, or flap away).
+            auto_away_minutes: settings.auto_away_minutes.max(1),
             auto_away_message: settings.auto_away_message,
             sasl_username: settings.sasl_username,
             sasl_password: settings.sasl_password,
@@ -585,13 +589,13 @@ impl IrcApp {
             log_manager: logging::LogManager::new(settings.logging_enabled),
             logging_enabled: settings.logging_enabled,
             logging_load_history: settings.logging_load_history,
-            logging_history_lines: settings.logging_history_lines,
+            logging_history_lines: settings.logging_history_lines.max(10),
 
             // Display settings
             timestamp_format: settings.timestamp_format,
             hide_join_part: settings.hide_join_part,
             font_size: settings.font_size,
-            max_scrollback: settings.max_scrollback,
+            max_scrollback: settings.max_scrollback.max(100),
 
             // Privacy
             ctcp_replies_enabled: settings.ctcp_replies_enabled,
@@ -613,8 +617,8 @@ impl IrcApp {
             next_whox_token: 1,
 
             // Reconnect settings
-            reconnect_delay_secs: settings.reconnect_delay_secs,
-            max_reconnect_attempts: settings.max_reconnect_attempts,
+            reconnect_delay_secs: settings.reconnect_delay_secs.max(1),
+            max_reconnect_attempts: settings.max_reconnect_attempts.max(1),
 
             // Custom messages
             quit_message: settings.quit_message,
@@ -1306,9 +1310,10 @@ impl IrcApp {
             return None;
         }
         let (network, legacy_host, allow_legacy) = self.active_log_context()?;
-        let mut local = self.log_manager.load_history_with_legacy(
+        let mut local = self.log_manager.load_history_casemapped(
             &network,
             &legacy_host,
+            &self.network_support.canonicalize(target),
             target,
             self.logging_history_lines.saturating_add(1),
             allow_legacy,
@@ -1324,7 +1329,8 @@ impl IrcApp {
         if local.len() > self.logging_history_lines {
             local.drain(..local.len() - self.logging_history_lines);
         }
-        self.log_manager.log_session_start(&network, target);
+        self.log_manager
+            .log_session_start(&network, &self.network_support.canonicalize(target));
         if local.is_empty() {
             return None;
         }
@@ -1725,7 +1731,10 @@ impl IrcApp {
                     channel.history_loaded = true;
                 }
                 if !local_history_loaded && let Some((network, _, _)) = self.active_log_context() {
-                    self.log_manager.log_session_start(&network, &batch.target);
+                    self.log_manager.log_session_start(
+                        &network,
+                        &self.network_support.canonicalize(&batch.target),
+                    );
                 }
             }
         }
@@ -2868,9 +2877,10 @@ impl IrcApp {
                             && let Some((network, legacy_host, allow_legacy)) =
                                 self.active_log_context()
                         {
-                            let history = self.log_manager.load_history_with_legacy(
+                            let history = self.log_manager.load_history_casemapped(
                                 &network,
                                 &legacy_host,
+                                &self.network_support.canonicalize(channel),
                                 channel,
                                 self.logging_history_lines,
                                 allow_legacy,
@@ -2884,11 +2894,17 @@ impl IrcApp {
                                 new_channel.history_loaded = true;
                             }
                             // Log session start
-                            self.log_manager.log_session_start(&network, channel);
+                            self.log_manager.log_session_start(
+                                &network,
+                                &self.network_support.canonicalize(channel),
+                            );
                         } else if (!self.chathistory_enabled || !self.logging_load_history)
                             && let Some((network, _, _)) = self.active_log_context()
                         {
-                            self.log_manager.log_session_start(&network, channel);
+                            self.log_manager.log_session_start(
+                                &network,
+                                &self.network_support.canonicalize(channel),
+                            );
                         }
                         self.channels.insert(channel.clone(), new_channel);
                     }
@@ -3250,7 +3266,11 @@ impl IrcApp {
             IrcCommand::Batch(reference, batch_type, params) => {
                 if let Some(batch_id) = reference.strip_prefix('+') {
                     tracing::debug!("Batch started: {} type={:?}", reference, batch_type);
-                    if let Some(parent) = msg.get_batch() {
+                    if let Some(parent) = msg.get_batch()
+                        && self.batch_parents.len() < 4096
+                    {
+                        // Server-controlled map: a stream of unclosed tagged
+                        // opens must not grow it for the whole session.
                         self.batch_parents.insert(batch_id.to_string(), parent);
                     }
                     if batch_type
@@ -4602,9 +4622,10 @@ impl IrcApp {
                 && !self.is_channel_name(&key)
                 && let Some((network, legacy_host, allow_legacy)) = self.active_log_context()
             {
-                let history = self.log_manager.load_history_with_legacy(
+                let history = self.log_manager.load_history_casemapped(
                     &network,
                     &legacy_host,
+                    &self.network_support.canonicalize(&key),
                     &key,
                     self.logging_history_lines,
                     allow_legacy,
@@ -4617,7 +4638,8 @@ impl IrcApp {
                     new_channel.messages.extend(history);
                     new_channel.history_loaded = true;
                 }
-                self.log_manager.log_session_start(&network, &key);
+                self.log_manager
+                    .log_session_start(&network, &self.network_support.canonicalize(&key));
             }
             self.channels.insert(key.clone(), new_channel);
         }
@@ -4633,12 +4655,14 @@ impl IrcApp {
         }
         // Log message to disk (display-only messages like /lastlog output are
         // excluded so search results don't pollute the persistent history).
-        // Always use the display-preserving resolved key: CASEMAPPING-equivalent
-        // spellings must never fork one tab into multiple log files.
+        // Always use the casemapped key: CASEMAPPING-equivalent spellings must
+        // never fork one tab into multiple log files (the readable prefix of
+        // the path keeps the session's display spelling).
         if !msg.no_log
             && let Some((network, _, _)) = self.active_log_context()
         {
-            self.log_manager.log_message(&network, &key, &msg);
+            self.log_manager
+                .log_message(&network, &self.network_support.canonicalize(&key), &msg);
         }
 
         let is_current = self.current_target_is(&key);
@@ -5042,7 +5066,9 @@ impl IrcApp {
                 let candidate = if let Some(command_line) = input.strip_prefix('/') {
                     let mut parts = command_line.splitn(2, char::is_whitespace);
                     let command = parts.next().unwrap_or("");
-                    if command.eq_ignore_ascii_case("SAY") {
+                    // SAY and ME carry the raw text to the current target; a
+                    // password typed as an action must not enter history.
+                    if command.eq_ignore_ascii_case("SAY") || command.eq_ignore_ascii_case("ME") {
                         parts.next().unwrap_or("").trim_start()
                     } else {
                         ""
@@ -7006,19 +7032,91 @@ mod tests {
 
         assert_eq!(app.channels.len(), 1);
         assert!(app.channels.contains_key("#Te[st"));
+        // Log keys are casemapped (#142): both spellings hash to one file.
+        let canonical = app.network_support.canonicalize("#Te[st");
         let path = app
             .log_manager
-            .test_log_path("tls://irc.example:6697", "#Te[st");
+            .test_log_path("tls://irc.example:6697", &canonical);
         let alternate = app
             .log_manager
             .test_log_path("tls://irc.example:6697", "#te{st");
-        let contents = std::fs::read_to_string(path).unwrap();
+        let contents = std::fs::read_to_string(&path).unwrap();
         assert!(contents.contains("first"));
         assert!(contents.contains("second"));
-        assert!(!alternate.exists());
+        assert_eq!(alternate, std::path::PathBuf::from(&path));
 
         drop(app);
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn casemapping_variant_spelling_still_finds_history() {
+        let dir = temporary_log_dir("casemapped-history");
+        let mut app = test_app();
+        app.log_manager = logging::LogManager::with_test_dir(dir.clone());
+        app.logging_enabled = true;
+        app.server_host = "IRC.Example".into();
+        app.server_port = "6697".into();
+        app.use_tls = true;
+        assert!(app.start_session_from_form());
+
+        // A pre-#142 session wrote under the raw spelling.
+        app.log_manager.log_message(
+            "tls://irc.example:6697",
+            "#Te[st",
+            &ChatMessage::new_fmt("alice", "legacy line", "short"),
+        );
+        app.log_manager.flush_all();
+
+        // The new session joins under the canonical spelling and must still
+        // find the old file through the raw-spelling fallback.
+        let raw = "#Te[st";
+        let canonical = app.network_support.canonicalize(raw);
+        assert_ne!(raw, canonical.as_str());
+        let history = app.log_manager.load_history_casemapped(
+            "tls://irc.example:6697",
+            "irc.example",
+            &canonical,
+            raw,
+            50,
+            false,
+        );
+        assert!(
+            history
+                .iter()
+                .any(|message| message.content == "legacy line")
+        );
+
+        drop(app);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn batch_parents_is_capped_against_hostile_opens() {
+        let mut app = test_app();
+        for i in 0..5000 {
+            app.handle_incoming_message(
+                IrcMessage::parse(&format!("@batch=p BATCH +x{i} chathistory #c")).unwrap(),
+            );
+        }
+        assert_eq!(app.batch_parents.len(), 4096);
+    }
+
+    #[test]
+    fn out_of_range_persisted_settings_self_heal_on_load() {
+        let app = IrcApp::with_settings(Settings {
+            max_scrollback: 0,
+            reconnect_delay_secs: 0,
+            max_reconnect_attempts: 0,
+            auto_away_minutes: 0,
+            logging_history_lines: 0,
+            ..Settings::default()
+        });
+        assert_eq!(app.max_scrollback, 100);
+        assert_eq!(app.reconnect_delay_secs, 1);
+        assert_eq!(app.max_reconnect_attempts, 1);
+        assert_eq!(app.auto_away_minutes, 1);
+        assert_eq!(app.logging_history_lines, 10);
     }
 
     #[test]
