@@ -333,9 +333,13 @@ impl LogManager {
         messages
     }
 
-    /// Load history through the casemapped log key, falling back to the
-    /// pre-canonicalization raw-spelling file so logs written before the key
-    /// was casemapped stay reachable (issue #142).
+    /// Load history through the casemapped log key. Logs written before the
+    /// key was casemapped live under the raw display spelling, so read BOTH
+    /// whenever the spellings differ and concatenate (older raw file first):
+    /// a read-only fallback that fires only on an empty canonical read would
+    /// be permanently sealed by the first canonical-side write (issue #146).
+    /// Legacy host-only files migrate through the same claim machinery under
+    /// either spelling.
     pub fn load_history_casemapped(
         &self,
         network: &str,
@@ -352,14 +356,21 @@ impl LogManager {
             max_lines,
             allow_legacy_migration,
         );
-        if messages.is_empty() && channel_raw != channel_canonical {
-            messages = self.load_history_with_legacy(
+        if channel_raw != channel_canonical {
+            let mut legacy_raw = self.load_history_with_legacy(
                 network,
                 legacy_network,
                 channel_raw,
                 max_lines,
-                false,
+                allow_legacy_migration,
             );
+            if !legacy_raw.is_empty() {
+                legacy_raw.extend(messages);
+                if legacy_raw.len() > max_lines {
+                    legacy_raw.drain(..legacy_raw.len() - max_lines);
+                }
+                messages = legacy_raw;
+            }
         }
         messages
     }

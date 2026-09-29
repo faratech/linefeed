@@ -1320,10 +1320,15 @@ impl IrcApp {
         );
         // The current JOIN has already written this marker to the log and
         // placed it in the tab. Keep its live copy in the right position.
-        if local
-            .last()
-            .is_some_and(|message| message.content == format!("Now talking in {target}"))
-        {
+        // The marker may carry a CASEMAPPING-equivalent spelling of the
+        // target (one shared canonical log file), so match by casemapping,
+        // not exact text.
+        if local.last().is_some_and(|message| {
+            message
+                .content
+                .strip_prefix("Now talking in ")
+                .is_some_and(|rest| self.identifiers_equal(rest, target))
+        }) {
             local.pop();
         }
         if local.len() > self.logging_history_lines {
@@ -2487,6 +2492,25 @@ impl IrcApp {
                 }
 
                 if let Some(batch_id) = &history_batch {
+                    // Our own /notice already left a local confirmation row
+                    // ("-> -target- text") in the tab; it never learns the
+                    // server msgid, so the msgid-based replay dedup cannot
+                    // see it — drop the replayed copy instead of showing the
+                    // notice twice (issue #150).
+                    if self.identifiers_equal(&sender, &self.my_nick) {
+                        let confirmation = format!("-> -{routed_target}- {content}");
+                        let confirmed = self
+                            .channel_key(&routed_target)
+                            .and_then(|key| self.channels.get(&key))
+                            .is_some_and(|channel| {
+                                channel.messages.iter().rev().take(64).any(|row| {
+                                    row.is_system && row.content == confirmation
+                                })
+                            });
+                        if confirmed {
+                            return;
+                        }
+                    }
                     let server_time = msg
                         .get_server_time()
                         .map(|epoch| epoch_time_formatted(epoch, &self.timestamp_format));
@@ -2877,10 +2901,11 @@ impl IrcApp {
                             && let Some((network, legacy_host, allow_legacy)) =
                                 self.active_log_context()
                         {
+                            let log_key = self.network_support.canonicalize(channel);
                             let history = self.log_manager.load_history_casemapped(
                                 &network,
                                 &legacy_host,
-                                &self.network_support.canonicalize(channel),
+                                &log_key,
                                 channel,
                                 self.logging_history_lines,
                                 allow_legacy,
@@ -2894,10 +2919,7 @@ impl IrcApp {
                                 new_channel.history_loaded = true;
                             }
                             // Log session start
-                            self.log_manager.log_session_start(
-                                &network,
-                                &self.network_support.canonicalize(channel),
-                            );
+                            self.log_manager.log_session_start(&network, &log_key);
                         } else if (!self.chathistory_enabled || !self.logging_load_history)
                             && let Some((network, _, _)) = self.active_log_context()
                         {
@@ -3266,11 +3288,17 @@ impl IrcApp {
             IrcCommand::Batch(reference, batch_type, params) => {
                 if let Some(batch_id) = reference.strip_prefix('+') {
                     tracing::debug!("Batch started: {} type={:?}", reference, batch_type);
-                    if let Some(parent) = msg.get_batch()
-                        && self.batch_parents.len() < 4096
-                    {
+                    if let Some(parent) = msg.get_batch() {
                         // Server-controlled map: a stream of unclosed tagged
-                        // opens must not grow it for the whole session.
+                        // opens must not grow it for the whole session. Evict
+                        // rather than refuse — a full map pinned shut would
+                        // permanently lose legitimate nesting links (issue
+                        // #151); a displaced entry only costs one link.
+                        if self.batch_parents.len() >= 4096
+                            && let Some(evicted) = self.batch_parents.keys().next().cloned()
+                        {
+                            self.batch_parents.remove(&evicted);
+                        }
                         self.batch_parents.insert(batch_id.to_string(), parent);
                     }
                     if batch_type
@@ -4623,10 +4651,11 @@ impl IrcApp {
                 && !self.is_channel_name(&key)
                 && let Some((network, legacy_host, allow_legacy)) = self.active_log_context()
             {
+                let log_key = self.network_support.canonicalize(&key);
                 let history = self.log_manager.load_history_casemapped(
                     &network,
                     &legacy_host,
-                    &self.network_support.canonicalize(&key),
+                    &log_key,
                     &key,
                     self.logging_history_lines,
                     allow_legacy,
@@ -4639,8 +4668,7 @@ impl IrcApp {
                     new_channel.messages.extend(history);
                     new_channel.history_loaded = true;
                 }
-                self.log_manager
-                    .log_session_start(&network, &self.network_support.canonicalize(&key));
+                self.log_manager.log_session_start(&network, &log_key);
             }
             self.channels.insert(key.clone(), new_channel);
         }
@@ -4662,8 +4690,8 @@ impl IrcApp {
         if !msg.no_log
             && let Some((network, _, _)) = self.active_log_context()
         {
-            self.log_manager
-                .log_message(&network, &self.network_support.canonicalize(&key), &msg);
+            let log_key = self.network_support.canonicalize(&key);
+            self.log_manager.log_message(&network, &log_key, &msg);
         }
 
         let is_current = self.current_target_is(&key);
@@ -7088,6 +7116,45 @@ mod tests {
                 .any(|message| message.content == "legacy line")
         );
 
+        // The fallback must not seal once the canonical file has a row: the
+        // first post-upgrade write lands in the canonical file, and later
+        // sessions must still see the pre-#142 lines (#146).
+        app.log_manager.log_message(
+            "tls://irc.example:6697",
+            &canonical,
+            &ChatMessage::new_fmt("bob", "canonical line", "short"),
+        );
+        app.log_manager.flush_all();
+        let history = app.log_manager.load_history_casemapped(
+            "tls://irc.example:6697",
+            "irc.example",
+            &canonical,
+            raw,
+            50,
+            false,
+        );
+        assert!(
+            history
+                .iter()
+                .any(|message| message.content == "legacy line"),
+            "raw-spelling history must survive the first canonical write"
+        );
+        assert!(
+            history
+                .iter()
+                .any(|message| message.content == "canonical line")
+        );
+        // Older file first.
+        let contents: Vec<&str> = history
+            .iter()
+            .filter_map(|message| match message.content.as_str() {
+                "legacy line" => Some("legacy"),
+                "canonical line" => Some("canonical"),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(contents, vec!["legacy", "canonical"]);
+
         drop(app);
         std::fs::remove_dir_all(dir).unwrap();
     }
@@ -7141,6 +7208,38 @@ mod tests {
         let bob = app.channels["#chan"].get_user("bob").unwrap();
         assert_eq!(bob.account.as_deref(), None);
         assert!(!bob.is_away());
+    }
+
+    #[test]
+    fn replayed_own_notice_does_not_duplicate_the_local_confirmation() {
+        let mut app = test_app();
+        app.set_my_nick("me".into());
+        app.handle_cap_message(
+            "ACK",
+            &["echo-message".into(), "draft/chathistory".into()],
+        );
+        let mut channel = Channel::new();
+        channel.joined = true;
+        app.channels.insert("#chan".to_string(), channel);
+        app.current_channel = Some("#chan".to_string());
+
+        // The local confirmation row "-> -#chan- unique-notice-text" exists.
+        app.process_command("/notice #chan unique-notice-text");
+
+        // The server replays the same notice with a msgid inside a batch.
+        app.handle_incoming_message(IrcMessage::parse(":srv BATCH +r chathistory #chan").unwrap());
+        app.handle_incoming_message(
+            IrcMessage::parse("@batch=r;msgid=n1 :me!u@h NOTICE #chan :unique-notice-text")
+                .unwrap(),
+        );
+        app.handle_incoming_message(IrcMessage::parse(":srv BATCH -r").unwrap());
+
+        let hits = app.channels["#chan"]
+            .messages
+            .iter()
+            .filter(|message| message.content.contains("unique-notice-text"))
+            .count();
+        assert_eq!(hits, 1, "the notice must appear exactly once");
     }
 
     #[test]

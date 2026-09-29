@@ -79,7 +79,10 @@ impl IrcApp {
             }
 
             "MSG" | "PRIVMSG" => {
-                let msg_parts: Vec<&str> = args.splitn(2, ' ').collect();
+                // Whitespace separator (not just ' '): the credential filter
+                // splits on any whitespace, so dispatch must agree or a
+                // tab-pasted target dodges the service redaction (#148).
+                let msg_parts: Vec<&str> = args.splitn(2, char::is_whitespace).collect();
                 if let (Some(target), Some(message)) = (msg_parts.first(), msg_parts.get(1)) {
                     if self.connected {
                         if self.send_privmsg_text(target, message) {
@@ -110,7 +113,8 @@ impl IrcApp {
             }
 
             "QUERY" | "Q" => {
-                let msg_parts: Vec<&str> = args.splitn(2, ' ').collect();
+                // Whitespace separator: see the MSG arm (#148).
+                let msg_parts: Vec<&str> = args.splitn(2, char::is_whitespace).collect();
                 if let Some(&target) = msg_parts.first() {
                     if target.is_empty() {
                         self.add_server_message(ChatMessage::system(
@@ -548,18 +552,24 @@ impl IrcApp {
                         "Usage: /{} <subcommand or arguments>",
                         cmd.to_ascii_lowercase()
                     )));
-                } else {
-                    self.send_command(IrcCommand::Raw(format!("{cmd} {args}")));
+                } else if !self.send_command(IrcCommand::Raw(format!("{cmd} {args}"))) {
+                    self.add_message_to_current(ChatMessage::system(
+                        "Not connected - server command not sent",
+                    ));
                 }
             }
 
             "RAW" | "QUOTE" => {
                 if args.is_empty() {
                     self.add_message_to_current(ChatMessage::system("Usage: /raw <command>"));
-                } else if !self.send_command(IrcCommand::Raw(args.to_string())) {
+                } else if !self.connected {
                     self.add_message_to_current(ChatMessage::system(
                         "Not connected - server command not sent",
                     ));
+                } else {
+                    // While connected, send_command reports its own accurate
+                    // row for too-long / denied-tag failures.
+                    let _ = self.send_command(IrcCommand::Raw(args.to_string()));
                 }
             }
 
@@ -663,13 +673,17 @@ impl IrcApp {
                                 };
                                 if sent {
                                     self.prepare_history_target(target);
-                                } else {
+                                } else if !self.connected {
+                                    // While connected, send_command already
+                                    // reported its own accurate failure row.
                                     self.add_message_to_current(ChatMessage::system(
                                         "Not connected - history request not sent",
                                     ));
                                 }
-                            } else {
-                                self.send_command(command);
+                            } else if !self.send_command(command) && !self.connected {
+                                self.add_message_to_current(ChatMessage::system(
+                                    "Not connected - history request not sent",
+                                ));
                             }
                         } else {
                             self.add_message_to_current(ChatMessage::system(
@@ -1166,7 +1180,8 @@ impl IrcApp {
 
             // === Messaging Commands ===
             "NOTICE" | "N" => {
-                let parts: Vec<&str> = args.splitn(2, ' ').collect();
+                // Whitespace separator: see the MSG arm (#148).
+                let parts: Vec<&str> = args.splitn(2, char::is_whitespace).collect();
                 if let (Some(target), Some(message)) = (parts.first(), parts.get(1)) {
                     if self.connected {
                         if self.send_notice_text(target, message) {
@@ -1246,12 +1261,26 @@ impl IrcApp {
                     ));
                 } else {
                     for channel_name in self.channels.keys().cloned().collect::<Vec<_>>() {
-                        if self.is_channel_name(&channel_name)
-                            && self.send_privmsg_text(&channel_name, args)
-                        {
-                            let msg =
-                                ChatMessage::new_fmt(&self.my_nick, args, &self.timestamp_format);
+                        if !self.is_channel_name(&channel_name) {
+                            continue;
+                        }
+                        if self.send_privmsg_text(&channel_name, args) {
+                            let msg = ChatMessage::new_fmt(
+                                &self.my_nick,
+                                args,
+                                &self.timestamp_format,
+                            );
                             self.add_message_to_channel(&channel_name, msg);
+                        } else {
+                            // A stale (kicked-from) tab must not swallow the
+                            // broadcast silently.
+                            self.add_message_to_channel(
+                                &channel_name,
+                                ChatMessage::system_fmt(
+                                    "Message not sent",
+                                    &self.timestamp_format,
+                                ),
+                            );
                         }
                     }
                 }
@@ -1268,15 +1297,24 @@ impl IrcApp {
                     ));
                 } else {
                     for channel_name in self.channels.keys().cloned().collect::<Vec<_>>() {
-                        if self.is_channel_name(&channel_name)
-                            && self.send_action_text(&channel_name, args)
-                        {
+                        if !self.is_channel_name(&channel_name) {
+                            continue;
+                        }
+                        if self.send_action_text(&channel_name, args) {
                             let msg = ChatMessage::action_fmt(
                                 &self.my_nick,
                                 args,
                                 &self.timestamp_format,
                             );
                             self.add_message_to_channel(&channel_name, msg);
+                        } else {
+                            self.add_message_to_channel(
+                                &channel_name,
+                                ChatMessage::system_fmt(
+                                    "Action not sent",
+                                    &self.timestamp_format,
+                                ),
+                            );
                         }
                     }
                 }
@@ -1309,7 +1347,8 @@ impl IrcApp {
 
             "DESCRIBE" => {
                 // Send action to specific target: /describe <target> <action>
-                let parts: Vec<&str> = args.splitn(2, ' ').collect();
+                // Whitespace separator: see the MSG arm (#148).
+                let parts: Vec<&str> = args.splitn(2, char::is_whitespace).collect();
                 if let (Some(target), Some(action_text)) = (parts.first(), parts.get(1)) {
                     if self.connected {
                         if self.send_action_text(target, action_text) {
@@ -2182,15 +2221,11 @@ fn is_auth_service_target(raw_target: &str) -> bool {
     )
 }
 
-pub(super) fn service_message_contains_credentials(target: &str, message: &str) -> bool {
-    // IRC permits comma-separated message targets and network-qualified nicks
-    // (NickServ@services.example). Treat a command as sensitive if any target
-    // is an authentication or channel service (ChanServ IDENTIFY/REGISTER
-    // carries channel keys and passwords too).
-    if !target.split(',').any(is_auth_service_target) {
-        return false;
-    }
-
+/// The auth-command half of the credential test, without the service-target
+/// gate. Targetless senders (/me, /say) use it alone — for those,
+/// over-redaction (a `/me identify as the night` kept out of history) is the
+/// safe direction.
+fn content_has_auth_command(message: &str) -> bool {
     let mut words = message.trim_start_matches(':').split_whitespace();
     let command = words.next().unwrap_or("").to_ascii_uppercase();
     if matches!(
@@ -2217,6 +2252,18 @@ pub(super) fn service_message_contains_credentials(target: &str, message: &str) 
         })
 }
 
+pub(super) fn service_message_contains_credentials(target: &str, message: &str) -> bool {
+    // IRC permits comma-separated message targets and network-qualified nicks
+    // (NickServ@services.example). Treat a command as sensitive if any target
+    // is an authentication or channel service (ChanServ IDENTIFY/REGISTER
+    // carries channel keys and passwords too).
+    if !target.split(',').any(is_auth_service_target) {
+        return false;
+    }
+
+    content_has_auth_command(message)
+}
+
 pub(super) fn command_line_contains_credentials(line: &str) -> bool {
     let line = line.trim().trim_start_matches('/');
     let mut parts = line.splitn(2, char::is_whitespace);
@@ -2232,20 +2279,15 @@ pub(super) fn command_line_contains_credentials(line: &str) -> bool {
         "NS" | "NICKSERV" => service_message_contains_credentials("NickServ", args),
         "CS" | "CHANSERV" => service_message_contains_credentials("ChanServ", args),
         "AS" | "AUTHSERV" => service_message_contains_credentials("AuthServ", args),
-        "MSG" | "PRIVMSG" | "QUERY" | "Q" | "NOTICE" | "N" => {
+        "MSG" | "PRIVMSG" | "QUERY" | "Q" | "NOTICE" | "N" | "DESCRIBE" => {
+            // First word is the target, rest is the text (DESCRIBE sends it
+            // as a CTCP ACTION).
             let mut message = args.splitn(2, char::is_whitespace);
             let target = message.next().unwrap_or("");
             let content = message.next().unwrap_or("").trim_start();
             service_message_contains_credentials(target, content)
         }
-        "DESCRIBE" => {
-            // Same shape as /msg: first word is the target, rest is the text
-            // (sent as a CTCP ACTION).
-            let mut message = args.splitn(2, char::is_whitespace);
-            let target = message.next().unwrap_or("");
-            let content = message.next().unwrap_or("").trim_start();
-            service_message_contains_credentials(target, content)
-        }
+        "ME" | "SAY" => content_has_auth_command(args),
         "RAW" | "QUOTE" => command_line_contains_credentials(args),
         "LABEL" => {
             let nested = args
@@ -2694,6 +2736,74 @@ mod tests {
             );
         }
         while rx.try_recv().is_ok() {}
+    }
+
+    #[test]
+    fn connected_send_failure_is_reported_once_with_the_accurate_reason() {
+        let (mut app, _rx) = connected_command_app();
+        // Connected, but the line is too long: send_command prints its own
+        // accurate row; the command arm must not add a "Not connected" row.
+        let long_arg = "x".repeat(600);
+        app.process_command(&format!("/raw PING {long_arg}"));
+        let rows: Vec<&str> = app
+            .server_messages
+            .iter()
+            .map(|message| message.content.as_str())
+            .collect();
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert!(rows[0].contains("too long"), "{rows:?}");
+        assert!(!rows[0].contains("Not connected"), "{rows:?}");
+    }
+
+    #[test]
+    fn tab_separated_target_is_split_the_same_way_by_dispatch_and_filter() {
+        let (mut app, mut rx) = connected_command_app();
+        app.set_my_nick("me".into());
+        // A paste can carry a tab: dispatch must see target "NickServ" exactly
+        // like the credential filter does (#148).
+        app.input_text = "/msg NickServ\tIDENTIFY hunter10".into();
+        app.process_input();
+
+        assert!(
+            !app.channels.keys().any(|key| key.contains('\t')),
+            "no junk tab: {:?}",
+            app.channels.keys().collect::<Vec<_>>()
+        );
+        let query = &app.channels["NickServ"];
+        assert!(
+            query
+                .messages
+                .iter()
+                .all(|message| !message.content.contains("hunter10"))
+        );
+        assert!(app.command_history.is_empty());
+        assert!(
+            matches!(rx.try_recv(), Ok(IrcCommand::Privmsg(target, _)) if target == "NickServ")
+        );
+    }
+
+    #[test]
+    fn perform_listing_redacts_targetless_credential_lines() {
+        let mut app = IrcApp::default();
+        app.process_command("/perform /me IDENTIFY hunter11");
+        app.process_command("/perform");
+        let shown: Vec<&str> = app
+            .server_messages
+            .iter()
+            .map(|message| message.content.as_str())
+            .collect();
+        assert!(
+            shown
+                .iter()
+                .any(|line| line.contains("<credential command redacted>")),
+            "{shown:?}"
+        );
+        assert!(
+            shown
+                .iter()
+                .all(|line| !line.contains("hunter11")),
+            "{shown:?}"
+        );
     }
 
     #[test]
