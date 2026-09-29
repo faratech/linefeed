@@ -852,7 +852,21 @@ impl IrcApp {
 
             "WHOIS" => {
                 if !args.is_empty() {
-                    self.send_command(IrcCommand::Whois(args.to_string()));
+                    // A single nick is queried twice (`WHOIS nick nick`): the
+                    // reply then comes from the user's own server, which is
+                    // what reveals the real host behind a cloak plus idle/
+                    // signon time — a one-parameter WHOIS is answered by the
+                    // local server and omits both (#164). Explicit
+                    // separators (a manual double target, a comma list, or a
+                    // mask) pass through unchanged.
+                    let target = if args.split_whitespace().count() == 1
+                        && !args.contains([',', '*', '?'])
+                    {
+                        format!("{args} {args}")
+                    } else {
+                        args.to_string()
+                    };
+                    self.send_command(IrcCommand::Whois(target));
                 } else {
                     self.add_message_to_current(ChatMessage::system("Usage: /whois <nick>"));
                 }
@@ -2827,6 +2841,21 @@ mod tests {
                 .all(|line| !line.contains("hunter11")),
             "{shown:?}"
         );
+    }
+
+    #[test]
+    fn single_nick_whois_queries_the_users_own_server() {
+        let (mut app, mut rx) = connected_command_app();
+        app.process_command("/whois alice");
+        assert!(matches!(rx.try_recv(), Ok(IrcCommand::Whois(t)) if t == "alice alice"));
+        // Separator-carrying forms pass through: masks, comma lists, and an
+        // explicit manual double target.
+        app.process_command("/whois alice,bob");
+        assert!(matches!(rx.try_recv(), Ok(IrcCommand::Whois(t)) if t == "alice,bob"));
+        app.process_command("/whois alice bob");
+        assert!(matches!(rx.try_recv(), Ok(IrcCommand::Whois(t)) if t == "alice bob"));
+        app.process_command("/whois *lur*");
+        assert!(matches!(rx.try_recv(), Ok(IrcCommand::Whois(t)) if t == "*lur*"));
     }
 
     #[test]

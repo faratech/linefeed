@@ -6240,7 +6240,9 @@ impl eframe::App for IrcApp {
             self.open_query(&nick);
         }
         if let Some(nick) = whois_nick {
-            self.send_command(IrcCommand::Whois(nick));
+            // Double target: the reply comes from the user's own server,
+            // revealing the real host behind a cloak plus idle/signon (#164).
+            self.send_command(IrcCommand::Whois(format!("{nick} {nick}")));
         }
         if let Some((channel, nick)) = op_nick {
             self.send_command(IrcCommand::Mode(
