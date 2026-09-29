@@ -2282,6 +2282,15 @@ impl IrcApp {
         if self.nickname.trim().is_empty() {
             return Err("Nickname cannot be empty".to_string());
         }
+        // Mirror connect()'s wire-value rule so the dialog rejects up front
+        // what the connection would deterministically fail on later (#177).
+        if self
+            .nickname
+            .bytes()
+            .any(|byte| matches!(byte, b'\r' | b'\n' | b'\0' | b' ' | b'@'))
+        {
+            return Err("Nickname must be free of spaces, @, CR, LF and NUL".to_string());
+        }
         let mut host = self.server_host.trim();
         if let Some(inner) = host
             .strip_prefix('[')
@@ -2333,7 +2342,7 @@ impl IrcApp {
                 port,
                 use_tls: self.use_tls,
                 accept_invalid_certs: self.accept_invalid_certs,
-                nick: self.nickname.clone(),
+                nick: self.nickname.trim().to_string(),
                 username: self.username.clone(),
                 realname: self.realname.clone(),
                 password: if self.password.is_empty() {

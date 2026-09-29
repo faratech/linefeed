@@ -269,7 +269,9 @@ fn redact_for_log(line: &str) -> std::borrow::Cow<'_, str> {
 /// Read the next protocol message during the registration handshake: parse it,
 /// forward a copy to the GUI, and transparently answer server PINGs (which can
 /// arrive mid-handshake, before the writer task that normally handles them
-/// exists). Loops until it has a non-PING message to return, or errors if the
+/// exists). Reads exactly one line: PINGs are answered inline (returning
+/// `None` so the caller re-arms its fresh per-step budget), and any other
+/// message is returned for the caller's state machine.
 /// connection closes.
 async fn read_handshake_msg<W, R>(
     writer: &mut W,
@@ -662,6 +664,30 @@ impl IrcClient {
         mut outgoing_rx: mpsc::UnboundedReceiver<IrcCommand>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let mut pending_commands = VecDeque::new();
+        // Config-sourced registration fields are formatted verbatim into
+        // PASS/NICK/USER lines: reject CR/LF/NUL so a hand-edited or synced
+        // settings file cannot inject commands, and bound the nick length
+        // (nothing downstream re-checks a registration NICK). Hoisted above
+        // the STS probe so an invalid config fails before any I/O (#177).
+        for (field, value) in [
+            ("nickname", self.config.nick.as_str()),
+            ("username", self.config.username.as_str()),
+            ("realname", self.config.realname.as_str()),
+            (
+                "password",
+                self.config.password.as_deref().unwrap_or_default(),
+            ),
+        ] {
+            if value
+                .bytes()
+                .any(|byte| matches!(byte, b'\r' | b'\n' | b'\0'))
+            {
+                return Err(format!("{field} must not contain CR, LF or NUL").into());
+            }
+        }
+        if self.config.nick.len() > 500 {
+            return Err("Nickname is too long".into());
+        }
         // The loopback protocol tests use one-shot listeners and do not model
         // the preliminary STS connection. Keep policy I/O out of those tests;
         // STS parsing and probing have focused unit coverage below.
@@ -997,7 +1023,7 @@ impl IrcClient {
                 index += 1;
             }
         }
-        tokio::select! {
+        let registration_result = tokio::select! {
             biased;
             _ = wait_for_registration_events(
                 &mut outgoing_rx,
@@ -1012,15 +1038,21 @@ impl IrcClient {
                 &incoming_tx,
                 &mut nick_rx,
                 REGISTRATION_TIMEOUT,
-            ) => result?,
-        }
+            ) => result,
+        };
         // A NICK forwarded in the window where registration has already
         // finished its tail writes is still pending: hand it (and any
         // siblings) back to the post-001 writer so it reaches the wire
-        // instead of vanishing with this scope (#176).
+        // instead of vanishing with this scope — on the failure path too
+        // (#176). FIFO order: forwarded first, so first back.
+        let mut forwarded = Vec::new();
         while let Ok(nick) = nick_rx.try_recv() {
-            pending_commands.push_front(IrcCommand::Nick(nick));
+            forwarded.push(nick);
         }
+        for nick in forwarded {
+            pending_commands.push_back(IrcCommand::Nick(nick));
+        }
+        registration_result?;
 
         // Create channel for sending
         let (send_tx, mut send_rx) = mpsc::channel::<String>(100);
@@ -2310,7 +2342,7 @@ mod tests {
                     .connect(msg_tx, cmd_rx)
                     .await
                     .unwrap_err();
-                assert!(error.to_string().contains("Nickname"), "{nick}: {error}");
+                assert!(error.to_string().contains("ickname"), "{nick}: {error}");
             }
         });
     }
