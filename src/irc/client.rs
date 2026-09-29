@@ -1624,7 +1624,12 @@ impl IrcClient {
 
         // Registration-only extensions run after their CAP ACK. Persistence
         // profiles also need the SASL account established, and both commands
-        // must precede CAP END.
+        // must precede CAP END. All are skipped when a raced Welcome already
+        // completed registration — post-001 they are no-ops or errors
+        // (#179).
+        if welcome_received {
+            return Ok(true);
+        }
         if acked_tokens.contains("draft/persistence")
             && let Some(profile) = config
                 .persistence_profile
@@ -1665,11 +1670,16 @@ impl IrcClient {
             });
         }
 
-        // Step 7: Send CAP END
-        let cap_end = "CAP END\r\n";
-        tracing::debug!("> {}", cap_end.trim());
-        writer.write_all(cap_end.as_bytes()).await?;
-        writer.flush().await?;
+        // Step 7: Send CAP END — skipped when a raced Welcome already
+        // completed registration (CAP END post-001 is a no-op on most
+        // ircds but an error on some; the caller tracks registration via
+        // its own 001 handling) (#179).
+        if !welcome_received {
+            let cap_end = "CAP END\r\n";
+            tracing::debug!("> {}", cap_end.trim());
+            writer.write_all(cap_end.as_bytes()).await?;
+            writer.flush().await?;
+        }
 
         Ok(welcome_received)
     }
@@ -1840,10 +1850,12 @@ impl IrcClient {
             {
                 SaslServerEvent::Challenge(challenge) => {
                     let Some(expected) = expected_server_signature.as_deref() else {
+                        // Out-of-protocol second challenge: abort the live
+                        // exchange before falling back (#176/#181).
+                        self.abort_sasl_exchange(writer).await?;
                         return Ok(SaslAttemptOutcome::Failed);
                     };
-                    let decoded = BASE64_STANDARD
-                        .decode(challenge.as_bytes())
+                    let decoded = decode_base64_forgiving(&challenge)
                         .ok()
                         .and_then(|bytes| String::from_utf8(bytes).ok());
                     let supplied = decoded
@@ -1854,8 +1866,7 @@ impl IrcClient {
                         .as_deref()
                         .is_some_and(|actual| constant_time_eq(actual, expected));
                     if !server_verified {
-                        writer.write_all(b"AUTHENTICATE *\r\n").await?;
-                        writer.flush().await?;
+                        self.abort_sasl_exchange(writer).await?;
                         return Ok(SaslAttemptOutcome::Failed);
                     }
                 }
