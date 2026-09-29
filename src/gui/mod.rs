@@ -457,6 +457,11 @@ pub struct IrcApp {
     /// rows replayed under a former nick — e.g. a credential command sent
     /// before a GHOST/REGAIN — must still be recognized as ours (#163).
     past_nicks: Vec<String>,
+    /// Whether `my_nick` was confirmed in use (001 or an accepted NICK) on
+    /// the current connection. Unconfirmed nicks — the configured nick a 433
+    /// retry walked away from, a pre-registration speculative suffix — must
+    /// not be recorded as held when replaced (#167).
+    nick_confirmed: bool,
     /// Canonicalized keys of my_nick + past_nicks, maintained on nick change
     /// and CASEMAPPING refresh so sender_is_self is allocation-free per row.
     self_nick_keys: Vec<String>,
@@ -655,6 +660,7 @@ impl IrcApp {
             last_notification_time: None,
             nick_retry_attempts: 0,
             past_nicks: Vec::new(),
+            nick_confirmed: false,
             self_nick_keys,
         }
     }
@@ -938,6 +944,7 @@ impl IrcApp {
         }
         self.my_nick = nick;
         self.my_nick_lower = self.network_support.canonicalize(&self.my_nick);
+        self.nick_confirmed = true;
         self.refresh_self_nick_keys();
     }
 
@@ -952,11 +959,13 @@ impl IrcApp {
     fn adopt_nick_unrecorded(&mut self, nick: String) {
         self.my_nick = nick;
         self.my_nick_lower = self.network_support.canonicalize(&self.my_nick);
+        self.nick_confirmed = false;
         self.refresh_self_nick_keys();
     }
 
     /// Canonicalized keys for every nick our own rows may carry (current
-    /// plus held), so sender_is_self does no per-row allocation (#167).
+    /// plus held), so sender_is_self per row costs one canonicalize of the
+    /// incoming nick instead of one per held nick (#167).
     fn refresh_self_nick_keys(&mut self) {
         let mut keys = Vec::with_capacity(self.past_nicks.len() + 1);
         keys.push(self.network_support.canonicalize(&self.my_nick));
@@ -969,15 +978,14 @@ impl IrcApp {
         self.self_nick_keys = keys;
     }
 
-    /// Whether a replayed row's sender is us — current or a nick we held
-    /// earlier this session (#163).
+    /// Whether a row's sender is us — the current nick or one we held
+    /// earlier this session (#163). One canonicalize of the incoming nick
+    /// per call; the held-nick keys are precomputed (#167).
     fn sender_is_self(&self, nick: &str) -> bool {
         let key = self.network_support.canonicalize(nick);
         self.self_nick_keys.contains(&key)
     }
 
-    /// Whether a replayed row's sender is us — current or a nick we held
-    /// earlier this session (#163).
     pub fn is_channel_name(&self, name: &str) -> bool {
         self.network_support.is_channel(name)
     }
@@ -1981,10 +1989,12 @@ impl IrcApp {
         self.auto_away_triggered = false;
         // A new session never shares a previous connection's nick history
         // (#166): replay attribution must not treat the old network's nicks
-        // (or nicks someone else held) as ours.
-        self.past_nicks.clear();
-        self.refresh_self_nick_keys();
+        // (or nicks someone else held) as ours. reset_connection_support
+        // runs first so the keys are rebuilt under the incoming mapping.
         self.reset_connection_support();
+        self.past_nicks.clear();
+        self.nick_confirmed = false;
+        self.refresh_self_nick_keys();
     }
 
     /// Load a server favorite into the connection form
@@ -2333,9 +2343,16 @@ impl IrcApp {
             self.cmd_tx = None;
             self.reset_session_state();
         }
-        // Session start: the previous session's nick was never held here, so
-        // adopt without recording (#166).
-        self.adopt_nick_unrecorded(session.server.nick.clone());
+        // Session start. On an endpoint change the previous connection's
+        // nick history is dropped (reset_session_state) and the configured
+        // nick is adopted unrecorded (#166). On a same-endpoint reconnect
+        // the outgoing nick WAS ours on this connection lineage — record it
+        // so replay attribution survives (#168).
+        if endpoint_changed {
+            self.adopt_nick_unrecorded(session.server.nick.clone());
+        } else {
+            self.set_my_nick(session.server.nick.clone());
+        }
         self.active_session = Some(session);
         self.pending_session = None;
         self.connection_error = None;
@@ -2587,9 +2604,11 @@ impl IrcApp {
                 );
 
                 // Send desktop notification for highlights and PMs
-                // Skip if we sent it ourselves (including under a former
-                // nick — a services nick-change can race the echo, #167).
-                let is_from_self = self.sender_is_self(&sender);
+                // Skip if we sent it ourselves. Current nick only, not held
+                // nicks: a peer squatting a nick we vacated must not
+                // suppress the user's notifications (#168) — a racing echo
+                // under the old nick costs at worst a duplicate row.
+                let is_from_self = self.identifiers_equal(&sender, &self.my_nick);
                 if is_pm && !is_from_self {
                     // PMs always notify (force=true)
                     self.send_notification(
@@ -2622,9 +2641,12 @@ impl IrcApp {
                 // identity. Suppress only our own negotiated echo — but not
                 // inside a CHATHISTORY replay batch, where our own rows must
                 // reach the queue branch just like the PRIVMSG arm's do.
+                // Current nick only: echoes always arrive under the nick we
+                // hold now, while a squatted former nick belongs to a peer
+                // whose notices must still render (#168).
                 if history_batch.is_none()
                     && self.enabled_caps.contains("echo-message")
-                    && self.sender_is_self(&sender)
+                    && self.identifiers_equal(&sender, &self.my_nick)
                 {
                     return;
                 }
@@ -3771,9 +3793,16 @@ impl IrcApp {
                 self.lag_ms = None;
                 if let Some(nick) = params.first() {
                     // 001 may report a rewritten/truncated form of the nick we
-                    // asked for; the pre-registration nick was never held, so
-                    // adopt without recording (#167).
-                    self.adopt_nick_unrecorded(nick.clone());
+                    // asked for: a never-confirmed pre-registration nick is
+                    // adopted unrecorded (#167), while a nick confirmed in use
+                    // on this connection lineage is recorded as held so a
+                    // bouncer's replay attribution survives the reconnect
+                    // (#168).
+                    if self.nick_confirmed && !self.identifiers_equal(nick, &self.my_nick) {
+                        self.set_my_nick(nick.clone());
+                    } else if !self.identifiers_equal(nick, &self.my_nick) {
+                        self.adopt_nick_unrecorded(nick.clone());
+                    }
                 }
                 let msg = params
                     .get(1)
@@ -7660,6 +7689,94 @@ mod tests {
             "{rows:?}"
         );
         assert!(rows.contains(&"hello there"), "{rows:?}");
+    }
+
+    #[test]
+    fn same_endpoint_reconnect_keeps_held_nicks() {
+        let mut app = test_app();
+        app.nickname = "alice".into();
+        app.server_host = "irc.example".into();
+        app.server_port = "6697".into();
+        app.use_tls = true;
+        let session = app.session_from_form().unwrap();
+        app.activate_session(session.clone());
+        // "/nick bob" accepted mid-session: alice recorded as held.
+        app.set_my_nick("bob".into());
+        assert!(app.sender_is_self("alice"));
+
+        // Reconnect to the SAME endpoint: bob was genuinely ours, and the
+        // configured alice stays held (#168).
+        app.activate_session(session);
+        assert!(app.sender_is_self("bob"), "held nick must survive reconnect");
+        assert!(app.sender_is_self("alice"));
+    }
+
+    #[test]
+    fn endpoint_change_and_speculative_nicks_are_not_recorded() {
+        let mut app = test_app();
+        app.server_host = "irc.example".into();
+        app.server_port = "6697".into();
+        app.use_tls = true;
+        let session = app.session_from_form().unwrap();
+        app.activate_session(session.clone());
+        app.set_my_nick("bob".into());
+
+        // 433 walkaway: the rejected nick was never held (#167).
+        app.handle_numeric(ERR_NICKNAMEINUSE, &["me".into(), "bob".into(), "in use".into()]);
+        assert!(!app.sender_is_self("bob"));
+
+        // Endpoint change drops the old lineage entirely.
+        app.nickname = "other".into();
+        app.server_host = "other.example".into();
+        let other = app.session_from_form().unwrap();
+        app.activate_session(other);
+        assert!(app.past_nicks.is_empty());
+        assert!(!app.sender_is_self("bob"));
+        assert!(app.sender_is_self("other"));
+    }
+
+    #[test]
+    fn welcome_records_a_confirmed_replacement_but_adopts_speculative() {
+        let mut app = test_app();
+        // Confirmed nick replaced by the server's 001 (bouncer rewrite):
+        // the confirmed nick is recorded as held (#168).
+        app.set_my_nick("bob".into());
+        // Real 001 shape: the granted nick is the first parameter.
+        app.handle_numeric(RPL_WELCOME, &["alice".into(), "welcome".into()]);
+        assert_eq!(app.my_nick, "alice");
+        assert!(app.sender_is_self("bob"), "confirmed nick must be recorded");
+
+        // Speculative pre-registration nick replaced at 001: never held.
+        let mut app2 = test_app();
+        app2.handle_numeric(ERR_NICKNAMEINUSE, &["x".into(), "in use".into()]);
+        app2.handle_numeric(RPL_WELCOME, &["x__".into(), "welcome".into()]);
+        assert_eq!(app2.my_nick, "x__");
+        assert!(!app2.sender_is_self("x"), "never-held nick must not count");
+    }
+
+    #[test]
+    fn squatted_former_nick_notices_and_notifications_still_render() {
+        let (mut app, _rx) = test_app_connected();
+        app.set_my_nick("alice".into());
+        app.set_my_nick("bob".into());
+        app.handle_cap_message("ACK", &["echo-message".into()]);
+        let mut channel = Channel::new();
+        channel.joined = true;
+        app.channels.insert("#chan".to_string(), channel);
+        app.current_channel = Some("#chan".to_string());
+
+        // A peer took 'alice' and sends a channel NOTICE: the live
+        // echo-suppression gate is current-nick-only (#168).
+        app.handle_incoming_message(
+            IrcMessage::parse(":alice!u@h NOTICE #chan :maintenance at noon").unwrap(),
+        );
+        assert!(
+            app.channels["#chan"]
+                .messages
+                .iter()
+                .any(|message| message.content.contains("maintenance at noon")),
+            "a squatter's notice must not be dropped as our echo"
+        );
     }
 
     #[test]

@@ -109,10 +109,10 @@ impl IrcApp {
                 );
                         }
                     } else {
-                        self.add_message_to_current(ChatMessage::system_fmt(
-                            "Not connected - message not sent",
-                            &self.timestamp_format,
-                        ));
+                        self.add_message_to_current(
+                    ChatMessage::system_fmt("Not connected - message not sent", &self.timestamp_format)
+                        .without_logging(),
+                );
                     }
                 } else {
                     self.add_message_to_current(ChatMessage::system(
@@ -158,10 +158,10 @@ impl IrcApp {
                 );
                             }
                         } else {
-                            self.add_message_to_current(ChatMessage::system_fmt(
-                                "Not connected - message not sent",
-                                &self.timestamp_format,
-                            ));
+                            self.add_message_to_current(
+                    ChatMessage::system_fmt("Not connected - message not sent", &self.timestamp_format)
+                        .without_logging(),
+                );
                         }
                     }
                 }
@@ -186,10 +186,10 @@ impl IrcApp {
                 );
                         }
                     } else {
-                        self.add_message_to_current(ChatMessage::system_fmt(
-                            "Not connected - action not sent",
-                            &self.timestamp_format,
-                        ));
+                        self.add_message_to_current(
+                    ChatMessage::system_fmt("Not connected - action not sent", &self.timestamp_format)
+                        .without_logging(),
+                );
                     }
                 }
             }
@@ -223,10 +223,10 @@ impl IrcApp {
                 );
                         }
                     } else {
-                        self.add_message_to_current(ChatMessage::system_fmt(
-                            "Not connected - action not sent",
-                            &self.timestamp_format,
-                        ));
+                        self.add_message_to_current(
+                    ChatMessage::system_fmt("Not connected - action not sent", &self.timestamp_format)
+                        .without_logging(),
+                );
                     }
                 }
             }
@@ -1223,10 +1223,10 @@ impl IrcApp {
                 );
                         }
                     } else {
-                        self.add_message_to_current(ChatMessage::system_fmt(
-                            "Not connected - notice not sent",
-                            &self.timestamp_format,
-                        ));
+                        self.add_message_to_current(
+                    ChatMessage::system_fmt("Not connected - notice not sent", &self.timestamp_format)
+                        .without_logging(),
+                );
                     }
                 } else {
                     self.add_message_to_current(ChatMessage::system(
@@ -1256,10 +1256,10 @@ impl IrcApp {
                 );
                             }
                         } else {
-                            self.add_message_to_current(ChatMessage::system_fmt(
-                                "Not connected - notice not sent",
-                                &self.timestamp_format,
-                            ));
+                            self.add_message_to_current(
+                    ChatMessage::system_fmt("Not connected - notice not sent", &self.timestamp_format)
+                        .without_logging(),
+                );
                         }
                     }
                 } else {
@@ -1272,10 +1272,10 @@ impl IrcApp {
                 if args.is_empty() {
                     self.add_message_to_current(ChatMessage::system("Usage: /amsg <message>"));
                 } else if !self.connected {
-                    self.add_message_to_current(ChatMessage::system_fmt(
-                        "Not connected - message not sent",
-                        &self.timestamp_format,
-                    ));
+                    self.add_message_to_current(
+                    ChatMessage::system_fmt("Not connected - message not sent", &self.timestamp_format)
+                        .without_logging(),
+                );
                 } else {
                     for channel_name in self.channels.keys().cloned().collect::<Vec<_>>() {
                         if !self.is_channel_name(&channel_name) {
@@ -1308,10 +1308,10 @@ impl IrcApp {
                 if args.is_empty() {
                     self.add_message_to_current(ChatMessage::system("Usage: /ame <action>"));
                 } else if !self.connected {
-                    self.add_message_to_current(ChatMessage::system_fmt(
-                        "Not connected - action not sent",
-                        &self.timestamp_format,
-                    ));
+                    self.add_message_to_current(
+                    ChatMessage::system_fmt("Not connected - action not sent", &self.timestamp_format)
+                        .without_logging(),
+                );
                 } else {
                     for channel_name in self.channels.keys().cloned().collect::<Vec<_>>() {
                         if !self.is_channel_name(&channel_name) {
@@ -1354,10 +1354,10 @@ impl IrcApp {
                 );
                         }
                     } else {
-                        self.add_message_to_current(ChatMessage::system_fmt(
-                            "Not connected - message not sent",
-                            &self.timestamp_format,
-                        ));
+                        self.add_message_to_current(
+                    ChatMessage::system_fmt("Not connected - message not sent", &self.timestamp_format)
+                        .without_logging(),
+                );
                     }
                 }
             }
@@ -1382,10 +1382,10 @@ impl IrcApp {
                 );
                         }
                     } else {
-                        self.add_message_to_current(ChatMessage::system_fmt(
-                            "Not connected - action not sent",
-                            &self.timestamp_format,
-                        ));
+                        self.add_message_to_current(
+                    ChatMessage::system_fmt("Not connected - action not sent", &self.timestamp_format)
+                        .without_logging(),
+                );
                     }
                 } else {
                     self.add_message_to_current(ChatMessage::system(
@@ -1993,10 +1993,10 @@ impl IrcApp {
                 );
             }
         } else {
-            self.add_message_to_current(ChatMessage::system_fmt(
-                "Not connected - message not sent",
-                &self.timestamp_format,
-            ));
+            self.add_message_to_current(
+                    ChatMessage::system_fmt("Not connected - message not sent", &self.timestamp_format)
+                        .without_logging(),
+                );
         }
     }
 
@@ -2351,8 +2351,9 @@ fn whitespace_to_commas(value: &str) -> String {
 /// mask makes solanum-family ircds parse the first parameter as a routing
 /// target and fail with ERR_NOSUCHSERVER (#167).
 pub(super) fn whois_query_target(args: &str) -> String {
-    let single = args.split_whitespace().count() == 1
-        && !args.contains([',', '*', '?', '!', '@']);
+    let args = args.trim();
+    let single =
+        args.split_whitespace().count() == 1 && !args.contains([',', '*', '?', '!', '@']);
     if single {
         format!("{args} {args}")
     } else {
