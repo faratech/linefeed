@@ -195,10 +195,25 @@ impl IrcApp {
             }
 
             "SLAP" => {
-                // Classic IRC slap action
+                // Classic IRC slap action, with an optional custom phrase:
+                // "/slap <nick> [text...]" — a bare slap keeps the trout.
                 if let Some(channel) = &self.current_channel.clone() {
-                    let target = if args.is_empty() { "everyone" } else { args };
-                    let action_text = format!("slaps {} around a bit with a large trout", target);
+                    let mut slap_parts = args.splitn(2, char::is_whitespace);
+                    let target = slap_parts.next().unwrap_or("").trim();
+                    let custom = slap_parts.next().map(str::trim).unwrap_or("");
+                    let (target, action_text) = if target.is_empty() {
+                        (
+                            "everyone".to_string(),
+                            "slaps everyone around a bit with a large trout".to_string(),
+                        )
+                    } else if custom.is_empty() {
+                        (
+                            target.to_string(),
+                            format!("slaps {target} around a bit with a large trout"),
+                        )
+                    } else {
+                        (target.to_string(), format!("slaps {target} {custom}"))
+                    };
                     if self.connected {
                         if self.send_action_text(channel, &action_text) {
                             let msg = ChatMessage::action_fmt(
@@ -2131,7 +2146,7 @@ impl IrcApp {
                     "/echo <text>        - Echo to window",
                     "/raw <command>      - Send raw IRC",
                     "/settings           - Open settings",
-                    "/slap <nick>        - Slap with trout",
+                    "/slap <nick> [text] - Slap (default: large trout)",
                 ],
             ),
             (
@@ -2856,6 +2871,38 @@ mod tests {
         assert!(matches!(rx.try_recv(), Ok(IrcCommand::Whois(t)) if t == "alice bob"));
         app.process_command("/whois *lur*");
         assert!(matches!(rx.try_recv(), Ok(IrcCommand::Whois(t)) if t == "*lur*"));
+    }
+
+    #[test]
+    fn slap_supports_a_custom_action() {
+        let (mut app, mut rx) = connected_command_app();
+        app.set_my_nick("me".into());
+        app.current_channel = Some("#chan".into());
+        app.channels.insert("#chan".into(), Channel::new());
+
+        app.process_command("/slap alice with a frozen herring");
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(IrcCommand::Privmsg(target, content))
+                if target == "#chan"
+                    && content == "\x01ACTION slaps alice with a frozen herring\x01"
+        ));
+
+        // Bare target keeps the classic trout.
+        app.process_command("/slap bob");
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(IrcCommand::Privmsg(_, content))
+                if content == "\x01ACTION slaps bob around a bit with a large trout\x01"
+        ));
+
+        // Targetless keeps the classic everyone/trout.
+        app.process_command("/slap");
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(IrcCommand::Privmsg(_, content))
+                if content == "\x01ACTION slaps everyone around a bit with a large trout\x01"
+        ));
     }
 
     #[test]
