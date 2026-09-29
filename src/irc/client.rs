@@ -658,36 +658,68 @@ impl IrcClient {
         Self { config, tx: None }
     }
 
+    /// Wire-value validation for the config-sourced registration fields:
+    /// they are formatted verbatim into PASS/NICK/USER lines, so CR/LF/NUL
+    /// (command injection), spaces or a leading ':' in the username
+    /// (parameter shifting) and over-length values are rejected before any
+    /// I/O (#177/#179). Shared by the connect form so the dialog rejects up
+    /// front what the connection would fail on later.
+    pub(crate) fn validate_registration_fields(
+        nick: &str,
+        username: &str,
+        realname: &str,
+        password: &str,
+    ) -> Result<(), String> {
+        if nick.is_empty() {
+            return Err("Nickname must be non-empty".into());
+        }
+        if nick.len() > 500 {
+            return Err("Nickname is too long".into());
+        }
+        if nick
+            .bytes()
+            .any(|byte| matches!(byte, b'\r' | b'\n' | b'\0' | b' ' | b'@'))
+        {
+            return Err("Nickname must be free of spaces, @, CR, LF and NUL".into());
+        }
+        if username.is_empty() {
+            return Err("Username must be non-empty".into());
+        }
+        if username.len() > 400 {
+            return Err("Username is too long".into());
+        }
+        if username.starts_with(':') {
+            return Err("Username must not start with ':'".into());
+        }
+        if username.bytes().any(|byte| byte == b' ') {
+            return Err("Username must be free of spaces".into());
+        }
+        for (field, value) in [("Realname", realname), ("Password", password)] {
+            if value
+                .bytes()
+                .any(|byte| matches!(byte, b'\r' | b'\n' | b'\0'))
+            {
+                return Err(format!("{field} must not contain CR, LF or NUL"));
+            }
+            if value.len() > 400 {
+                return Err(format!("{field} is too long"));
+            }
+        }
+        Ok(())
+    }
+
     pub async fn connect(
         &mut self,
         incoming_tx: mpsc::Sender<IrcMessage>,
         mut outgoing_rx: mpsc::UnboundedReceiver<IrcCommand>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let mut pending_commands = VecDeque::new();
-        // Config-sourced registration fields are formatted verbatim into
-        // PASS/NICK/USER lines: reject CR/LF/NUL so a hand-edited or synced
-        // settings file cannot inject commands, and bound the nick length
-        // (nothing downstream re-checks a registration NICK). Hoisted above
-        // the STS probe so an invalid config fails before any I/O (#177).
-        for (field, value) in [
-            ("nickname", self.config.nick.as_str()),
-            ("username", self.config.username.as_str()),
-            ("realname", self.config.realname.as_str()),
-            (
-                "password",
-                self.config.password.as_deref().unwrap_or_default(),
-            ),
-        ] {
-            if value
-                .bytes()
-                .any(|byte| matches!(byte, b'\r' | b'\n' | b'\0'))
-            {
-                return Err(format!("{field} must not contain CR, LF or NUL").into());
-            }
-        }
-        if self.config.nick.len() > 500 {
-            return Err("Nickname is too long".into());
-        }
+        Self::validate_registration_fields(
+            &self.config.nick,
+            &self.config.username,
+            &self.config.realname,
+            self.config.password.as_deref().unwrap_or_default(),
+        )?;
         // The loopback protocol tests use one-shot listeners and do not model
         // the preliminary STS connection. Keep policy I/O out of those tests;
         // STS parsing and probing have focused unit coverage below.
@@ -719,15 +751,6 @@ impl IrcClient {
                 self.config.accept_invalid_certs = false;
                 self.config.port = port;
             }
-        }
-        if self.config.nick.is_empty()
-            || self
-                .config
-                .nick
-                .bytes()
-                .any(|byte| matches!(byte, b'\r' | b'\n' | b'\0' | b' ' | b'@'))
-        {
-            return Err("Nickname must be non-empty and free of spaces, @, CR, LF and NUL".into());
         }
         if self
             .config
@@ -1040,18 +1063,10 @@ impl IrcClient {
                 REGISTRATION_TIMEOUT,
             ) => result,
         };
-        // A NICK forwarded in the window where registration has already
-        // finished its tail writes is still pending: hand it (and any
-        // siblings) back to the post-001 writer so it reaches the wire
-        // instead of vanishing with this scope — on the failure path too
-        // (#176). FIFO order: forwarded first, so first back.
-        let mut forwarded = Vec::new();
-        while let Ok(nick) = nick_rx.try_recv() {
-            forwarded.push(nick);
-        }
-        for nick in forwarded {
-            pending_commands.push_back(IrcCommand::Nick(nick));
-        }
+        // NOTE: a NICK forwarded after the registration read loops have
+        // returned (the CAP-END/001 tail) is dropped with nick_rx — the
+        // window is sub-millisecond and the post-001 writer handles
+        // everything still in outgoing_rx (#169 residual race, accepted).
         registration_result?;
 
         // Create channel for sending
@@ -1238,11 +1253,15 @@ impl IrcClient {
             raw: String::new(),
         });
 
+        // One handshake buffer for the whole registration: a line dribbled
+        // across the CAP→welcome phase boundary must not lose its head when
+        // do_cap_negotiation returns (#179).
+        let mut buf = Vec::with_capacity(512);
         let welcome_received = self
-            .do_cap_negotiation(writer, reader, incoming_tx, nick_rx)
+            .do_cap_negotiation(writer, reader, incoming_tx, nick_rx, &mut buf)
             .await?;
         if !welcome_received {
-            self.wait_for_welcome(writer, reader, incoming_tx, nick_rx)
+            self.wait_for_welcome(writer, reader, incoming_tx, nick_rx, &mut buf)
                 .await?;
         }
 
@@ -1255,12 +1274,12 @@ impl IrcClient {
         reader: &mut R,
         incoming_tx: &mpsc::Sender<IrcMessage>,
         nick_rx: &mut mpsc::UnboundedReceiver<String>,
+        buf: &mut Vec<u8>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
     where
         W: tokio::io::AsyncWrite + Unpin,
         R: tokio::io::AsyncBufRead + Unpin,
     {
-        let mut buf = Vec::with_capacity(512);
         loop {
             // read_handshake_msg_timed returns None for a PING (answered
             // inline) and for an unparseable line. Both are legal
@@ -1268,7 +1287,7 @@ impl IrcClient {
             // keep waiting instead of panicking. The outer
             // REGISTRATION_TIMEOUT bounds the total wait.
             let Some(msg) =
-                read_handshake_msg_timed(writer, reader, &mut buf, incoming_tx, nick_rx).await?
+                read_handshake_msg_timed(writer, reader, buf, incoming_tx, nick_rx).await?
             else {
                 continue;
             };
@@ -1285,6 +1304,7 @@ impl IrcClient {
         reader: &mut R,
         incoming_tx: &mpsc::Sender<IrcMessage>,
         nick_rx: &mut mpsc::UnboundedReceiver<String>,
+        buf: &mut Vec<u8>,
     ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>>
     where
         W: tokio::io::AsyncWrite + Unpin,
@@ -1301,13 +1321,12 @@ impl IrcClient {
 
         // CAP LS and NICK/USER have already been sent together. Read the CAP
         // response while registration completion remains suspended.
-        let mut buf = Vec::with_capacity(512);
         let mut available_caps = String::new();
         let mut cap_budget = CapBudget::default();
 
         loop {
             let Some(msg) =
-                read_handshake_msg_timed(writer, reader, &mut buf, incoming_tx, nick_rx).await?
+                read_handshake_msg_timed(writer, reader, buf, incoming_tx, nick_rx).await?
             else {
                 if config.sasl_required {
                     return Err("Required SASL authentication could not be negotiated".into());
@@ -1483,7 +1502,7 @@ impl IrcClient {
             caps_to_request.iter().map(|cap| cap.to_string()).collect();
         loop {
             let Some(msg) =
-                read_handshake_msg_timed(writer, reader, &mut buf, incoming_tx, nick_rx).await?
+                read_handshake_msg_timed(writer, reader, buf, incoming_tx, nick_rx).await?
             else {
                 if config.sasl_required && pending_caps.contains("sasl") {
                     return Err("Required SASL capability was not acknowledged".into());
@@ -1821,6 +1840,16 @@ impl IrcClient {
             let Some(msg) =
                 read_handshake_msg_timed(writer, reader, buf, incoming_tx, nick_rx).await?
             else {
+                // Step budget expired mid-exchange: abort it so the server
+                // stops composing the late reply — otherwise the next
+                // mechanism's exchange interleaves with this one's (#179).
+                writer
+                    .write_all(
+                        b"AUTHENTICATE *
+",
+                    )
+                    .await?;
+                writer.flush().await?;
                 return Ok(SaslServerEvent::Failed);
             };
             match &msg.command {
@@ -2328,7 +2357,7 @@ mod tests {
     #[test]
     fn invalid_nick_is_rejected_before_connecting() {
         test_runtime().block_on(async {
-            for nick in ["", "a b", "a\rb", "a@b"] {
+            for nick in ["", "a b", "a\rb", "a@b", "a\nb", "a\0b", &"x".repeat(501)] {
                 let config = ServerConfig {
                     host: "127.0.0.1".into(),
                     port: 6697,
@@ -2343,6 +2372,34 @@ mod tests {
                     .await
                     .unwrap_err();
                 assert!(error.to_string().contains("ickname"), "{nick}: {error}");
+            }
+            // Username/realname/password rules (#179).
+            for (username, realname, password) in [
+                ("us er", "", ""),
+                (":oper", "", ""),
+                ("", &"r".repeat(401), ""),
+                ("", "", "p\r\nOPER x y"),
+            ] {
+                let config = ServerConfig {
+                    host: "127.0.0.1".into(),
+                    port: 6697,
+                    use_tls: false,
+                    nick: "tester".into(),
+                    username: username.to_string(),
+                    realname: realname.to_string(),
+                    password: Some(password.to_string()),
+                    ..Default::default()
+                };
+                let (msg_tx, _msg_rx) = mpsc::channel(100);
+                let (_cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+                let error = IrcClient::new(config)
+                    .connect(msg_tx, cmd_rx)
+                    .await
+                    .unwrap_err();
+                assert!(
+                    error.to_string().contains("must") || error.to_string().contains("too long"),
+                    "{username}/{realname}/{password}: {error}"
+                );
             }
         });
     }
