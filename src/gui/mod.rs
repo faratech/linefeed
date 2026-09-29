@@ -2102,7 +2102,6 @@ fn row_height(
     ui: &mut egui::Ui,
     msg: &ChatMessage,
     my_nick: &str,
-    self_nick_keys: &[String],
     content_width: f32,
     layout_key: u64,
     stats: &mut ScrollbackStats,
@@ -2118,7 +2117,7 @@ fn row_height(
     );
     let scratch_rect = egui::Rect::from_min_size(scratch_origin, egui::vec2(content_width, 0.0));
     let mut scratch = ui.new_child(egui::UiBuilder::new().max_rect(scratch_rect));
-    draw_chat_row(&mut scratch, msg, my_nick, self_nick_keys);
+    draw_chat_row(&mut scratch, msg, my_nick);
     let h = scratch.min_rect().height();
     msg.row_height.set(RowHeightEntry {
         key: layout_key,
@@ -2128,15 +2127,11 @@ fn row_height(
 }
 
 /// Draw one scrollback row: timestamp, optional indicator, nick, body.
-fn draw_chat_row(ui: &mut egui::Ui, msg: &ChatMessage, my_nick: &str, self_nick_keys: &[String]) {
-    // Own-row styling covers held nicks too, so replayed rows sent under a
-    // former nick keep our emphasis; the casemapping-insensitive compare
-    // matches rfc1459 case-folding (bracket-form folds remain unstyled).
-    let is_own_msg = !msg.is_system
-        && (msg.sender.eq_ignore_ascii_case(my_nick)
-            || self_nick_keys
-                .iter()
-                .any(|key| key.eq_ignore_ascii_case(&msg.sender)));
+fn draw_chat_row(ui: &mut egui::Ui, msg: &ChatMessage, my_nick: &str) {
+    // Current nick only, matching the other display gates (#170): held-nick
+    // styling would misattribute a stranger who picked up a nick we
+    // vacated, and misattribution is not the safe direction for display.
+    let is_own_msg = !msg.is_system && msg.sender.eq_ignore_ascii_case(my_nick);
 
     let render_row = |ui: &mut egui::Ui| {
         ui.horizontal(|ui| {
@@ -2360,11 +2355,27 @@ impl IrcApp {
         // nick history is dropped (reset_session_state) and the configured
         // nick is adopted unrecorded (#166). On a same-endpoint reconnect
         // the outgoing nick WAS ours on this connection lineage — record it
-        // so replay attribution survives (#168). Either way the configured
-        // nick is not yet confirmed: this connection's own 001 does that
-        // (#169).
-        let record_previous = !endpoint_changed && self.nick_confirmed;
-        self.set_session_nick(session.server.nick.clone(), record_previous, false);
+        // so replay attribution survives (#168) — but only when the identity
+        // (nickname + SASL account) is unchanged; a changed identity is a
+        // new lineage whose nicks mean someone else (#170). The configured
+        // nick is not yet confirmed either way, except that re-applying the
+        // same confirmed nick re-confirms it (#170): this connection's own
+        // 001 would confirm it regardless.
+        let same_lineage = !endpoint_changed
+            && self.active_session.as_ref().is_some_and(|active| {
+                active
+                    .server
+                    .nick
+                    .eq_ignore_ascii_case(&session.server.nick)
+                    && active.server.sasl_username == session.server.sasl_username
+            });
+        if !same_lineage && self.active_session.is_some() {
+            // A new endpoint or a new identity drops held-nick attribution.
+            self.past_nicks.clear();
+            self.refresh_self_nick_keys();
+        }
+        let reconfirmed = same_lineage && self.nick_confirmed;
+        self.set_session_nick(session.server.nick.clone(), reconfirmed, reconfirmed);
         self.active_session = Some(session);
         self.pending_session = None;
         self.connection_error = None;
@@ -5515,7 +5526,6 @@ impl IrcApp {
             };
         };
         let my_nick = self.my_nick.clone();
-        let self_nick_keys = self.self_nick_keys.clone();
         let stick = self.scroll_to_bottom;
         let mut stats = ScrollbackStats {
             drawn: 0,
@@ -5547,15 +5557,8 @@ impl IrcApp {
                 let mut first_idx = msgs.len();
                 let mut first_y = 0.0f32;
                 for (i, msg) in msgs.iter().enumerate() {
-                    let bottom = y + row_height(
-                        ui,
-                        msg,
-                        &my_nick,
-                        &self_nick_keys,
-                        content_width,
-                        layout_key,
-                        &mut stats,
-                    );
+                    let bottom =
+                        y + row_height(ui, msg, &my_nick, content_width, layout_key, &mut stats);
                     if first_idx == msgs.len() && bottom >= viewport.min.y {
                         first_idx = i;
                         first_y = y;
@@ -5571,15 +5574,8 @@ impl IrcApp {
                     // an empty area; egui re-clamps the offset next frame.
                     let mut yy = viewport.max.y;
                     for msg in msgs.iter().rev() {
-                        let h = row_height(
-                            ui,
-                            msg,
-                            &my_nick,
-                            &self_nick_keys,
-                            content_width,
-                            layout_key,
-                            &mut stats,
-                        );
+                        let h =
+                            row_height(ui, msg, &my_nick, content_width, layout_key, &mut stats);
                         let top = yy - h;
                         first_idx -= 1;
                         first_y = top;
@@ -5619,7 +5615,7 @@ impl IrcApp {
                         }
                         // Warm cache at this point: pass 1 measured everything.
                         cy += msg.row_height.get().height + spacing.y;
-                        draw_chat_row(rows_ui, msg, &my_nick, &self_nick_keys);
+                        draw_chat_row(rows_ui, msg, &my_nick);
                         drawn += 1;
                     }
                 });
@@ -6874,8 +6870,8 @@ mod tests {
                 };
                 // Narrow width forces the long message to wrap over lines;
                 // the measured advance must reflect that.
-                let h_short = row_height(ui, &short_msg, "me", &[], width, key, &mut stats);
-                let h_long = row_height(ui, &long_msg, "me", &[], width, key, &mut stats);
+                let h_short = row_height(ui, &short_msg, "me", width, key, &mut stats);
+                let h_long = row_height(ui, &long_msg, "me", width, key, &mut stats);
                 heights = Some((h_short, h_long));
             });
         })
@@ -8544,7 +8540,9 @@ mod tests {
     #[test]
     fn nick_in_use_during_registration_retries_with_suffix() {
         let mut app = test_app();
-        app.set_session_nick("mike".to_string(), false, true);
+        // Pre-registration: mike was configured but never confirmed here
+        // (accepted=false — a state the connected test above cannot model).
+        app.set_session_nick("mike".to_string(), false, false);
         app.connected = false;
         app.handle_numeric(
             ERR_NICKNAMEINUSE,
@@ -8555,6 +8553,10 @@ mod tests {
             ],
         );
         assert_eq!(app.my_nick, "mike_");
+        assert!(
+            !app.sender_is_self("mike"),
+            "the walkaway must not record the configured nick (#166)"
+        );
     }
 
     #[test]

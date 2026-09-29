@@ -1330,8 +1330,7 @@ impl IrcApp {
                             // broadcast silently.
                             self.add_message_to_channel(
                                 &channel_name,
-                                ChatMessage::system_fmt("Message not sent", &self.timestamp_format)
-                                    .without_logging(),
+                                ChatMessage::system_fmt("Message not sent", &self.timestamp_format),
                             );
                         }
                     }
@@ -1365,8 +1364,7 @@ impl IrcApp {
                         } else {
                             self.add_message_to_channel(
                                 &channel_name,
-                                ChatMessage::system_fmt("Action not sent", &self.timestamp_format)
-                                    .without_logging(),
+                                ChatMessage::system_fmt("Action not sent", &self.timestamp_format),
                             );
                         }
                     }
