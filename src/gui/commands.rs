@@ -6,7 +6,10 @@ use crate::irc::IrcCommand;
 
 impl IrcApp {
     pub fn process_command(&mut self, input: &str) {
-        let parts: Vec<&str> = input[1..].splitn(2, ' ').collect();
+        // Whitespace separator (not just ' '): the credential filter splits
+        // on any whitespace, so the command token must too — a tab after the
+        // command word would otherwise become an unknown command (#148).
+        let parts: Vec<&str> = input[1..].splitn(2, char::is_whitespace).collect();
         let cmd = parts[0].to_uppercase();
         // trim_start: a doubled space after the command ("/msg  alice hi") must
         // not produce an empty first argument (which silently sent messages to
@@ -552,10 +555,15 @@ impl IrcApp {
                         "Usage: /{} <subcommand or arguments>",
                         cmd.to_ascii_lowercase()
                     )));
-                } else if !self.send_command(IrcCommand::Raw(format!("{cmd} {args}"))) {
-                    self.add_message_to_current(ChatMessage::system(
-                        "Not connected - server command not sent",
-                    ));
+                } else {
+                    let sent = self.send_command(IrcCommand::Raw(format!("{cmd} {args}")));
+                    if !sent && !self.connected {
+                        // While connected, send_command already reported its
+                        // own accurate failure row.
+                        self.add_message_to_current(ChatMessage::system(
+                            "Not connected - server command not sent",
+                        ));
+                    }
                 }
             }
 
@@ -567,9 +575,16 @@ impl IrcApp {
                         "Not connected - server command not sent",
                     ));
                 } else {
-                    // While connected, send_command reports its own accurate
-                    // row for too-long / denied-tag failures.
-                    let _ = self.send_command(IrcCommand::Raw(args.to_string()));
+                    // Send even during CAP/SASL negotiation: cmd_tx is live
+                    // before RPL_WELCOME and manual negotiation lines are
+                    // legitimate. While connected, send_command reports its
+                    // own accurate row for too-long / denied-tag failures.
+                    let sent = self.send_command(IrcCommand::Raw(args.to_string()));
+                    if !sent && !self.connected {
+                        self.add_message_to_current(ChatMessage::system(
+                            "Not connected - server command not sent",
+                        ));
+                    }
                 }
             }
 
@@ -1941,7 +1956,10 @@ impl IrcApp {
                     } else {
                         format!("{cmd} {args}")
                     };
-                    if !self.send_command(IrcCommand::Raw(line)) {
+                    let sent = self.send_command(IrcCommand::Raw(line));
+                    if !sent && !self.connected {
+                        // While connected, send_command already reported its
+                        // own accurate failure row.
                         self.add_message_to_current(ChatMessage::system(
                             "Not connected - server command not sent",
                         ));
@@ -2225,7 +2243,7 @@ fn is_auth_service_target(raw_target: &str) -> bool {
 /// gate. Targetless senders (/me, /say) use it alone — for those,
 /// over-redaction (a `/me identify as the night` kept out of history) is the
 /// safe direction.
-fn content_has_auth_command(message: &str) -> bool {
+pub(super) fn content_has_auth_command(message: &str) -> bool {
     let mut words = message.trim_start_matches(':').split_whitespace();
     let command = words.next().unwrap_or("").to_ascii_uppercase();
     if matches!(
@@ -2784,8 +2802,12 @@ mod tests {
 
     #[test]
     fn perform_listing_redacts_targetless_credential_lines() {
-        let mut app = IrcApp::default();
-        app.process_command("/perform /me IDENTIFY hunter11");
+        // Set directly: the PERFORM add branch calls get_settings().save(),
+        // which writes the real user's settings.json from a test (#152).
+        let mut app = IrcApp {
+            auto_perform: "/me IDENTIFY hunter11".into(),
+            ..IrcApp::default()
+        };
         app.process_command("/perform");
         let shown: Vec<&str> = app
             .server_messages

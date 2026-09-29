@@ -356,7 +356,9 @@ impl LogManager {
             max_lines,
             allow_legacy_migration,
         );
-        if channel_raw != channel_canonical {
+        // A full canonical read already fills the cap; raw rows are the older
+        // ones and would be drained away — skip the second read entirely.
+        if channel_raw != channel_canonical && messages.len() < max_lines {
             let mut legacy_raw = self.load_history_with_legacy(
                 network,
                 legacy_network,

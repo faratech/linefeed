@@ -1324,10 +1324,11 @@ impl IrcApp {
         // target (one shared canonical log file), so match by casemapping,
         // not exact text.
         if local.last().is_some_and(|message| {
-            message
-                .content
-                .strip_prefix("Now talking in ")
-                .is_some_and(|rest| self.identifiers_equal(rest, target))
+            message.is_system
+                && message
+                    .content
+                    .strip_prefix("Now talking in ")
+                    .is_some_and(|rest| self.identifiers_equal(rest, target))
         }) {
             local.pop();
         }
@@ -1635,6 +1636,57 @@ impl IrcApp {
                 .as_ref()
                 .is_none_or(|msgid| !existing_ids.contains(msgid))
         });
+        // Own-notice replays whose local confirmation row ("-> -target- text")
+        // is already in the tab are display duplicates: the confirmation never
+        // learns the server msgid, so the msgid dedup above cannot see it.
+        // Dropped here — after page_count/remaining were computed — so the
+        // pagination heuristic stays exact (#153). Own-notice replays carrying
+        // an auth command are always dropped: their confirmation row was
+        // redacted, so replaying them would re-display the secret on screen.
+        if !messages.is_empty() {
+            let routed_target = self.strip_status_prefix(&batch.target).to_string();
+            let confirmations: Vec<(String, String)> = self
+                .channel_key(&routed_target)
+                .and_then(|key| self.channels.get(&key))
+                .map(|channel| {
+                    channel
+                        .messages
+                        .iter()
+                        .rev()
+                        .take(64)
+                        .filter_map(|row| {
+                            row.content.strip_prefix("-> -").and_then(|rest| {
+                                rest.split_once("- ").map(|(target, text)| {
+                                    (target.to_string(), text.to_string())
+                                })
+                            })
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            let my_nick = self.my_nick.clone();
+            let keep_row = |row: &ChatMessage| {
+                row.is_system
+                    .then(|| {
+                        row.content
+                            .strip_prefix('-')
+                            .and_then(|rest| rest.split_once("- "))
+                    })
+                    .flatten()
+                    .is_none_or(|(nick, text)| {
+                        if !self.identifiers_equal(nick, &my_nick) {
+                            return true;
+                        }
+                        if commands::content_has_auth_command(text) {
+                            return false;
+                        }
+                        !confirmations.iter().any(|(target, confirmed_text)| {
+                            confirmed_text == text && self.identifiers_equal(target, &routed_target)
+                        })
+                    })
+            };
+            messages.retain(keep_row);
+        }
         let shown = batch.request.shown.saturating_add(messages.len());
         let next = if !batch.partial && !complete && remaining > 0 {
             next_reference.map(|reference| {
@@ -2492,25 +2544,6 @@ impl IrcApp {
                 }
 
                 if let Some(batch_id) = &history_batch {
-                    // Our own /notice already left a local confirmation row
-                    // ("-> -target- text") in the tab; it never learns the
-                    // server msgid, so the msgid-based replay dedup cannot
-                    // see it — drop the replayed copy instead of showing the
-                    // notice twice (issue #150).
-                    if self.identifiers_equal(&sender, &self.my_nick) {
-                        let confirmation = format!("-> -{routed_target}- {content}");
-                        let confirmed = self
-                            .channel_key(&routed_target)
-                            .and_then(|key| self.channels.get(&key))
-                            .is_some_and(|channel| {
-                                channel.messages.iter().rev().take(64).any(|row| {
-                                    row.is_system && row.content == confirmation
-                                })
-                            });
-                        if confirmed {
-                            return;
-                        }
-                    }
                     let server_time = msg
                         .get_server_time()
                         .map(|epoch| epoch_time_formatted(epoch, &self.timestamp_format));
@@ -7212,7 +7245,10 @@ mod tests {
 
     #[test]
     fn replayed_own_notice_does_not_duplicate_the_local_confirmation() {
-        let mut app = test_app();
+        // Must be connected: the confirmation row only exists when the
+        // /notice actually went out (#152 — the disconnected branch never
+        // creates the row and the dedup under test would not run).
+        let (mut app, _rx) = test_app_connected();
         app.set_my_nick("me".into());
         app.handle_cap_message(
             "ACK",
@@ -7225,6 +7261,13 @@ mod tests {
 
         // The local confirmation row "-> -#chan- unique-notice-text" exists.
         app.process_command("/notice #chan unique-notice-text");
+        assert!(
+            app.channels["#chan"]
+                .messages
+                .iter()
+                .any(|message| message.content == "-> -#chan- unique-notice-text"),
+            "precondition: the confirmation row must exist"
+        );
 
         // The server replays the same notice with a msgid inside a batch.
         app.handle_incoming_message(IrcMessage::parse(":srv BATCH +r chathistory #chan").unwrap());
