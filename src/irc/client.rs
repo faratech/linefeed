@@ -801,6 +801,11 @@ impl IrcClient {
             if count == 0 {
                 return Ok(None);
             }
+            if !buf.ends_with(b"\n") {
+                // EOF left a truncated fragment: never parse it as a complete
+                // message (mirrors read_handshake_msg and the main read loop).
+                return Ok(None);
+            }
             let line = String::from_utf8_lossy(&buf);
             let Some(message) = IrcMessage::parse(&line) else {
                 continue;
@@ -1970,6 +1975,38 @@ mod tests {
             .unwrap();
             assert_eq!(port, Some(6697));
             assert!(pending.is_empty());
+            server.await.unwrap();
+        });
+    }
+
+    #[test]
+    fn sts_probe_ignores_a_truncated_final_line() {
+        test_runtime().block_on(async {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                let (_, mut write_half) = stream.into_split();
+                // No trailing CRLF: an EOF-truncated fragment must never be
+                // parsed as a complete CAP LS reply.
+                write_half
+                    .write_all(b":srv CAP * LS :sts=port=6697")
+                    .await
+                    .unwrap();
+            });
+            let (incoming_tx, _incoming_rx) = mpsc::channel(1);
+            let (_outgoing_tx, mut outgoing_rx) = mpsc::unbounded_channel();
+            let mut pending = VecDeque::new();
+            let port = IrcClient::probe_sts_upgrade(
+                "127.0.0.1",
+                address.port(),
+                &incoming_tx,
+                &mut outgoing_rx,
+                &mut pending,
+            )
+            .await
+            .unwrap();
+            assert_eq!(port, None);
             server.await.unwrap();
         });
     }

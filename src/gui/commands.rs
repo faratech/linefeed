@@ -81,14 +81,21 @@ impl IrcApp {
             "MSG" | "PRIVMSG" => {
                 let msg_parts: Vec<&str> = args.splitn(2, ' ').collect();
                 if let (Some(target), Some(message)) = (msg_parts.first(), msg_parts.get(1)) {
-                    if self.connected && self.send_privmsg_text(target, message) {
-                        let chat_msg = outgoing_local_echo(
-                            target,
-                            &self.my_nick,
-                            message,
-                            &self.timestamp_format,
-                        );
-                        self.add_message_to_channel(target, chat_msg);
+                    if self.connected {
+                        if self.send_privmsg_text(target, message) {
+                            let chat_msg = outgoing_local_echo(
+                                target,
+                                &self.my_nick,
+                                message,
+                                &self.timestamp_format,
+                            );
+                            self.add_message_to_channel(target, chat_msg);
+                        } else {
+                            self.add_message_to_current(ChatMessage::system_fmt(
+                                "Message not sent",
+                                &self.timestamp_format,
+                            ));
+                        }
                     } else {
                         self.add_message_to_current(ChatMessage::system_fmt(
                             "Not connected - message not sent",
@@ -122,14 +129,21 @@ impl IrcApp {
                     if let Some(&message) = msg_parts.get(1)
                         && !message.is_empty()
                     {
-                        if self.connected && self.send_privmsg_text(target, message) {
-                            let chat_msg = outgoing_local_echo(
-                                target,
-                                &self.my_nick,
-                                message,
-                                &self.timestamp_format,
-                            );
-                            self.add_message_to_channel(target, chat_msg);
+                        if self.connected {
+                            if self.send_privmsg_text(target, message) {
+                                let chat_msg = outgoing_local_echo(
+                                    target,
+                                    &self.my_nick,
+                                    message,
+                                    &self.timestamp_format,
+                                );
+                                self.add_message_to_channel(target, chat_msg);
+                            } else {
+                                self.add_message_to_current(ChatMessage::system_fmt(
+                                    "Message not sent",
+                                    &self.timestamp_format,
+                                ));
+                            }
                         } else {
                             self.add_message_to_current(ChatMessage::system_fmt(
                                 "Not connected - message not sent",
@@ -144,10 +158,20 @@ impl IrcApp {
                 if args.is_empty() {
                     self.add_message_to_current(ChatMessage::system("Usage: /me <action>"));
                 } else if let Some(channel) = &self.current_channel.clone() {
-                    if self.connected && self.send_action_text(channel, args) {
-                        let msg =
-                            ChatMessage::action_fmt(&self.my_nick, args, &self.timestamp_format);
-                        self.add_message_to_channel(channel, msg);
+                    if self.connected {
+                        if self.send_action_text(channel, args) {
+                            let msg = ChatMessage::action_fmt(
+                                &self.my_nick,
+                                args,
+                                &self.timestamp_format,
+                            );
+                            self.add_message_to_channel(channel, msg);
+                        } else {
+                            self.add_message_to_current(ChatMessage::system_fmt(
+                                "Action not sent",
+                                &self.timestamp_format,
+                            ));
+                        }
                     } else {
                         self.add_message_to_current(ChatMessage::system_fmt(
                             "Not connected - action not sent",
@@ -162,13 +186,20 @@ impl IrcApp {
                 if let Some(channel) = &self.current_channel.clone() {
                     let target = if args.is_empty() { "everyone" } else { args };
                     let action_text = format!("slaps {} around a bit with a large trout", target);
-                    if self.connected && self.send_action_text(channel, &action_text) {
-                        let msg = ChatMessage::action_fmt(
-                            &self.my_nick,
-                            &action_text,
-                            &self.timestamp_format,
-                        );
-                        self.add_message_to_channel(channel, msg);
+                    if self.connected {
+                        if self.send_action_text(channel, &action_text) {
+                            let msg = ChatMessage::action_fmt(
+                                &self.my_nick,
+                                &action_text,
+                                &self.timestamp_format,
+                            );
+                            self.add_message_to_channel(channel, msg);
+                        } else {
+                            self.add_message_to_current(ChatMessage::system_fmt(
+                                "Action not sent",
+                                &self.timestamp_format,
+                            ));
+                        }
                     } else {
                         self.add_message_to_current(ChatMessage::system_fmt(
                             "Not connected - action not sent",
@@ -523,7 +554,13 @@ impl IrcApp {
             }
 
             "RAW" | "QUOTE" => {
-                self.send_command(IrcCommand::Raw(args.to_string()));
+                if args.is_empty() {
+                    self.add_message_to_current(ChatMessage::system("Usage: /raw <command>"));
+                } else if !self.send_command(IrcCommand::Raw(args.to_string())) {
+                    self.add_message_to_current(ChatMessage::system(
+                        "Not connected - server command not sent",
+                    ));
+                }
             }
 
             "HISTORY" | "CHATHISTORY" => {
@@ -616,11 +653,20 @@ impl IrcApp {
                     if let Some((target, command, pending)) = command {
                         if self.chathistory_enabled {
                             if let Some(target) = target {
-                                self.prepare_history_target(target);
-                                if let Some(pending) = pending {
-                                    self.queue_history_request(target, command, pending);
+                                // Send first: switching tabs for a request that
+                                // was never queued would silently strand the
+                                // user in a tab with no history in flight.
+                                let sent = if let Some(pending) = pending {
+                                    self.queue_history_request(target, command, pending)
                                 } else {
-                                    self.send_command(command);
+                                    self.send_command(command)
+                                };
+                                if sent {
+                                    self.prepare_history_target(target);
+                                } else {
+                                    self.add_message_to_current(ChatMessage::system(
+                                        "Not connected - history request not sent",
+                                    ));
                                 }
                             } else {
                                 self.send_command(command);
@@ -1122,21 +1168,28 @@ impl IrcApp {
             "NOTICE" | "N" => {
                 let parts: Vec<&str> = args.splitn(2, ' ').collect();
                 if let (Some(target), Some(message)) = (parts.first(), parts.get(1)) {
-                    if self.connected && self.send_notice_text(target, message) {
-                        let confirmation = if service_message_contains_credentials(target, message)
-                        {
-                            ChatMessage::system_fmt(
-                                &format!("-> -{}- <credential command sent>", target),
-                                &self.timestamp_format,
-                            )
-                            .without_logging()
+                    if self.connected {
+                        if self.send_notice_text(target, message) {
+                            let confirmation =
+                                if service_message_contains_credentials(target, message) {
+                                    ChatMessage::system_fmt(
+                                        &format!("-> -{}- <credential command sent>", target),
+                                        &self.timestamp_format,
+                                    )
+                                    .without_logging()
+                                } else {
+                                    ChatMessage::system_fmt(
+                                        &format!("-> -{}- {}", target, message),
+                                        &self.timestamp_format,
+                                    )
+                                };
+                            self.add_message_to_current(confirmation);
                         } else {
-                            ChatMessage::system_fmt(
-                                &format!("-> -{}- {}", target, message),
+                            self.add_message_to_current(ChatMessage::system_fmt(
+                                "Notice not sent",
                                 &self.timestamp_format,
-                            )
-                        };
-                        self.add_message_to_current(confirmation);
+                            ));
+                        }
                     } else {
                         self.add_message_to_current(ChatMessage::system_fmt(
                             "Not connected - notice not sent",
@@ -1158,11 +1211,18 @@ impl IrcApp {
                         && self.is_channel_name(channel)
                     {
                         let target = format!("@{}", channel);
-                        if self.connected && self.send_notice_text(&target, message) {
-                            self.add_message_to_current(ChatMessage::system_fmt(
-                                &format!("-> -{}- {}", target, message),
-                                &self.timestamp_format,
-                            ));
+                        if self.connected {
+                            if self.send_notice_text(&target, message) {
+                                self.add_message_to_current(ChatMessage::system_fmt(
+                                    &format!("-> -{}- {}", target, message),
+                                    &self.timestamp_format,
+                                ));
+                            } else {
+                                self.add_message_to_current(ChatMessage::system_fmt(
+                                    "Notice not sent",
+                                    &self.timestamp_format,
+                                ));
+                            }
                         } else {
                             self.add_message_to_current(ChatMessage::system_fmt(
                                 "Not connected - notice not sent",
@@ -1227,9 +1287,17 @@ impl IrcApp {
                 if let Some(channel) = &self.current_channel.clone()
                     && !args.is_empty()
                 {
-                    if self.connected && self.send_privmsg_text(channel, args) {
-                        let msg = ChatMessage::new_fmt(&self.my_nick, args, &self.timestamp_format);
-                        self.add_message_to_channel(channel, msg);
+                    if self.connected {
+                        if self.send_privmsg_text(channel, args) {
+                            let msg =
+                                ChatMessage::new_fmt(&self.my_nick, args, &self.timestamp_format);
+                            self.add_message_to_channel(channel, msg);
+                        } else {
+                            self.add_message_to_current(ChatMessage::system_fmt(
+                                "Message not sent",
+                                &self.timestamp_format,
+                            ));
+                        }
                     } else {
                         self.add_message_to_current(ChatMessage::system_fmt(
                             "Not connected - message not sent",
@@ -1243,13 +1311,20 @@ impl IrcApp {
                 // Send action to specific target: /describe <target> <action>
                 let parts: Vec<&str> = args.splitn(2, ' ').collect();
                 if let (Some(target), Some(action_text)) = (parts.first(), parts.get(1)) {
-                    if self.connected && self.send_action_text(target, action_text) {
-                        let msg = ChatMessage::action_fmt(
-                            &self.my_nick,
-                            action_text,
-                            &self.timestamp_format,
-                        );
-                        self.add_message_to_channel(target, msg);
+                    if self.connected {
+                        if self.send_action_text(target, action_text) {
+                            let msg = ChatMessage::action_fmt(
+                                &self.my_nick,
+                                action_text,
+                                &self.timestamp_format,
+                            );
+                            self.add_message_to_channel(target, msg);
+                        } else {
+                            self.add_message_to_current(ChatMessage::system_fmt(
+                                "Action not sent",
+                                &self.timestamp_format,
+                            ));
+                        }
                     } else {
                         self.add_message_to_current(ChatMessage::system_fmt(
                             "Not connected - action not sent",
@@ -1847,11 +1922,18 @@ impl IrcApp {
     /// dropping e.g. "/ns identify <pass>" would leave the user believing they
     /// are identified.
     fn send_service_message(&mut self, service: &str, args: &str) {
-        if self.connected && self.send_privmsg_text(service, args) {
-            self.add_message_to_channel(
-                service,
-                outgoing_local_echo(service, &self.my_nick, args, &self.timestamp_format),
-            );
+        if self.connected {
+            if self.send_privmsg_text(service, args) {
+                self.add_message_to_channel(
+                    service,
+                    outgoing_local_echo(service, &self.my_nick, args, &self.timestamp_format),
+                );
+            } else {
+                self.add_message_to_current(ChatMessage::system_fmt(
+                    "Message not sent",
+                    &self.timestamp_format,
+                ));
+            }
         } else {
             self.add_message_to_current(ChatMessage::system_fmt(
                 "Not connected - message not sent",
@@ -2429,6 +2511,75 @@ mod tests {
         assert_eq!(
             rx.try_recv().unwrap(),
             IrcCommand::Raw("WATCH +alice +bob".into())
+        );
+    }
+
+    #[test]
+    fn raw_command_reports_usage_and_disconnect_feedback() {
+        let mut app = IrcApp::default();
+        app.process_command("/raw");
+        assert!(
+            app.server_messages
+                .iter()
+                .any(|message| message.content.contains("Usage: /raw"))
+        );
+        app.process_command("/raw JOIN #x");
+        assert!(
+            app.server_messages
+                .iter()
+                .any(|message| message.content.contains("Not connected - server command not sent"))
+        );
+    }
+
+    #[test]
+    fn history_subcommand_does_not_switch_tabs_when_the_request_cannot_be_sent() {
+        let mut app = IrcApp::default();
+        app.handle_cap_message("ACK", &["draft/chathistory".into()]);
+        app.process_command("/history before #chan *");
+        assert!(
+            !app.channels.contains_key("#chan"),
+            "the tab must not be created for an unsent request"
+        );
+        assert!(
+            app.server_messages
+                .iter()
+                .any(|message| message.content.contains("history request not sent"))
+        );
+    }
+
+    #[test]
+    fn stale_tab_send_failure_reports_the_real_reason() {
+        let (mut app, mut rx) = connected_command_app();
+        let mut stale = Channel::new();
+        stale.joined = false;
+        app.channels.insert("#stale".into(), stale);
+        app.current_channel = Some("#stale".into());
+
+        app.process_command("/msg #stale hello");
+        assert!(rx.try_recv().is_err());
+        assert!(
+            app.channels["#stale"]
+                .messages
+                .iter()
+                .any(|message| message.content == "Message not sent")
+        );
+        assert!(
+            app.channels["#stale"]
+                .messages
+                .iter()
+                .all(|message| !message.content.contains("Not connected"))
+        );
+
+        // While actually disconnected, the disconnection is still what's
+        // reported.
+        app.connected = false;
+        app.cmd_tx = None;
+        app.process_command("/msg #stale hello again");
+        assert!(
+            app.channels["#stale"]
+                .messages
+                .iter()
+                .any(|message| message.content.contains("Not connected - message not sent"))
         );
     }
 

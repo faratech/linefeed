@@ -2461,8 +2461,11 @@ impl IrcApp {
 
                 // NOTICE uses a decorated local confirmation row rather than a
                 // normal chat row, so its server echo cannot be merged by
-                // identity. Suppress only our own negotiated echo.
-                if self.enabled_caps.contains("echo-message")
+                // identity. Suppress only our own negotiated echo — but not
+                // inside a CHATHISTORY replay batch, where our own rows must
+                // reach the queue branch just like the PRIVMSG arm's do.
+                if history_batch.is_none()
+                    && self.enabled_caps.contains("echo-message")
                     && self.identifiers_equal(&sender, &self.my_nick)
                 {
                     return;
@@ -6899,6 +6902,39 @@ mod tests {
         assert_eq!(
             app.active_session.as_ref().unwrap().auto_join_channels,
             "#private key"
+        );
+    }
+
+    #[test]
+    fn chathistory_replay_keeps_own_notice_rows() {
+        let mut app = test_app();
+        app.set_my_nick("me".into());
+        app.handle_cap_message("ACK", &["echo-message".into()]);
+
+        app.handle_incoming_message(
+            IrcMessage::parse(":srv BATCH +replay chathistory #chan").unwrap(),
+        );
+        app.handle_incoming_message(
+            IrcMessage::parse("@batch=replay :me!u@h NOTICE #chan :my own notice").unwrap(),
+        );
+        app.handle_incoming_message(IrcMessage::parse(":srv BATCH -replay").unwrap());
+
+        let chan = app.channels.get("#chan").expect("batch creates the tab");
+        assert!(
+            chan
+                .messages
+                .iter()
+                .any(|message| message.content.contains("my own notice")),
+            "replayed own notices must not be dropped as echoes"
+        );
+
+        // A live (non-batch) own notice is still suppressed as an echo.
+        app.handle_incoming_message(IrcMessage::parse(":me!u@h NOTICE #chan :live echo").unwrap());
+        assert!(
+            !app.channels["#chan"]
+                .messages
+                .iter()
+                .any(|message| message.content.contains("live echo"))
         );
     }
 
