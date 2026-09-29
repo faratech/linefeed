@@ -973,8 +973,7 @@ impl IrcClient {
         let mut index = 0;
         while index < pending_commands.len() {
             if let IrcCommand::Nick(nick) = &pending_commands[index] {
-                let line = format!("NICK {nick}
-");
+                let line = format!("NICK {nick}\r\n");
                 pending_commands.remove(index);
                 writer.write_all(line.as_bytes()).await?;
                 writer.flush().await?;
@@ -994,8 +993,7 @@ impl IrcClient {
                             break Err("Connection cancelled during registration".into());
                         }
                         RegistrationEvent::Nick(nick) => {
-                            let line = format!("NICK {nick}
-");
+                            let line = format!("NICK {nick}\r\n");
                             if let Err(e) = writer.write_all(line.as_bytes()).await {
                                 break Err(e.into());
                             }
@@ -2900,8 +2898,7 @@ mod tests {
                 // The write-through NICK must arrive before 001, not after
                 // the registration buffer flushes (#173).
                 write_half
-                    .write_all(b":srv 001 tester :Welcome
-")
+                    .write_all(b":srv 001 tester :Welcome\r\n")
                     .await
                     .unwrap();
                 tokio::time::sleep(Duration::from_millis(100)).await;
@@ -2925,7 +2922,10 @@ mod tests {
             let client_task = tokio::spawn(async move {
                 let _ = client.connect(msg_tx, cmd_rx).await;
             });
-            timeout(Duration::from_secs(2), server).await.unwrap().unwrap();
+            timeout(Duration::from_secs(2), server)
+                .await
+                .unwrap()
+                .unwrap();
             client_task.abort();
         });
     }
