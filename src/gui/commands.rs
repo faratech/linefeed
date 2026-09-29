@@ -561,13 +561,7 @@ impl IrcApp {
                     )));
                 } else {
                     let sent = self.send_command(IrcCommand::Raw(format!("{cmd} {args}")));
-                    if !sent && !self.connected {
-                        // While connected, send_command already reported its
-                        // own accurate failure row.
-                        self.add_message_to_current(ChatMessage::system(
-                            "Not connected - server command not sent",
-                        ));
-                    }
+                    self.report_send_failure(sent, "Not connected - server command not sent");
                 }
             }
 
@@ -577,15 +571,11 @@ impl IrcApp {
                 } else {
                     // Send even during CAP/SASL negotiation: cmd_tx is live
                     // before RPL_WELCOME and manual negotiation lines are
-                    // legitimate (#156). While connected, send_command
-                    // reports its own accurate row for too-long / denied-tag
-                    // failures; only a true disconnect gets the extra row.
+                    // legitimate (#156). While the channel is live,
+                    // send_command reports its own accurate row for
+                    // too-long / denied-tag failures.
                     let sent = self.send_command(IrcCommand::Raw(args.to_string()));
-                    if !sent && !self.connected {
-                        self.add_message_to_current(ChatMessage::system(
-                            "Not connected - server command not sent",
-                        ));
-                    }
+                    self.report_send_failure(sent, "Not connected - server command not sent");
                 }
             }
 
@@ -689,17 +679,20 @@ impl IrcApp {
                                 };
                                 if sent {
                                     self.prepare_history_target(target);
-                                } else if !self.connected {
-                                    // While connected, send_command already
-                                    // reported its own accurate failure row.
-                                    self.add_message_to_current(ChatMessage::system(
+                                } else {
+                                    // While the channel is live, send_command
+                                    // already reported its own accurate row.
+                                    self.report_send_failure(
+                                        sent,
                                         "Not connected - history request not sent",
-                                    ));
+                                    );
                                 }
-                            } else if !self.send_command(command) && !self.connected {
-                                self.add_message_to_current(ChatMessage::system(
+                            } else {
+                                let sent = self.send_command(command);
+                                self.report_send_failure(
+                                    sent,
                                     "Not connected - history request not sent",
-                                ));
+                                );
                             }
                         } else {
                             self.add_message_to_current(ChatMessage::system(
@@ -1958,13 +1951,7 @@ impl IrcApp {
                         format!("{cmd} {args}")
                     };
                     let sent = self.send_command(IrcCommand::Raw(line));
-                    if !sent && !self.connected {
-                        // While connected, send_command already reported its
-                        // own accurate failure row.
-                        self.add_message_to_current(ChatMessage::system(
-                            "Not connected - server command not sent",
-                        ));
-                    }
+                    self.report_send_failure(sent, "Not connected - server command not sent");
                 } else {
                     self.add_message_to_current(ChatMessage::system(&format!(
                         "Invalid command: {}. Type /help for list.",

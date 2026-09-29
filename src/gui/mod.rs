@@ -5104,8 +5104,19 @@ impl IrcApp {
         self.send_text_command("PRIVMSG", target, text, "\x01ACTION ", "\x01")
     }
 
-    pub fn send_command(&mut self, cmd: IrcCommand) -> bool {
-        let base_limit = self
+    /// Feedback for a failed send. While the connection channel is gone the
+    /// command was silently dropped, so say so. While it is live — including
+    /// pre-WELCOME CAP/SASL negotiation — send_command already printed its
+    /// own accurate failure row, and a "Not connected" row here would
+    /// contradict it (also wrong during negotiation, where connected is
+    /// still false; #161).
+    fn report_send_failure(&mut self, sent: bool, message: &str) {
+        if !sent && self.cmd_tx.is_none() {
+            self.add_message_to_current(ChatMessage::system(message));
+        }
+    }
+
+    pub fn send_command(&mut self, cmd: IrcCommand) -> bool {        let base_limit = self
             .network_support
             .line_len
             .unwrap_or(IRC_MAX_LINE_BYTES.saturating_add(2))
