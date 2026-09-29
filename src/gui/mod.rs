@@ -453,6 +453,10 @@ pub struct IrcApp {
     last_notification_time: Option<std::time::Instant>,
 
     nick_retry_attempts: u8,
+    /// Nicks this client has held this session (newest first, capped). Own
+    /// rows replayed under a former nick — e.g. a credential command sent
+    /// before a GHOST/REGAIN — must still be recognized as ours (#163).
+    past_nicks: Vec<String>,
 }
 
 impl Default for IrcApp {
@@ -646,6 +650,7 @@ impl IrcApp {
             had_messages_this_frame: false,
             last_notification_time: None,
             nick_retry_attempts: 0,
+            past_nicks: Vec::new(),
         }
     }
 
@@ -916,8 +921,22 @@ impl IrcApp {
     }
 
     fn set_my_nick(&mut self, nick: String) {
+        if !self.my_nick.is_empty() && self.my_nick != nick {
+            self.past_nicks.insert(0, self.my_nick.clone());
+            self.past_nicks.truncate(8);
+        }
         self.my_nick = nick;
         self.my_nick_lower = self.network_support.canonicalize(&self.my_nick);
+    }
+
+    /// Whether a replayed row's sender is us — current or a nick we held
+    /// earlier this session (#163).
+    fn sender_is_self(&self, nick: &str) -> bool {
+        self.identifiers_equal(nick, &self.my_nick)
+            || self
+                .past_nicks
+                .iter()
+                .any(|held| self.identifiers_equal(nick, held))
     }
 
     pub fn is_channel_name(&self, name: &str) -> bool {
@@ -1643,8 +1662,7 @@ impl IrcApp {
         // computed, so the pagination heuristic stays exact (#153/#158).
         let has_candidates = messages.iter().any(|row| {
             (row.is_system && row.content.starts_with('-'))
-                || (!row.is_system
-                    && self.identifiers_equal(&row.sender, &self.my_nick))
+                || (!row.is_system && self.sender_is_self(&row.sender))
         });
         if has_candidates {
             let routed_target = self.strip_status_prefix(&batch.target).to_string();
@@ -1672,18 +1690,19 @@ impl IrcApp {
                         .collect()
                 })
                 .unwrap_or_default();
-            let my_nick = self.my_nick.clone();
             let keep_row = |row: &ChatMessage| {
                 if !row.is_system {
                     // Own-credential chat rows: the local redacted copy has
                     // no msgid; replaying the server's verbatim copy would
-                    // re-render the secret (#158).
-                    return !(
-                        self.identifiers_equal(&row.sender, &my_nick)
-                            && commands::service_message_contains_credentials(
-                                &routed_target, &row.content,
-                            )
-                    );
+                    // re-render the secret. Keyword-only — the same safe
+                    // over-redaction as the ME/SAY decision (#149) — because
+                    // the original target list is unknowable here (multi-
+                    // target sends) and the sending nick may predate a
+                    // GHOST/REGAIN (#163). Non-own rows are never touched.
+                    if !self.sender_is_self(&row.sender) {
+                        return true;
+                    }
+                    return !commands::content_has_auth_command(&row.content);
                 }
                 let Some((nick, text)) = row
                     .content
@@ -1692,7 +1711,7 @@ impl IrcApp {
                 else {
                     return true;
                 };
-                if !self.identifiers_equal(nick, &my_nick) {
+                if !self.sender_is_self(nick) {
                     return true;
                 }
                 // The confirmation for a credential command was redacted, so
@@ -5116,7 +5135,8 @@ impl IrcApp {
         }
     }
 
-    pub fn send_command(&mut self, cmd: IrcCommand) -> bool {        let base_limit = self
+    pub fn send_command(&mut self, cmd: IrcCommand) -> bool {
+        let base_limit = self
             .network_support
             .line_len
             .unwrap_or(IRC_MAX_LINE_BYTES.saturating_add(2))
@@ -7400,7 +7420,10 @@ mod tests {
             .iter()
             .filter(|message| message.content.contains("hello"))
             .count();
-        assert!(hits >= 1, "the replay must survive third-party lookalikes");
+        // Both rows must survive: the peer's lookalike AND our own replay.
+        // (hits >= 1 would pass even with the confirmation collector broken,
+        // because the peer row alone satisfies it — #163.)
+        assert_eq!(hits, 2, "replay must survive third-party lookalikes");
     }
 
     #[test]
@@ -7456,6 +7479,43 @@ mod tests {
                 .iter()
                 .any(|message| message.content == "INFO alice")
         );
+    }
+
+    #[test]
+    fn replayed_own_credential_row_is_dropped_for_multi_target_and_former_nick() {
+        let (mut app, _rx) = test_app_connected();
+        app.set_my_nick("Guest123".into());
+        app.set_my_nick("alice".into()); // GHOST/REGAIN: Guest123 is a past nick
+        app.handle_cap_message("ACK", &["draft/chathistory".into()]);
+        let mut channel = Channel::new();
+        channel.joined = true;
+        app.channels.insert("#chan".to_string(), channel);
+        app.current_channel = Some("#chan".to_string());
+
+        // Multi-target send: locally redacted because the target LIST
+        // contains NickServ, but the #chan replay's routed target is not a
+        // service — the keyword-only own-row drop must still catch it.
+        app.handle_incoming_message(IrcMessage::parse(":srv BATCH +r chathistory #chan").unwrap());
+        app.handle_incoming_message(
+            IrcMessage::parse("@batch=r;msgid=n7 :Guest123!u@h PRIVMSG #chan :IDENTIFY hunter13")
+                .unwrap(),
+        );
+        // A non-credential own row under the former nick must survive.
+        app.handle_incoming_message(
+            IrcMessage::parse("@batch=r;msgid=n8 :Guest123!u@h PRIVMSG #chan :hello there").unwrap(),
+        );
+        app.handle_incoming_message(IrcMessage::parse(":srv BATCH -r").unwrap());
+
+        let rows: Vec<&str> = app.channels["#chan"]
+            .messages
+            .iter()
+            .map(|message| message.content.as_str())
+            .collect();
+        assert!(
+            rows.iter().all(|content| !content.contains("hunter13")),
+            "{rows:?}"
+        );
+        assert!(rows.contains(&"hello there"), "{rows:?}");
     }
 
     #[test]

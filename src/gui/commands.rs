@@ -35,11 +35,8 @@ impl IrcApp {
                 let channel = self.normalize_channel_name(channel_arg);
                 let sent =
                     self.send_command(IrcCommand::Join(channel.clone(), key.clone(), None, None));
+                self.report_send_failure(sent, &format!("Not connected - join {channel} not sent"));
                 if !sent {
-                    self.add_message_to_current(ChatMessage::system_fmt(
-                        &format!("Not connected - join {channel} not sent"),
-                        &self.timestamp_format,
-                    ));
                     return;
                 }
                 // Store the key only for a channel actually being joined.
@@ -73,10 +70,15 @@ impl IrcApp {
                             Some(self.part_message.clone())
                         }
                     });
-                    if !self.send_command(IrcCommand::Part(ch.clone(), reason)) {
+                    if !self.send_command(IrcCommand::Part(ch.clone(), reason))
+                        && self.cmd_tx.is_none()
+                    {
                         // Disconnected: the server can't confirm the part, so
                         // close the stale channel window locally instead of
-                        // leaving a tab that cannot be removed.
+                        // leaving a tab that cannot be removed. A send
+                        // failure on a live channel (e.g. a line-too-long
+                        // reason) must never destroy a joined tab (#162) —
+                        // send_command already reported the real cause.
                         self.remove_channel(&ch);
                         if self.current_target_is(&ch) {
                             self.current_channel = self.channels.keys().next().cloned();
@@ -259,7 +261,8 @@ impl IrcApp {
                 if args.is_empty() {
                     // Clear away status - only track the change if it was sent,
                     // otherwise the client claims a state the server never saw.
-                    if self.send_command(IrcCommand::Away(None)) {
+                    let sent = self.send_command(IrcCommand::Away(None));
+                    if sent {
                         self.away_status = None;
                         self.auto_away_triggered = false;
                         // Update our own status in all channels
@@ -269,13 +272,12 @@ impl IrcApp {
                             "You are no longer marked as away",
                         ));
                     } else {
-                        self.add_server_message(ChatMessage::system(
-                            "Not connected - away status not changed",
-                        ));
+                        self.report_send_failure(sent, "Not connected - away status not changed");
                     }
                 } else {
                     let reason = args.to_string();
-                    if self.send_command(IrcCommand::Away(Some(reason.clone()))) {
+                    let sent = self.send_command(IrcCommand::Away(Some(reason.clone())));
+                    if sent {
                         self.away_status = Some(reason.clone());
                         self.auto_away_triggered = false;
                         // Update our own status in all channels
@@ -286,15 +288,14 @@ impl IrcApp {
                             reason
                         )));
                     } else {
-                        self.add_server_message(ChatMessage::system(
-                            "Not connected - away status not changed",
-                        ));
+                        self.report_send_failure(sent, "Not connected - away status not changed");
                     }
                 }
             }
 
             "BACK" => {
-                if self.send_command(IrcCommand::Away(None)) {
+                let sent = self.send_command(IrcCommand::Away(None));
+                if sent {
                     self.away_status = None;
                     self.auto_away_triggered = false;
                     // Update our own status in all channels
@@ -304,9 +305,7 @@ impl IrcApp {
                         "You are no longer marked as away",
                     ));
                 } else {
-                    self.add_server_message(ChatMessage::system(
-                        "Not connected - away status not changed",
-                    ));
+                    self.report_send_failure(sent, "Not connected - away status not changed");
                 }
             }
 
@@ -521,11 +520,12 @@ impl IrcApp {
                     && self.is_channel_name(&old_name)
                     && self.is_channel_name(new_name)
                 {
-                    self.send_command(IrcCommand::Rename(
+                    let sent = self.send_command(IrcCommand::Rename(
                         old_name,
                         new_name.to_string(),
                         parts.next().map(str::to_string),
                     ));
+                    self.report_send_failure(sent, "Not connected - server command not sent");
                 } else {
                     self.add_message_to_current(ChatMessage::system(
                         "Usage: /rename <#new-channel> [reason]",
@@ -540,11 +540,12 @@ impl IrcApp {
                     && self.is_channel_name(&old_name)
                     && self.is_channel_name(new_name)
                 {
-                    self.send_command(IrcCommand::Relocate(
+                    let sent = self.send_command(IrcCommand::Relocate(
                         old_name,
                         new_name.to_string(),
                         parts.next().map(str::to_string),
                     ));
+                    self.report_send_failure(sent, "Not connected - server command not sent");
                 } else {
                     self.add_message_to_current(ChatMessage::system(
                         "Usage: /relocate <#new-channel> [reason]",
@@ -907,16 +908,14 @@ impl IrcApp {
                 } else {
                     IrcCommand::List(Some(args.to_string()))
                 };
-                if self.send_command(request) {
+                let sent = self.send_command(request);
+                if sent {
                     self.channel_list.clear();
                     self.channel_list_dirty = true;
                     self.channel_list_loading = true;
                 } else {
                     self.channel_list_loading = false;
-                    self.add_server_message(ChatMessage::system_fmt(
-                        "Not connected - channel list was not refreshed",
-                        &self.timestamp_format,
-                    ));
+                    self.report_send_failure(sent, "Not connected - channel list was not refreshed");
                 }
             }
 
@@ -1909,7 +1908,9 @@ impl IrcApp {
                         cmd.to_ascii_lowercase()
                     )));
                 } else {
-                    self.send_command(IrcCommand::Raw(format!("{cmd} {target} {channel} :{text}")));
+                    let sent =
+                        self.send_command(IrcCommand::Raw(format!("{cmd} {target} {channel} :{text}")));
+                    self.report_send_failure(sent, "Not connected - server command not sent");
                 }
             }
 
@@ -1923,7 +1924,9 @@ impl IrcApp {
                         cmd.to_ascii_lowercase()
                     )));
                 } else {
-                    self.send_command(IrcCommand::Raw(format!("{cmd} {channel} :{text}")));
+                    let sent =
+                        self.send_command(IrcCommand::Raw(format!("{cmd} {channel} :{text}")));
+                    self.report_send_failure(sent, "Not connected - server command not sent");
                 }
             }
 
@@ -1933,7 +1936,8 @@ impl IrcApp {
                 } else {
                     format!("HELP {args}")
                 };
-                self.send_command(IrcCommand::Raw(line));
+                let sent = self.send_command(IrcCommand::Raw(line));
+                self.report_send_failure(sent, "Not connected - server command not sent");
             }
 
             "HELP" | "H" | "?" => {
@@ -2318,6 +2322,12 @@ fn outgoing_local_echo(target: &str, sender: &str, content: &str, format: &str) 
 /// Split /monitor arguments into (subcommand, targets), accepting both the
 /// documented "+ nick1,nick2" form and the attached "+nick1,nick2" form
 /// (which would otherwise send the sign as part of the nick: "MONITOR + +nick").
+/// Nick lists are comma-separated on the wire; the user types them with any
+/// whitespace (tabs from a paste included — #163).
+fn whitespace_to_commas(value: &str) -> String {
+    value.split_whitespace().collect::<Vec<_>>().join(",")
+}
+
 fn monitor_args(args: &str) -> (String, Option<String>) {
     // Whitespace separator: see process_command's command-token split (#159).
     let parts: Vec<&str> = args.splitn(2, char::is_whitespace).collect();
@@ -2334,12 +2344,12 @@ fn monitor_args(args: &str) -> (String, Option<String>) {
                 if let Some(more) = rest {
                     // "/monitor +a b" -> targets are comma-separated on the wire.
                     targets.push(',');
-                    targets.push_str(&more.replace(' ', ","));
+                    targets.push_str(&whitespace_to_commas(&more));
                 }
                 (sign, Some(targets))
             } else {
                 // Bare nick(s): assume add.
-                ("+".to_string(), Some(args.to_string()))
+                ("+".to_string(), Some(whitespace_to_commas(args)))
             }
         }
     }
@@ -2424,7 +2434,7 @@ mod tests {
     use tokio::sync::mpsc;
 
     fn connected_command_app() -> (IrcApp, mpsc::UnboundedReceiver<IrcCommand>) {
-        let mut app = IrcApp::default();
+        let mut app = IrcApp::with_settings(crate::gui::Settings::default());
         let (tx, rx) = mpsc::unbounded_channel();
         app.cmd_tx = Some(tx);
         app.connected = true;
@@ -2574,7 +2584,7 @@ mod tests {
 
     #[test]
     fn raw_command_reports_usage_and_disconnect_feedback() {
-        let mut app = IrcApp::default();
+        let mut app = IrcApp::with_settings(crate::gui::Settings::default());
         app.process_command("/raw");
         assert!(
             app.server_messages
@@ -2591,7 +2601,7 @@ mod tests {
 
     #[test]
     fn history_subcommand_does_not_switch_tabs_when_the_request_cannot_be_sent() {
-        let mut app = IrcApp::default();
+        let mut app = IrcApp::with_settings(crate::gui::Settings::default());
         app.handle_cap_message("ACK", &["draft/chathistory".into()]);
         app.process_command("/history before #chan *");
         assert!(
@@ -2643,7 +2653,7 @@ mod tests {
 
     #[test]
     fn disconnected_commands_never_claim_they_were_sent() {
-        let mut app = IrcApp::default();
+        let mut app = IrcApp::with_settings(crate::gui::Settings::default());
         app.process_command("/ctcp bob VERSION");
         app.process_command("/invite bob #room");
         app.process_command("/knock #room");
@@ -2829,7 +2839,7 @@ mod tests {
             auto_perform: "/ns identify nickserv-pass".into(),
             pending_auto_perform: Some(vec!["/ns identify nickserv-pass".into()]),
             accept_invalid_certs: true,
-            ..IrcApp::default()
+            ..IrcApp::with_settings(crate::gui::Settings::default())
         };
 
         app.clear_endpoint_credentials();
@@ -2852,7 +2862,7 @@ mod tests {
             auto_join_channels: "#private key".into(),
             auto_perform: "/ns identify nickserv-pass".into(),
             accept_invalid_certs: true,
-            ..IrcApp::default()
+            ..IrcApp::with_settings(crate::gui::Settings::default())
         };
         let original_host = app.server_host.clone();
         app.process_command("/server new.example 0");

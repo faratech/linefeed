@@ -1038,17 +1038,18 @@ impl IrcApp {
                         } else {
                             IrcCommand::List(None)
                         };
-                        if self.send_command(request) {
+                        let sent = self.send_command(request);
+                        if sent {
                             self.channel_list.clear();
                             self.channel_list_dirty = true;
                             self.channel_list_selected = None;
                             self.channel_list_loading = true;
                         } else {
                             self.channel_list_loading = false;
-                            self.add_server_message(super::types::ChatMessage::system_fmt(
+                            self.report_send_failure(
+                                sent,
                                 "Not connected - channel list was not refreshed",
-                                &self.timestamp_format,
-                            ));
+                            );
                         }
                     }
                     if ui.button("Close").clicked() {
