@@ -271,9 +271,6 @@ fn redact_for_log(line: &str) -> std::borrow::Cow<'_, str> {
 /// arrive mid-handshake, before the writer task that normally handles them
 /// exists). Loops until it has a non-PING message to return, or errors if the
 /// connection closes.
-/// Read and handle one handshake line. Answers a server PING inline (and
-/// forwards it), returning `None` so the caller re-arms its fresh per-step
-/// budget; returns `Some(msg)` for anything else.
 async fn read_handshake_msg<W, R>(
     writer: &mut W,
     reader: &mut R,
@@ -345,7 +342,7 @@ where
         tokio::select! {
             biased;
             Some(nick) = nick_rx.recv() => {
-                let line = format!("NICK {nick}\r\n");
+                let line = format!("{}\r\n", IrcCommand::Nick(nick));
                 tracing::debug!("> {}", line.trim_end());
                 writer.write_all(line.as_bytes()).await?;
                 writer.flush().await?;
@@ -697,6 +694,15 @@ impl IrcClient {
                 self.config.port = port;
             }
         }
+        if self.config.nick.is_empty()
+            || self
+                .config
+                .nick
+                .bytes()
+                .any(|byte| matches!(byte, b'\r' | b'\n' | b'\0' | b' ' | b'@'))
+        {
+            return Err("Nickname must be non-empty and free of spaces, @, CR, LF and NUL".into());
+        }
         if self
             .config
             .pre_away_message
@@ -1007,6 +1013,13 @@ impl IrcClient {
                 &mut nick_rx,
                 REGISTRATION_TIMEOUT,
             ) => result?,
+        }
+        // A NICK forwarded in the window where registration has already
+        // finished its tail writes is still pending: hand it (and any
+        // siblings) back to the post-001 writer so it reaches the wire
+        // instead of vanishing with this scope (#176).
+        while let Ok(nick) = nick_rx.try_recv() {
+            pending_commands.push_front(IrcCommand::Nick(nick));
         }
 
         // Create channel for sending
@@ -2277,6 +2290,28 @@ mod tests {
 
             server.abort();
             client_task.abort();
+        });
+    }
+
+    #[test]
+    fn invalid_nick_is_rejected_before_connecting() {
+        test_runtime().block_on(async {
+            for nick in ["", "a b", "a\rb", "a@b"] {
+                let config = ServerConfig {
+                    host: "127.0.0.1".into(),
+                    port: 6697,
+                    use_tls: false,
+                    nick: nick.to_string(),
+                    ..Default::default()
+                };
+                let (msg_tx, _msg_rx) = mpsc::channel(100);
+                let (_cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+                let error = IrcClient::new(config)
+                    .connect(msg_tx, cmd_rx)
+                    .await
+                    .unwrap_err();
+                assert!(error.to_string().contains("Nickname"), "{nick}: {error}");
+            }
         });
     }
 
