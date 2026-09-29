@@ -501,6 +501,22 @@ fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
         == 0
 }
 
+/// Base64 decode tolerating missing padding: the client's own SCRAM nonce
+/// is emitted unpadded, and some servers emit unpadded salt/proofs the same
+/// way (#180).
+fn decode_base64_forgiving(value: &str) -> Result<Vec<u8>, base64::DecodeError> {
+    match BASE64_STANDARD.decode(value) {
+        Ok(bytes) => Ok(bytes),
+        Err(_) => {
+            let mut padded = value.to_string();
+            while !padded.len().is_multiple_of(4) {
+                padded.push('=');
+            }
+            BASE64_STANDARD.decode(padded)
+        }
+    }
+}
+
 fn scram_sha256_response(
     password: &str,
     client_nonce: &str,
@@ -1734,15 +1750,11 @@ impl IrcClient {
             SaslServerEvent::Welcome => return Ok(SaslAttemptOutcome::Welcome),
             SaslServerEvent::Challenge(_) => {
                 // A malformed/unexpected challenge leaves the server-side
-                // exchange live: abort it so the next mechanism does not
-                // inherit its state (#180).
-                writer
-                    .write_all(
-                        b"AUTHENTICATE *
-",
-                    )
-                    .await?;
-                writer.flush().await?;
+                // exchange live: abort it (consuming the acknowledgment so
+                // the next mechanism's read does not mistake the stale 906
+                // for its own) and fall through to the next mechanism
+                // (#180).
+                Self::abort_sasl_exchange(writer, reader, buf, incoming_tx, nick_rx).await?;
                 return Ok(SaslAttemptOutcome::Failed);
             }
             _ => return Ok(SaslAttemptOutcome::Failed),
@@ -1772,21 +1784,55 @@ impl IrcClient {
                 let client_first = format!("n,,{client_first_bare}");
                 Self::write_sasl_payload(writer, client_first.as_bytes()).await?;
 
-                let server_first = match self
+                let server_first: String = match self
                     .read_sasl_event(writer, reader, incoming_tx, nick_rx, buf)
                     .await?
                 {
-                    SaslServerEvent::Challenge(challenge) => String::from_utf8(
-                        BASE64_STANDARD
-                            .decode(challenge.as_bytes())
-                            .map_err(|_| "Invalid base64 SCRAM challenge")?,
-                    )
-                    .map_err(|_| "Non-UTF-8 SCRAM challenge")?,
-                    SaslServerEvent::Welcome => return Ok(SaslAttemptOutcome::Welcome),
+                    SaslServerEvent::Challenge(challenge) => {
+                        // A malformed challenge (bad base64/UTF-8 or a
+                        // server-first that fails validation) must not kill
+                        // the whole connect: abort the live exchange and
+                        // fall back to the next mechanism (#180). Base64 is
+                        // decoded forgivingly — the client's own nonce is
+                        // unpadded, so tolerate missing padding too.
+                        let decoded = decode_base64_forgiving(&challenge)
+                            .ok()
+                            .and_then(|bytes| String::from_utf8(bytes).ok());
+                        match decoded {
+                            Some(server_first) => server_first,
+                            None => {
+                                Self::abort_sasl_exchange(
+                                    writer,
+                                    reader,
+                                    buf,
+                                    incoming_tx,
+                                    nick_rx,
+                                )
+                                .await?;
+                                return Ok(SaslAttemptOutcome::Failed);
+                            }
+                        }
+                    }
+                    SaslServerEvent::Welcome => {
+                        return Ok(SaslAttemptOutcome::Welcome);
+                    }
                     _ => return Ok(SaslAttemptOutcome::Failed),
                 };
-                let (client_final, signature) =
-                    scram_sha256_response(password, &nonce, &client_first_bare, &server_first)?;
+                let (client_final, signature) = match scram_sha256_response(
+                    password,
+                    &nonce,
+                    &client_first_bare,
+                    &server_first,
+                ) {
+                    Ok(result) => result,
+                    Err(_) => {
+                        // Server-first failed validation: same fallback
+                        // as the malformed-challenge case (#180).
+                        Self::abort_sasl_exchange(writer, reader, buf, incoming_tx, nick_rx)
+                            .await?;
+                        return Ok(SaslAttemptOutcome::Failed);
+                    }
+                };
                 expected_server_signature = Some(signature);
                 Self::write_sasl_payload(writer, client_final.as_bytes()).await?;
             }
@@ -1840,6 +1886,27 @@ impl IrcClient {
         }
     }
 
+    /// Abort a live SASL exchange (AUTHENTICATE *) and consume the server's
+    /// acknowledgment so the stale reply cannot be misattributed to the next
+    /// mechanism's read (#180). Best effort: a silent server costs one step
+    /// budget here, bounded by the overall registration deadline.
+    async fn abort_sasl_exchange<W, R>(
+        writer: &mut W,
+        reader: &mut R,
+        buf: &mut Vec<u8>,
+        incoming_tx: &mpsc::Sender<IrcMessage>,
+        nick_rx: &mut mpsc::UnboundedReceiver<String>,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
+    where
+        W: tokio::io::AsyncWrite + Unpin,
+        R: tokio::io::AsyncBufRead + Unpin,
+    {
+        writer.write_all(b"AUTHENTICATE *\r\n").await?;
+        writer.flush().await?;
+        let _ = read_handshake_msg_timed(writer, reader, buf, incoming_tx, nick_rx).await?;
+        Ok(())
+    }
+
     async fn read_sasl_event<W, R>(
         &self,
         writer: &mut W,
@@ -1859,17 +1926,7 @@ impl IrcClient {
                 // Step budget expired mid-exchange: abort it so the server
                 // stops composing the late reply — otherwise the next
                 // mechanism's exchange interleaves with this one's (#179).
-                writer
-                    .write_all(
-                        b"AUTHENTICATE *
-",
-                    )
-                    .await?;
-                writer.flush().await?;
-                // Consume the server's abort acknowledgment so the next
-                // mechanism's read does not mistake the stale reply for its
-                // own (#180).
-                let _ = read_handshake_msg_timed(writer, reader, buf, incoming_tx, nick_rx).await?;
+                Self::abort_sasl_exchange(writer, reader, buf, incoming_tx, nick_rx).await?;
                 return Ok(SaslServerEvent::Failed);
             };
             match &msg.command {
