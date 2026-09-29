@@ -1541,10 +1541,8 @@ impl IrcClient {
                 if config.sasl_required {
                     return Err("Server completed registration without required SASL".into());
                 }
-                let cap_end = "CAP END\r\n";
-                tracing::debug!("> {}", cap_end.trim());
-                writer.write_all(cap_end.as_bytes()).await?;
-                writer.flush().await?;
+                // Registration already completed: CAP END post-001 is a
+                // no-op or an error depending on ircd — skip it (#182).
                 return Ok(true);
             }
 
@@ -1631,6 +1629,7 @@ impl IrcClient {
             return Ok(true);
         }
         if acked_tokens.contains("draft/persistence")
+            && sasl_authenticated
             && let Some(profile) = config
                 .persistence_profile
                 .as_deref()
