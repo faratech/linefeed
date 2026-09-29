@@ -207,9 +207,12 @@ async fn wait_for_disconnect(
     }
 }
 
-/// Registration-phase variant of wait_for_disconnect: a queued NICK surfaces
-/// as an event so the caller can write it through at once; everything else
-/// stays buffered in order.
+/// Registration-phase variant of wait_for_disconnect: a queued NICK (the
+/// GUI's 433 walkaway retry — registration state that must reach the wire
+/// at once, not held until 001; #173/#174) is forwarded to the registration
+/// read loops, which write it through beside their socket reads; everything
+/// else stays buffered in order. The future completes only on disconnect,
+/// so it can never drop or restart the in-flight registration.
 async fn wait_for_registration_events(
     outgoing_rx: &mut mpsc::UnboundedReceiver<IrcCommand>,
     pending: &mut VecDeque<IrcCommand>,
@@ -343,6 +346,7 @@ where
             biased;
             Some(nick) = nick_rx.recv() => {
                 let line = format!("NICK {nick}\r\n");
+                tracing::debug!("> {}", line.trim_end());
                 writer.write_all(line.as_bytes()).await?;
                 writer.flush().await?;
                 continue;
@@ -969,25 +973,14 @@ impl IrcClient {
         // The deadline covers the complete registration state machine through
         // RPL_WELCOME, not merely writing NICK/USER. Dropping the GUI receiver
         // cancels blocked writes and reads immediately as well. A queued NICK
-        // is written through immediately: it is registration state (the GUI's
-        // 433 walkaway retry), and buffering it until 001 would strand the
-        // retry on conforming servers (#173). Pre-connect phases have no
-        // writer and buffer everything, so the queue is swept first.
-        let mut index = 0;
-        while index < pending_commands.len() {
-            if let IrcCommand::Nick(nick) = &pending_commands[index] {
-                let line = format!("NICK {nick}\r\n");
-                pending_commands.remove(index);
-                writer.write_all(line.as_bytes()).await?;
-                writer.flush().await?;
-            } else {
-                index += 1;
-            }
-        }
+        // is forwarded to the registration read loops: it is registration
+        // state (the GUI's 433 walkaway retry), and buffering it until 001
+        // would strand the retry on conforming servers (#173). Pre-connect
+        // phases have no writer and buffer everything, so the queue is swept
+        // into the forwarder first; the read loops write it through after
+        // send_registration's own NICK, so the retry is not clobbered
+        // (#175).
         let (nick_tx, mut nick_rx) = mpsc::unbounded_channel::<String>();
-        // Pre-connect phases have no writer and buffer everything: sweep any
-        // queued NICK into the forwarder so the write-through below covers
-        // it too (#173).
         let mut index = 0;
         while index < pending_commands.len() {
             if let IrcCommand::Nick(nick) = &pending_commands[index] {
@@ -2914,14 +2907,15 @@ mod tests {
                 let (stream, _) = listener.accept().await.unwrap();
                 let (read_half, mut write_half) = stream.into_split();
                 let mut reader = BufReader::new(read_half);
-                assert_eq!(read_wire_line(&mut reader).await, "NICK tester_");
                 assert_eq!(read_wire_line(&mut reader).await, "CAP LS 302");
                 assert_eq!(read_wire_line(&mut reader).await, "NICK tester");
                 assert!(read_wire_line(&mut reader).await.starts_with("USER "));
                 // The write-through NICK must arrive before 001, not after
-                // the registration buffer flushes (#173).
+                // the registration buffer flushes (#173); and after the
+                // config NICK, not clobbering it (#175).
+                assert_eq!(read_wire_line(&mut reader).await, "NICK tester_");
                 write_half
-                    .write_all(b":srv 001 tester :Welcome\r\n")
+                    .write_all(b":srv 001 tester_ :Welcome\r\n")
                     .await
                     .unwrap();
                 tokio::time::sleep(Duration::from_millis(100)).await;
@@ -2945,6 +2939,54 @@ mod tests {
             let client_task = tokio::spawn(async move {
                 let _ = client.connect(msg_tx, cmd_rx).await;
             });
+            timeout(Duration::from_secs(2), server)
+                .await
+                .unwrap()
+                .unwrap();
+            client_task.abort();
+        });
+    }
+
+    #[test]
+    fn mid_registration_nick_is_written_through() {
+        test_runtime().block_on(async {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let (user_read_tx, mut user_read_rx) = mpsc::channel(1);
+            let server = tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                let (read_half, mut write_half) = stream.into_split();
+                let mut reader = BufReader::new(read_half);
+                assert_eq!(read_wire_line(&mut reader).await, "CAP LS 302");
+                assert_eq!(read_wire_line(&mut reader).await, "NICK tester");
+                assert!(read_wire_line(&mut reader).await.starts_with("USER "));
+                // Registration reads are in flight when the GUI queues the
+                // walkaway retry: the write-through must reach the wire
+                // before 001 (#175).
+                user_read_tx.send(()).await.unwrap();
+                assert_eq!(read_wire_line(&mut reader).await, "NICK late_");
+                write_half
+                    .write_all(b":srv 001 late_ :Welcome\r\n")
+                    .await
+                    .unwrap();
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            });
+
+            let config = ServerConfig {
+                host: "127.0.0.1".into(),
+                port: addr.port(),
+                use_tls: false,
+                nick: "tester".into(),
+                ..Default::default()
+            };
+            let (msg_tx, _msg_rx) = mpsc::channel(100);
+            let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+            let mut client = IrcClient::new(config);
+            let client_task = tokio::spawn(async move {
+                let _ = client.connect(msg_tx, cmd_rx).await;
+            });
+            user_read_rx.recv().await.unwrap();
+            cmd_tx.send(IrcCommand::Nick("late_".to_string())).unwrap();
             timeout(Duration::from_secs(2), server)
                 .await
                 .unwrap()
