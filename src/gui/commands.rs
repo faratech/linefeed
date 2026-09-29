@@ -18,7 +18,11 @@ impl IrcApp {
 
         match cmd.as_str() {
             "JOIN" | "J" => {
-                let join_parts: Vec<&str> = args.splitn(2, ' ').collect();
+                // Whitespace separators throughout the arg-splitting arms:
+                // the command token already splits on any whitespace (#148),
+                // so a tab-pasted argument must not be glued into a single
+                // mangled token here (#159).
+                let join_parts: Vec<&str> = args.splitn(2, char::is_whitespace).collect();
                 let channel_arg = join_parts.first().copied().unwrap_or("");
                 let key = join_parts.get(1).map(|k| k.to_string());
                 if channel_arg.is_empty() {
@@ -52,7 +56,7 @@ impl IrcApp {
                 let (channel, inline_reason) = if args.is_empty() {
                     (self.current_channel.clone(), None)
                 } else {
-                    let mut it = args.splitn(2, ' ');
+                    let mut it = args.splitn(2, char::is_whitespace);
                     let first = it.next().unwrap_or("");
                     if self.is_channel_name(first) {
                         (Some(first.to_string()), it.next().map(|r| r.to_string()))
@@ -570,15 +574,12 @@ impl IrcApp {
             "RAW" | "QUOTE" => {
                 if args.is_empty() {
                     self.add_message_to_current(ChatMessage::system("Usage: /raw <command>"));
-                } else if !self.connected {
-                    self.add_message_to_current(ChatMessage::system(
-                        "Not connected - server command not sent",
-                    ));
                 } else {
                     // Send even during CAP/SASL negotiation: cmd_tx is live
                     // before RPL_WELCOME and manual negotiation lines are
-                    // legitimate. While connected, send_command reports its
-                    // own accurate row for too-long / denied-tag failures.
+                    // legitimate (#156). While connected, send_command
+                    // reports its own accurate row for too-long / denied-tag
+                    // failures; only a true disconnect gets the extra row.
                     let sent = self.send_command(IrcCommand::Raw(args.to_string()));
                     if !sent && !self.connected {
                         self.add_message_to_current(ChatMessage::system(
@@ -928,7 +929,7 @@ impl IrcApp {
 
             // === Channel Operator Commands ===
             "KICK" | "K" => {
-                let parts: Vec<&str> = args.splitn(2, ' ').collect();
+                let parts: Vec<&str> = args.splitn(2, char::is_whitespace).collect();
                 let nick = parts.first().copied().unwrap_or("");
                 if nick.is_empty() {
                     self.add_message_to_current(ChatMessage::system(
@@ -985,7 +986,7 @@ impl IrcApp {
             }
 
             "KICKBAN" | "KB" => {
-                let parts: Vec<&str> = args.splitn(2, ' ').collect();
+                let parts: Vec<&str> = args.splitn(2, char::is_whitespace).collect();
                 let target = parts.first().copied().unwrap_or("");
                 if target.is_empty() {
                     self.add_message_to_current(ChatMessage::system(
@@ -1394,7 +1395,7 @@ impl IrcApp {
 
             // === Channel Management ===
             "INVITE" => {
-                let parts: Vec<&str> = args.splitn(2, ' ').collect();
+                let parts: Vec<&str> = args.splitn(2, char::is_whitespace).collect();
                 let nick = parts.first().copied().unwrap_or("");
                 let channel = parts
                     .get(1)
@@ -2331,7 +2332,8 @@ fn outgoing_local_echo(target: &str, sender: &str, content: &str, format: &str) 
 /// documented "+ nick1,nick2" form and the attached "+nick1,nick2" form
 /// (which would otherwise send the sign as part of the nick: "MONITOR + +nick").
 fn monitor_args(args: &str) -> (String, Option<String>) {
-    let parts: Vec<&str> = args.splitn(2, ' ').collect();
+    // Whitespace separator: see process_command's command-token split (#159).
+    let parts: Vec<&str> = args.splitn(2, char::is_whitespace).collect();
     let first = parts[0];
     let rest = parts.get(1).map(|s| s.to_string());
 
@@ -2385,8 +2387,9 @@ fn mode_command_args(
 /// split on the first one).
 fn parse_server_arg(args: &str) -> Result<(String, Option<String>), String> {
     let args = args.trim();
-    // Space-separated form: "host 6697" (works for any host including IPv6).
-    if let Some((host, port)) = args.split_once(' ') {
+    // Space-separated form: "host 6697" (works for any host including IPv6;
+    // any whitespace, per the command-token split — #159).
+    if let Some((host, port)) = args.split_once(char::is_whitespace) {
         let host = host.trim_matches(['[', ']']);
         let port = parse_server_port(port)?;
         return Ok((host.to_string(), Some(port.to_string())));
@@ -2802,12 +2805,13 @@ mod tests {
 
     #[test]
     fn perform_listing_redacts_targetless_credential_lines() {
-        // Set directly: the PERFORM add branch calls get_settings().save(),
-        // which writes the real user's settings.json from a test (#152).
-        let mut app = IrcApp {
-            auto_perform: "/me IDENTIFY hunter11".into(),
-            ..IrcApp::default()
-        };
+        // Hermetic by construction: IrcApp::default() reads the real user's
+        // settings.json (and would rename a torn file), which is what #152
+        // was about. Set auto_perform directly — the PERFORM add branch also
+        // calls get_settings().save() and so cannot run against the real
+        // config from a test.
+        let mut app = IrcApp::with_settings(crate::gui::Settings::default());
+        app.auto_perform = "/me IDENTIFY hunter11".into();
         app.process_command("/perform");
         let shown: Vec<&str> = app
             .server_messages

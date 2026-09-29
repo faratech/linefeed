@@ -1637,23 +1637,31 @@ impl IrcApp {
                 .is_none_or(|msgid| !existing_ids.contains(msgid))
         });
         // Own-notice replays whose local confirmation row ("-> -target- text")
-        // is already in the tab are display duplicates: the confirmation never
-        // learns the server msgid, so the msgid dedup above cannot see it.
-        // Dropped here — after page_count/remaining were computed — so the
-        // pagination heuristic stays exact (#153). Own-notice replays carrying
-        // an auth command are always dropped: their confirmation row was
-        // redacted, so replaying them would re-display the secret on screen.
-        if !messages.is_empty() {
+        // is already in the tab are display duplicates, and own-credential
+        // chat rows replay the server's verbatim copy of a redacted local
+        // row: both are dropped here — after page_count/remaining were
+        // computed, so the pagination heuristic stays exact (#153/#158).
+        let has_candidates = messages.iter().any(|row| {
+            (row.is_system && row.content.starts_with('-'))
+                || (!row.is_system
+                    && self.identifiers_equal(&row.sender, &self.my_nick))
+        });
+        if has_candidates {
             let routed_target = self.strip_status_prefix(&batch.target).to_string();
+            // Only rows the client itself rendered as notice confirmations
+            // count — a peer typing the literal "-> -#chan- hello" must not
+            // suppress a replay (#157). The stored target is the spelling the
+            // user typed, so it is compared after stripping status prefixes.
             let confirmations: Vec<(String, String)> = self
-                .channel_key(&routed_target)
-                .and_then(|key| self.channels.get(&key))
+                .channels
+                .get(&key)
                 .map(|channel| {
                     channel
                         .messages
                         .iter()
                         .rev()
                         .take(64)
+                        .filter(|row| row.is_system)
                         .filter_map(|row| {
                             row.content.strip_prefix("-> -").and_then(|rest| {
                                 rest.split_once("- ").map(|(target, text)| {
@@ -1666,24 +1674,39 @@ impl IrcApp {
                 .unwrap_or_default();
             let my_nick = self.my_nick.clone();
             let keep_row = |row: &ChatMessage| {
-                row.is_system
-                    .then(|| {
-                        row.content
-                            .strip_prefix('-')
-                            .and_then(|rest| rest.split_once("- "))
-                    })
-                    .flatten()
-                    .is_none_or(|(nick, text)| {
-                        if !self.identifiers_equal(nick, &my_nick) {
-                            return true;
-                        }
-                        if commands::content_has_auth_command(text) {
-                            return false;
-                        }
-                        !confirmations.iter().any(|(target, confirmed_text)| {
-                            confirmed_text == text && self.identifiers_equal(target, &routed_target)
-                        })
-                    })
+                if !row.is_system {
+                    // Own-credential chat rows: the local redacted copy has
+                    // no msgid; replaying the server's verbatim copy would
+                    // re-render the secret (#158).
+                    return !(
+                        self.identifiers_equal(&row.sender, &my_nick)
+                            && commands::service_message_contains_credentials(
+                                &routed_target, &row.content,
+                            )
+                    );
+                }
+                let Some((nick, text)) = row
+                    .content
+                    .strip_prefix('-')
+                    .and_then(|rest| rest.split_once("- "))
+                else {
+                    return true;
+                };
+                if !self.identifiers_equal(nick, &my_nick) {
+                    return true;
+                }
+                // The confirmation for a credential command was redacted, so
+                // replaying it would re-display the secret; gated on the
+                // target actually being an auth service so e.g. a notice
+                // starting "REGISTER …" to a plain channel survives (#157).
+                if commands::service_message_contains_credentials(&routed_target, text) {
+                    return false;
+                }
+                !confirmations.iter().any(|(target, confirmed_text)| {
+                    confirmed_text == text
+                        && self
+                            .identifiers_equal(self.strip_status_prefix(target), &routed_target)
+                })
             };
             messages.retain(keep_row);
         }
@@ -7283,6 +7306,117 @@ mod tests {
             .filter(|message| message.content.contains("unique-notice-text"))
             .count();
         assert_eq!(hits, 1, "the notice must appear exactly once");
+    }
+
+    #[test]
+    fn replayed_own_credential_privmsg_is_not_displayed() {
+        let (mut app, _rx) = test_app_connected();
+        app.set_my_nick("me".into());
+        app.handle_cap_message("ACK", &["draft/chathistory".into()]);
+        let mut channel = Channel::new();
+        channel.joined = true;
+        app.channels.insert("NickServ".to_string(), channel);
+        app.current_channel = Some("NickServ".to_string());
+
+        app.handle_incoming_message(
+            IrcMessage::parse(":srv BATCH +r chathistory NickServ").unwrap(),
+        );
+        app.handle_incoming_message(
+            IrcMessage::parse("@batch=r;msgid=n2 :me!u@h PRIVMSG NickServ :IDENTIFY hunter12")
+                .unwrap(),
+        );
+        app.handle_incoming_message(IrcMessage::parse(":srv BATCH -r").unwrap());
+
+        assert!(
+            app.channels["NickServ"]
+                .messages
+                .iter()
+                .all(|message| !message.content.contains("hunter12")),
+            "the server's verbatim copy of a redacted local row must not render"
+        );
+    }
+
+    #[test]
+    fn status_prefixed_confirmation_still_suppresses_replay() {
+        let (mut app, _rx) = test_app_connected();
+        app.set_my_nick("me".into());
+        app.handle_cap_message("ACK", &["echo-message".into()]);
+        let mut channel = Channel::new();
+        channel.joined = true;
+        app.channels.insert("#chan".to_string(), channel);
+        app.current_channel = Some("#chan".to_string());
+
+        // Confirmation stores the target as typed: "-> -@#chan- op hello".
+        app.process_command("/notice @#chan op hello");
+
+        app.handle_incoming_message(IrcMessage::parse(":srv BATCH +r chathistory #chan").unwrap());
+        app.handle_incoming_message(
+            IrcMessage::parse("@batch=r;msgid=n3 :me!u@h NOTICE #chan :op hello").unwrap(),
+        );
+        app.handle_incoming_message(IrcMessage::parse(":srv BATCH -r").unwrap());
+
+        let hits = app.channels["#chan"]
+            .messages
+            .iter()
+            .filter(|message| message.content.contains("op hello"))
+            .count();
+        assert_eq!(hits, 1, "status-prefixed confirmation must match");
+    }
+
+    #[test]
+    fn peer_chat_text_does_not_create_a_confirmation() {
+        let (mut app, _rx) = test_app_connected();
+        app.set_my_nick("me".into());
+        app.handle_cap_message("ACK", &["echo-message".into()]);
+        let mut channel = Channel::new();
+        channel.joined = true;
+        app.channels.insert("#chan".to_string(), channel);
+        app.current_channel = Some("#chan".to_string());
+
+        // A peer types the literal confirmation shape: it must not suppress
+        // a genuine replay of our own notice sent from another device.
+        app.handle_incoming_message(
+            IrcMessage::parse(":pal!u@h PRIVMSG #chan :-> -#chan- hello").unwrap(),
+        );
+        app.handle_incoming_message(IrcMessage::parse(":srv BATCH +r chathistory #chan").unwrap());
+        app.handle_incoming_message(
+            IrcMessage::parse("@batch=r;msgid=n4 :me!u@h NOTICE #chan :hello").unwrap(),
+        );
+        app.handle_incoming_message(IrcMessage::parse(":srv BATCH -r").unwrap());
+
+        let hits = app.channels["#chan"]
+            .messages
+            .iter()
+            .filter(|message| message.content.contains("hello"))
+            .count();
+        assert!(hits >= 1, "the replay must survive third-party lookalikes");
+    }
+
+    #[test]
+    fn own_notice_to_plain_channel_is_never_dropped_from_replay() {
+        let (mut app, _rx) = test_app_connected();
+        app.set_my_nick("me".into());
+        app.handle_cap_message("ACK", &["echo-message".into()]);
+        let mut channel = Channel::new();
+        channel.joined = true;
+        app.channels.insert("#chan".to_string(), channel);
+        app.current_channel = Some("#chan".to_string());
+
+        // Auth-keyword text to a NON-service target, sent from another
+        // device (no confirmation exists here): the replay must survive.
+        app.handle_incoming_message(IrcMessage::parse(":srv BATCH +r chathistory #chan").unwrap());
+        app.handle_incoming_message(
+            IrcMessage::parse("@batch=r;msgid=n5 :me!u@h NOTICE #chan :REGISTER early to vote")
+                .unwrap(),
+        );
+        app.handle_incoming_message(IrcMessage::parse(":srv BATCH -r").unwrap());
+
+        let hits = app.channels["#chan"]
+            .messages
+            .iter()
+            .filter(|message| message.content.contains("REGISTER early"))
+            .count();
+        assert_eq!(hits, 1, "plain-channel own notices must not be dropped");
     }
 
     #[test]
