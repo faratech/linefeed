@@ -932,17 +932,15 @@ impl IrcApp {
             .collect();
     }
 
-    /// The single nick-change choke point. `record_previous` remembers the
-    /// outgoing nick as held — pass true only when it was confirmed in use
-    /// on this connection lineage (an accepted NICK echo, or a prior
-    /// registration on a same-endpoint reconnect); pass false for nicks that
-    /// were never ours (session start, an ERR_NICKNAMEINUSE walkaway, a 001
-    /// rewrite of a speculative nick). `accepted` marks whether the incoming
-    /// nick is server-accepted on this path (true for 001 and NICK echoes;
-    /// false for activation and 433 walkaways, where confirmation must wait
-    /// for this connection's own 001 — #169).
-    fn set_session_nick(&mut self, nick: String, record_previous: bool, accepted: bool) {
-        if record_previous
+    /// The single nick-change choke point. A nick the server confirmed on
+    /// this connection lineage is remembered when replaced, so replay rows
+    /// sent under it stay attributed to us; recording derives from
+    /// nick_confirmed, so call sites pass only whether the INCOMING nick is
+    /// server-accepted on this path (true for 001 and accepted NICK echoes;
+    /// false for activation and 433 walkaways, where confirmation waits for
+    /// this connection's own 001 — #169, recording derivation #171).
+    fn set_session_nick(&mut self, nick: String, accepted: bool) {
+        if self.nick_confirmed
             && !self.my_nick.is_empty()
             && !self.identifiers_equal(&self.my_nick, &nick)
         {
@@ -2355,27 +2353,29 @@ impl IrcApp {
         // nick history is dropped (reset_session_state) and the configured
         // nick is adopted unrecorded (#166). On a same-endpoint reconnect
         // the outgoing nick WAS ours on this connection lineage — record it
-        // so replay attribution survives (#168) — but only when the identity
-        // (nickname + SASL account) is unchanged; a changed identity is a
-        // new lineage whose nicks mean someone else (#170). The configured
-        // nick is not yet confirmed either way, except that re-applying the
-        // same confirmed nick re-confirms it (#170): this connection's own
-        // 001 would confirm it regardless.
-        let same_lineage = !endpoint_changed
-            && self.active_session.as_ref().is_some_and(|active| {
-                active
-                    .server
-                    .nick
-                    .eq_ignore_ascii_case(&session.server.nick)
-                    && active.server.sasl_username == session.server.sasl_username
-            });
-        if !same_lineage && self.active_session.is_some() {
-            // A new endpoint or a new identity drops held-nick attribution.
+        // so replay attribution survives (#168) — but only when the services
+        // identity (SASL account, or the client certificate for EXTERNAL) is
+        // unchanged; the nickname is precisely what legitimately changes, so
+        // it never breaks the lineage, while a changed identity is a new
+        // lineage whose nicks mean someone else (#171). An unconfirmed nick
+        // (fresh or speculative) is adopted unrecorded; a re-applied
+        // confirmed nick stays confirmed (#170).
+        let identity_changed = self.active_session.as_ref().is_some_and(|active| {
+            active.server.sasl_username != session.server.sasl_username
+                || active.server.sasl_mechanism != session.server.sasl_mechanism
+                || active.server.tls_client_cert_path != session.server.tls_client_cert_path
+        });
+        if !endpoint_changed && identity_changed {
+            // The flag goes too: the outgoing nick was the other account's
+            // holder, and leaving it confirmed would let the record below
+            // re-insert it (#171).
             self.past_nicks.clear();
+            self.nick_confirmed = false;
             self.refresh_self_nick_keys();
         }
-        let reconfirmed = same_lineage && self.nick_confirmed;
-        self.set_session_nick(session.server.nick.clone(), reconfirmed, reconfirmed);
+        let accepted =
+            self.nick_confirmed && self.identifiers_equal(&session.server.nick, &self.my_nick);
+        self.set_session_nick(session.server.nick.clone(), accepted);
         self.active_session = Some(session);
         self.pending_session = None;
         self.connection_error = None;
@@ -3244,7 +3244,7 @@ impl IrcApp {
                 if self.identifiers_equal(&old_nick, &self.my_nick) {
                     // Accepted NICK change: the outgoing nick was confirmed
                     // in use, so record it as held (#168).
-                    self.set_session_nick(new_nick.clone(), true, true);
+                    self.set_session_nick(new_nick.clone(), true);
                 }
                 let sys_msg =
                     ChatMessage::system(&format!("{} is now known as {}", old_nick, new_nick));
@@ -3822,9 +3822,7 @@ impl IrcApp {
                     // held so bouncer replay attribution survives (#168),
                     // while a rewrite of a speculative pre-registration nick
                     // records nothing (#167/#169).
-                    let record_previous =
-                        self.nick_confirmed && !self.identifiers_equal(nick, &self.my_nick);
-                    self.set_session_nick(nick.clone(), record_previous, true);
+                    self.set_session_nick(nick.clone(), true);
                 }
                 let msg = params
                     .get(1)
@@ -4149,8 +4147,7 @@ impl IrcApp {
                 // registered as a held nick before 433 hit): its replayed
                 // rows must stay attributed (#169). A pre-registration
                 // walkaway from the configured nick records nothing (#166).
-                let record_previous = self.nick_confirmed;
-                self.set_session_nick(new_nick.clone(), record_previous, false);
+                self.set_session_nick(new_nick.clone(), false);
                 if let Some(tx) = &self.cmd_tx {
                     let _ = tx.send(IrcCommand::Nick(new_nick));
                 }
@@ -6630,7 +6627,7 @@ mod tests {
     #[test]
     fn self_kick_marks_channel_unjoined_and_blocks_send_and_echo() {
         let (mut app, mut rx) = test_app_connected();
-        app.set_session_nick("me".to_string(), false, true);
+        app.set_session_nick("me".to_string(), true);
         let mut channel = Channel::new();
         channel.joined = true;
         channel.add_user("me", UserMode::Normal);
@@ -7180,7 +7177,7 @@ mod tests {
     #[test]
     fn chathistory_replay_keeps_own_notice_rows() {
         let mut app = test_app();
-        app.set_session_nick("me".into(), false, true);
+        app.set_session_nick("me".into(), true);
         app.handle_cap_message("ACK", &["echo-message".into()]);
 
         app.handle_incoming_message(
@@ -7212,7 +7209,7 @@ mod tests {
     #[test]
     fn credential_commands_never_enter_history_search_or_local_scrollback() {
         let (mut app, mut rx) = test_app_connected();
-        app.set_session_nick("me".into(), false, true);
+        app.set_session_nick("me".into(), true);
         assert!(app.open_query("NickServ"));
 
         for input in [
@@ -7378,7 +7375,7 @@ mod tests {
     #[test]
     fn whox_fields_follow_the_requested_column_order() {
         let mut app = test_app();
-        app.set_session_nick("me".into(), false, true);
+        app.set_session_nick("me".into(), true);
         let mut channel = Channel::new();
         channel.add_user("alice", UserMode::Normal);
         channel.add_user("bob", UserMode::Normal);
@@ -7433,7 +7430,7 @@ mod tests {
         // /notice actually went out (#152 — the disconnected branch never
         // creates the row and the dedup under test would not run).
         let (mut app, _rx) = test_app_connected();
-        app.set_session_nick("me".into(), false, true);
+        app.set_session_nick("me".into(), true);
         app.handle_cap_message("ACK", &["echo-message".into(), "draft/chathistory".into()]);
         let mut channel = Channel::new();
         channel.joined = true;
@@ -7469,7 +7466,7 @@ mod tests {
     #[test]
     fn replayed_own_credential_privmsg_is_not_displayed() {
         let (mut app, _rx) = test_app_connected();
-        app.set_session_nick("me".into(), false, true);
+        app.set_session_nick("me".into(), true);
         app.handle_cap_message("ACK", &["draft/chathistory".into()]);
         let mut channel = Channel::new();
         channel.joined = true;
@@ -7497,7 +7494,7 @@ mod tests {
     #[test]
     fn status_prefixed_confirmation_still_suppresses_replay() {
         let (mut app, _rx) = test_app_connected();
-        app.set_session_nick("me".into(), false, true);
+        app.set_session_nick("me".into(), true);
         app.handle_cap_message("ACK", &["echo-message".into()]);
         let mut channel = Channel::new();
         channel.joined = true;
@@ -7524,7 +7521,7 @@ mod tests {
     #[test]
     fn peer_chat_text_does_not_create_a_confirmation() {
         let (mut app, _rx) = test_app_connected();
-        app.set_session_nick("me".into(), false, true);
+        app.set_session_nick("me".into(), true);
         app.handle_cap_message("ACK", &["echo-message".into()]);
         let mut channel = Channel::new();
         channel.joined = true;
@@ -7556,7 +7553,7 @@ mod tests {
     #[test]
     fn own_notice_starting_with_an_auth_keyword_is_dropped_from_replay() {
         let (mut app, _rx) = test_app_connected();
-        app.set_session_nick("me".into(), false, true);
+        app.set_session_nick("me".into(), true);
         app.handle_cap_message("ACK", &["echo-message".into()]);
         let mut channel = Channel::new();
         channel.joined = true;
@@ -7599,7 +7596,7 @@ mod tests {
     fn nick_in_use_retry_does_not_record_the_configured_nick() {
         let mut app = test_app();
         // Pre-registration: alice was configured but never confirmed here.
-        app.set_session_nick("alice".into(), false, false);
+        app.set_session_nick("alice".into(), false);
         app.handle_numeric(
             ERR_NICKNAMEINUSE,
             &["me".into(), "alice".into(), "in use".into()],
@@ -7614,8 +7611,8 @@ mod tests {
     #[test]
     fn session_reset_clears_past_nicks() {
         let mut app = test_app();
-        app.set_session_nick("alice".into(), false, true);
-        app.set_session_nick("bob".into(), true, true);
+        app.set_session_nick("alice".into(), true);
+        app.set_session_nick("bob".into(), true);
         assert!(!app.past_nicks.is_empty());
         app.reset_session_state();
         assert!(app.past_nicks.is_empty());
@@ -7653,8 +7650,8 @@ mod tests {
     #[test]
     fn live_credential_redaction_recovers_former_nicks() {
         let (mut app, _rx) = test_app_connected();
-        app.set_session_nick("Guest123".into(), false, true);
-        app.set_session_nick("alice".into(), true, true);
+        app.set_session_nick("Guest123".into(), true);
+        app.set_session_nick("alice".into(), true);
         app.add_message_to_channel(
             "NickServ",
             ChatMessage::new_fmt("Guest123", "IDENTIFY hunter16", "short"),
@@ -7673,7 +7670,7 @@ mod tests {
     #[test]
     fn replayed_own_non_credential_privmsg_survives() {
         let (mut app, _rx) = test_app_connected();
-        app.set_session_nick("me".into(), false, true);
+        app.set_session_nick("me".into(), true);
         app.handle_cap_message("ACK", &["draft/chathistory".into()]);
         let mut channel = Channel::new();
         channel.joined = true;
@@ -7701,8 +7698,8 @@ mod tests {
     #[test]
     fn replayed_own_credential_row_is_dropped_for_multi_target_and_former_nick() {
         let (mut app, _rx) = test_app_connected();
-        app.set_session_nick("Guest123".into(), false, true);
-        app.set_session_nick("alice".into(), true, true); // GHOST/REGAIN: Guest123 is a past nick
+        app.set_session_nick("Guest123".into(), true);
+        app.set_session_nick("alice".into(), true); // GHOST/REGAIN: Guest123 is a past nick
         app.handle_cap_message("ACK", &["draft/chathistory".into()]);
         let mut channel = Channel::new();
         channel.joined = true;
@@ -7749,7 +7746,7 @@ mod tests {
         app.handle_numeric(RPL_WELCOME, &["alice".into(), "welcome".into()]);
         assert!(app.nick_confirmed);
         // "/nick bob" accepted mid-session: alice recorded as held.
-        app.set_session_nick("bob".into(), true, true);
+        app.set_session_nick("bob".into(), true);
         assert!(app.sender_is_self("alice"));
 
         // Reconnect to the SAME endpoint: bob was genuinely ours, and the
@@ -7800,7 +7797,7 @@ mod tests {
         let mut app = test_app();
         // Confirmed nick replaced by the server's 001 (bouncer rewrite):
         // the confirmed nick is recorded as held (#168).
-        app.set_session_nick("bob".into(), false, true);
+        app.set_session_nick("bob".into(), true);
         // Real 001 shape: the granted nick is the first parameter.
         app.handle_numeric(RPL_WELCOME, &["alice".into(), "welcome".into()]);
         assert_eq!(app.my_nick, "alice");
@@ -7817,8 +7814,8 @@ mod tests {
     #[test]
     fn squatted_former_nick_notices_and_notifications_still_render() {
         let (mut app, _rx) = test_app_connected();
-        app.set_session_nick("alice".into(), false, true);
-        app.set_session_nick("bob".into(), false, true);
+        app.set_session_nick("alice".into(), true);
+        app.set_session_nick("bob".into(), true);
         app.handle_cap_message("ACK", &["echo-message".into()]);
         let mut channel = Channel::new();
         channel.joined = true;
@@ -7837,6 +7834,64 @@ mod tests {
                 .any(|message| message.content.contains("maintenance at noon")),
             "a squatter's notice must not be dropped as our echo"
         );
+    }
+
+    #[test]
+    fn reconnection_chains_keep_attribution_exact_across_identities() {
+        let mut app = test_app();
+        app.nickname = "alice".into();
+        app.server_host = "irc.example".into();
+        app.server_port = "6697".into();
+        app.use_tls = true;
+        app.sasl_username = "acct".into();
+        app.sasl_password = "pw1".into();
+        let session = app.session_from_form().unwrap();
+        app.activate_session(session.clone());
+
+        // Pre-registration walkaway: nothing recorded, then 001 grants the
+        // suffixed nick (confirmed, past_nicks empty).
+        app.handle_numeric(
+            ERR_NICKNAMEINUSE,
+            &["me".into(), "alice".into(), "in use".into()],
+        );
+        app.handle_numeric(RPL_WELCOME, &["alice_".into(), "welcome".into()]);
+        assert_eq!(app.my_nick, "alice_");
+        assert!(app.past_nicks.is_empty());
+        assert!(app.nick_confirmed);
+
+        // Manual same-endpoint reconnect with the same account: the config
+        // nick differs from the confirmed one, so it is adopted unconfirmed
+        // and a subsequent pre-registration 433 must NOT attribute the
+        // stranger-held "alice" (#171).
+        app.activate_session(session.clone());
+        assert!(!app.nick_confirmed);
+        app.handle_numeric(
+            ERR_NICKNAMEINUSE,
+            &["me".into(), "alice".into(), "in use".into()],
+        );
+        assert!(
+            !app.past_nicks.iter().any(|held| held == "alice"),
+            "a never-granted nick must not be recorded from the config match (#171)"
+        );
+
+        // Re-applying the confirmed nick itself keeps confirmation (#170),
+        // and the equal-case 001 records nothing (#169).
+        app.activate_session(session.clone());
+        app.handle_numeric(RPL_WELCOME, &["alice_".into(), "welcome".into()]);
+        assert_eq!(app.my_nick, "alice_");
+        assert!(app.nick_confirmed);
+        // The same-lineage reconnect kept the genuinely-held nick (#168).
+        assert_eq!(app.past_nicks, vec!["alice_".to_string()]);
+
+        // SASL account change: the lineage is dropped even on the same
+        // endpoint (#171) — a different account's holder must not inherit
+        // our attribution.
+        app.sasl_username = "other".into();
+        app.sasl_password = "pw2".into();
+        let other = app.session_from_form().unwrap();
+        app.activate_session(other);
+        assert!(app.past_nicks.is_empty());
+        assert!(!app.sender_is_self("alice_"));
     }
 
     #[test]
@@ -8028,7 +8083,7 @@ mod tests {
     #[test]
     fn casemapped_incoming_query_reuses_existing_tab() {
         let mut app = test_app();
-        app.set_session_nick("me".to_string(), false, true);
+        app.set_session_nick("me".to_string(), true);
         app.add_message_to_channel("Alice", ChatMessage::system("opened"));
 
         let msg = IrcMessage::parse(":alice!u@h PRIVMSG me :hello").unwrap();
@@ -8059,13 +8114,13 @@ mod tests {
     #[test]
     fn special_character_nicks_highlight_with_identifier_boundaries() {
         let mut app = test_app();
-        app.set_session_nick("foo-bar".to_string(), false, true);
+        app.set_session_nick("foo-bar".to_string(), true);
         assert!(app.check_nick_mention("hello foo-bar!"));
         assert!(app.check_nick_mention("(FOO-BAR), ping"));
         assert!(!app.check_nick_mention("xfoo-bar"));
         assert!(!app.check_nick_mention("foo-barry"));
 
-        app.set_session_nick("[alice]".to_string(), false, true);
+        app.set_session_nick("[alice]".to_string(), true);
         assert!(app.check_nick_mention("hi {ALICE},"));
         assert!(!app.check_nick_mention("x[alice]"));
     }
@@ -8176,7 +8231,7 @@ mod tests {
     #[test]
     fn extended_join_and_setname_retain_member_identity() {
         let mut app = test_app();
-        app.set_session_nick("me".into(), false, true);
+        app.set_session_nick("me".into(), true);
         app.channels.insert("#room".into(), Channel::new());
 
         app.handle_incoming_message(
@@ -8202,7 +8257,7 @@ mod tests {
     #[test]
     fn private_reaction_routes_to_the_senders_query() {
         let mut app = test_app();
-        app.set_session_nick("me".into(), false, true);
+        app.set_session_nick("me".into(), true);
         app.handle_incoming_message(
             IrcMessage::parse("@+draft/react=👍;+reply=abc :alice!u@h TAGMSG me").unwrap(),
         );
@@ -8219,7 +8274,7 @@ mod tests {
     #[test]
     fn no_implicit_names_requests_membership_after_join() {
         let (mut app, mut rx) = test_app_connected();
-        app.set_session_nick("me".into(), false, true);
+        app.set_session_nick("me".into(), true);
         app.handle_incoming_message(
             IrcMessage::parse(":srv CAP me ACK :no-implicit-names").unwrap(),
         );
@@ -8234,7 +8289,7 @@ mod tests {
     #[test]
     fn echo_message_enriches_the_local_row_without_duplication() {
         let (mut app, _rx) = test_app_connected();
-        app.set_session_nick("me".into(), false, true);
+        app.set_session_nick("me".into(), true);
         app.handle_incoming_message(IrcMessage::parse(":srv CAP me ACK :echo-message").unwrap());
         app.add_message_to_channel("#room", ChatMessage::new_fmt("me", "hello", "short"));
 
@@ -8255,7 +8310,7 @@ mod tests {
     #[test]
     fn selected_live_message_advances_the_server_read_marker() {
         let (mut app, mut rx) = test_app_connected();
-        app.set_session_nick("me".into(), false, true);
+        app.set_session_nick("me".into(), true);
         app.current_channel = Some("#room".into());
         app.channels.insert("#room".into(), Channel::new());
         app.handle_incoming_message(
@@ -8498,7 +8553,7 @@ mod tests {
     #[test]
     fn incoming_self_kick_clears_users_but_keeps_tab() {
         let mut app = test_app();
-        app.set_session_nick("me".to_string(), false, true);
+        app.set_session_nick("me".to_string(), true);
         let mut channel = Channel::new();
         channel.add_user("me", UserMode::Normal);
         channel.add_user("bob", UserMode::Normal);
@@ -8519,7 +8574,7 @@ mod tests {
     #[test]
     fn nick_in_use_while_connected_reports_without_renaming() {
         let mut app = test_app();
-        app.set_session_nick("mike".to_string(), false, true);
+        app.set_session_nick("mike".to_string(), true);
         app.connected = true;
         app.handle_numeric(
             ERR_NICKNAMEINUSE,
@@ -8542,7 +8597,7 @@ mod tests {
         let mut app = test_app();
         // Pre-registration: mike was configured but never confirmed here
         // (accepted=false — a state the connected test above cannot model).
-        app.set_session_nick("mike".to_string(), false, false);
+        app.set_session_nick("mike".to_string(), false);
         app.connected = false;
         app.handle_numeric(
             ERR_NICKNAMEINUSE,
@@ -8741,7 +8796,7 @@ mod tests {
     #[test]
     fn joining_with_chathistory_requests_server_backlog() {
         let (mut app, mut rx) = test_app_connected();
-        app.set_session_nick("me".into(), false, true);
+        app.set_session_nick("me".into(), true);
         app.handle_incoming_message(
             IrcMessage::parse(":srv CAP me ACK :draft/chathistory").unwrap(),
         );
@@ -8758,7 +8813,7 @@ mod tests {
     #[test]
     fn reconnect_requests_history_after_last_seen_msgid() {
         let (mut app, mut rx) = test_app_connected();
-        app.set_session_nick("me".into(), false, true);
+        app.set_session_nick("me".into(), true);
         app.handle_incoming_message(
             IrcMessage::parse(":srv CAP me ACK :draft/chathistory").unwrap(),
         );
@@ -8862,7 +8917,7 @@ mod tests {
     #[test]
     fn chathistory_pages_backward_until_requested_limit() {
         let (mut app, mut rx) = test_app_connected();
-        app.set_session_nick("me".into(), false, true);
+        app.set_session_nick("me".into(), true);
         app.max_scrollback = 5;
         app.handle_incoming_message(
             IrcMessage::parse(":srv CAP me LS :draft/chathistory=2").unwrap(),
@@ -9083,7 +9138,7 @@ mod tests {
         );
         app.log_manager.flush_all();
 
-        app.set_session_nick("me".into(), false, true);
+        app.set_session_nick("me".into(), true);
         app.handle_incoming_message(
             IrcMessage::parse(":srv CAP me ACK :draft/chathistory").unwrap(),
         );
@@ -9134,7 +9189,7 @@ mod tests {
         );
         app.log_manager.flush_all();
 
-        app.set_session_nick("me".into(), false, true);
+        app.set_session_nick("me".into(), true);
         app.handle_incoming_message(
             IrcMessage::parse(":srv CAP me ACK :draft/chathistory").unwrap(),
         );
@@ -9187,7 +9242,7 @@ mod tests {
         );
         app.log_manager.flush_all();
 
-        app.set_session_nick("me".into(), false, true);
+        app.set_session_nick("me".into(), true);
         app.handle_incoming_message(
             IrcMessage::parse(":srv CAP me ACK :draft/chathistory").unwrap(),
         );

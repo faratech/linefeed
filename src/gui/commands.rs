@@ -2824,7 +2824,7 @@ mod tests {
     #[test]
     fn action_and_describe_credential_lines_never_enter_history() {
         let (mut app, mut rx) = connected_command_app();
-        app.set_session_nick("me".into(), false, true);
+        app.set_session_nick("me".into(), true);
         assert!(app.open_query("NickServ"));
 
         for input in [
@@ -2868,7 +2868,7 @@ mod tests {
     #[test]
     fn tab_separated_target_is_split_the_same_way_by_dispatch_and_filter() {
         let (mut app, mut rx) = connected_command_app();
-        app.set_session_nick("me".into(), false, true);
+        app.set_session_nick("me".into(), true);
         // A paste can carry a tab: dispatch must see target "NickServ" exactly
         // like the credential filter does (#148).
         app.input_text = "/msg NickServ\tIDENTIFY hunter10".into();
@@ -2941,7 +2941,7 @@ mod tests {
     #[test]
     fn slap_supports_a_custom_action() {
         let (mut app, mut rx) = connected_command_app();
-        app.set_session_nick("me".into(), false, true);
+        app.set_session_nick("me".into(), true);
         app.current_channel = Some("#chan".into());
         let mut channel = Channel::new();
         channel.joined = true;
