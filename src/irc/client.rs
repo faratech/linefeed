@@ -207,27 +207,20 @@ async fn wait_for_disconnect(
     }
 }
 
-/// Events the registration phase must react to while its reads are in
-/// flight.
-enum RegistrationEvent {
-    Disconnected,
-    /// A pre-001 NICK: registration state (the GUI's 433 walkaway retry),
-    /// which must be written through immediately rather than buffered until
-    /// 001 (#173).
-    Nick(String),
-}
-
 /// Registration-phase variant of wait_for_disconnect: a queued NICK surfaces
 /// as an event so the caller can write it through at once; everything else
 /// stays buffered in order.
 async fn wait_for_registration_events(
     outgoing_rx: &mut mpsc::UnboundedReceiver<IrcCommand>,
     pending: &mut VecDeque<IrcCommand>,
-) -> RegistrationEvent {
+    nick_tx: &mpsc::UnboundedSender<String>,
+) {
     loop {
         match outgoing_rx.recv().await {
-            Some(IrcCommand::Quit(_)) | None => return RegistrationEvent::Disconnected,
-            Some(IrcCommand::Nick(nick)) => return RegistrationEvent::Nick(nick),
+            Some(IrcCommand::Quit(_)) | None => return,
+            Some(IrcCommand::Nick(nick)) => {
+                let _ = nick_tx.send(nick);
+            }
             Some(command) => pending.push_back(command),
         }
     }
@@ -333,6 +326,7 @@ async fn read_handshake_msg_timed<W, R>(
     reader: &mut R,
     buf: &mut Vec<u8>,
     incoming_tx: &mpsc::Sender<IrcMessage>,
+    nick_rx: &mut mpsc::UnboundedReceiver<String>,
 ) -> Result<Option<IrcMessage>, Box<dyn std::error::Error + Send + Sync>>
 where
     W: tokio::io::AsyncWrite + Unpin,
@@ -342,18 +336,27 @@ where
     // message we actually care about: a server that PINGs during registration
     // (ZNC-style bouncers do) must not consume the budget for its delayed CAP
     // or SASL reply. The overall registration deadline still bounds the total.
+    // A queued NICK (the GUI's 433 walkaway retry) is written through on
+    // arrival — registration state, so no budget is consumed for it (#173).
     loop {
-        match timeout(
-            HANDSHAKE_STEP_TIMEOUT,
-            read_handshake_msg(writer, reader, buf, incoming_tx),
-        )
-        .await
-        {
-            Ok(Ok(Some(msg))) => return Ok(Some(msg)),
-            // PING answered (or junk line skipped): re-arm a fresh budget.
-            Ok(Ok(None)) => continue,
-            Ok(Err(e)) => return Err(e),
-            Err(_) => return Ok(None),
+        tokio::select! {
+            biased;
+            Some(nick) = nick_rx.recv() => {
+                let line = format!("NICK {nick}\r\n");
+                writer.write_all(line.as_bytes()).await?;
+                writer.flush().await?;
+                continue;
+            }
+            outcome = timeout(
+                HANDSHAKE_STEP_TIMEOUT,
+                read_handshake_msg(writer, reader, buf, incoming_tx),
+            ) => match outcome {
+                Ok(Ok(Some(msg))) => return Ok(Some(msg)),
+                // PING answered (or junk line skipped): re-arm a fresh budget.
+                Ok(Ok(None)) => continue,
+                Ok(Err(e)) => return Err(e),
+                Err(_) => return Ok(None),
+            }
         }
     }
 }
@@ -981,35 +984,37 @@ impl IrcClient {
                 index += 1;
             }
         }
-        let registration = loop {
-            tokio::select! {
-                biased;
-                event = wait_for_registration_events(
-                    &mut outgoing_rx,
-                    &mut pending_commands,
-                ) => {
-                    match event {
-                        RegistrationEvent::Disconnected => {
-                            break Err("Connection cancelled during registration".into());
-                        }
-                        RegistrationEvent::Nick(nick) => {
-                            let line = format!("NICK {nick}\r\n");
-                            if let Err(e) = writer.write_all(line.as_bytes()).await {
-                                break Err(e.into());
-                            }
-                            writer.flush().await?;
-                        }
-                    }
-                }
-                result = self.register_with_deadline(
-                    &mut writer,
-                    &mut reader,
-                    &incoming_tx,
-                    REGISTRATION_TIMEOUT,
-                ) => break result,
+        let (nick_tx, mut nick_rx) = mpsc::unbounded_channel::<String>();
+        // Pre-connect phases have no writer and buffer everything: sweep any
+        // queued NICK into the forwarder so the write-through below covers
+        // it too (#173).
+        let mut index = 0;
+        while index < pending_commands.len() {
+            if let IrcCommand::Nick(nick) = &pending_commands[index] {
+                let nick = nick.clone();
+                pending_commands.remove(index);
+                let _ = nick_tx.send(nick);
+            } else {
+                index += 1;
             }
-        };
-        registration?;
+        }
+        tokio::select! {
+            biased;
+            _ = wait_for_registration_events(
+                &mut outgoing_rx,
+                &mut pending_commands,
+                &nick_tx,
+            ) => {
+                return Err("Connection cancelled during registration".into());
+            }
+            result = self.register_with_deadline(
+                &mut writer,
+                &mut reader,
+                &incoming_tx,
+                &mut nick_rx,
+                REGISTRATION_TIMEOUT,
+            ) => result?,
+        }
 
         // Create channel for sending
         let (send_tx, mut send_rx) = mpsc::channel::<String>(100);
@@ -1107,6 +1112,7 @@ impl IrcClient {
         writer: &mut W,
         reader: &mut R,
         incoming_tx: &mpsc::Sender<IrcMessage>,
+        nick_rx: &mut mpsc::UnboundedReceiver<String>,
         deadline: Duration,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
     where
@@ -1119,7 +1125,7 @@ impl IrcClient {
             }
             result = timeout(
                 deadline,
-                self.send_registration(writer, reader, incoming_tx),
+                self.send_registration(writer, reader, incoming_tx, nick_rx),
             ) => match result {
                 Ok(result) => result,
                 Err(_) => Err(
@@ -1134,6 +1140,7 @@ impl IrcClient {
         writer: &mut W,
         reader: &mut R,
         incoming_tx: &mpsc::Sender<IrcMessage>,
+        nick_rx: &mut mpsc::UnboundedReceiver<String>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
     where
         W: tokio::io::AsyncWrite + Unpin,
@@ -1193,9 +1200,12 @@ impl IrcClient {
             raw: String::new(),
         });
 
-        let welcome_received = self.do_cap_negotiation(writer, reader, incoming_tx).await?;
+        let welcome_received = self
+            .do_cap_negotiation(writer, reader, incoming_tx, nick_rx)
+            .await?;
         if !welcome_received {
-            self.wait_for_welcome(writer, reader, incoming_tx).await?;
+            self.wait_for_welcome(writer, reader, incoming_tx, nick_rx)
+                .await?;
         }
 
         Ok(())
@@ -1206,6 +1216,7 @@ impl IrcClient {
         writer: &mut W,
         reader: &mut R,
         incoming_tx: &mpsc::Sender<IrcMessage>,
+        nick_rx: &mut mpsc::UnboundedReceiver<String>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
     where
         W: tokio::io::AsyncWrite + Unpin,
@@ -1213,11 +1224,14 @@ impl IrcClient {
     {
         let mut buf = Vec::with_capacity(512);
         loop {
-            // read_handshake_msg returns None for a PING (answered inline) and
-            // for an unparseable line. Both are legal pre-welcome traffic —
-            // bouncers PING unregistered clients — so keep waiting instead of
-            // panicking. The outer REGISTRATION_TIMEOUT bounds the total wait.
-            let Some(msg) = read_handshake_msg(writer, reader, &mut buf, incoming_tx).await? else {
+            // read_handshake_msg_timed returns None for a PING (answered
+            // inline) and for an unparseable line. Both are legal
+            // pre-welcome traffic — bouncers PING unregistered clients — so
+            // keep waiting instead of panicking. The outer
+            // REGISTRATION_TIMEOUT bounds the total wait.
+            let Some(msg) =
+                read_handshake_msg_timed(writer, reader, &mut buf, incoming_tx, nick_rx).await?
+            else {
                 continue;
             };
             if matches!(msg.command, IrcCommand::Numeric(RPL_WELCOME, _)) {
@@ -1232,6 +1246,7 @@ impl IrcClient {
         writer: &mut W,
         reader: &mut R,
         incoming_tx: &mpsc::Sender<IrcMessage>,
+        nick_rx: &mut mpsc::UnboundedReceiver<String>,
     ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>>
     where
         W: tokio::io::AsyncWrite + Unpin,
@@ -1253,7 +1268,8 @@ impl IrcClient {
         let mut cap_budget = CapBudget::default();
 
         loop {
-            let Some(msg) = read_handshake_msg_timed(writer, reader, &mut buf, incoming_tx).await?
+            let Some(msg) =
+                read_handshake_msg_timed(writer, reader, &mut buf, incoming_tx, nick_rx).await?
             else {
                 if config.sasl_required {
                     return Err("Required SASL authentication could not be negotiated".into());
@@ -1428,7 +1444,8 @@ impl IrcClient {
         let mut pending_caps: std::collections::HashSet<String> =
             caps_to_request.iter().map(|cap| cap.to_string()).collect();
         loop {
-            let Some(msg) = read_handshake_msg_timed(writer, reader, &mut buf, incoming_tx).await?
+            let Some(msg) =
+                read_handshake_msg_timed(writer, reader, &mut buf, incoming_tx, nick_rx).await?
             else {
                 if config.sasl_required && pending_caps.contains("sasl") {
                     return Err("Required SASL capability was not acknowledged".into());
@@ -1507,7 +1524,7 @@ impl IrcClient {
         // Step 6: If SASL was ACKed and we want it, do SASL authentication
         let (welcome_received, sasl_authenticated) =
             if want_sasl && acked_tokens.contains("sasl") && !sasl_mechanisms.is_empty() {
-                self.do_sasl_auth_inner(writer, reader, incoming_tx, &sasl_mechanisms)
+                self.do_sasl_auth_inner(writer, reader, incoming_tx, nick_rx, &sasl_mechanisms)
                     .await?
             } else if want_sasl {
                 let message = if !sasl_available {
@@ -1589,6 +1606,7 @@ impl IrcClient {
         writer: &mut W,
         reader: &mut R,
         incoming_tx: &mpsc::Sender<IrcMessage>,
+        nick_rx: &mut mpsc::UnboundedReceiver<String>,
         mechanisms: &[SaslMechanism],
     ) -> Result<(bool, bool), Box<dyn std::error::Error + Send + Sync>>
     where
@@ -1608,7 +1626,7 @@ impl IrcClient {
                 raw: String::new(),
             });
             match self
-                .do_sasl_attempt(writer, reader, incoming_tx, &mut buf, *mechanism)
+                .do_sasl_attempt(writer, reader, incoming_tx, nick_rx, &mut buf, *mechanism)
                 .await?
             {
                 SaslAttemptOutcome::Success => return Ok((false, true)),
@@ -1633,6 +1651,7 @@ impl IrcClient {
         writer: &mut W,
         reader: &mut R,
         incoming_tx: &mpsc::Sender<IrcMessage>,
+        nick_rx: &mut mpsc::UnboundedReceiver<String>,
         buf: &mut Vec<u8>,
         mechanism: SaslMechanism,
     ) -> Result<SaslAttemptOutcome, Box<dyn std::error::Error + Send + Sync>>
@@ -1647,7 +1666,7 @@ impl IrcClient {
         writer.flush().await?;
 
         match self
-            .read_sasl_event(writer, reader, incoming_tx, buf)
+            .read_sasl_event(writer, reader, incoming_tx, nick_rx, buf)
             .await?
         {
             SaslServerEvent::Challenge(challenge) if challenge == "+" => {}
@@ -1681,7 +1700,7 @@ impl IrcClient {
                 Self::write_sasl_payload(writer, client_first.as_bytes()).await?;
 
                 let server_first = match self
-                    .read_sasl_event(writer, reader, incoming_tx, buf)
+                    .read_sasl_event(writer, reader, incoming_tx, nick_rx, buf)
                     .await?
                 {
                     SaslServerEvent::Challenge(challenge) => String::from_utf8(
@@ -1704,7 +1723,7 @@ impl IrcClient {
         let mut server_verified = expected_server_signature.is_none();
         loop {
             match self
-                .read_sasl_event(writer, reader, incoming_tx, buf)
+                .read_sasl_event(writer, reader, incoming_tx, nick_rx, buf)
                 .await?
             {
                 SaslServerEvent::Challenge(challenge) => {
@@ -1753,6 +1772,7 @@ impl IrcClient {
         writer: &mut W,
         reader: &mut R,
         incoming_tx: &mpsc::Sender<IrcMessage>,
+        nick_rx: &mut mpsc::UnboundedReceiver<String>,
         buf: &mut Vec<u8>,
     ) -> Result<SaslServerEvent, Box<dyn std::error::Error + Send + Sync>>
     where
@@ -1760,7 +1780,8 @@ impl IrcClient {
         R: tokio::io::AsyncBufRead + Unpin,
     {
         loop {
-            let Some(msg) = read_handshake_msg_timed(writer, reader, buf, incoming_tx).await?
+            let Some(msg) =
+                read_handshake_msg_timed(writer, reader, buf, incoming_tx, nick_rx).await?
             else {
                 return Ok(SaslServerEvent::Failed);
             };
@@ -2430,12 +2451,14 @@ mod tests {
             };
             let client = IrcClient::new(config);
             let (msg_tx, mut msg_rx) = mpsc::channel(100);
+            let (_nick_tx, mut nick_rx) = mpsc::unbounded_channel::<String>();
             let drain = tokio::spawn(async move { while msg_rx.recv().await.is_some() {} });
             let error = client
                 .register_with_deadline(
                     &mut client_write,
                     &mut client_read,
                     &msg_tx,
+                    &mut nick_rx,
                     Duration::from_millis(100),
                 )
                 .await
