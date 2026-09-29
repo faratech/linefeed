@@ -547,8 +547,7 @@ fn scram_sha256_response(
     if nonce.len() <= client_nonce.len() || !nonce.starts_with(client_nonce) {
         return Err("SCRAM server nonce does not extend client nonce".into());
     }
-    let salt = BASE64_STANDARD
-        .decode(salt.ok_or("SCRAM challenge omitted salt")?.as_bytes())
+    let salt = decode_base64_forgiving(salt.ok_or("SCRAM challenge omitted salt")?)
         .map_err(|_| "Invalid SCRAM salt")?;
     let iterations: u32 = iterations
         .ok_or("SCRAM challenge omitted iteration count")?
@@ -1754,7 +1753,7 @@ impl IrcClient {
                 // the next mechanism's read does not mistake the stale 906
                 // for its own) and fall through to the next mechanism
                 // (#180).
-                Self::abort_sasl_exchange(writer, reader, buf, incoming_tx, nick_rx).await?;
+                self.abort_sasl_exchange(writer).await?;
                 return Ok(SaslAttemptOutcome::Failed);
             }
             _ => return Ok(SaslAttemptOutcome::Failed),
@@ -1801,14 +1800,7 @@ impl IrcClient {
                         match decoded {
                             Some(server_first) => server_first,
                             None => {
-                                Self::abort_sasl_exchange(
-                                    writer,
-                                    reader,
-                                    buf,
-                                    incoming_tx,
-                                    nick_rx,
-                                )
-                                .await?;
+                                self.abort_sasl_exchange(writer).await?;
                                 return Ok(SaslAttemptOutcome::Failed);
                             }
                         }
@@ -1825,11 +1817,12 @@ impl IrcClient {
                     &server_first,
                 ) {
                     Ok(result) => result,
-                    Err(_) => {
-                        // Server-first failed validation: same fallback
-                        // as the malformed-challenge case (#180).
-                        Self::abort_sasl_exchange(writer, reader, buf, incoming_tx, nick_rx)
-                            .await?;
+                    Err(error) => {
+                        tracing::warn!(
+                            "SCRAM server-first rejected: {error}; aborting and \
+                             trying the next mechanism"
+                        );
+                        self.abort_sasl_exchange(writer).await?;
                         return Ok(SaslAttemptOutcome::Failed);
                     }
                 };
@@ -1856,7 +1849,7 @@ impl IrcClient {
                     let supplied = decoded
                         .as_deref()
                         .and_then(|value| value.split(',').find_map(|part| part.strip_prefix("v=")))
-                        .and_then(|value| BASE64_STANDARD.decode(value.as_bytes()).ok());
+                        .and_then(|value| decode_base64_forgiving(value).ok());
                     server_verified = supplied
                         .as_deref()
                         .is_some_and(|actual| constant_time_eq(actual, expected));
@@ -1886,24 +1879,20 @@ impl IrcClient {
         }
     }
 
-    /// Abort a live SASL exchange (AUTHENTICATE *) and consume the server's
-    /// acknowledgment so the stale reply cannot be misattributed to the next
-    /// mechanism's read (#180). Best effort: a silent server costs one step
-    /// budget here, bounded by the overall registration deadline.
-    async fn abort_sasl_exchange<W, R>(
+    /// Abort a live SASL exchange (AUTHENTICATE *). The server's 906
+    /// ERR_SASLABORTED acknowledgment is skipped by read_sasl_event — it can
+    /// only acknowledge this client-initiated abort — so no blind ack read
+    /// is needed here (one risked swallowing a late 903 success or a
+    /// Welcome; #181).
+    async fn abort_sasl_exchange<W>(
+        &self,
         writer: &mut W,
-        reader: &mut R,
-        buf: &mut Vec<u8>,
-        incoming_tx: &mpsc::Sender<IrcMessage>,
-        nick_rx: &mut mpsc::UnboundedReceiver<String>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
     where
         W: tokio::io::AsyncWrite + Unpin,
-        R: tokio::io::AsyncBufRead + Unpin,
     {
         writer.write_all(b"AUTHENTICATE *\r\n").await?;
         writer.flush().await?;
-        let _ = read_handshake_msg_timed(writer, reader, buf, incoming_tx, nick_rx).await?;
         Ok(())
     }
 
@@ -1926,7 +1915,7 @@ impl IrcClient {
                 // Step budget expired mid-exchange: abort it so the server
                 // stops composing the late reply — otherwise the next
                 // mechanism's exchange interleaves with this one's (#179).
-                Self::abort_sasl_exchange(writer, reader, buf, incoming_tx, nick_rx).await?;
+                self.abort_sasl_exchange(writer).await?;
                 return Ok(SaslServerEvent::Failed);
             };
             match &msg.command {
@@ -1935,9 +1924,11 @@ impl IrcClient {
                 }
                 IrcCommand::Numeric(RPL_WELCOME, _) => return Ok(SaslServerEvent::Welcome),
                 IrcCommand::Numeric(RPL_SASLSUCCESS, _) => return Ok(SaslServerEvent::Success),
+                // 906 can only acknowledge this client's own abort: skip it
+                // so the stale ack cannot fail the next mechanism (#181).
+                IrcCommand::Numeric(ERR_SASLABORTED, _) => continue,
                 IrcCommand::Numeric(
-                    RPL_NICKLOCKED | ERR_SASLFAIL | ERR_SASLTOOLONG | ERR_SASLABORTED
-                    | ERR_SASLALREADY,
+                    RPL_NICKLOCKED | ERR_SASLFAIL | ERR_SASLTOOLONG | ERR_SASLALREADY,
                     _,
                 ) => return Ok(SaslServerEvent::Failed),
                 // 908 advertises the mechanisms supported by the server. It
