@@ -4,6 +4,8 @@
 
 // Connection/Welcome replies
 pub const RPL_WELCOME: u16 = 1;
+/// ircu/IRCnet/Undernet: the server force-renamed us on a nick collision.
+pub const RPL_SAVENICK: u16 = 43;
 pub const RPL_YOURHOST: u16 = 2;
 pub const RPL_CREATED: u16 = 3;
 pub const RPL_MYINFO: u16 = 4;

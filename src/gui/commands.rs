@@ -3035,6 +3035,15 @@ mod tests {
     }
 
     #[test]
+    fn empty_nickname_is_rejected_by_the_connection_form() {
+        let mut app = IrcApp::with_settings(crate::gui::Settings::default());
+        app.nickname = "  ".into();
+        app.server_host = "irc.example".into();
+        app.server_port = "6697".into();
+        assert!(app.session_from_form().is_err());
+    }
+
+    #[test]
     fn server_arg_handles_ipv6() {
         assert_eq!(
             parse_server_arg("irc.libera.chat:6697"),

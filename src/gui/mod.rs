@@ -118,6 +118,31 @@ impl SessionConfig {
         format!("{scheme}://{}", self.endpoint_label().to_lowercase())
     }
 
+    /// The services identity this session authenticates as: the SASL
+    /// account, or the client certificate for EXTERNAL. Normalized so
+    /// cosmetic edits (case, whitespace, an Auto↔PLAIN mechanism spelling of
+    /// the same account, path separators) do not fork the connection
+    /// lineage (#172). Held-nick attribution does not carry across a change
+    /// of this key.
+    fn services_identity_key(&self) -> (Option<String>, Option<String>) {
+        match self.server.sasl_mechanism {
+            SaslMechanism::External => (
+                None,
+                self.server
+                    .tls_client_cert_path
+                    .as_deref()
+                    .map(|path| path.trim().to_ascii_lowercase()),
+            ),
+            _ => (
+                self.server
+                    .sasl_username
+                    .as_deref()
+                    .map(|account| account.trim().to_ascii_lowercase()),
+                None,
+            ),
+        }
+    }
+
     fn allows_legacy_log_migration(&self) -> bool {
         (self.server.use_tls && self.server.port == 6697)
             || (!self.server.use_tls && self.server.port == 6667)
@@ -939,8 +964,23 @@ impl IrcApp {
     /// server-accepted on this path (true for 001 and accepted NICK echoes;
     /// false for activation and 433 walkaways, where confirmation waits for
     /// this connection's own 001 — #169, recording derivation #171).
+    /// Drop held-nick attribution for the current lineage. Order-coupled:
+    /// nick_confirmed clears with the list, or set_session_nick's record
+    /// guard re-inserts the outgoing nick (#172).
+    fn clear_nick_lineage(&mut self) {
+        self.past_nicks.clear();
+        self.nick_confirmed = false;
+        self.refresh_self_nick_keys();
+    }
+
     fn set_session_nick(&mut self, nick: String, accepted: bool) {
+        // Re-applying the server-confirmed nick itself preserves its
+        // confirmation: a manual same-endpoint reconnect (which passes
+        // accepted=false — this connection's own 001 has not happened yet)
+        // must not lose held-nick attribution (#169/#170).
+        let preserved = self.nick_confirmed && self.identifiers_equal(&self.my_nick, &nick);
         if self.nick_confirmed
+            && !preserved
             && !self.my_nick.is_empty()
             && !self.identifiers_equal(&self.my_nick, &nick)
         {
@@ -955,7 +995,7 @@ impl IrcApp {
         }
         self.my_nick = nick;
         self.my_nick_lower = self.network_support.canonicalize(&self.my_nick);
-        self.nick_confirmed = accepted;
+        self.nick_confirmed = accepted || preserved;
         self.refresh_self_nick_keys();
     }
 
@@ -1995,9 +2035,7 @@ impl IrcApp {
         // (or nicks someone else held) as ours. reset_connection_support
         // runs first so the keys are rebuilt under the incoming mapping.
         self.reset_connection_support();
-        self.past_nicks.clear();
-        self.nick_confirmed = false;
-        self.refresh_self_nick_keys();
+        self.clear_nick_lineage();
     }
 
     /// Load a server favorite into the connection form
@@ -2239,6 +2277,9 @@ impl IrcApp {
     }
 
     fn session_from_form(&self) -> Result<SessionConfig, String> {
+        if self.nickname.trim().is_empty() {
+            return Err("Nickname cannot be empty".to_string());
+        }
         let mut host = self.server_host.trim();
         if let Some(inner) = host
             .strip_prefix('[')
@@ -2361,18 +2402,21 @@ impl IrcApp {
         // (fresh or speculative) is adopted unrecorded; a re-applied
         // confirmed nick stays confirmed (#170).
         let identity_changed = self.active_session.as_ref().is_some_and(|active| {
-            active.server.sasl_username != session.server.sasl_username
-                || active.server.sasl_mechanism != session.server.sasl_mechanism
-                || active.server.tls_client_cert_path != session.server.tls_client_cert_path
+            active.services_identity_key() != session.services_identity_key()
         });
         if !endpoint_changed && identity_changed {
             // The flag goes too: the outgoing nick was the other account's
             // holder, and leaving it confirmed would let the record below
-            // re-insert it (#171).
-            self.past_nicks.clear();
-            self.nick_confirmed = false;
-            self.refresh_self_nick_keys();
+            // re-insert it (#171). The outgoing session's away state belongs
+            // to its account, not the new one (#172).
+            self.clear_nick_lineage();
+            self.away_status = None;
+            self.auto_away_triggered = false;
         }
+        // A fresh connection gets a fresh 433 walkaway budget: one exhausted
+        // ladder must not brick every later reconnect to this endpoint
+        // (#172).
+        self.nick_retry_attempts = 0;
         let accepted =
             self.nick_confirmed && self.identifiers_equal(&session.server.nick, &self.my_nick);
         self.set_session_nick(session.server.nick.clone(), accepted);
@@ -3808,6 +3852,15 @@ impl IrcApp {
 
     fn handle_numeric(&mut self, num: u16, params: &[String]) {
         match num {
+            RPL_SAVENICK => {
+                // ircu/IRCnet/Undernet force a rename on nick collision; the
+                // granted nick is server-accepted and the outgoing one was
+                // ours, so both route through the choke point (#172).
+                if let Some(new_nick) = params.get(1) {
+                    self.set_session_nick(new_nick.clone(), true);
+                }
+            }
+
             RPL_WELCOME => {
                 self.connected = true;
                 self.connecting = false;
@@ -4141,7 +4194,16 @@ impl IrcApp {
                     return;
                 }
                 self.nick_retry_attempts = self.nick_retry_attempts.saturating_add(1);
-                let new_nick = format!("{}_", self.my_nick);
+                // Keep the suffixed retry within the server's NICKLEN when
+                // advertised: an over-limit retry would fail with
+                // ERR_ERRONEUSNICKNAME instead of walking away (#172).
+                let mut base = self.my_nick.clone();
+                if let Some(max) = self.network_support.nick_len {
+                    while base.chars().count() + 1 > max && !base.is_empty() {
+                        base.pop();
+                    }
+                }
+                let new_nick = format!("{base}_");
                 // The walkaway records the rejected nick only when it was
                 // confirmed in use on this lineage (an auto-reconnect that
                 // registered as a held nick before 433 hit): its replayed
@@ -7892,6 +7954,88 @@ mod tests {
         app.activate_session(other);
         assert!(app.past_nicks.is_empty());
         assert!(!app.sender_is_self("alice_"));
+    }
+
+    #[test]
+    fn same_endpoint_reactivation_resets_the_433_walkaway_budget() {
+        let mut app = test_app();
+        app.nickname = "alice".into();
+        app.server_host = "irc.example".into();
+        app.server_port = "6697".into();
+        app.use_tls = true;
+        let session = app.session_from_form().unwrap();
+        app.activate_session(session.clone());
+
+        // Exhaust the walkaway ladder.
+        for _ in 0..3 {
+            app.handle_numeric(
+                ERR_NICKNAMEINUSE,
+                &["me".into(), "alice".into(), "in use".into()],
+            );
+        }
+        app.fail_registration("Registration failed".into());
+
+        // Manual reconnect to the same endpoint: the fresh connection gets
+        // a fresh budget, so the FIRST 433 walks away again (#172).
+        app.activate_session(session);
+        assert_eq!(app.nick_retry_attempts, 0);
+        app.handle_numeric(
+            ERR_NICKNAMEINUSE,
+            &["me".into(), "alice".into(), "in use".into()],
+        );
+        assert_eq!(app.my_nick, "alice_");
+    }
+
+    #[test]
+    fn identity_change_clears_the_outgoing_sessions_away_state() {
+        let mut app = test_app();
+        app.nickname = "alice".into();
+        app.sasl_username = "acct".into();
+        app.sasl_password = "pw1".into();
+        app.server_host = "irc.example".into();
+        app.server_port = "6697".into();
+        app.use_tls = true;
+        let session = app.session_from_form().unwrap();
+        app.activate_session(session.clone());
+        app.away_status = Some("brb".into());
+        app.auto_away_triggered = true;
+
+        app.sasl_username = "other".into();
+        app.sasl_password = "pw2".into();
+        let other = app.session_from_form().unwrap();
+        app.activate_session(other);
+        assert!(
+            app.away_status.is_none(),
+            "#172: away state is account-scoped"
+        );
+        assert!(!app.auto_away_triggered);
+    }
+
+    #[test]
+    fn forced_nick_rename_routes_through_the_choke_point() {
+        let mut app = test_app();
+        app.set_session_nick("mine".into(), true);
+        // ircu/IRCnet 043: the server force-renamed us on a collision.
+        app.handle_numeric(RPL_SAVENICK, &["me".into(), "forced2".into()]);
+        assert_eq!(app.my_nick, "forced2");
+        assert!(app.nick_confirmed);
+        assert!(
+            app.sender_is_self("mine"),
+            "the forced-away nick stays ours"
+        );
+    }
+
+    #[test]
+    fn walkaway_suffix_respects_the_advertised_nick_len() {
+        let mut app = test_app();
+        app.set_session_nick("michael".into(), false);
+        app.network_support.nick_len = Some(5);
+        app.handle_numeric(
+            ERR_NICKNAMEINUSE,
+            &["me".into(), "michael".into(), "in use".into()],
+        );
+        assert_eq!(app.my_nick, "mich_");
+        assert!(app.my_nick.chars().count() <= 5);
     }
 
     #[test]
