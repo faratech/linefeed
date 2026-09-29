@@ -207,6 +207,32 @@ async fn wait_for_disconnect(
     }
 }
 
+/// Events the registration phase must react to while its reads are in
+/// flight.
+enum RegistrationEvent {
+    Disconnected,
+    /// A pre-001 NICK: registration state (the GUI's 433 walkaway retry),
+    /// which must be written through immediately rather than buffered until
+    /// 001 (#173).
+    Nick(String),
+}
+
+/// Registration-phase variant of wait_for_disconnect: a queued NICK surfaces
+/// as an event so the caller can write it through at once; everything else
+/// stays buffered in order.
+async fn wait_for_registration_events(
+    outgoing_rx: &mut mpsc::UnboundedReceiver<IrcCommand>,
+    pending: &mut VecDeque<IrcCommand>,
+) -> RegistrationEvent {
+    loop {
+        match outgoing_rx.recv().await {
+            Some(IrcCommand::Quit(_)) | None => return RegistrationEvent::Disconnected,
+            Some(IrcCommand::Nick(nick)) => return RegistrationEvent::Nick(nick),
+            Some(command) => pending.push_back(command),
+        }
+    }
+}
+
 /// Redact credentials from an outgoing line before it reaches the log output.
 /// PASS carries the server/bouncer password, AUTHENTICATE carries the base64
 /// SASL payload, and NickServ IDENTIFY/GHOST/REGAIN/RECOVER lines (from
@@ -939,19 +965,53 @@ impl IrcClient {
 
         // The deadline covers the complete registration state machine through
         // RPL_WELCOME, not merely writing NICK/USER. Dropping the GUI receiver
-        // cancels blocked writes and reads immediately as well.
-        tokio::select! {
-            biased;
-            _ = wait_for_disconnect(&mut outgoing_rx, &mut pending_commands) => {
-                return Err("Connection cancelled during registration".into());
+        // cancels blocked writes and reads immediately as well. A queued NICK
+        // is written through immediately: it is registration state (the GUI's
+        // 433 walkaway retry), and buffering it until 001 would strand the
+        // retry on conforming servers (#173). Pre-connect phases have no
+        // writer and buffer everything, so the queue is swept first.
+        let mut index = 0;
+        while index < pending_commands.len() {
+            if let IrcCommand::Nick(nick) = &pending_commands[index] {
+                let line = format!("NICK {nick}
+");
+                pending_commands.remove(index);
+                writer.write_all(line.as_bytes()).await?;
+                writer.flush().await?;
+            } else {
+                index += 1;
             }
-            result = self.register_with_deadline(
-                &mut writer,
-                &mut reader,
-                &incoming_tx,
-                REGISTRATION_TIMEOUT,
-            ) => result?,
         }
+        let registration = loop {
+            tokio::select! {
+                biased;
+                event = wait_for_registration_events(
+                    &mut outgoing_rx,
+                    &mut pending_commands,
+                ) => {
+                    match event {
+                        RegistrationEvent::Disconnected => {
+                            break Err("Connection cancelled during registration".into());
+                        }
+                        RegistrationEvent::Nick(nick) => {
+                            let line = format!("NICK {nick}
+");
+                            if let Err(e) = writer.write_all(line.as_bytes()).await {
+                                break Err(e.into());
+                            }
+                            writer.flush().await?;
+                        }
+                    }
+                }
+                result = self.register_with_deadline(
+                    &mut writer,
+                    &mut reader,
+                    &incoming_tx,
+                    REGISTRATION_TIMEOUT,
+                ) => break result,
+            }
+        };
+        registration?;
 
         // Create channel for sending
         let (send_tx, mut send_rx) = mpsc::channel::<String>(100);
@@ -2821,6 +2881,52 @@ mod tests {
                 .unwrap_err();
             assert!(error.contains("cancelled during registration"));
             server.abort();
+        });
+    }
+
+    #[test]
+    fn pre_registration_nick_is_written_through_immediately() {
+        test_runtime().block_on(async {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                let (read_half, mut write_half) = stream.into_split();
+                let mut reader = BufReader::new(read_half);
+                assert_eq!(read_wire_line(&mut reader).await, "NICK tester_");
+                assert_eq!(read_wire_line(&mut reader).await, "CAP LS 302");
+                assert_eq!(read_wire_line(&mut reader).await, "NICK tester");
+                assert!(read_wire_line(&mut reader).await.starts_with("USER "));
+                // The write-through NICK must arrive before 001, not after
+                // the registration buffer flushes (#173).
+                write_half
+                    .write_all(b":srv 001 tester :Welcome
+")
+                    .await
+                    .unwrap();
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            });
+
+            let config = ServerConfig {
+                host: "127.0.0.1".into(),
+                port: addr.port(),
+                use_tls: false,
+                nick: "tester".into(),
+                ..Default::default()
+            };
+            let (msg_tx, _msg_rx) = mpsc::channel(100);
+            let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+            // Queued before the connection starts: the registration event
+            // loop must write it through at once, not hold it until 001.
+            cmd_tx
+                .send(IrcCommand::Nick("tester_".to_string()))
+                .unwrap();
+            let mut client = IrcClient::new(config);
+            let client_task = tokio::spawn(async move {
+                let _ = client.connect(msg_tx, cmd_rx).await;
+            });
+            timeout(Duration::from_secs(2), server).await.unwrap().unwrap();
+            client_task.abort();
         });
     }
 
