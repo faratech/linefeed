@@ -2279,18 +2279,17 @@ impl IrcApp {
     }
 
     fn session_from_form(&self) -> Result<SessionConfig, String> {
-        if self.nickname.trim().is_empty() {
-            return Err("Nickname cannot be empty".to_string());
-        }
-        // Mirror connect()'s wire-value rule so the dialog rejects up front
-        // what the connection would deterministically fail on later (#177).
-        if self
-            .nickname
-            .bytes()
-            .any(|byte| matches!(byte, b'\r' | b'\n' | b'\0' | b' ' | b'@'))
-        {
-            return Err("Nickname must be free of spaces, @, CR, LF and NUL".to_string());
-        }
+        // Mirror connect()'s wire-value rules via the shared validator so the
+        // dialog rejects up front what the connection would fail on later
+        // (#180).
+        let nickname = self.nickname.trim();
+        crate::irc::client::IrcClient::validate_registration_fields(
+            nickname,
+            &self.username,
+            &self.realname,
+            &self.password,
+        )
+        .map_err(|error| format!("Nickname/identity: {error}"))?;
         let mut host = self.server_host.trim();
         if let Some(inner) = host
             .strip_prefix('[')

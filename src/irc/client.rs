@@ -691,8 +691,11 @@ impl IrcClient {
         if username.starts_with(':') {
             return Err("Username must not start with ':'".into());
         }
-        if username.bytes().any(|byte| byte == b' ') {
-            return Err("Username must be free of spaces".into());
+        if username
+            .bytes()
+            .any(|byte| matches!(byte, b' ' | b'\r' | b'\n' | b'\0'))
+        {
+            return Err("Username must be free of spaces, CR, LF and NUL".into());
         }
         for (field, value) in [("Realname", realname), ("Password", password)] {
             if value
@@ -1581,7 +1584,7 @@ impl IrcClient {
         // Step 6: If SASL was ACKed and we want it, do SASL authentication
         let (welcome_received, sasl_authenticated) =
             if want_sasl && acked_tokens.contains("sasl") && !sasl_mechanisms.is_empty() {
-                self.do_sasl_auth_inner(writer, reader, incoming_tx, nick_rx, &sasl_mechanisms)
+                self.do_sasl_auth_inner(writer, reader, incoming_tx, nick_rx, buf, &sasl_mechanisms)
                     .await?
             } else if want_sasl {
                 let message = if !sasl_available {
@@ -1664,13 +1667,13 @@ impl IrcClient {
         reader: &mut R,
         incoming_tx: &mpsc::Sender<IrcMessage>,
         nick_rx: &mut mpsc::UnboundedReceiver<String>,
+        buf: &mut Vec<u8>,
         mechanisms: &[SaslMechanism],
     ) -> Result<(bool, bool), Box<dyn std::error::Error + Send + Sync>>
     where
         W: tokio::io::AsyncWrite + Unpin,
         R: tokio::io::AsyncBufRead + Unpin,
     {
-        let mut buf = Vec::with_capacity(512);
         for mechanism in mechanisms {
             let name = mechanism.wire_name().expect("Auto is never attempted");
             let _ = incoming_tx.try_send(IrcMessage {
@@ -1683,7 +1686,7 @@ impl IrcClient {
                 raw: String::new(),
             });
             match self
-                .do_sasl_attempt(writer, reader, incoming_tx, nick_rx, &mut buf, *mechanism)
+                .do_sasl_attempt(writer, reader, incoming_tx, nick_rx, buf, *mechanism)
                 .await?
             {
                 SaslAttemptOutcome::Success => return Ok((false, true)),
@@ -1729,6 +1732,19 @@ impl IrcClient {
             SaslServerEvent::Challenge(challenge) if challenge == "+" => {}
             SaslServerEvent::Success => return Ok(SaslAttemptOutcome::Success),
             SaslServerEvent::Welcome => return Ok(SaslAttemptOutcome::Welcome),
+            SaslServerEvent::Challenge(_) => {
+                // A malformed/unexpected challenge leaves the server-side
+                // exchange live: abort it so the next mechanism does not
+                // inherit its state (#180).
+                writer
+                    .write_all(
+                        b"AUTHENTICATE *
+",
+                    )
+                    .await?;
+                writer.flush().await?;
+                return Ok(SaslAttemptOutcome::Failed);
+            }
             _ => return Ok(SaslAttemptOutcome::Failed),
         }
 
@@ -1850,6 +1866,10 @@ impl IrcClient {
                     )
                     .await?;
                 writer.flush().await?;
+                // Consume the server's abort acknowledgment so the next
+                // mechanism's read does not mistake the stale reply for its
+                // own (#180).
+                let _ = read_handshake_msg_timed(writer, reader, buf, incoming_tx, nick_rx).await?;
                 return Ok(SaslServerEvent::Failed);
             };
             match &msg.command {
@@ -2373,12 +2393,16 @@ mod tests {
                     .unwrap_err();
                 assert!(error.to_string().contains("ickname"), "{nick}: {error}");
             }
-            // Username/realname/password rules (#179).
+            // Username/realname/password rules (#179/#180): each row
+            // isolates one branch.
             for (username, realname, password) in [
                 ("us er", "", ""),
                 (":oper", "", ""),
-                ("", &"r".repeat(401), ""),
-                ("", "", "p\r\nOPER x y"),
+                ("a\rb", "", ""),
+                ("a\nb", "", ""),
+                ("a\0b", "", ""),
+                ("ok", &"r".repeat(401), ""),
+                ("ok", "", "p\r\nOPER x y"),
             ] {
                 let config = ServerConfig {
                     host: "127.0.0.1".into(),
