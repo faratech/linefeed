@@ -201,18 +201,12 @@ impl IrcApp {
                     let mut slap_parts = args.splitn(2, char::is_whitespace);
                     let target = slap_parts.next().unwrap_or("").trim();
                     let custom = slap_parts.next().map(str::trim).unwrap_or("");
-                    let (target, action_text) = if target.is_empty() {
-                        (
-                            "everyone".to_string(),
-                            "slaps everyone around a bit with a large trout".to_string(),
-                        )
+                    let action_text = if target.is_empty() {
+                        "slaps everyone around a bit with a large trout".to_string()
                     } else if custom.is_empty() {
-                        (
-                            target.to_string(),
-                            format!("slaps {target} around a bit with a large trout"),
-                        )
+                        format!("slaps {target} around a bit with a large trout")
                     } else {
-                        (target.to_string(), format!("slaps {target} {custom}"))
+                        format!("slaps {target} {custom}")
                     };
                     if self.connected {
                         if self.send_action_text(channel, &action_text) {
@@ -2878,7 +2872,9 @@ mod tests {
         let (mut app, mut rx) = connected_command_app();
         app.set_my_nick("me".into());
         app.current_channel = Some("#chan".into());
-        app.channels.insert("#chan".into(), Channel::new());
+        let mut channel = Channel::new();
+        channel.joined = true;
+        app.channels.insert("#chan".into(), channel);
 
         app.process_command("/slap alice with a frozen herring");
         assert!(matches!(
