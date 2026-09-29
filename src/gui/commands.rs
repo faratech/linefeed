@@ -2267,7 +2267,9 @@ pub(super) fn content_has_auth_command(message: &str) -> bool {
             | "ID"
             | "SIDENTIFY"
             | "AUTH"
+            | "AUTHENTICATE"
             | "LOGIN"
+            | "PASS"
             | "REGISTER"
             | "GHOST"
             | "REGAIN"
@@ -2359,15 +2361,25 @@ fn monitor_args(args: &str) -> (String, Option<String>) {
 
     let subcmd = first.to_uppercase();
     match subcmd.as_str() {
-        "+" | "-" | "C" | "L" | "S" => (subcmd, rest),
+        // The separated-sign form carries a nick list in `rest` too: it must
+        // reach the wire comma-separated (#163/#166).
+        "+" | "-" | "C" | "L" | "S" => {
+            let targets = rest
+                .map(|value| whitespace_to_commas(&value))
+                .filter(|value| !value.is_empty());
+            (subcmd, targets)
+        }
         _ => {
             if let Some(stripped) = first.strip_prefix(['+', '-']) {
                 let sign = first[..1].to_string();
                 let mut targets = stripped.to_string();
                 if let Some(more) = rest {
                     // "/monitor +a b" -> targets are comma-separated on the wire.
-                    targets.push(',');
-                    targets.push_str(&whitespace_to_commas(&more));
+                    let normalized = whitespace_to_commas(&more);
+                    if !normalized.is_empty() {
+                        targets.push(',');
+                        targets.push_str(&normalized);
+                    }
                 }
                 (sign, Some(targets))
             } else {
@@ -2475,6 +2487,12 @@ mod tests {
         assert_eq!(monitor_args("+a,b c"), ("+".into(), Some("a,b,c".into())));
         assert_eq!(monitor_args("L"), ("L".into(), None));
         assert_eq!(monitor_args("friend"), ("+".into(), Some("friend".into())));
+        // Separated-sign lists and whitespace-only tails (#166).
+        assert_eq!(
+            monitor_args("+ alice bob"),
+            ("+".into(), Some("alice,bob".into()))
+        );
+        assert_eq!(monitor_args("+a\t"), ("+".into(), Some("a".into())));
     }
 
     #[test]

@@ -922,9 +922,25 @@ impl IrcApp {
 
     fn set_my_nick(&mut self, nick: String) {
         if !self.my_nick.is_empty() && self.my_nick != nick {
-            self.past_nicks.insert(0, self.my_nick.clone());
-            self.past_nicks.truncate(8);
+            let already_held = self
+                .past_nicks
+                .iter()
+                .any(|held| self.identifiers_equal(held, &self.my_nick));
+            if !already_held {
+                self.past_nicks.insert(0, self.my_nick.clone());
+            }
+            self.past_nicks.truncate(32);
         }
+        self.my_nick = nick;
+        self.my_nick_lower = self.network_support.canonicalize(&self.my_nick);
+    }
+
+    /// Adopt a nick without recording the previous one as "held": the ERR_
+    /// NICKNAMEINUSE speculative retry pushes the *configured* nick that
+    /// someone else holds, and a new session (activate_session) starts from
+    /// the previous session's nick — neither was ever ours here (#166).
+    fn adopt_nick_unrecorded(&mut self, nick: String) {
+        self.past_nicks.clear();
         self.my_nick = nick;
         self.my_nick_lower = self.network_support.canonicalize(&self.my_nick);
     }
@@ -1511,7 +1527,7 @@ impl IrcApp {
     /// available to REDACT, reconnect history cursors, and MARKREAD.
     fn merge_server_echo(&mut self, target: &str, echoed: &ChatMessage) -> bool {
         if !self.enabled_caps.contains("echo-message")
-            || !self.identifiers_equal(&echoed.sender, &self.my_nick)
+            || !self.sender_is_self(&echoed.sender)
             || echoed.is_system
         {
             return false;
@@ -1714,11 +1730,13 @@ impl IrcApp {
                 if !self.sender_is_self(nick) {
                     return true;
                 }
-                // The confirmation for a credential command was redacted, so
-                // replaying it would re-display the secret; gated on the
-                // target actually being an auth service so e.g. a notice
-                // starting "REGISTER …" to a plain channel survives (#157).
-                if commands::service_message_contains_credentials(&routed_target, text) {
+                // A credential command's confirmation was redacted — locally,
+                // or via a multi-target send whose routed target here is not
+                // the service — so replaying the verbatim copy would
+                // re-display the secret. Keyword-only for self rows, matching
+                // the PRIVMSG branch (documented over-redaction; #166
+                // supersedes #157's service gate).
+                if commands::content_has_auth_command(text) {
                     return false;
                 }
                 !confirmations.iter().any(|(target, confirmed_text)| {
@@ -1937,6 +1955,10 @@ impl IrcApp {
         self.channel_list_loading = false;
         self.away_status = None;
         self.auto_away_triggered = false;
+        // A new session never shares a previous connection's nick history
+        // (#166): replay attribution must not treat the old network's nicks
+        // (or nicks someone else held) as ours.
+        self.past_nicks.clear();
         self.reset_connection_support();
     }
 
@@ -2286,7 +2308,9 @@ impl IrcApp {
             self.cmd_tx = None;
             self.reset_session_state();
         }
-        self.set_my_nick(session.server.nick.clone());
+        // Session start: the previous session's nick was never held here, so
+        // adopt without recording (#166).
+        self.adopt_nick_unrecorded(session.server.nick.clone());
         self.active_session = Some(session);
         self.pending_session = None;
         self.connection_error = None;
@@ -4040,7 +4064,10 @@ impl IrcApp {
                 }
                 self.nick_retry_attempts = self.nick_retry_attempts.saturating_add(1);
                 let new_nick = format!("{}_", self.my_nick);
-                self.set_my_nick(new_nick.clone());
+                // The rejected nick was never held on this connection (it is
+                // the configured nick someone else is using) — adopting the
+                // suffixed nick must not record it as ours (#166).
+                self.adopt_nick_unrecorded(new_nick.clone());
                 if let Some(tx) = &self.cmd_tx {
                     let _ = tx.send(IrcCommand::Nick(new_nick));
                 }
@@ -4689,7 +4716,10 @@ impl IrcApp {
         // covers ordinary query input, /say, service shortcuts, server echo-
         // message, and future command paths that might otherwise forget to use
         // outgoing_local_echo().
-        if self.identifiers_equal(&msg.sender, &self.my_nick)
+        // sender_is_self (not just the current nick): a bouncer replaying our
+        // own credential row under a former nick must still be redacted and
+        // excluded from the disk log (#166).
+        if self.sender_is_self(&msg.sender)
             && commands::service_message_contains_credentials(&key, &msg.content)
         {
             msg.content = "<credential command sent>".to_string();
@@ -5131,7 +5161,10 @@ impl IrcApp {
     /// still false; #161).
     fn report_send_failure(&mut self, sent: bool, message: &str) {
         if !sent && self.cmd_tx.is_none() {
-            self.add_message_to_current(ChatMessage::system(message));
+            // without_logging: connection-scope client state does not belong
+            // in a channel's on-disk history, which add_message_to_channel
+            // would otherwise write (#166).
+            self.add_message_to_current(ChatMessage::system(message).without_logging());
         }
     }
 
@@ -7429,7 +7462,7 @@ mod tests {
     }
 
     #[test]
-    fn own_notice_to_plain_channel_is_never_dropped_from_replay() {
+    fn own_notice_starting_with_an_auth_keyword_is_dropped_from_replay() {
         let (mut app, _rx) = test_app_connected();
         app.set_my_nick("me".into());
         app.handle_cap_message("ACK", &["echo-message".into()]);
@@ -7438,21 +7471,98 @@ mod tests {
         app.channels.insert("#chan".to_string(), channel);
         app.current_channel = Some("#chan".to_string());
 
-        // Auth-keyword text to a NON-service target, sent from another
-        // device (no confirmation exists here): the replay must survive.
+        // Multi-target credential notices (e.g. "/notice NickServ,#chan
+        // IDENTIFY pw") replay into a batch whose routed target is not the
+        // service: own rows with auth-keyword text are dropped keyword-only,
+        // mirroring the PRIVMSG branch (documented over-redaction; #166
+        // supersedes #157's service gate).
         app.handle_incoming_message(IrcMessage::parse(":srv BATCH +r chathistory #chan").unwrap());
         app.handle_incoming_message(
-            IrcMessage::parse("@batch=r;msgid=n5 :me!u@h NOTICE #chan :REGISTER early to vote")
+            IrcMessage::parse("@batch=r;msgid=n5 :me!u@h NOTICE #chan :IDENTIFY hunter15").unwrap(),
+        );
+        // Non-auth own notices survive.
+        app.handle_incoming_message(
+            IrcMessage::parse("@batch=r;msgid=n6 :me!u@h NOTICE #chan :see you at the vote")
                 .unwrap(),
         );
         app.handle_incoming_message(IrcMessage::parse(":srv BATCH -r").unwrap());
 
-        let hits = app.channels["#chan"]
+        let rows: Vec<&str> = app.channels["#chan"]
             .messages
             .iter()
-            .filter(|message| message.content.contains("REGISTER early"))
-            .count();
-        assert_eq!(hits, 1, "plain-channel own notices must not be dropped");
+            .map(|message| message.content.as_str())
+            .collect();
+        assert!(
+            rows.iter().all(|content| !content.contains("hunter15")),
+            "{rows:?}"
+        );
+        assert!(
+            rows.iter().any(|content| content.contains("see you at the vote")),
+            "{rows:?}"
+        );
+    }
+
+    #[test]
+    fn nick_in_use_retry_does_not_record_the_configured_nick() {
+        let mut app = test_app();
+        app.set_my_nick("alice".into());
+        app.handle_numeric(ERR_NICKNAMEINUSE, &["me".into(), "alice".into(), "in use".into()]);
+        assert_eq!(app.my_nick, "alice_");
+        assert!(
+            !app.past_nicks.iter().any(|held| held == "alice"),
+            "the in-use nick is held by someone else and must not count as ours"
+        );
+    }
+
+    #[test]
+    fn session_reset_clears_past_nicks() {
+        let mut app = test_app();
+        app.set_my_nick("alice".into());
+        app.set_my_nick("bob".into());
+        assert!(!app.past_nicks.is_empty());
+        app.reset_session_state();
+        assert!(app.past_nicks.is_empty());
+    }
+
+    #[test]
+    fn pass_and_authenticate_are_credential_commands() {
+        assert!(commands::service_message_contains_credentials("NickServ", "PASS hunter2"));
+        assert!(commands::service_message_contains_credentials("NickServ", "AUTHENTICATE <b64>"));
+        assert!(commands::command_line_contains_credentials("/ns PASS hunter2"));
+    }
+
+    #[test]
+    fn send_failure_rows_are_not_persisted_to_logs() {
+        let mut app = IrcApp::with_settings(crate::gui::Settings::default());
+        app.current_channel = Some("#chan".into());
+        app.channels.insert("#chan".into(), Channel::new());
+        app.report_send_failure(false, "Not connected - away status not changed");
+        assert!(
+            app.channels["#chan"]
+                .messages
+                .iter()
+                .all(|message| message.no_log)
+        );
+    }
+
+    #[test]
+    fn live_credential_redaction_recovers_former_nicks() {
+        let (mut app, _rx) = test_app_connected();
+        app.set_my_nick("Guest123".into());
+        app.set_my_nick("alice".into());
+        app.add_message_to_channel(
+            "NickServ",
+            ChatMessage::new_fmt("Guest123", "IDENTIFY hunter16", "short"),
+        );
+        let query = &app.channels["NickServ"];
+        assert!(
+            query
+                .messages
+                .iter()
+                .all(|message| !message.content.contains("hunter16")),
+            "former-nick credential rows must be redacted on the live path"
+        );
+        assert!(query.messages.iter().any(|message| message.no_log));
     }
 
     #[test]

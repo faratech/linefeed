@@ -1316,10 +1316,10 @@ impl IrcApp {
                     ch.mode_lists_complete.clear();
                 }
             } else {
-                self.add_server_message(super::types::ChatMessage::system_fmt(
+                self.report_send_failure(
+                    modes_sent && lists_sent,
                     "Not connected - channel information was not refreshed",
-                    &self.timestamp_format,
-                ));
+                );
             }
         }
         if close {
