@@ -1316,8 +1316,11 @@ impl IrcApp {
                     ch.mode_lists_complete.clear();
                 }
             } else {
+                // Always reports (the guard above already filtered the
+                // success case); report_send_failure's channel check
+                // decides whether the row is needed.
                 self.report_send_failure(
-                    modes_sent && lists_sent,
+                    false,
                     "Not connected - channel information was not refreshed",
                 );
             }

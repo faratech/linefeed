@@ -103,10 +103,10 @@ impl IrcApp {
                             );
                             self.add_message_to_channel(target, chat_msg);
                         } else {
-                            self.add_message_to_current(ChatMessage::system_fmt(
-                                "Message not sent",
-                                &self.timestamp_format,
-                            ));
+                            self.add_message_to_current(
+                    ChatMessage::system_fmt("Message not sent", &self.timestamp_format)
+                        .without_logging(),
+                );
                         }
                     } else {
                         self.add_message_to_current(ChatMessage::system_fmt(
@@ -152,10 +152,10 @@ impl IrcApp {
                                 );
                                 self.add_message_to_channel(target, chat_msg);
                             } else {
-                                self.add_message_to_current(ChatMessage::system_fmt(
-                                    "Message not sent",
-                                    &self.timestamp_format,
-                                ));
+                                self.add_message_to_current(
+                    ChatMessage::system_fmt("Message not sent", &self.timestamp_format)
+                        .without_logging(),
+                );
                             }
                         } else {
                             self.add_message_to_current(ChatMessage::system_fmt(
@@ -180,10 +180,10 @@ impl IrcApp {
                             );
                             self.add_message_to_channel(channel, msg);
                         } else {
-                            self.add_message_to_current(ChatMessage::system_fmt(
-                                "Action not sent",
-                                &self.timestamp_format,
-                            ));
+                            self.add_message_to_current(
+                    ChatMessage::system_fmt("Action not sent", &self.timestamp_format)
+                        .without_logging(),
+                );
                         }
                     } else {
                         self.add_message_to_current(ChatMessage::system_fmt(
@@ -217,10 +217,10 @@ impl IrcApp {
                             );
                             self.add_message_to_channel(channel, msg);
                         } else {
-                            self.add_message_to_current(ChatMessage::system_fmt(
-                                "Action not sent",
-                                &self.timestamp_format,
-                            ));
+                            self.add_message_to_current(
+                    ChatMessage::system_fmt("Action not sent", &self.timestamp_format)
+                        .without_logging(),
+                );
                         }
                     } else {
                         self.add_message_to_current(ChatMessage::system_fmt(
@@ -861,21 +861,7 @@ impl IrcApp {
 
             "WHOIS" => {
                 if !args.is_empty() {
-                    // A single nick is queried twice (`WHOIS nick nick`): the
-                    // reply then comes from the user's own server, which is
-                    // what reveals the real host behind a cloak plus idle/
-                    // signon time — a one-parameter WHOIS is answered by the
-                    // local server and omits both (#164). Explicit
-                    // separators (a manual double target, a comma list, or a
-                    // mask) pass through unchanged.
-                    let target = if args.split_whitespace().count() == 1
-                        && !args.contains([',', '*', '?'])
-                    {
-                        format!("{args} {args}")
-                    } else {
-                        args.to_string()
-                    };
-                    self.send_command(IrcCommand::Whois(target));
+                    self.send_command(IrcCommand::Whois(whois_query_target(args)));
                 } else {
                     self.add_message_to_current(ChatMessage::system("Usage: /whois <nick>"));
                 }
@@ -1231,10 +1217,10 @@ impl IrcApp {
                                 };
                             self.add_message_to_current(confirmation);
                         } else {
-                            self.add_message_to_current(ChatMessage::system_fmt(
-                                "Notice not sent",
-                                &self.timestamp_format,
-                            ));
+                            self.add_message_to_current(
+                    ChatMessage::system_fmt("Notice not sent", &self.timestamp_format)
+                        .without_logging(),
+                );
                         }
                     } else {
                         self.add_message_to_current(ChatMessage::system_fmt(
@@ -1264,10 +1250,10 @@ impl IrcApp {
                                     &self.timestamp_format,
                                 ));
                             } else {
-                                self.add_message_to_current(ChatMessage::system_fmt(
-                                    "Notice not sent",
-                                    &self.timestamp_format,
-                                ));
+                                self.add_message_to_current(
+                    ChatMessage::system_fmt("Notice not sent", &self.timestamp_format)
+                        .without_logging(),
+                );
                             }
                         } else {
                             self.add_message_to_current(ChatMessage::system_fmt(
@@ -1362,10 +1348,10 @@ impl IrcApp {
                                 ChatMessage::new_fmt(&self.my_nick, args, &self.timestamp_format);
                             self.add_message_to_channel(channel, msg);
                         } else {
-                            self.add_message_to_current(ChatMessage::system_fmt(
-                                "Message not sent",
-                                &self.timestamp_format,
-                            ));
+                            self.add_message_to_current(
+                    ChatMessage::system_fmt("Message not sent", &self.timestamp_format)
+                        .without_logging(),
+                );
                         }
                     } else {
                         self.add_message_to_current(ChatMessage::system_fmt(
@@ -1390,10 +1376,10 @@ impl IrcApp {
                             );
                             self.add_message_to_channel(target, msg);
                         } else {
-                            self.add_message_to_current(ChatMessage::system_fmt(
-                                "Action not sent",
-                                &self.timestamp_format,
-                            ));
+                            self.add_message_to_current(
+                    ChatMessage::system_fmt("Action not sent", &self.timestamp_format)
+                        .without_logging(),
+                );
                         }
                     } else {
                         self.add_message_to_current(ChatMessage::system_fmt(
@@ -2001,10 +1987,10 @@ impl IrcApp {
                     outgoing_local_echo(service, &self.my_nick, args, &self.timestamp_format),
                 );
             } else {
-                self.add_message_to_current(ChatMessage::system_fmt(
-                    "Message not sent",
-                    &self.timestamp_format,
-                ));
+                self.add_message_to_current(
+                    ChatMessage::system_fmt("Message not sent", &self.timestamp_format)
+                        .without_logging(),
+                );
             }
         } else {
             self.add_message_to_current(ChatMessage::system_fmt(
@@ -2261,6 +2247,11 @@ fn is_auth_service_target(raw_target: &str) -> bool {
 pub(super) fn content_has_auth_command(message: &str) -> bool {
     let mut words = message.trim_start_matches(':').split_whitespace();
     let command = words.next().unwrap_or("").to_ascii_uppercase();
+    // NOTE: keywords here also gate replay-row drops and log suppression for
+    // peers on service-shaped nick aliases (q, x, ns, cs…) — bare PASS can
+    // over-redact an ordinary "Pass me the file" from such a peer, but the
+    // invariant is over-redaction (a leaked password cannot be recalled;
+    // #167 weighed both and kept PASS).
     if matches!(
         command.as_str(),
         "IDENTIFY"
@@ -2353,33 +2344,44 @@ fn whitespace_to_commas(value: &str) -> String {
     value.split_whitespace().collect::<Vec<_>>().join(",")
 }
 
+/// The wire target for a /whois query: a single nick is doubled so the reply
+/// comes from the user's own server (real host behind a cloak, idle/signon —
+/// #164). Separator-carrying input passes through unchanged: a manual double
+/// target, a comma list, or a nick/mask with wildcards or !/@ — doubling a
+/// mask makes solanum-family ircds parse the first parameter as a routing
+/// target and fail with ERR_NOSUCHSERVER (#167).
+pub(super) fn whois_query_target(args: &str) -> String {
+    let single = args.split_whitespace().count() == 1
+        && !args.contains([',', '*', '?', '!', '@']);
+    if single {
+        format!("{args} {args}")
+    } else {
+        args.to_string()
+    }
+}
+
 fn monitor_args(args: &str) -> (String, Option<String>) {
     // Whitespace separator: see process_command's command-token split (#159).
     let parts: Vec<&str> = args.splitn(2, char::is_whitespace).collect();
     let first = parts[0];
-    let rest = parts.get(1).map(|s| s.to_string());
+    let rest = parts
+        .get(1)
+        .map(|s| whitespace_to_commas(s))
+        .filter(|value| !value.is_empty());
 
     let subcmd = first.to_uppercase();
     match subcmd.as_str() {
         // The separated-sign form carries a nick list in `rest` too: it must
         // reach the wire comma-separated (#163/#166).
-        "+" | "-" | "C" | "L" | "S" => {
-            let targets = rest
-                .map(|value| whitespace_to_commas(&value))
-                .filter(|value| !value.is_empty());
-            (subcmd, targets)
-        }
+        "+" | "-" | "C" | "L" | "S" => (subcmd, rest),
         _ => {
             if let Some(stripped) = first.strip_prefix(['+', '-']) {
                 let sign = first[..1].to_string();
                 let mut targets = stripped.to_string();
                 if let Some(more) = rest {
                     // "/monitor +a b" -> targets are comma-separated on the wire.
-                    let normalized = whitespace_to_commas(&more);
-                    if !normalized.is_empty() {
-                        targets.push(',');
-                        targets.push_str(&normalized);
-                    }
+                    targets.push(',');
+                    targets.push_str(&more);
                 }
                 (sign, Some(targets))
             } else {
@@ -2883,6 +2885,10 @@ mod tests {
         assert!(matches!(rx.try_recv(), Ok(IrcCommand::Whois(t)) if t == "alice bob"));
         app.process_command("/whois *lur*");
         assert!(matches!(rx.try_recv(), Ok(IrcCommand::Whois(t)) if t == "*lur*"));
+        // A hostmask must not be doubled: solanum-family ircds parse the
+        // first parameter as a routing target and fail (#167).
+        app.process_command("/whois bob!user@host");
+        assert!(matches!(rx.try_recv(), Ok(IrcCommand::Whois(t)) if t == "bob!user@host"));
     }
 
     #[test]

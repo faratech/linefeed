@@ -457,6 +457,9 @@ pub struct IrcApp {
     /// rows replayed under a former nick — e.g. a credential command sent
     /// before a GHOST/REGAIN — must still be recognized as ours (#163).
     past_nicks: Vec<String>,
+    /// Canonicalized keys of my_nick + past_nicks, maintained on nick change
+    /// and CASEMAPPING refresh so sender_is_self is allocation-free per row.
+    self_nick_keys: Vec<String>,
 }
 
 impl Default for IrcApp {
@@ -475,6 +478,7 @@ impl IrcApp {
         };
         let network_support = NetworkSupport::default();
         let my_nick_lower = network_support.canonicalize(&nickname);
+        let self_nick_keys = vec![my_nick_lower.clone()];
 
         Self {
             connected: false,
@@ -651,6 +655,7 @@ impl IrcApp {
             last_notification_time: None,
             nick_retry_attempts: 0,
             past_nicks: Vec::new(),
+            self_nick_keys,
         }
     }
 
@@ -933,28 +938,46 @@ impl IrcApp {
         }
         self.my_nick = nick;
         self.my_nick_lower = self.network_support.canonicalize(&self.my_nick);
+        self.refresh_self_nick_keys();
     }
 
     /// Adopt a nick without recording the previous one as "held": the ERR_
     /// NICKNAMEINUSE speculative retry pushes the *configured* nick that
-    /// someone else holds, and a new session (activate_session) starts from
-    /// the previous session's nick — neither was ever ours here (#166).
+    /// someone else holds, a new session (activate_session) starts from the
+    /// previous session's nick, and RPL_WELCOME may report a rewritten or
+    /// truncated form of the nick we asked for — none of those were ever
+    /// held on this connection, so none may count as ours (#167). Held-nick
+    /// history itself must survive: a manual reconnect to the same endpoint
+    /// replays rows sent under earlier nicks.
     fn adopt_nick_unrecorded(&mut self, nick: String) {
-        self.past_nicks.clear();
         self.my_nick = nick;
         self.my_nick_lower = self.network_support.canonicalize(&self.my_nick);
+        self.refresh_self_nick_keys();
+    }
+
+    /// Canonicalized keys for every nick our own rows may carry (current
+    /// plus held), so sender_is_self does no per-row allocation (#167).
+    fn refresh_self_nick_keys(&mut self) {
+        let mut keys = Vec::with_capacity(self.past_nicks.len() + 1);
+        keys.push(self.network_support.canonicalize(&self.my_nick));
+        for held in &self.past_nicks {
+            let key = self.network_support.canonicalize(held);
+            if !keys.contains(&key) {
+                keys.push(key);
+            }
+        }
+        self.self_nick_keys = keys;
     }
 
     /// Whether a replayed row's sender is us — current or a nick we held
     /// earlier this session (#163).
     fn sender_is_self(&self, nick: &str) -> bool {
-        self.identifiers_equal(nick, &self.my_nick)
-            || self
-                .past_nicks
-                .iter()
-                .any(|held| self.identifiers_equal(nick, held))
+        let key = self.network_support.canonicalize(nick);
+        self.self_nick_keys.contains(&key)
     }
 
+    /// Whether a replayed row's sender is us — current or a nick we held
+    /// earlier this session (#163).
     pub fn is_channel_name(&self, name: &str) -> bool {
         self.network_support.is_channel(name)
     }
@@ -1095,6 +1118,7 @@ impl IrcApp {
             channel.set_case_mapping(mapping);
         }
         self.my_nick_lower = self.network_support.canonicalize(&self.my_nick);
+        self.refresh_self_nick_keys();
         self.update_cached_lowercase();
 
         // Pending JOIN keys are internal lookup state, so normalize them rather
@@ -1959,6 +1983,7 @@ impl IrcApp {
         // (#166): replay attribution must not treat the old network's nicks
         // (or nicks someone else held) as ours.
         self.past_nicks.clear();
+        self.refresh_self_nick_keys();
         self.reset_connection_support();
     }
 
@@ -2562,8 +2587,9 @@ impl IrcApp {
                 );
 
                 // Send desktop notification for highlights and PMs
-                // Skip if we sent it ourselves
-                let is_from_self = self.identifiers_equal(&sender, &self.my_nick);
+                // Skip if we sent it ourselves (including under a former
+                // nick — a services nick-change can race the echo, #167).
+                let is_from_self = self.sender_is_self(&sender);
                 if is_pm && !is_from_self {
                     // PMs always notify (force=true)
                     self.send_notification(
@@ -2598,7 +2624,7 @@ impl IrcApp {
                 // reach the queue branch just like the PRIVMSG arm's do.
                 if history_batch.is_none()
                     && self.enabled_caps.contains("echo-message")
-                    && self.identifiers_equal(&sender, &self.my_nick)
+                    && self.sender_is_self(&sender)
                 {
                     return;
                 }
@@ -3744,7 +3770,10 @@ impl IrcApp {
                 // Clear any lag reading left over from a previous connection.
                 self.lag_ms = None;
                 if let Some(nick) = params.first() {
-                    self.set_my_nick(nick.clone());
+                    // 001 may report a rewritten/truncated form of the nick we
+                    // asked for; the pre-registration nick was never held, so
+                    // adopt without recording (#167).
+                    self.adopt_nick_unrecorded(nick.clone());
                 }
                 let msg = params
                     .get(1)
@@ -5177,17 +5206,20 @@ impl IrcApp {
             .max(IRC_MAX_LINE_BYTES);
         if !Self::command_fits_limits(&cmd, base_limit) {
             tracing::warn!("Outgoing command not sent (line too long): {:?}", cmd);
-            self.add_message_to_current(ChatMessage::system_fmt(
-                "Command not sent - IRC line is too long",
-                &self.timestamp_format,
-            ));
+            self.add_message_to_current(
+                ChatMessage::system_fmt("Command not sent - IRC line is too long", &self.timestamp_format)
+                    .without_logging(),
+            );
             return false;
         }
         if let Some(tag) = self.client_tag_is_denied(&cmd) {
-            self.add_message_to_current(ChatMessage::system_fmt(
-                &format!("Command not sent - server blocks client tag +{tag}"),
-                &self.timestamp_format,
-            ));
+            self.add_message_to_current(
+                ChatMessage::system_fmt(
+                    &format!("Command not sent - server blocks client tag +{tag}"),
+                    &self.timestamp_format,
+                )
+                .without_logging(),
+            );
             return false;
         }
         if let Some(tx) = &self.cmd_tx {
@@ -6275,7 +6307,7 @@ impl eframe::App for IrcApp {
         if let Some(nick) = whois_nick {
             // Double target: the reply comes from the user's own server,
             // revealing the real host behind a cloak plus idle/signon (#164).
-            self.send_command(IrcCommand::Whois(format!("{nick} {nick}")));
+            self.send_command(IrcCommand::Whois(commands::whois_query_target(&nick)));
         }
         if let Some((channel, nick)) = op_nick {
             self.send_command(IrcCommand::Mode(
