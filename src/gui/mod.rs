@@ -4286,16 +4286,17 @@ impl IrcApp {
             }
 
             RPL_WHOSPCRPL => {
-                // Our request is `%tcuhnafr,<token>`:
-                // token, channel, user, host, nick, flags, account, realname.
+                // Our request is `%tcuhnafr,<token>`: WHOX returns the fields
+                // in the order requested, so after the token:
+                // token, channel, user, host, nick, account, flags, realname.
                 if let (
                     Some(token),
                     Some(_channel),
                     Some(user),
                     Some(host),
                     Some(nick),
-                    Some(flags),
                     Some(account),
+                    Some(flags),
                 ) = (
                     params.get(1),
                     params.get(2),
@@ -7089,6 +7090,57 @@ mod tests {
 
         drop(app);
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn whox_fields_follow_the_requested_column_order() {
+        let mut app = test_app();
+        app.set_my_nick("me".into());
+        let mut channel = Channel::new();
+        channel.add_user("alice", UserMode::Normal);
+        channel.add_user("bob", UserMode::Normal);
+        app.channels.insert("#chan".to_string(), channel);
+        app.pending_whox.insert("7".to_string(), "#chan".to_string());
+
+        // Request is %tcuhnafr -> token, channel, user, host, nick,
+        // account, flags, realname (WHOX returns fields in query order).
+        app.handle_numeric(
+            RPL_WHOSPCRPL,
+            &[
+                "me".into(),
+                "7".into(),
+                "#chan".into(),
+                "u".into(),
+                "h".into(),
+                "alice".into(),
+                "acc".into(),
+                "G".into(),
+                "Alice Real".into(),
+            ],
+        );
+        let alice = app.channels["#chan"].get_user("alice").unwrap();
+        assert_eq!(alice.account.as_deref(), Some("acc"));
+        assert!(alice.is_away(), "flags column G must mark away");
+        assert_eq!(alice.realname.as_deref(), Some("Alice Real"));
+
+        // Logged-out user: account "0" maps to None, here-flags to present.
+        app.handle_numeric(
+            RPL_WHOSPCRPL,
+            &[
+                "me".into(),
+                "7".into(),
+                "#chan".into(),
+                "u".into(),
+                "h".into(),
+                "bob".into(),
+                "0".into(),
+                "H@".into(),
+                "Bob".into(),
+            ],
+        );
+        let bob = app.channels["#chan"].get_user("bob").unwrap();
+        assert_eq!(bob.account.as_deref(), None);
+        assert!(!bob.is_away());
     }
 
     #[test]
