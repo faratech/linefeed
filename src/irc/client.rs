@@ -1515,9 +1515,6 @@ impl IrcClient {
 
         // Step 5: Wait for CAP ACK/NAK
         let mut acked_caps = String::new();
-        // Set when the server's 001 races the CAP negotiation: the tail then
-        // skips CAP END and PERSISTENCE (#182).
-        let mut welcome_raced = false;
         let mut rejected_caps = Vec::new();
         let mut pending_caps: std::collections::HashSet<String> =
             caps_to_request.iter().map(|cap| cap.to_string()).collect();
@@ -1544,12 +1541,24 @@ impl IrcClient {
                 if config.sasl_required {
                     return Err("Server completed registration without required SASL".into());
                 }
-                // Registration already completed: fall through to the shared
-                // tail with welcome_raced set, so CAP END and PERSISTENCE
-                // are skipped post-001 while the pre-away AWAY and the caps
-                // notice still run (#182).
-                welcome_raced = true;
-                break;
+                // Registration already completed: return at once (the
+                // pre-001 state is exactly what the whole registration
+                // machine above expects). SASL was left unattempted — say so
+                // rather than failing silently (#182).
+                if want_sasl {
+                    let _ = incoming_tx.try_send(IrcMessage {
+                        tags: None,
+                        prefix: None,
+                        command: IrcCommand::Notice(
+                            "*".to_string(),
+                            "SASL skipped: registration completed before SASL \
+                             negotiation finished"
+                                .to_string(),
+                        ),
+                        raw: String::new(),
+                    });
+                }
+                return Ok(true);
             }
 
             if let IrcCommand::Cap(_target, subcmd, rest) = &msg.command {
@@ -1622,15 +1631,9 @@ impl IrcClient {
                 (false, false)
             };
 
-        if config.sasl_required && !sasl_authenticated && !welcome_raced {
+        if config.sasl_required && !sasl_authenticated {
             return Err("Required SASL authentication did not succeed".into());
         }
-        // A raced Welcome means the server registered us mid-CAP: the SASL
-        // outcome is unknown-to-irrelevant for CAP END gating, and PERSISTENCE
-        // (which needs the confirmed SASL account) is skipped below either way
-        // (#182).
-        let welcome_received = welcome_received || welcome_raced;
-
         // Registration tail, unified for both exits: the capability notice
         // and the pre-away AWAY always run (AWAY is an ordinary command and
         // stays valid post-001); PERSISTENCE needs the SASL account
@@ -1654,11 +1657,7 @@ impl IrcClient {
                 raw: String::new(),
             });
         }
-        let skip_reason = if welcome_raced {
-            "registration completed before SASL negotiation finished"
-        } else {
-            "SASL authentication required"
-        };
+        let skip_reason = "SASL authentication required";
         if acked_tokens.contains("draft/persistence")
             && let Some(profile) = config
                 .persistence_profile
@@ -3018,7 +3017,7 @@ mod tests {
     }
 
     #[test]
-    fn raced_welcome_in_ack_loop_skips_persistence_and_cap_end() {
+    fn raced_welcome_in_ack_loop_returns_immediately() {
         test_runtime().block_on(async {
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let addr = listener.local_addr().unwrap();
@@ -3029,41 +3028,26 @@ mod tests {
                 assert_eq!(read_wire_line(&mut reader).await, "CAP LS 302");
                 assert_eq!(read_wire_line(&mut reader).await, "NICK tester");
                 assert!(read_wire_line(&mut reader).await.starts_with("USER "));
-                // Advertise the two caps the test exercises, then grant them.
+                // Advertise sasl, then race 001 ahead of the CAP ACK: the
+                // Welcome arm must return at once — no CAP END, no post-001
+                // writes (#182).
                 write_half
                     .write_all(
-                        b":srv CAP * LS :draft/pre-away draft/persistence
+                        b":srv CAP * LS :sasl
 ",
                     )
                     .await
                     .unwrap();
-                // The full request is split across several CAP REQ lines:
-                // skip ahead to the one carrying the two caps the ACK below
-                // grants.
-                loop {
-                    let line = read_wire_line(&mut reader).await;
-                    eprintln!("server: saw {line}");
-                    if line == "CAP REQ :draft/pre-away draft/persistence" {
-                        break;
-                    }
-                }
-                eprintln!("server: saw CAP REQ");
-                // Race 001 ahead of the CAP ACK for sasl: registration
-                // completes mid-CAP (#182 tail policy).
+                assert_eq!(read_wire_line(&mut reader).await, "CAP REQ :sasl");
                 write_half
                     .write_all(
-                        b":srv CAP * ACK :draft/pre-away draft/persistence\r\n\
-                          :srv 001 tester :Welcome\r\n",
+                        b":srv 001 tester :Welcome
+",
                     )
                     .await
                     .unwrap();
-                // The pre-away AWAY is honored post-001; no PERSISTENCE
-                // ATTACH (SASL never authenticated) and no CAP END.
-                eprintln!("server: awaiting AWAY");
-                assert_eq!(read_wire_line(&mut reader).await, "AWAY :syncing");
-                eprintln!("server: saw AWAY");
                 write_half
-                    .write_all(b":srv 001 tester :Welcome again\r\n")
+                    .write_all(b":srv 001 tester :Welcome\r\n")
                     .await
                     .unwrap();
                 tokio::time::sleep(Duration::from_millis(100)).await;
@@ -3074,18 +3058,32 @@ mod tests {
                 port: addr.port(),
                 use_tls: false,
                 nick: "tester".into(),
-                pre_away_message: Some("syncing".into()),
-                persistence_profile: Some("mobile".into()),
+                sasl_username: Some("u".into()),
+                sasl_password: Some("p".into()),
                 ..Default::default()
             };
-            let (msg_tx, _msg_rx) = mpsc::channel(100);
+            let (msg_tx, mut msg_rx) = mpsc::channel(100);
             let (_cmd_tx, cmd_rx) = mpsc::unbounded_channel();
             let mut client = IrcClient::new(config);
             timeout(Duration::from_secs(2), client.connect(msg_tx, cmd_rx))
                 .await
                 .expect("registration timed out")
                 .unwrap();
-            server.abort();
+            server.await.unwrap();
+            // The only SASL signal is the skip notice; nothing else was sent
+            // post-001.
+            let notices: Vec<String> = std::iter::from_fn(|| msg_rx.try_recv().ok())
+                .filter_map(|message| match message.command {
+                    IrcCommand::Notice(_, content) => Some(content),
+                    _ => None,
+                })
+                .collect();
+            assert!(
+                notices
+                    .iter()
+                    .any(|content| content.contains("SASL skipped")),
+                "notices: {notices:?}"
+            );
         });
     }
 
