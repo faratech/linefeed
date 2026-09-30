@@ -9,7 +9,7 @@ repository = "https://github.com/faratech/linefeed"
 
 [dependencies]
 # GUI (no default_fonts - we load custom fonts)
-egui = "0.36.1"
+egui = "0.36.2"
 
 # Async runtime (minimal features for lower memory)
 tokio = { version = "1.53.1", features = ["rt", "net", "io-util", "sync", "time", "macros"] }
@@ -23,9 +23,9 @@ serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", default-features = false, features = ["fmt", "std"] }
-dirs = "6.0.0"
+dirs = "7.0.0"
 base64 = "0.23.1"  # For SASL authentication
-precis-profiles = "0.1.14" # IRCv3 UTF8MAPPING=rfc8265 identifier folding
+precis-profiles = "0.2.0" # IRCv3 UTF8MAPPING=rfc8265 identifier folding
 hmac = "0.13.0"
 sha2 = "0.11.0"
 pbkdf2 = "0.13.0"
@@ -35,14 +35,14 @@ same-file = "1.0.6"  # Detect replaced/rotated log files portably
 
 # Platform-specific: eframe with x11/wayland only on Linux
 [target.'cfg(target_os = "linux")'.dependencies]
-eframe = { version = "0.36.1", default-features = false, features = ["glow", "persistence", "x11", "wayland"] }
+eframe = { version = "0.36.2", default-features = false, features = ["glow", "persistence", "x11", "wayland"] }
 
 # Used by cfg(unix) code paths (local time conversion), so macOS needs it too
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
 [target.'cfg(not(target_os = "linux"))'.dependencies]
-eframe = { version = "0.36.1", default-features = false, features = ["glow", "persistence"] }
+eframe = { version = "0.36.2", default-features = false, features = ["glow", "persistence"] }
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.62.2", features = [
