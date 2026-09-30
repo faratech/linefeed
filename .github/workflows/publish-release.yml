@@ -1,0 +1,39 @@
+name: Publish verified release
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Complete, signed draft release tag
+        required: true
+
+permissions:
+  contents: write
+
+concurrency:
+  group: linefeed-release-${{ inputs.tag }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: windows-latest
+    timeout-minutes: 15
+    env:
+      GH_TOKEN: ${{ github.token }}
+      RELEASE_TAG: ${{ inputs.tag }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.tag }}
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.13'
+      - name: Download final draft assets
+        shell: pwsh
+        run: |
+          python .github/scripts/release-assets.py guard
+          if ($LASTEXITCODE -ne 0) { throw 'A matching draft release is required' }
+          gh release download "$env:RELEASE_TAG" --repo "$env:GITHUB_REPOSITORY" --dir binaries
+          if ($LASTEXITCODE -ne 0) { throw 'Release download failed' }
+      - name: Verify final assets and publish
+        run: python .github/scripts/release-assets.py publish

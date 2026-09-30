@@ -38,12 +38,24 @@ struct EndpointKey {
 /// editable Settings/Connect fields may change while a socket is active; those
 /// changes must not relabel the session or alter what an automatic reconnect
 /// authenticates with and executes.
-#[derive(Clone)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 struct SessionConfig {
     server: ServerConfig,
     auto_join_channels: String,
     auto_perform: String,
     set_invisible: bool,
+}
+
+/// Private, short-lived state used only across an explicit update restart.
+/// Deliberately has no Debug implementation: credentials and drafts are secret.
+#[derive(serde::Serialize, serde::Deserialize)]
+pub struct UpdateSession {
+    session: Option<SessionConfig>,
+    reconnect: bool,
+    tabs: Vec<(String, Option<String>, bool)>,
+    selected: Option<String>,
+    input: String,
+    away: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -274,6 +286,11 @@ pub(crate) fn apply_font_size(ctx: &egui::Context, font_size: f32) {
 }
 
 pub struct IrcApp {
+    pub updater: crate::updater::Controller,
+    pub automatic_updates: bool,
+    update_rejoins: Option<Vec<(String, Option<String>)>>,
+    update_selected: Option<String>,
+    update_join_targets: Vec<String>,
     // Connection state
     pub connected: bool,
     pub connecting: bool,
@@ -510,6 +527,11 @@ impl IrcApp {
         let self_nick_keys = vec![my_nick_lower.clone()];
 
         Self {
+            updater: crate::updater::Controller::default(),
+            automatic_updates: settings.automatic_updates,
+            update_rejoins: None,
+            update_selected: None,
+            update_join_targets: Vec::new(),
             connected: false,
             connecting: false,
             my_nick: nickname.clone(),
@@ -702,6 +724,7 @@ impl IrcApp {
             auto_join_channels: self.auto_join_channels.clone(),
             set_invisible: self.set_invisible,
             minimize_to_tray: self.minimize_to_tray,
+            automatic_updates: self.automatic_updates,
             auto_reconnect: self.auto_reconnect,
             notifications_enabled: self.notifications_enabled,
             ignore_list: self.ignore_list.clone(),
@@ -942,6 +965,84 @@ impl IrcApp {
         self.update_cached_lowercase();
         ChatMessage::configure_default_timestamp_format(&self.timestamp_format);
         self.get_settings().save();
+    }
+
+    pub fn update_session(&self) -> UpdateSession {
+        let mut session = self.active_session.clone();
+        if let Some(session) = &mut session {
+            session.server.nick = self.my_nick.clone();
+        }
+        UpdateSession {
+            session,
+            reconnect: self.connected || self.connecting || self.awaiting_reconnect(),
+            tabs: self
+                .channels
+                .iter()
+                .map(|(name, channel)| (name.clone(), channel.key.clone(), channel.joined))
+                .collect(),
+            selected: self.current_channel.clone(),
+            input: self.input_text.clone(),
+            away: self.away_status.clone(),
+        }
+    }
+
+    pub fn restore_update_session(&mut self, snapshot: UpdateSession) {
+        if let Some(session) = snapshot.session {
+            self.activate_session(session);
+        }
+        let mut rejoins = Vec::new();
+        for (name, key, joined) in snapshot.tabs {
+            let mut channel = Channel::new();
+            channel.key = key.clone();
+            channel.joined = false;
+            // Membership is authoritative even before the server advertises
+            // its channel prefixes again on the restored connection.
+            if joined {
+                rejoins.push((name.clone(), key));
+            }
+            if self.logging_load_history
+                && let Some((network, legacy, allow_legacy)) = self.active_log_context()
+            {
+                channel
+                    .messages
+                    .extend(self.log_manager.load_history_casemapped(
+                        &network,
+                        &legacy,
+                        &self.network_support.canonicalize(&name),
+                        &name,
+                        self.logging_history_lines,
+                        allow_legacy,
+                    ));
+                channel.history_loaded = !channel.messages.is_empty();
+            }
+            self.channels.insert(name, channel);
+        }
+        self.update_join_targets = rejoins.iter().map(|(name, _)| name.clone()).collect();
+        self.update_rejoins = Some(rejoins);
+        self.current_channel = snapshot.selected.clone();
+        self.update_selected = snapshot.selected;
+        self.input_text = snapshot.input;
+        self.away_status = snapshot.away;
+        self.connecting = snapshot.reconnect && self.active_session.is_some();
+        self.show_connect_dialog = false;
+    }
+
+    pub fn prepare_update_shutdown(&mut self) {
+        self.save_settings();
+        self.log_manager.flush_all();
+        self.connection_intent = ConnectionIntent::ManualDisconnect;
+        self.pending_session = None;
+        if self.cmd_tx.is_some() {
+            self.send_command(IrcCommand::Quit(Self::clamp_quit_reason(Some(
+                self.quit_message.clone(),
+            ))));
+        }
+        self.cmd_tx = None;
+        // Keep the incoming receiver alive until the connection thread has
+        // flushed QUIT. Dropping it here could cancel the writer first.
+        self.connected = false;
+        self.connecting = false;
+        self.connection_lost = false;
     }
 
     /// Update cached lowercase versions of strings for efficient comparison
@@ -2069,6 +2170,76 @@ impl IrcApp {
             self.realname = fav.realname.clone();
         }
         self.accept_invalid_certs = fav.accept_invalid_certs;
+    }
+}
+
+#[cfg(test)]
+mod update_session_tests {
+    use super::*;
+
+    #[test]
+    fn update_restart_restores_active_endpoint_memberships_queries_and_draft() {
+        let settings = Settings {
+            server_host: "active.example".into(),
+            nickname: "me".into(),
+            logging_enabled: false,
+            logging_load_history: false,
+            auto_join_channels: "#configured".into(),
+            ..Settings::default()
+        };
+        let mut before = IrcApp::with_settings(settings.clone());
+        assert!(before.start_session_from_form());
+        before.connected = true;
+        before.connecting = false;
+        before.server_host = "edited.example".into();
+        let mut live = Channel::new();
+        live.joined = true;
+        live.key = Some("private-key".into());
+        let mut kicked = Channel::new();
+        kicked.joined = false;
+        before.channels.insert("#live".into(), live);
+        let mut custom = Channel::new();
+        custom.joined = true;
+        before.channels.insert("!custom".into(), custom);
+        before.channels.insert("#kicked".into(), kicked);
+        before.channels.insert("alice".into(), Channel::new());
+        before.current_channel = Some("alice".into());
+        before.input_text = "unsent draft".into();
+        let snapshot = before.update_session();
+        let encoded = serde_json::to_vec(&snapshot).unwrap();
+        let snapshot = serde_json::from_slice(&encoded).unwrap();
+        let mut after = IrcApp::with_settings(settings);
+        after.restore_update_session(snapshot);
+        assert_eq!(after.active_server_config().unwrap().host, "active.example");
+        assert!(after.connecting);
+        assert_eq!(after.input_text, "unsent draft");
+        assert_eq!(after.current_channel.as_deref(), Some("alice"));
+        assert!(after.channels.contains_key("#kicked"));
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        after.cmd_tx = Some(tx);
+        after.handle_numeric(RPL_WELCOME, &["me".into(), "Welcome".into()]);
+        let sent: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        assert!(sent.iter().any(|cmd| matches!(cmd, IrcCommand::Join(name, Some(key), _, _) if name == "#live" && key == "private-key")));
+        assert!(
+            sent.iter()
+                .any(|cmd| matches!(cmd, IrcCommand::Join(name, _, _, _) if name == "!custom"))
+        );
+        assert!(!sent.iter().any(|cmd| matches!(cmd, IrcCommand::Join(name, _, _, _) if name == "#kicked" || name == "#configured")));
+        after.handle_incoming_message(IrcMessage::parse(":me!u@h JOIN #live").unwrap());
+        assert_eq!(after.current_channel.as_deref(), Some("alice"));
+        after.handle_incoming_message(IrcMessage::parse(":me!u@h JOIN !custom").unwrap());
+        assert!(after.update_selected.is_none());
+    }
+
+    #[test]
+    fn update_restart_preserves_disconnected_state_and_old_settings_default_to_auto_updates() {
+        let settings: Settings = serde_json::from_str("{}").unwrap();
+        assert!(settings.automatic_updates);
+        let before = IrcApp::with_settings(settings.clone());
+        let mut after = IrcApp::with_settings(settings);
+        after.restore_update_session(before.update_session());
+        assert!(!after.connecting);
+        assert!(!after.connected);
     }
 }
 
@@ -3206,7 +3377,20 @@ impl IrcApp {
                     if self.enabled_caps.contains("no-implicit-names") {
                         self.send_command(IrcCommand::Names(Some(channel.clone())));
                     }
-                    self.current_channel = Some(existing_key.unwrap_or_else(|| channel.clone()));
+                    if let Some(index) = self
+                        .update_join_targets
+                        .iter()
+                        .position(|target| self.identifiers_equal(target, channel))
+                    {
+                        self.update_join_targets.remove(index);
+                        self.current_channel = self.update_selected.clone();
+                        if self.update_join_targets.is_empty() {
+                            self.update_selected = None;
+                        }
+                    } else {
+                        self.current_channel =
+                            Some(existing_key.unwrap_or_else(|| channel.clone()));
+                    }
                     let sys_msg = ChatMessage::system(&format!("Now talking in {}", channel));
                     self.add_message_to_channel(channel, sys_msg);
                     if self.chathistory_enabled && self.logging_load_history {
@@ -3924,8 +4108,19 @@ impl IrcApp {
                     ));
                 }
 
-                // Auto-join channels
-                if !auto_join.is_empty() {
+                // Restore actual memberships, including keys, through JOIN.
+                if let Some(rejoins) = self.update_rejoins.take() {
+                    for (name, key) in rejoins {
+                        if let Some(key) = &key {
+                            self.pending_channel_keys
+                                .insert(self.network_support.canonicalize(&name), key.clone());
+                        }
+                        self.send_command(IrcCommand::Join(name, key, None, None));
+                    }
+                    if let Some(away) = self.away_status.clone() {
+                        self.send_command(IrcCommand::Away(Some(away)));
+                    }
+                } else if !auto_join.is_empty() {
                     for chan in auto_join.split(',') {
                         let chan = chan.trim();
                         if !chan.is_empty() {

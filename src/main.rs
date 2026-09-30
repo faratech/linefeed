@@ -4,6 +4,7 @@ mod gui;
 mod icon_data;
 mod irc;
 mod opener;
+mod updater;
 
 #[cfg(windows)]
 mod systray;
@@ -204,6 +205,25 @@ fn ensure_single_instance() -> bool {
 }
 
 fn main() -> eframe::Result<()> {
+    if let Some(result) = updater::install::early_mode() {
+        if let Err(error) = &result {
+            eprintln!("Linefeed updater: {error}");
+        }
+        std::process::exit(if result.is_ok() { 0 } else { 1 });
+    }
+    let supervised =
+        updater::install::supervised_args().map_err(|e| eframe::Error::AppCreation(Box::new(e)))?;
+    let startup = updater::install::startup(supervised)
+        .map_err(|e| eframe::Error::AppCreation(Box::new(e)))?;
+    let updater::install::Startup {
+        paths,
+        running: _running,
+        acknowledgment,
+        snapshot,
+        update_error,
+    } = startup;
+    let shutdown = Arc::new(std::sync::Mutex::new(None::<updater::install::Armed>));
+    let app_shutdown = shutdown.clone();
     // Check for existing instance FIRST (before any GUI setup)
     if !ensure_single_instance() {
         // Another instance is running, exit silently
@@ -239,10 +259,10 @@ fn main() -> eframe::Result<()> {
         ..Default::default()
     };
 
-    eframe::run_native(
+    let result = eframe::run_native(
         "Linefeed",
         options,
-        Box::new(|cc| {
+        Box::new(move |cc| {
             // Load emoji fonts for comprehensive Unicode support
             setup_fonts(&cc.egui_ctx);
 
@@ -251,7 +271,13 @@ fn main() -> eframe::Result<()> {
                 opts.reduce_texture_memory = true;
             });
 
-            let app = IrcApp::new(cc);
+            let mut app = IrcApp::new(cc);
+            if let Some(snapshot) = snapshot {
+                app.restore_update_session(snapshot);
+            }
+            app.updater.install_reason = update_error;
+            app.updater
+                .start(paths, cc.egui_ctx.clone(), app.automatic_updates);
             let mut style = (*cc.egui_ctx.global_style()).clone();
             style.spacing.item_spacing = egui::vec2(8.0, 4.0);
             cc.egui_ctx.set_global_style(style);
@@ -263,12 +289,23 @@ fn main() -> eframe::Result<()> {
                 last_message_time: std::time::Instant::now(),
                 window_size_ok: false,
                 list_loading_since: None,
+                startup_ack: acknowledgment,
+                shutdown: app_shutdown,
             }))
         }),
-    )
+    );
+    if result.is_ok()
+        && let Ok(mut shutdown) = shutdown.lock()
+        && let Some(armed) = shutdown.take()
+    {
+        armed.commit();
+    }
+    result
 }
 
 struct LinefeedApp {
+    startup_ack: Option<updater::install::Transaction>,
+    shutdown: Arc<std::sync::Mutex<Option<updater::install::Armed>>>,
     app: IrcApp,
     connection_thread: Option<std::thread::JoinHandle<()>>,
     /// Track when we last received messages (for adaptive repaint intervals)
@@ -285,6 +322,24 @@ impl eframe::App for LinefeedApp {
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         let ctx = &ctx;
+        self.app.updater.poll();
+        // UI callback proves eframe's native renderer initialized. This must
+        // run before hidden/minimized early returns too.
+        if let Some(tx) = self.startup_ack.take() {
+            std::thread::spawn(move || {
+                if let Err(e) = updater::install::confirm_startup(&tx) {
+                    tracing::warn!("Could not confirm update startup: {e}");
+                }
+            });
+        }
+        if std::mem::take(&mut self.app.updater.restart_requested) {
+            let snapshot = self.app.update_session();
+            self.app.updater.prepare_restart(snapshot);
+        }
+        if self.app.updater.closing {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            return;
+        }
         // Tray handling (Windows only)
         #[cfg(windows)]
         {
@@ -388,7 +443,9 @@ impl eframe::App for LinefeedApp {
                     urls.push(open.url.clone());
                 }
             }
-            output.commands.retain(|command| !matches!(command, egui::OutputCommand::OpenUrl(_)));
+            output
+                .commands
+                .retain(|command| !matches!(command, egui::OutputCommand::OpenUrl(_)));
         });
         for url in urls {
             opener::open_in_browser(&url);
@@ -440,6 +497,22 @@ impl eframe::App for LinefeedApp {
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        self.app.prepare_update_shutdown();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        if let Some(thread) = self.connection_thread.take() {
+            while !thread.is_finished() && std::time::Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            if thread.is_finished() {
+                let _ = thread.join();
+            }
+        }
+        self.app.msg_rx = None;
+        if let Some(armed) = self.app.updater.arm_on_exit(self.app.automatic_updates)
+            && let Ok(mut shutdown) = self.shutdown.lock()
+        {
+            *shutdown = Some(armed);
+        }
         // Remove the tray icon and free its HICON on shutdown (no-op elsewhere).
         #[cfg(windows)]
         systray::destroy_tray_icon();
@@ -589,6 +662,8 @@ mod tests {
         let mut app = IrcApp::default();
         app.connected = true;
         let mut linefeed = LinefeedApp {
+            startup_ack: None,
+            shutdown: Arc::new(std::sync::Mutex::new(None)),
             app,
             connection_thread: Some(handle),
             last_message_time: std::time::Instant::now(),

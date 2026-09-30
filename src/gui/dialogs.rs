@@ -719,7 +719,108 @@ impl IrcApp {
                     .color(Color32::GRAY),
             );
             ui.add_space(20.0);
-            ui.label(RichText::new("Windows ARM64 / x86 / Linux").small());
+            ui.label(
+                RichText::new(format!(
+                    "{} / {}",
+                    std::env::consts::OS,
+                    std::env::consts::ARCH
+                ))
+                .small(),
+            );
+            ui.add_space(12.0);
+            ui.separator();
+            if ui
+                .checkbox(&mut self.automatic_updates, "Automatic updates")
+                .changed()
+            {
+                self.updater.set_automatic(self.automatic_updates);
+                self.save_settings();
+            }
+            ui.label(
+                RichText::new("Downloads updates in the background and installs when you exit.")
+                    .small(),
+            );
+            if let Some(time) = self.updater.last_check {
+                ui.label(
+                    RichText::new(format!(
+                        "Last checked: {}",
+                        super::helpers::epoch_time_formatted(time, "full")
+                    ))
+                    .small(),
+                );
+            }
+            let busy = self.updater.busy();
+            if ui
+                .add_enabled(!busy, egui::Button::new("Check for updates"))
+                .clicked()
+            {
+                self.updater.check();
+            }
+            use crate::updater::Status;
+            match &self.updater.status {
+                Status::Idle => {}
+                Status::Checking => {
+                    ui.spinner();
+                    ui.label("Checking for updates…");
+                }
+                Status::UpToDate => {
+                    ui.label("You're up to date.");
+                }
+                Status::Available => {
+                    ui.label("An update is available.");
+                }
+                Status::Downloading { received, total } => {
+                    let fraction = if *total > 0 {
+                        *received as f32 / *total as f32
+                    } else {
+                        0.0
+                    };
+                    ui.add(
+                        egui::ProgressBar::new(fraction)
+                            .show_percentage()
+                            .text("Downloading update…"),
+                    );
+                }
+                Status::Ready => {
+                    ui.label("Update downloaded and verified.");
+                }
+                Status::Applying => {
+                    ui.spinner();
+                    ui.label("Preparing to restart…");
+                }
+                Status::Error(message) => {
+                    ui.colored_label(Color32::LIGHT_RED, message);
+                }
+            }
+            if let Some(offer) = &self.updater.offer {
+                ui.label(format!("Version {} is available", offer.version));
+                ui.hyperlink_to("Release notes", offer.release_url());
+                if self.updater.staged.is_none()
+                    && self.updater.install_reason.is_none()
+                    && ui
+                        .add_enabled(!busy, egui::Button::new("Download update"))
+                        .clicked()
+                {
+                    self.updater.download();
+                }
+            }
+            if let Some(tx) = &self.updater.staged {
+                ui.label(format!("Version {} is ready to install", tx.version));
+                if self.updater.install_reason.is_none()
+                    && ui
+                        .add_enabled(!busy, egui::Button::new("Restart to update"))
+                        .clicked()
+                {
+                    self.updater.restart_requested = true;
+                }
+            }
+            if let Some(reason) = &self.updater.install_reason {
+                ui.label(RichText::new(reason).small());
+            }
+            ui.hyperlink_to(
+                "Download releases",
+                "https://github.com/faratech/linefeed/releases",
+            );
         });
     }
 

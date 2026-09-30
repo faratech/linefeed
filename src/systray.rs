@@ -364,7 +364,7 @@ fn create_icon() -> Option<windows::Win32::UI::WindowsAndMessaging::HICON> {
 
     // Convert RGBA to BGRA (Windows format) and separate into color and mask
     let mut bgra_data = icon_data::ICON_RGBA.to_vec();
-    for chunk in bgra_data.chunks_exact_mut(4) {
+    for chunk in bgra_data.as_chunks_mut::<4>().0 {
         chunk.swap(0, 2); // Swap R and B
     }
 

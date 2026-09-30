@@ -13,7 +13,7 @@ permissions:
   attestations: write
 
 concurrency:
-  group: sign-release-${{ github.ref }}-${{ inputs.tag }}
+  group: linefeed-release-${{ inputs.tag }}
   cancel-in-progress: false
 
 jobs:
@@ -23,7 +23,17 @@ jobs:
     env:
       __COMPAT_LAYER: RunAsInvoker
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.tag }}
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.13'
+      - name: Require draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.tag }}
+        run: python .github/scripts/release-assets.py guard
 
       - name: Download Windows binaries from release
         env:
@@ -32,10 +42,11 @@ jobs:
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force -Path "binaries" | Out-Null
-          gh release download "$env:TAG" --repo "$env:GITHUB_REPOSITORY" --dir "binaries" --pattern "*.exe"
+          gh release download "$env:TAG" --repo "$env:GITHUB_REPOSITORY" --dir "binaries" --pattern "linefeed_*"
+          if ($LASTEXITCODE -ne 0) { throw 'Could not download draft release assets' }
           $files = Get-ChildItem -Path "binaries" -Filter "*.exe"
-          if ($files.Count -eq 0) {
-            throw "No .exe binaries found in release $env:TAG"
+          if ($files.Count -ne 3) {
+            throw "Expected all three Windows binaries in release $env:TAG"
           }
           Write-Host "Found $($files.Count) executable(s) to sign."
 
@@ -96,24 +107,16 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ inputs.tag }}
+          RELEASE_TAG: ${{ inputs.tag }}
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
           $signedFiles = @(Get-ChildItem -Path 'binaries' -Filter '*.exe' -File)
-          gh release download "$env:TAG" --pattern 'SHA256SUMS' --dir binaries --clobber --repo "$env:GITHUB_REPOSITORY"
-          if ($LASTEXITCODE -ne 0) { throw 'Could not download the release checksum manifest' }
+          python .github/scripts/release-assets.py checksums
+          if ($LASTEXITCODE -ne 0) { throw 'Could not create final release checksums' }
           $checksumPath = Join-Path 'binaries' 'SHA256SUMS'
-          $checksums = @(Get-Content -LiteralPath $checksumPath)
-          foreach ($file in $signedFiles) {
-            $pattern = '^[0-9a-fA-F]{64}\s+\*?' + [regex]::Escape($file.Name) + '$'
-            $checksumIndexes = @(for ($i = 0; $i -lt $checksums.Count; $i++) {
-              if ($checksums[$i] -match $pattern) { $i }
-            })
-            if ($checksumIndexes.Count -ne 1) { throw "Expected one checksum entry for $($file.Name)" }
-            $hash = (Get-FileHash -LiteralPath $file.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
-            $checksums[$checksumIndexes[0]] = "$hash  $($file.Name)"
-          }
-          Set-Content -LiteralPath $checksumPath -Value $checksums -Encoding utf8NoBOM
+          python .github/scripts/release-assets.py guard
+          if ($LASTEXITCODE -ne 0) { throw 'Release is no longer a draft' }
           $uploads = @($signedFiles.FullName) + @($checksumPath)
           gh release upload "$env:TAG" @uploads --clobber --repo "$env:GITHUB_REPOSITORY"
           if ($LASTEXITCODE -ne 0) { throw 'Failed to upload signed binaries and checksums' }

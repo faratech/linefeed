@@ -46,6 +46,7 @@ InspIRCd, UnrealIRCd, Solanum, Ergo, Bahamut, ircu, Hybrid, and Plexus features.
 - Notices
 
 ### User Experience
+- Automatic GitHub Release updates, installed on exit, with checks and restart controls in About
 - Tab completion for nicks and commands
 - Command history (up/down arrows)
 - Configurable timestamps
@@ -80,6 +81,9 @@ InspIRCd, UnrealIRCd, Solanum, Ergo, Bahamut, ircu, Hybrid, and Plexus features.
 - Efficiency Mode (EcoQoS) for reduced power usage
 
 ## Installation
+
+Release binaries support automatic updates. See [automatic updates and release
+publication](docs/auto-updates.md) for behavior, recovery, and publishing steps.
 
 ### Pre-built Binaries
 

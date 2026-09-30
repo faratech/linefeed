@@ -1,6 +1,6 @@
 [package]
 name = "linefeed"
-version = "0.0.9"
+version = "0.1.0"
 edition = "2024"
 rust-version = "1.97"
 description = "Linefeed IRC Client"
@@ -32,6 +32,8 @@ pbkdf2 = "0.13.0"
 getrandom = "0.4.3"
 mimalloc = { version = "0.1.52", default-features = false }  # Lower memory allocator
 same-file = "1.0.6"  # Detect replaced/rotated log files portably
+ureq = { version = "3.4.2", default-features = false, features = ["native-tls"] }
+semver = "1.0.28"
 
 # Platform-specific: eframe with x11/wayland only on Linux
 [target.'cfg(target_os = "linux")'.dependencies]
@@ -53,6 +55,12 @@ windows = { version = "0.62.2", features = [
     "Win32_UI_Shell",
     "Win32_System_Threading",
     "Win32_System_LibraryLoader",
+    "Win32_Storage_FileSystem",
+    "Win32_Security_Authorization",
+    "Win32_Security_Cryptography",
+    "Win32_Security_Cryptography_Catalog",
+    "Win32_Security_Cryptography_Sip",
+    "Win32_Security_WinTrust",
 ] }
 
 # Compatibility-preserving copy of the published scanner with only its XML
