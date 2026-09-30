@@ -24,8 +24,19 @@ def validate_tag(tag):
         raise RuntimeError("Release tag must match Cargo.toml's stable version")
 
 
+def list_releases(repo):
+    # The tag endpoint only resolves published releases. Authenticated listing
+    # includes drafts; paginate so older draft tags remain accessible too.
+    pages = json.loads(run("gh", "api", "--paginate", "--slurp",
+                           f"repos/{repo}/releases?per_page=100"))
+    return [release for page in pages for release in page]
+
+
 def get_release(repo, tag):
-    return json.loads(run("gh", "api", f"repos/{repo}/releases/tags/{tag}"))
+    matches = [release for release in list_releases(repo) if release["tag_name"] == tag]
+    if len(matches) != 1:
+        raise RuntimeError("Expected exactly one release for this tag")
+    return matches[0]
 
 
 def require_draft(repo, tag):
@@ -84,7 +95,7 @@ def main():
     validate_tag(tag)
     if args.command == "ensure-draft":
         # Distinguish a missing release from authentication/network failures.
-        releases = json.loads(run("gh", "api", f"repos/{repo}/releases?per_page=100"))
+        releases = list_releases(repo)
         if not any(release["tag_name"] == tag for release in releases):
             run("gh", "release", "create", tag, "--repo", repo, "--draft", "--verify-tag",
                 "--title", f"Linefeed {tag[1:]}", "--generate-notes")
