@@ -204,6 +204,15 @@ fn ensure_single_instance() -> bool {
     true // No single-instance check on non-Windows
 }
 
+/// Whether startup may proceed past the single-instance gate (issue #199).
+/// A normal launch checks before updater recovery, which can otherwise block
+/// on the transaction lock or downgrade a `Prepared` transaction. A supervised
+/// update launch defers the check until after recovery: the outgoing instance
+/// may still hold the mutex while its replacement validates the handoff.
+fn single_instance_allows_startup(supervised: bool) -> bool {
+    supervised || ensure_single_instance()
+}
+
 fn main() -> eframe::Result<()> {
     if let Some(result) = updater::install::early_mode() {
         if let Err(error) = &result {
@@ -213,6 +222,12 @@ fn main() -> eframe::Result<()> {
     }
     let supervised =
         updater::install::supervised_args().map_err(|e| eframe::Error::AppCreation(Box::new(e)))?;
+    // Second launches activate the running instance before updater recovery
+    // can stall on its lock or touch a pending transaction (issue #199).
+    let startup_supervised = supervised.is_some();
+    if !single_instance_allows_startup(startup_supervised) {
+        return Ok(());
+    }
     let startup = updater::install::startup(supervised)
         .map_err(|e| eframe::Error::AppCreation(Box::new(e)))?;
     let updater::install::Startup {
@@ -224,8 +239,9 @@ fn main() -> eframe::Result<()> {
     } = startup;
     let shutdown = Arc::new(std::sync::Mutex::new(None::<updater::install::Armed>));
     let app_shutdown = shutdown.clone();
-    // Check for existing instance FIRST (before any GUI setup)
-    if !ensure_single_instance() {
+    // Supervised launches deferred this check until after recovery above;
+    // normal launches already passed it before recovery (issue #199).
+    if startup_supervised && !ensure_single_instance() {
         // Another instance is running, exit silently
         return Ok(());
     }
@@ -651,6 +667,14 @@ impl LinefeedApp {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn single_instance_gate_runs_before_recovery_except_when_supervised() {
+        // Normal launches gate (and pass here) before recovery; supervised
+        // update launches defer the gate until after recovery (issue #199).
+        assert!(single_instance_allows_startup(false));
+        assert!(single_instance_allows_startup(true));
+    }
 
     #[test]
     fn background_tick_observes_finished_connection_threads() {

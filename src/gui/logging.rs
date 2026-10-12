@@ -27,6 +27,37 @@ pub struct LogManager {
     writers: std::cell::RefCell<std::collections::HashMap<PathBuf, CachedWriter>>,
 }
 
+/// Create a log directory and keep it owner-only on Unix (issue #201),
+/// mirroring the settings and updater state directories.
+fn create_private_log_dir(path: &std::path::Path) -> std::io::Result<()> {
+    fs::create_dir_all(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(())
+}
+
+/// Open a log file for appending, owner-only on Unix (issue #201). The mode
+/// covers new files; existing files are tightened explicitly.
+fn open_private_log_file(path: &std::path::Path) -> std::io::Result<File> {
+    let mut options = OpenOptions::new();
+    options.create(true).append(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let file = options.open(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        file.set_permissions(fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(file)
+}
+
 impl LogManager {
     /// Create a new log manager
     pub fn new(enabled: bool) -> Self {
@@ -84,12 +115,12 @@ impl LogManager {
             Entry::Occupied(e) => e.into_mut(),
             Entry::Vacant(v) => {
                 if let Some(parent) = path.parent()
-                    && let Err(e) = fs::create_dir_all(parent)
+                    && let Err(e) = create_private_log_dir(parent)
                 {
                     tracing::error!("Failed to create log directory: {}", e);
                     return;
                 }
-                match OpenOptions::new().create(true).append(true).open(&path) {
+                match open_private_log_file(&path) {
                     Ok(file) => {
                         let identity = match file.try_clone().and_then(same_file::Handle::from_file)
                         {
@@ -211,7 +242,7 @@ impl LogManager {
         }
 
         if let Some(parent) = destination.parent()
-            && fs::create_dir_all(parent).is_ok()
+            && create_private_log_dir(parent).is_ok()
         {
             // Link-then-unlink rather than rename: hard_link fails atomically
             // when the destination already exists, so a log file a concurrent
@@ -974,6 +1005,34 @@ mod tests {
         manager.flush_all();
 
         assert!(!manager.writers.borrow().contains_key(&full));
+        fs::remove_dir_all(dir).expect("remove temporary log directory");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn log_files_and_directories_are_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let (manager, dir) = test_manager("private-permissions");
+        manager.log_message(
+            "tls:irc.example:6697",
+            "#room",
+            &msg("[09:30]", "alice", "private hello", false, false),
+        );
+        manager.flush_all();
+        let path = manager.log_path("tls:irc.example:6697", "#room");
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(
+            fs::metadata(path.parent().unwrap())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+        drop(manager);
         fs::remove_dir_all(dir).expect("remove temporary log directory");
     }
 

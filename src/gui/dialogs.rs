@@ -1,7 +1,7 @@
 //! Dialog windows for connect, settings, and channel list
 
 use super::helpers::format_timestamp;
-use super::{ChatMessage, IrcApp, ServerFavorite};
+use super::{ChatMessage, IrcApp, ServerFavorite, Settings};
 use crate::irc::IrcCommand;
 use crate::irc::client::SaslMechanism;
 use egui::{Color32, RichText, ScrollArea, TextEdit, Vec2};
@@ -25,7 +25,93 @@ const NETWORK_PRESETS: &[(&str, &str, &str, bool)] = &[
     ("Undernet", "irc.undernet.org", "6697", true),
 ];
 
+/// Build the `LIST` request for a channel-list refresh, mirroring `/list`:
+/// send a server-side `>N` filter only when `ELIST=U` is advertised, and
+/// otherwise ask for a plain list and filter by user count client-side.
+/// Returns the command and whether the client-side min-users filter applies.
+fn channel_list_refresh_request(min_users: u32, elist: &str) -> (IrcCommand, bool) {
+    let elist_has_u = elist.to_ascii_uppercase().contains('U');
+    let apply_client_filter = min_users >= 1 && !elist_has_u;
+    let request = if min_users >= 1 && elist_has_u {
+        // >N means "more than N users", so for min 5, send >4
+        IrcCommand::List(Some(format!(">{}", min_users.saturating_sub(1))))
+    } else {
+        IrcCommand::List(None)
+    };
+    (request, apply_client_filter)
+}
+
 impl IrcApp {
+    /// Restore every Connect-dialog form field from persisted settings,
+    /// discarding scratch edits made since the dialog opened (#208).
+    fn restore_connect_form_from(&mut self, persisted: &Settings) {
+        self.server_host = persisted.server_host.clone();
+        self.server_port = persisted.server_port.clone();
+        self.use_tls = persisted.use_tls;
+        self.accept_invalid_certs = persisted.accept_invalid_certs;
+        self.nickname = persisted.nickname.clone();
+        self.username = persisted.username.clone();
+        self.realname = persisted.realname.clone();
+        self.password = persisted.password.clone();
+        self.auto_join_channels = persisted.auto_join_channels.clone();
+        self.set_invisible = persisted.set_invisible;
+        self.auto_reconnect = persisted.auto_reconnect;
+        self.server_favorites = persisted.server_favorites.clone();
+        self.auto_perform = persisted.auto_perform.clone();
+        self.pre_away_message = persisted.pre_away_message.clone();
+        self.persistence_profile = persisted.persistence_profile.clone();
+        self.sasl_username = persisted.sasl_username.clone();
+        self.sasl_password = persisted.sasl_password.clone();
+        self.sasl_mechanism = persisted.sasl_mechanism;
+        self.sasl_required = persisted.sasl_required;
+        self.tls_client_cert_path = persisted.tls_client_cert_path.clone();
+        self.tls_client_key_path = persisted.tls_client_key_path.clone();
+        self.new_favorite_name.clear();
+        self.show_save_favorite_dialog = false;
+        self.connection_error = None;
+    }
+
+    /// Cancel the Connect dialog: discard scratch edits so a later unrelated
+    /// `save_settings()` cannot persist them, then hide the dialog (#208).
+    fn cancel_connect_dialog(&mut self) {
+        let persisted = Settings::load();
+        self.restore_connect_form_from(&persisted);
+        self.show_connect_dialog = false;
+    }
+
+    /// Close Settings only when the connection form validates; on failure
+    /// keep the window open on the Connection tab so the error is visible
+    /// and editable (#207). Returns whether the window was closed.
+    fn close_settings_window(&mut self) -> bool {
+        if self.validate_connection_form() {
+            self.save_settings();
+            self.show_settings = false;
+            true
+        } else {
+            self.settings_tab = 0;
+            false
+        }
+    }
+
+    /// Join from the Channel List only when the JOIN was actually sent;
+    /// on failure keep the window and selection and report it (#204).
+    /// Returns whether the join was sent (and the window closed).
+    fn join_from_channel_list(&mut self, channel: String) -> bool {
+        let sent = self.send_command(IrcCommand::Join(channel.clone(), None, None, None));
+        if sent {
+            self.show_channel_list = false;
+            self.channel_list_selected = None;
+            self.save_settings();
+            true
+        } else {
+            self.report_send_failure(
+                sent,
+                &format!("Not connected - join {channel} was not sent"),
+            );
+            false
+        }
+    }
+
     pub fn show_connect_window(&mut self, ctx: &egui::Context) {
         egui::Window::new("Connect to Server")
             .collapsible(false)
@@ -316,7 +402,7 @@ impl IrcApp {
                         self.show_connect_dialog = false;
                     }
                     if ui.button("Cancel").clicked() {
-                        self.show_connect_dialog = false;
+                        self.cancel_connect_dialog();
                     }
                 });
             });
@@ -376,8 +462,7 @@ impl IrcApp {
 
                 ui.separator();
                 if ui.button("Close").clicked() {
-                    self.save_settings();
-                    self.show_settings = false;
+                    self.close_settings_window();
                 }
             });
     }
@@ -1130,15 +1215,15 @@ impl IrcApp {
                     self.list_min_users = min_users.max(0) as u32;
 
                     if ui.button("Refresh").clicked() {
-                        // >N means "more than N users", so for min 5, send >4
-                        let request = if self.list_min_users >= 1 {
-                            IrcCommand::List(Some(format!(
-                                ">{}",
-                                self.list_min_users.saturating_sub(1)
-                            )))
-                        } else {
-                            IrcCommand::List(None)
-                        };
+                        // Mirror /list: server-side >N only with ELIST=U,
+                        // otherwise plain LIST plus the client-side filter.
+                        // Assigning the flag on every refresh also clears a
+                        // stale `true` left by an earlier /list (#205).
+                        let (request, apply_client_filter) = channel_list_refresh_request(
+                            self.list_min_users,
+                            &self.network_support.elist,
+                        );
+                        self.channel_list_apply_min_filter = apply_client_filter;
                         let sent = self.send_command(request);
                         if sent {
                             self.channel_list.clear();
@@ -1165,10 +1250,7 @@ impl IrcApp {
             self.save_settings();
         }
         if let Some(channel) = join_channel {
-            self.send_command(IrcCommand::Join(channel, None, None, None));
-            self.show_channel_list = false;
-            self.channel_list_selected = None;
-            self.save_settings();
+            self.join_from_channel_list(channel);
         }
     }
 
@@ -1382,18 +1464,23 @@ impl IrcApp {
             });
 
         if load_ban_list {
-            self.send_command(IrcCommand::Mode(
+            let sent = self.send_command(IrcCommand::Mode(
                 channel_name.clone(),
                 Some("+b".to_string()),
                 Vec::new(),
             ));
+            self.report_send_failure(sent, "Not connected - ban list was not loaded");
         }
         for mode in load_mode_lists {
-            self.send_command(IrcCommand::Mode(
+            let sent = self.send_command(IrcCommand::Mode(
                 channel_name.clone(),
                 Some(format!("+{mode}")),
                 Vec::new(),
             ));
+            self.report_send_failure(
+                sent,
+                &format!("Not connected - mode +{mode} list was not loaded"),
+            );
         }
         if refresh {
             // Clear displayed data only when every refresh request was queued;
@@ -1536,5 +1623,104 @@ impl IrcApp {
         }
 
         result
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn channel_list_refresh_mirrors_list_elist_logic() {
+        // No ELIST=U: plain LIST plus the client-side min-users filter.
+        assert_eq!(
+            channel_list_refresh_request(5, ""),
+            (IrcCommand::List(None), true)
+        );
+        assert_eq!(
+            channel_list_refresh_request(5, "CT"),
+            (IrcCommand::List(None), true)
+        );
+        // ELIST=U: server-side >N filter, no client-side filter.
+        assert_eq!(
+            channel_list_refresh_request(5, "U"),
+            (IrcCommand::List(Some(">4".into())), false)
+        );
+        assert_eq!(
+            channel_list_refresh_request(5, "ctu"),
+            (IrcCommand::List(Some(">4".into())), false)
+        );
+        // No minimum: unfiltered either way.
+        assert_eq!(
+            channel_list_refresh_request(0, ""),
+            (IrcCommand::List(None), false)
+        );
+        assert_eq!(
+            channel_list_refresh_request(0, "U"),
+            (IrcCommand::List(None), false)
+        );
+    }
+
+    #[test]
+    fn channel_list_join_keeps_window_open_when_send_fails() {
+        let mut app = IrcApp::with_settings(Settings::default());
+        app.show_channel_list = true;
+        app.channel_list_selected = Some("#room".into());
+
+        assert!(!app.join_from_channel_list("#room".into()));
+        assert!(app.show_channel_list);
+        assert_eq!(app.channel_list_selected.as_deref(), Some("#room"));
+        assert!(app.server_messages.iter().any(|message| {
+            message
+                .content
+                .contains("Not connected - join #room was not sent")
+        }));
+    }
+
+    #[test]
+    fn settings_close_keeps_window_open_on_invalid_connection_form() {
+        let mut app = IrcApp::with_settings(Settings::default());
+        app.show_settings = true;
+        app.settings_tab = 1;
+        app.server_port = "abc".into();
+
+        assert!(!app.close_settings_window());
+        assert!(app.show_settings);
+        assert_eq!(app.settings_tab, 0);
+        assert!(app.connection_error().is_some());
+    }
+
+    #[test]
+    fn cancelled_connect_edits_are_restored_from_persisted_settings() {
+        let persisted = Settings {
+            server_host: "persisted.example".into(),
+            server_port: "6697".into(),
+            nickname: "persistednick".into(),
+            password: "persisted-pass".into(),
+            sasl_password: "persisted-sasl".into(),
+            ..Settings::default()
+        };
+        let mut app = IrcApp::with_settings(persisted.clone());
+        app.server_host = "scratch.example".into();
+        app.server_port = "1234".into();
+        app.nickname = "scratchnick".into();
+        app.password = "scratch-pass".into();
+        app.sasl_password = "scratch-sasl".into();
+        app.auto_perform = "/ns identify scratch-pass".into();
+        app.new_favorite_name = "scratch".into();
+        app.show_save_favorite_dialog = true;
+
+        app.restore_connect_form_from(&persisted);
+
+        assert_eq!(app.server_host, "persisted.example");
+        assert_eq!(app.nickname, "persistednick");
+        assert!(app.new_favorite_name.is_empty());
+        assert!(!app.show_save_favorite_dialog);
+        // What a later unrelated save would persist no longer carries the
+        // cancelled credentials.
+        let snapshot = app.get_settings();
+        assert_eq!(snapshot.password, "persisted-pass");
+        assert_eq!(snapshot.sasl_password, "persisted-sasl");
+        assert!(snapshot.auto_perform.is_empty());
     }
 }

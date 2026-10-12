@@ -32,6 +32,18 @@ def decode_png(data: bytes) -> tuple[int, int, bytes]:
         elif chunk_type == b'IEND':
             break
 
+    if color_type not in (2, 6):
+        raise ValueError(
+            f"Unsupported PNG color type {color_type}: "
+            "only RGB (2) and RGBA (6) are supported"
+        )
+    if bit_depth not in (8, 16):
+        raise ValueError(
+            f"Unsupported PNG bit depth {bit_depth}: only 8 and 16 are supported"
+        )
+    if width <= 0 or height <= 0:
+        raise ValueError(f"Invalid PNG dimensions {width}x{height}")
+
     # Decompress image data
     compressed = b''.join(idat_chunks)
     decompressed = zlib.decompress(compressed)
@@ -94,6 +106,11 @@ def decode_png(data: bytes) -> tuple[int, int, bytes]:
         else:  # Already RGBA
             rgba.extend(row)
 
+    if len(rgba) != width * height * 4:
+        raise ValueError(
+            f"Decoded RGBA length {len(rgba)} does not match "
+            f"width*height*4 ({width * height * 4}) for {width}x{height}"
+        )
     return width, height, bytes(rgba)
 
 
@@ -102,6 +119,9 @@ def main():
     png_data = ICON_PATH.read_bytes()
 
     width, height, rgba = decode_png(png_data)
+    assert len(rgba) == width * height * 4, (
+        f"RGBA length {len(rgba)} != width*height*4 ({width * height * 4})"
+    )
     print(f"Decoded: {width}x{height}, {len(rgba)} bytes RGBA")
 
     # Generate Rust source

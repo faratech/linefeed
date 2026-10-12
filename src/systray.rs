@@ -12,13 +12,13 @@ use windows::Win32::UI::Shell::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, CreatePopupMenu, CreateWindowExW, DefWindowProcW,
-    DestroyMenu, DispatchMessageW, EnumWindows, FindWindowW, GetClassNameW, GetCursorPos,
-    GetMessageW, GetWindowTextW, GetWindowThreadProcessId, HICON, InsertMenuW, IsIconic,
-    IsWindowVisible, MF_BYPOSITION, MF_SEPARATOR, MF_STRING, MSG, PostMessageW, PostQuitMessage,
-    RegisterClassExW, RegisterWindowMessageW, SW_HIDE, SW_RESTORE, SW_SHOW, SetForegroundWindow,
-    SetMenuDefaultItem, ShowWindow, TPM_BOTTOMALIGN, TPM_LEFTALIGN, TPM_RIGHTBUTTON,
-    TrackPopupMenu, TranslateMessage, WINDOW_EX_STYLE, WM_COMMAND, WM_DESTROY, WM_LBUTTONDBLCLK,
-    WM_NULL, WM_RBUTTONUP, WM_USER, WNDCLASSEXW, WS_OVERLAPPEDWINDOW,
+    DestroyMenu, DispatchMessageW, EnumWindows, GetClassNameW, GetCursorPos, GetMessageW,
+    GetWindowTextW, GetWindowThreadProcessId, HICON, InsertMenuW, IsIconic, IsWindowVisible,
+    MF_BYPOSITION, MF_SEPARATOR, MF_STRING, MSG, PostMessageW, PostQuitMessage, RegisterClassExW,
+    RegisterWindowMessageW, SW_HIDE, SW_RESTORE, SW_SHOW, SetForegroundWindow, SetMenuDefaultItem,
+    ShowWindow, TPM_BOTTOMALIGN, TPM_LEFTALIGN, TPM_RIGHTBUTTON, TrackPopupMenu, TranslateMessage,
+    WINDOW_EX_STYLE, WM_COMMAND, WM_DESTROY, WM_LBUTTONDBLCLK, WM_NULL, WM_RBUTTONUP, WM_USER,
+    WNDCLASSEXW, WS_OVERLAPPEDWINDOW,
 };
 use windows::core::{BOOL, PCWSTR, w};
 
@@ -147,20 +147,64 @@ pub fn is_active() -> bool {
     TRAY_ACTIVE.load(Ordering::SeqCst)
 }
 
+/// Whether a window is our tray message window. A title-only match is not
+/// enough: any same-desktop process can title a window "Linefeed Tray", so
+/// the window class must also be ours (issue #202).
+fn is_tray_window(class: &str, title: &str) -> bool {
+    class == "Linefeed_TrayClass" && title == "Linefeed Tray"
+}
+
+struct FindTrayState {
+    found: HWND,
+}
+
+unsafe extern "system" fn enum_find_tray_window(hwnd: HWND, lparam: LPARAM) -> BOOL {
+    let state = unsafe { &mut *(lparam.0 as *mut FindTrayState) };
+    let mut class_buf = [0u16; 64];
+    let class_len = unsafe { GetClassNameW(hwnd, &mut class_buf) }.max(0) as usize;
+    let mut title_buf = [0u16; 64];
+    let title_len = unsafe { GetWindowTextW(hwnd, &mut title_buf) }.max(0) as usize;
+    if is_tray_window(
+        &String::from_utf16_lossy(&class_buf[..class_len]),
+        &String::from_utf16_lossy(&title_buf[..title_len]),
+    ) {
+        state.found = hwnd;
+        return BOOL(0); // stop enumerating
+    }
+    BOOL(1)
+}
+
+/// Find the tray message window of another running instance, restricted by
+/// window class and title like `find_main_window` (issue #202).
+fn find_tray_window() -> Option<HWND> {
+    let mut state = FindTrayState {
+        found: HWND::default(),
+    };
+    unsafe {
+        // Returns Err when the callback stops enumeration early - not an error.
+        let _ = EnumWindows(
+            Some(enum_find_tray_window),
+            LPARAM(&mut state as *mut FindTrayState as isize),
+        );
+    }
+    if state.found.is_invalid() {
+        None
+    } else {
+        Some(state.found)
+    }
+}
+
 /// Send a message to an existing instance to show its window
 /// This is used when a second instance detects the first is already running
 pub fn activate_existing_instance() {
     use windows::Win32::UI::WindowsAndMessaging::SendMessageW;
 
-    unsafe {
-        // Find the tray message window of the existing instance
-        if let Ok(hwnd) = FindWindowW(None, w!("Linefeed Tray"))
-            && !hwnd.is_invalid()
-        {
+    if let Some(hwnd) = find_tray_window() {
+        unsafe {
             // Send our custom show message
             SendMessageW(hwnd, WM_SHOW_WINDOW, Some(WPARAM(0)), Some(LPARAM(0)));
-            tracing::info!("Sent activate message to existing instance");
         }
+        tracing::info!("Sent activate message to existing instance");
     }
 }
 
@@ -586,4 +630,18 @@ pub fn destroy_tray_icon() {
     }
 
     TRAY_ACTIVE.store(false, Ordering::SeqCst);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tray_activation_requires_our_class_not_title_alone() {
+        assert!(is_tray_window("Linefeed_TrayClass", "Linefeed Tray"));
+        // A foreign window with the same title must not be activated (#202).
+        assert!(!is_tray_window("ForeignClass", "Linefeed Tray"));
+        assert!(!is_tray_window("Linefeed_TrayClass", "Linefeed"));
+        assert!(!is_tray_window("", ""));
+    }
 }

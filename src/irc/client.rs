@@ -452,6 +452,49 @@ fn parse_sts_value(value: &str) -> (Option<u16>, Option<u64>) {
     (port, duration)
 }
 
+/// Resolve the `(port, duration)` to persist for an advertised STS value:
+/// the advertised port when present, otherwise the current connection port
+/// (#186).
+fn sts_policy_target(value: &str, current_port: u16) -> Option<(u16, u64)> {
+    let (advertised_port, duration) = parse_sts_value(value);
+    duration.map(|duration| (advertised_port.unwrap_or(current_port), duration))
+}
+
+/// Accumulates inbound `AUTHENTICATE` chunks per the IRCv3 SASL chunking
+/// rule: a 400-byte chunk is always followed by another chunk, a shorter
+/// chunk terminates the payload, and `+` terminates an exact multiple of
+/// 400 bytes (or stands for an empty payload on its own) (#187).
+#[derive(Default)]
+struct SaslChallengeAccumulator {
+    buffer: String,
+}
+
+impl SaslChallengeAccumulator {
+    /// Feed one chunk; returns the complete payload once terminated.
+    fn feed(&mut self, data: &str) -> Option<String> {
+        if data == "+" {
+            if self.buffer.is_empty() {
+                return Some("+".to_string());
+            }
+            return Some(std::mem::take(&mut self.buffer));
+        }
+        self.buffer.push_str(data);
+        if data.len() == 400 {
+            None
+        } else {
+            Some(std::mem::take(&mut self.buffer))
+        }
+    }
+
+    fn pending_len(&self) -> usize {
+        self.buffer.len()
+    }
+}
+
+/// Bound on a reassembled SASL challenge so a server drip-feeding 400-byte
+/// chunks cannot grow client memory without limit.
+const MAX_SASL_CHALLENGE_LEN: usize = 16 * 1024;
+
 fn update_sts_policy(host: &str, port: u16, duration: u64) {
     let mut policies = load_sts_policies();
     let key = host.to_ascii_lowercase();
@@ -868,13 +911,32 @@ impl IrcClient {
         outgoing_rx: &mut mpsc::UnboundedReceiver<IrcCommand>,
         pending_commands: &mut VecDeque<IrcCommand>,
     ) -> Result<Option<u16>, Box<dyn std::error::Error + Send + Sync>> {
+        Self::probe_sts_upgrade_with_timeout(
+            host,
+            port,
+            incoming_tx,
+            outgoing_rx,
+            pending_commands,
+            STS_PROBE_TIMEOUT,
+        )
+        .await
+    }
+
+    async fn probe_sts_upgrade_with_timeout(
+        host: &str,
+        port: u16,
+        incoming_tx: &mpsc::Sender<IrcMessage>,
+        outgoing_rx: &mut mpsc::UnboundedReceiver<IrcCommand>,
+        pending_commands: &mut VecDeque<IrcCommand>,
+        probe_timeout: Duration,
+    ) -> Result<Option<u16>, Box<dyn std::error::Error + Send + Sync>> {
         let stream = tokio::select! {
             biased;
             _ = incoming_tx.closed() => return Err("Connection cancelled during STS probe".into()),
             _ = wait_for_disconnect(outgoing_rx, pending_commands) => {
                 return Err("Connection cancelled during STS probe".into());
             }
-            result = timeout(STS_PROBE_TIMEOUT, TcpStream::connect((host, port))) => {
+            result = timeout(probe_timeout, TcpStream::connect((host, port))) => {
                 match result {
                     Ok(Ok(stream)) => stream,
                     _ => return Ok(None),
@@ -886,7 +948,14 @@ impl IrcClient {
         writer.write_all(b"CAP LS 302\r\n").await?;
         writer.flush().await?;
         let mut buf = Vec::with_capacity(512);
+        // One overall deadline for the whole probe: a drip-feeding endpoint
+        // must not re-arm the budget per line (#189).
+        let deadline = tokio::time::Instant::now() + probe_timeout;
         for _ in 0..MAX_CAP_LINES {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                return Ok(None);
+            }
             buf.clear();
             let read = tokio::select! {
                 biased;
@@ -897,7 +966,7 @@ impl IrcClient {
                     return Err("Connection cancelled during STS probe".into());
                 }
                 result = timeout(
-                    STS_PROBE_TIMEOUT,
+                    remaining,
                     read_until_lf_bounded(&mut reader, &mut buf, MAX_LINE_LEN),
                 ) => result,
             };
@@ -1377,7 +1446,7 @@ impl IrcClient {
             }
 
             if let IrcCommand::Cap(_target, subcmd, rest) = &msg.command {
-                if subcmd == "LS" {
+                if subcmd.eq_ignore_ascii_case("LS") {
                     // Multiline form `CAP * LS * :caps` -> rest = ["*", caps];
                     // final form `CAP * LS :caps`       -> rest = [caps].
                     let (is_more, caps) = match rest.first().map(String::as_str) {
@@ -1431,9 +1500,9 @@ impl IrcClient {
         if config.use_tls
             && !config.accept_invalid_certs
             && let Some(Some(sts)) = available_tokens.get("sts")
-            && let Some(duration) = parse_sts_value(sts).1
+            && let Some((port, duration)) = sts_policy_target(sts, config.port)
         {
-            update_sts_policy(&config.host, config.port, duration);
+            update_sts_policy(&config.host, port, duration);
         }
 
         // Step 3: Build list of capabilities to request
@@ -1936,6 +2005,7 @@ impl IrcClient {
         W: tokio::io::AsyncWrite + Unpin,
         R: tokio::io::AsyncBufRead + Unpin,
     {
+        let mut challenge = SaslChallengeAccumulator::default();
         loop {
             let Some(msg) =
                 read_handshake_msg_timed(writer, reader, buf, incoming_tx, nick_rx).await?
@@ -1948,7 +2018,14 @@ impl IrcClient {
             };
             match &msg.command {
                 IrcCommand::Authenticate(data) => {
-                    return Ok(SaslServerEvent::Challenge(data.clone()));
+                    if let Some(complete) = challenge.feed(data) {
+                        return Ok(SaslServerEvent::Challenge(complete));
+                    }
+                    if challenge.pending_len() > MAX_SASL_CHALLENGE_LEN {
+                        self.abort_sasl_exchange(writer).await?;
+                        return Ok(SaslServerEvent::Failed);
+                    }
+                    continue;
                 }
                 IrcCommand::Numeric(RPL_WELCOME, _) => return Ok(SaslServerEvent::Welcome),
                 IrcCommand::Numeric(RPL_SASLSUCCESS, _) => return Ok(SaslServerEvent::Success),
@@ -2097,13 +2174,10 @@ impl IrcClient {
                                         .into_iter()
                                         .flat_map(|caps| caps.split_whitespace())
                                         .find_map(|cap| cap.strip_prefix("sts="))
-                                    && let Some(duration) = parse_sts_value(sts).1
+                                    && let Some((port, duration)) =
+                                        sts_policy_target(sts, self.config.port)
                                 {
-                                    update_sts_policy(
-                                        &self.config.host,
-                                        self.config.port,
-                                        duration,
-                                    );
+                                    update_sts_policy(&self.config.host, port, duration);
                                 }
                                 // Handle PING automatically. Awaiting the send
                                 // (instead of try_send) means a saturated writer
@@ -2190,6 +2264,185 @@ mod tests {
             redact_for_log("PRIVMSG Q@CServe.quakenet.org :AUTH account secret\r\n"),
             "PRIVMSG NickServ :<redacted>"
         );
+    }
+
+    #[test]
+    fn sts_policy_target_uses_advertised_port_not_connection_port() {
+        // #186: TLS CAP LS / CAP NEW advertising a different port must pin
+        // that port, not the port already in use.
+        assert_eq!(
+            sts_policy_target("port=6698,duration=7776000", 6697),
+            Some((6698, 7776000))
+        );
+        assert_eq!(
+            sts_policy_target("duration=7776000", 6697),
+            Some((6697, 7776000))
+        );
+        assert_eq!(sts_policy_target("port=6698", 6697), None);
+    }
+
+    #[test]
+    fn sasl_challenge_chunks_are_reassembled_before_decoding() {
+        // #187: a 400-byte chunk is not complete; the short tail ends it.
+        let mut acc = SaslChallengeAccumulator::default();
+        assert_eq!(acc.feed(&"A".repeat(400)), None);
+        let complete = acc.feed("xyz").unwrap();
+        assert_eq!(complete.len(), 403);
+        assert!(complete.ends_with("xyz"));
+        // Exact multiple of 400 is terminated by `+`.
+        let mut acc = SaslChallengeAccumulator::default();
+        assert_eq!(acc.feed(&"B".repeat(400)), None);
+        assert_eq!(acc.feed("+").unwrap(), "B".repeat(400));
+        // A lone `+` keeps its empty-payload sentinel meaning, and a short
+        // single chunk completes immediately.
+        let mut acc = SaslChallengeAccumulator::default();
+        assert_eq!(acc.feed("+").unwrap(), "+");
+        assert_eq!(acc.feed("abc").unwrap(), "abc");
+    }
+
+    #[test]
+    fn sasl_chunked_server_challenge_is_returned_whole() {
+        test_runtime().block_on(async {
+            // #187 end-to-end through read_sasl_event over a duplex stream.
+            let payload = BASE64_STANDARD
+                .encode(format!("r=nonce,s=c2FsdA==,i=4096,x={}", "a".repeat(500)).as_bytes());
+            assert!(payload.len() > 400);
+            let (first, rest) = payload.split_at(400);
+            let wire = format!("AUTHENTICATE {first}\r\nAUTHENTICATE {rest}\r\n");
+            let (client_io, server_io) = tokio::io::duplex(8192);
+            let (client_read, mut client_write) = tokio::io::split(client_io);
+            let mut client_read = BufReader::new(client_read);
+            let (_server_read, mut server_write) = tokio::io::split(server_io);
+            let server = tokio::spawn(async move {
+                server_write.write_all(wire.as_bytes()).await.unwrap();
+                server_write.flush().await.unwrap();
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            });
+            let client = IrcClient::new(ServerConfig::default());
+            let (msg_tx, mut msg_rx) = mpsc::channel(100);
+            let drain = tokio::spawn(async move { while msg_rx.recv().await.is_some() {} });
+            let (_nick_tx, mut nick_rx) = mpsc::unbounded_channel::<String>();
+            let mut buf = Vec::new();
+            let event = client
+                .read_sasl_event(
+                    &mut client_write,
+                    &mut client_read,
+                    &msg_tx,
+                    &mut nick_rx,
+                    &mut buf,
+                )
+                .await
+                .unwrap();
+            match event {
+                SaslServerEvent::Challenge(challenge) => assert_eq!(challenge, payload),
+                _ => panic!("expected reassembled challenge"),
+            }
+            drop(msg_tx);
+            drain.await.unwrap();
+            server.await.unwrap();
+        });
+    }
+
+    #[test]
+    fn sts_probe_drip_feed_is_bounded_by_one_overall_deadline() {
+        test_runtime().block_on(async {
+            // #189: PINGs arriving faster than the per-line timeout must not
+            // keep re-arming the probe past its overall budget.
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                let (read_half, mut write_half) = stream.into_split();
+                let mut reader = BufReader::new(read_half);
+                assert_eq!(read_wire_line(&mut reader).await, "CAP LS 302");
+                // Drip PINGs well inside any per-line budget, indefinitely;
+                // also consume the client's PONGs so writes never block.
+                let drip = tokio::spawn(async move {
+                    loop {
+                        if write_half.write_all(b":srv PING :drip\r\n").await.is_err() {
+                            break;
+                        }
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                    }
+                });
+                let mut line = String::new();
+                while reader.read_line(&mut line).await.unwrap_or(0) > 0 {
+                    line.clear();
+                }
+                drip.abort();
+            });
+            let (incoming_tx, _incoming_rx) = mpsc::channel(100);
+            let (_outgoing_tx, mut outgoing_rx) = mpsc::unbounded_channel();
+            let mut pending = VecDeque::new();
+            let started = tokio::time::Instant::now();
+            let port = timeout(
+                Duration::from_secs(5),
+                IrcClient::probe_sts_upgrade_with_timeout(
+                    "127.0.0.1",
+                    address.port(),
+                    &incoming_tx,
+                    &mut outgoing_rx,
+                    &mut pending,
+                    Duration::from_millis(300),
+                ),
+            )
+            .await
+            .expect("STS probe was not bounded by its overall deadline")
+            .unwrap();
+            assert_eq!(port, None);
+            assert!(
+                started.elapsed() < Duration::from_secs(2),
+                "probe took {:?}",
+                started.elapsed()
+            );
+            server.abort();
+        });
+    }
+
+    #[test]
+    fn lowercase_cap_ls_still_negotiates() {
+        test_runtime().block_on(async {
+            // #188: CAP subcommands are case-insensitive.
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                let (read_half, mut write_half) = stream.into_split();
+                let mut reader = BufReader::new(read_half);
+                assert_eq!(read_wire_line(&mut reader).await, "CAP LS 302");
+                assert_eq!(read_wire_line(&mut reader).await, "NICK tester");
+                assert!(read_wire_line(&mut reader).await.starts_with("USER "));
+                write_half
+                    .write_all(b":srv CAP * ls :multi-prefix\r\n")
+                    .await
+                    .unwrap();
+                assert_eq!(read_wire_line(&mut reader).await, "CAP REQ :multi-prefix");
+                write_half
+                    .write_all(b":srv CAP * ACK :multi-prefix\r\n")
+                    .await
+                    .unwrap();
+                assert_eq!(read_wire_line(&mut reader).await, "CAP END");
+                write_half
+                    .write_all(b":srv 001 tester :Welcome\r\n")
+                    .await
+                    .unwrap();
+            });
+            let config = ServerConfig {
+                host: "127.0.0.1".into(),
+                port: addr.port(),
+                use_tls: false,
+                nick: "tester".into(),
+                ..Default::default()
+            };
+            let (msg_tx, _msg_rx) = mpsc::channel(100);
+            let (_cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+            let mut client = IrcClient::new(config);
+            timeout(Duration::from_secs(2), client.connect(msg_tx, cmd_rx))
+                .await
+                .expect("lowercase CAP ls stalled negotiation")
+                .unwrap();
+            server.await.unwrap();
+        });
     }
 
     #[test]

@@ -140,6 +140,9 @@ impl Controller {
                 self.status = Status::Ready;
                 self.staged = Some(tx);
             } else if tx.phase == Phase::Healthy {
+                // The snapshot lives in the state dir, outside the
+                // transaction directory removed below (issue #200).
+                let _ = fs::remove_file(tx.snapshot());
                 let _ = fs::remove_dir_all(&tx.directory);
                 let _ = fs::remove_file(paths.journal());
             }

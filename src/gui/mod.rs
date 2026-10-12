@@ -91,8 +91,11 @@ struct ChatHistoryBatch {
 struct MultilineBatch {
     target: String,
     sender: String,
+    sender_prefix: Option<String>,
     content: String,
     has_lines: bool,
+    line_count: usize,
+    oversized: bool,
     is_notice: bool,
     parent_history: Option<String>,
     server_time: Option<String>,
@@ -1602,10 +1605,26 @@ impl IrcApp {
             _ => return false,
         };
         let concat = msg.get_tag("draft/multiline-concat").is_some();
-        if batch.has_lines && !concat {
+        // Enforce negotiated multiline limits inbound (#191); fall back to
+        // the draft defaults so an unadvertised limit cannot grow unbounded.
+        let max_bytes = self.network_support.multiline_max_bytes.unwrap_or(4096);
+        let max_lines = self.network_support.multiline_max_lines.unwrap_or(24);
+        let new_line = batch.has_lines && !concat;
+        let projected_lines = batch.line_count + usize::from(new_line || !batch.has_lines);
+        let projected_bytes = batch.content.len() + usize::from(new_line) + content.len();
+        if projected_bytes > max_bytes || projected_lines > max_lines {
+            batch.oversized = true;
+            batch.content.clear();
+            return true;
+        }
+        if batch.oversized {
+            return true;
+        }
+        if new_line {
             batch.content.push('\n');
         }
         batch.content.push_str(content);
+        batch.line_count = projected_lines;
         batch.has_lines = true;
         batch.is_notice = is_notice;
         true
@@ -1654,6 +1673,13 @@ impl IrcApp {
         let Some(batch) = self.multiline_batches.remove(batch_id) else {
             return;
         };
+        if batch.oversized {
+            return;
+        }
+        // Multiline messages must honour the ignore list like live PRIVMSG (#192).
+        if self.is_ignored(&batch.sender, batch.sender_prefix.as_deref()) {
+            return;
+        }
         let is_action = batch.content.starts_with("\x01ACTION ") && batch.content.ends_with('\x01');
         let content = if is_action {
             batch
@@ -2767,8 +2793,31 @@ impl IrcApp {
         let old_identity_key = self.network_support.canonicalize(old_nick);
         if let Some(mut identity) = self.known_users.remove(&old_identity_key) {
             identity.nick = new_nick.to_string();
-            self.known_users
-                .insert(self.network_support.canonicalize(new_nick), identity);
+            let new_key = self.network_support.canonicalize(new_nick);
+            if let Some(existing) = self.known_users.get(&new_key) {
+                // Do not silently overwrite the destination identity (#194):
+                // keep its populated fields, fill gaps from the renamed user.
+                let mut merged = existing.clone();
+                if merged.username.is_none() {
+                    merged.username = identity.username;
+                }
+                if merged.hostname.is_none() {
+                    merged.hostname = identity.hostname;
+                }
+                if merged.account.is_none() {
+                    merged.account = identity.account;
+                }
+                if merged.realname.is_none() {
+                    merged.realname = identity.realname;
+                }
+                if merged.away.is_none() {
+                    merged.away = identity.away;
+                }
+                merged.online = merged.online || identity.online;
+                self.known_users.insert(new_key, merged);
+            } else {
+                self.known_users.insert(new_key, identity);
+            }
         }
         if self.monitored_users.remove(&old_identity_key) {
             self.monitored_users
@@ -2782,18 +2831,49 @@ impl IrcApp {
             .keys()
             .find(|k| !self.is_channel_name(k) && self.identifiers_equal(k, old_nick))
             .cloned();
-        if let Some(key) = query_key
-            && !self
+        if let Some(key) = query_key {
+            let collision_key = self
                 .channels
                 .keys()
-                .any(|k| self.identifiers_equal(k, new_nick))
-            && let Some(mut ch) = self.channels.remove(&key)
-        {
-            ch.push_trimmed(sys_msg, max);
-            let was_current = self.current_channel.as_deref() == Some(key.as_str());
-            self.channels.insert(new_nick.to_string(), ch);
-            if was_current {
-                self.current_channel = Some(new_nick.to_string());
+                .find(|k| {
+                    self.identifiers_equal(k, new_nick) && !self.identifiers_equal(k, old_nick)
+                })
+                .cloned();
+            if let Some(existing_key) = collision_key {
+                // Merge the old query into the destination tab (#194),
+                // mirroring RENAME, instead of stranding the old tab.
+                if let Some(mut old_ch) = self.channels.remove(&key) {
+                    let was_current = self.current_channel.as_deref() == Some(key.as_str());
+                    let old_unread = old_ch.unread;
+                    if let Some(existing) = self.channels.get_mut(&existing_key) {
+                        while let Some(message) = old_ch.messages.pop_front() {
+                            let duplicate = message.msgid.as_ref().is_some_and(|msgid| {
+                                existing
+                                    .messages
+                                    .iter()
+                                    .any(|row| row.msgid.as_deref() == Some(msgid.as_str()))
+                            });
+                            if !duplicate {
+                                existing.messages.push_back(message);
+                            }
+                        }
+                        existing.unread = existing.unread.saturating_add(old_unread);
+                        existing.push_trimmed(sys_msg, max);
+                        while existing.messages.len() > max && max > 0 {
+                            existing.messages.pop_front();
+                        }
+                    }
+                    if was_current {
+                        self.current_channel = Some(existing_key);
+                    }
+                }
+            } else if let Some(mut ch) = self.channels.remove(&key) {
+                ch.push_trimmed(sys_msg, max);
+                let was_current = self.current_channel.as_deref() == Some(key.as_str());
+                self.channels.insert(new_nick.to_string(), ch);
+                if was_current {
+                    self.current_channel = Some(new_nick.to_string());
+                }
             }
         }
     }
@@ -3463,6 +3543,7 @@ impl IrcApp {
                     if let Some(ch) = self.channel_mut(channel) {
                         ch.remove_user(&sender);
                     }
+                    self.evict_known_user_if_orphaned(&sender);
                 }
             }
 
@@ -3499,6 +3580,7 @@ impl IrcApp {
                     if let Some(ch) = self.channel_mut(channel) {
                         ch.remove_user(kicked);
                     }
+                    self.evict_known_user_if_orphaned(kicked);
                 }
             }
 
@@ -3520,7 +3602,23 @@ impl IrcApp {
                         channel.remove_user(&sender);
                     }
                 }
-                self.update_user_identity(&sender, None, None, None, None, None, None, Some(false));
+                // Evict orphaned identities instead of retaining them
+                // offline forever; monitored / still-present users are
+                // marked offline (#195).
+                let sender_key = self.network_support.canonicalize(&sender);
+                self.evict_known_user_if_orphaned(&sender);
+                if self.known_users.contains_key(&sender_key) {
+                    self.update_user_identity(
+                        &sender,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        Some(false),
+                    );
+                }
             }
 
             IrcCommand::Nick(new_nick) => {
@@ -3734,8 +3832,11 @@ impl IrcApp {
                             MultilineBatch {
                                 target: target.clone(),
                                 sender: msg.get_sender_nick().unwrap_or_else(|| "???".to_string()),
+                                sender_prefix: msg.prefix.clone(),
                                 content: String::new(),
                                 has_lines: false,
+                                line_count: 0,
+                                oversized: false,
                                 is_notice: false,
                                 parent_history,
                                 server_time: msg.get_server_time_raw(),
@@ -4117,9 +4218,6 @@ impl IrcApp {
                         }
                         self.send_command(IrcCommand::Join(name, key, None, None));
                     }
-                    if let Some(away) = self.away_status.clone() {
-                        self.send_command(IrcCommand::Away(Some(away)));
-                    }
                 } else if !auto_join.is_empty() {
                     for chan in auto_join.split(',') {
                         let chan = chan.trim();
@@ -4132,6 +4230,13 @@ impl IrcApp {
                             )));
                         }
                     }
+                }
+
+                // Re-send AWAY on every successful registration, not only
+                // the app-update restore path, so ordinary auto-reconnects
+                // do not silently clear the server-side away state (#190).
+                if let Some(away) = self.away_status.clone() {
+                    self.send_command(IrcCommand::Away(Some(away)));
                 }
 
                 // Nefarious suppresses its legacy bouncer replay for clients
@@ -5116,6 +5221,19 @@ impl IrcApp {
                     self.add_server_message(msg);
                     return;
                 }
+            } else {
+                // A new channel tab here is auto-created (not joined by us):
+                // cap unjoined channel tabs the same way (#193).
+                const MAX_UNJOINED_CHANNEL_WINDOWS: usize = 200;
+                let unjoined_count = self
+                    .channels
+                    .iter()
+                    .filter(|(k, ch)| self.is_channel_name(k) && !ch.joined)
+                    .count();
+                if unjoined_count >= MAX_UNJOINED_CHANNEL_WINDOWS {
+                    self.add_server_message(msg);
+                    return;
+                }
             }
             let mut new_channel = Channel::new();
             new_channel.set_case_mapping(self.network_support.case_mapping);
@@ -5193,6 +5311,18 @@ impl IrcApp {
         if self.current_channel.is_some() {
             self.server_unread += 1;
         }
+    }
+
+    /// Evict a departed user who shares no channel and is not monitored (#195).
+    fn evict_known_user_if_orphaned(&mut self, nick: &str) {
+        let key = self.network_support.canonicalize(nick);
+        if self.monitored_users.contains(&key) {
+            return;
+        }
+        if self.channels.values().any(|channel| channel.has_user(nick)) {
+            return;
+        }
+        self.known_users.remove(&key);
     }
 
     /// Update a user's away status in all channels they're in
@@ -5711,14 +5841,18 @@ impl IrcApp {
         if let Some(channel_name) = &self.current_channel
             && let Some(channel) = self.channels.get(channel_name)
         {
-            let prefix_lower = prefix.to_lowercase();
+            let prefix_key = self.network_support.canonicalize(prefix);
             let mut matches: Vec<String> = channel
                 .users
                 .iter()
-                .filter(|user| user.nick.to_lowercase().starts_with(&prefix_lower))
+                .filter(|user| {
+                    self.network_support
+                        .canonicalize(&user.nick)
+                        .starts_with(&prefix_key)
+                })
                 .map(|user| user.nick.clone())
                 .collect();
-            matches.sort_by_key(|a| a.to_lowercase());
+            matches.sort_by_key(|a| self.network_support.canonicalize(a));
             return matches;
         }
         Vec::new()
@@ -9209,6 +9343,179 @@ mod tests {
                 .any(|m| m.content.contains("alice is now known as alice2"))
         );
         assert_eq!(app.current_channel.as_deref(), Some("alice2"));
+    }
+
+    #[test]
+    fn welcome_resends_away_on_ordinary_reconnect() {
+        let (mut app, mut rx) = test_app_connected();
+        app.away_status = Some("lunch".into());
+        app.handle_numeric(RPL_WELCOME, &["me".into(), "welcome".into()]);
+        assert!(
+            std::iter::from_fn(|| rx.try_recv().ok())
+                .any(|cmd| matches!(cmd, IrcCommand::Away(Some(ref m)) if m == "lunch")),
+            "#190: AWAY re-sent on every 001"
+        );
+    }
+
+    #[test]
+    fn multiline_batch_over_limits_is_dropped() {
+        let mut app = test_app();
+        app.network_support.multiline_max_bytes = Some(10);
+        app.network_support.multiline_max_lines = Some(10);
+        app.handle_incoming_message(
+            IrcMessage::parse(":alice!u@h BATCH +ml draft/multiline #room").unwrap(),
+        );
+        app.handle_incoming_message(
+            IrcMessage::parse("@batch=ml :alice!u@h PRIVMSG #room :this is too long").unwrap(),
+        );
+        app.handle_incoming_message(IrcMessage::parse(":alice BATCH -ml").unwrap());
+        assert!(
+            !app.channels.contains_key("#room"),
+            "#191: oversized batch dropped"
+        );
+        // Line cap.
+        app.network_support.multiline_max_bytes = Some(4096);
+        app.network_support.multiline_max_lines = Some(1);
+        app.handle_incoming_message(
+            IrcMessage::parse(":alice!u@h BATCH +m2 draft/multiline #room").unwrap(),
+        );
+        app.handle_incoming_message(
+            IrcMessage::parse("@batch=m2 :alice!u@h PRIVMSG #room :one").unwrap(),
+        );
+        app.handle_incoming_message(
+            IrcMessage::parse("@batch=m2 :alice!u@h PRIVMSG #room :two").unwrap(),
+        );
+        app.handle_incoming_message(IrcMessage::parse(":alice BATCH -m2").unwrap());
+        assert!(
+            !app.channels.contains_key("#room"),
+            "#191: over-line batch dropped"
+        );
+    }
+
+    #[test]
+    fn multiline_batch_from_ignored_sender_is_dropped() {
+        let mut app = test_app();
+        app.ignore_list = vec!["Troll".to_string()];
+        app.update_cached_lowercase();
+        app.handle_incoming_message(
+            IrcMessage::parse(":Troll!u@h BATCH +ml draft/multiline #room").unwrap(),
+        );
+        app.handle_incoming_message(
+            IrcMessage::parse("@batch=ml :Troll!u@h PRIVMSG #room :hello").unwrap(),
+        );
+        app.handle_incoming_message(IrcMessage::parse(":Troll BATCH -ml").unwrap());
+        assert!(
+            !app.channels.contains_key("#room"),
+            "#192: ignored multiline dropped"
+        );
+    }
+
+    #[test]
+    fn unjoined_channel_tabs_are_capped() {
+        let mut app = test_app();
+        for i in 0..200 {
+            app.channels.insert(format!("#spam{i}"), Channel::new());
+        }
+        app.handle_incoming_message(
+            IrcMessage::parse(":alice!u@h PRIVMSG #spam200 :hello").unwrap(),
+        );
+        assert!(!app.channels.contains_key("#spam200"), "#193: unjoined cap");
+        assert_eq!(
+            app.channels
+                .keys()
+                .filter(|k| app.is_channel_name(k))
+                .count(),
+            200
+        );
+    }
+
+    #[test]
+    fn nick_change_merges_query_on_collision() {
+        let mut app = test_app();
+        let mut q1 = Channel::new();
+        q1.push_trimmed(ChatMessage::system("old talk"), 100);
+        app.channels.insert("alice".to_string(), q1);
+        let mut q2 = Channel::new();
+        q2.push_trimmed(ChatMessage::system("dest talk"), 100);
+        app.channels.insert("alice2".to_string(), q2);
+        app.current_channel = Some("alice".to_string());
+        app.handle_incoming_message(IrcMessage::parse(":alice!u@h NICK :alice2").unwrap());
+        assert!(
+            !app.channels.contains_key("alice"),
+            "#194: old tab merged away"
+        );
+        let merged = &app.channels["alice2"];
+        assert!(
+            merged
+                .messages
+                .iter()
+                .any(|m| m.content.contains("old talk"))
+        );
+        assert!(
+            merged
+                .messages
+                .iter()
+                .any(|m| m.content.contains("dest talk"))
+        );
+        assert!(
+            merged
+                .messages
+                .iter()
+                .any(|m| m.content.contains("alice is now known as alice2"))
+        );
+        assert_eq!(app.current_channel.as_deref(), Some("alice2"));
+    }
+
+    #[test]
+    fn known_users_evicted_on_part_and_quit_when_orphaned() {
+        let mut app = test_app();
+        app.handle_incoming_message(IrcMessage::parse(":bob!u@h JOIN #room").unwrap());
+        assert!(
+            app.known_users
+                .contains_key(&app.network_support.canonicalize("bob"))
+        );
+        app.handle_incoming_message(IrcMessage::parse(":bob!u@h PART #room :bye").unwrap());
+        assert!(
+            !app.known_users
+                .contains_key(&app.network_support.canonicalize("bob")),
+            "#195: PART evicts orphaned user"
+        );
+        app.handle_incoming_message(IrcMessage::parse(":carol!u@h JOIN #room").unwrap());
+        app.handle_incoming_message(IrcMessage::parse(":carol!u@h QUIT :gone").unwrap());
+        assert!(
+            !app.known_users
+                .contains_key(&app.network_support.canonicalize("carol")),
+            "#195: QUIT evicts orphaned user"
+        );
+        // Monitored users are retained.
+        app.monitored_users
+            .insert(app.network_support.canonicalize("eve"));
+        app.handle_incoming_message(IrcMessage::parse(":eve!u@h JOIN #room").unwrap());
+        app.handle_incoming_message(IrcMessage::parse(":eve!u@h PART #room :bye").unwrap());
+        assert!(
+            app.known_users
+                .contains_key(&app.network_support.canonicalize("eve"))
+        );
+    }
+
+    #[test]
+    fn nick_completion_uses_negotiated_casemapping() {
+        let mut app = test_app();
+        let mut channel = Channel::new();
+        channel.add_user("^Alice", UserMode::Normal);
+        channel.add_user("[Bob]", UserMode::Normal);
+        app.channels.insert("#room".to_string(), channel);
+        app.current_channel = Some("#room".to_string());
+        assert_eq!(
+            app.find_nick_completions("~a"),
+            vec!["^Alice".to_string()],
+            "#197"
+        );
+        assert_eq!(
+            app.find_nick_completions("{b"),
+            vec!["[Bob]".to_string()],
+            "#197"
+        );
     }
 
     #[test]

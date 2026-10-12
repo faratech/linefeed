@@ -105,6 +105,23 @@ pub fn hash(path: &Path) -> io::Result<String> {
     Ok(hex(&digest.finalize()))
 }
 
+/// Re-verify the staged candidate immediately before it is trusted again.
+/// The probe can run for up to 30s, so bytes checked before it may have been
+/// swapped by the time replacement happens (issue #198).
+fn verify_candidate(tx: &Transaction) -> io::Result<()> {
+    if hash(&tx.candidate())? != tx.new_hash {
+        return Err(io::Error::other("Update bytes changed"));
+    }
+    platform::verify_signature(&tx.candidate())
+}
+
+/// Erase the credential-bearing session snapshot and restart intent when an
+/// armed/prepared transaction is abandoned or downgraded (issue #200).
+fn scrub_session_snapshot(tx: &mut Transaction) {
+    tx.restart = false;
+    let _ = fs::remove_file(tx.snapshot());
+}
+
 pub fn new_file(path: &Path) -> io::Result<File> {
     let mut options = OpenOptions::new();
     options.write(true).create_new(true);
@@ -312,6 +329,10 @@ fn recover_startup(
         } else {
             // Recover an interrupted replacement before opening the GUI.
             reconcile(&mut tx)?;
+            if tx.phase == Phase::Staged && (tx.restart || tx.snapshot().exists()) {
+                scrub_session_snapshot(&mut tx);
+                tx.save()?;
+            }
         }
         if tx.restart
             && matches!(tx.phase, Phase::Replaced | Phase::RolledBack)
@@ -359,14 +380,17 @@ fn reconcile(tx: &mut Transaction) -> io::Result<()> {
         if matches!(tx.phase, Phase::Prepared | Phase::Replaced) {
             // A parent crash before the graceful-exit marker preserves a
             // completely staged candidate for the next actual exit.
-            tx.phase = if tx.phase == Phase::Prepared
+            let downgraded = tx.phase == Phase::Prepared
                 && !tx.backup().exists()
-                && hash(&tx.candidate()).ok().as_deref() == Some(&tx.new_hash)
-            {
+                && hash(&tx.candidate()).ok().as_deref() == Some(&tx.new_hash);
+            tx.phase = if downgraded {
                 Phase::Staged
             } else {
                 Phase::RolledBack
             };
+            if downgraded {
+                scrub_session_snapshot(tx);
+            }
             tx.save()?;
         }
         return Ok(());
@@ -424,13 +448,16 @@ pub fn arm(mut tx: Transaction, snapshot: Option<&crate::gui::UpdateSession>) ->
         return Err(io::Error::other("Update is no longer ready"));
     }
     tx.validate()?;
-    if hash(&tx.paths.target)? != tx.old_hash || hash(&tx.candidate())? != tx.new_hash {
+    if hash(&tx.paths.target)? != tx.old_hash {
         return Err(io::Error::other("Update bytes changed"));
     }
-    platform::verify_signature(&tx.candidate())?;
+    verify_candidate(&tx)?;
     tx.restart = snapshot.is_some();
     if let Some(snapshot) = snapshot {
         write_json(&tx.snapshot(), snapshot)?;
+    } else {
+        // No restart was requested: drop any snapshot an abandoned arm left.
+        let _ = fs::remove_file(tx.snapshot());
     }
     // Persist restart intent while still Staged. If spawning the helper fails,
     // the user can retry without leaving an orphaned Prepared transaction.
@@ -445,21 +472,44 @@ pub fn arm(mut tx: Transaction, snapshot: Option<&crate::gui::UpdateSession>) ->
         .stdout(Stdio::null())
         .stderr(Stdio::null());
     quiet(&mut command);
-    let mut child = command.spawn()?;
-    let input = child
-        .stdin
-        .take()
-        .ok_or_else(|| io::Error::other("No helper input"))?;
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        Err(error) => {
+            scrub_session_snapshot(&mut tx);
+            tx.phase = Phase::Staged;
+            let _ = tx.save();
+            return Err(error);
+        }
+    };
+    let Some(input) = child.stdin.take() else {
+        let _ = child.kill();
+        let _ = child.wait();
+        scrub_session_snapshot(&mut tx);
+        tx.phase = Phase::Staged;
+        let _ = tx.save();
+        return Err(io::Error::other("No helper input"));
+    };
     let deadline = Instant::now() + Duration::from_secs(10);
     while !tx.directory.join("ready").exists() {
         if child.try_wait()?.is_some() || Instant::now() >= deadline {
             let _ = child.kill();
             let _ = child.wait();
+            scrub_session_snapshot(&mut tx);
             tx.phase = Phase::Staged;
             tx.save()?;
             return Err(io::Error::other("Update helper could not start"));
         }
         std::thread::sleep(Duration::from_millis(50));
+    }
+    // Re-hash after the helper-ready wait: bytes verified above could have
+    // been swapped while the helper was starting (issue #198).
+    if let Err(error) = verify_candidate(&tx) {
+        let _ = child.kill();
+        let _ = child.wait();
+        scrub_session_snapshot(&mut tx);
+        tx.phase = Phase::Staged;
+        let _ = tx.save();
+        return Err(error);
     }
     tx.phase = Phase::Prepared;
     tx.save()?;
@@ -597,6 +647,7 @@ fn apply_transaction(tx: &mut Transaction) -> io::Result<()> {
     timed_lock(&transaction_lock, false, Duration::from_secs(30))?;
     let running = tx.paths.run_lock()?;
     if timed_lock(&running, false, Duration::from_secs(30)).is_err() {
+        scrub_session_snapshot(tx);
         tx.phase = Phase::Staged;
         tx.save()?;
         return Err(io::Error::other(
@@ -623,11 +674,15 @@ fn apply_transaction(tx: &mut Transaction) -> io::Result<()> {
         .stderr(Stdio::null());
     quiet(&mut probe);
     if !wait_child(&mut probe.spawn()?, Duration::from_secs(30))? {
+        scrub_session_snapshot(tx);
         tx.phase = Phase::Staged;
         tx.save()?;
         write_json(&tx.paths.state.join("failed.json"), &tx.version)?;
         return Err(io::Error::other("Update validation failed"));
     }
+    // The probe above may have run for 30s; re-hash (and re-verify the
+    // Windows signature) immediately before replacement (issue #198).
+    verify_candidate(tx)?;
     let deadline = Instant::now() + Duration::from_secs(15);
     loop {
         match platform::replace(&tx.paths.target, &tx.candidate(), Some(&tx.backup())) {
@@ -777,9 +832,9 @@ pub fn finish(tx: &mut Transaction) -> io::Result<()> {
     {
         let _ = fs::remove_file(tx.paths.state.join("failed.json"));
     }
+    let _ = fs::remove_file(tx.snapshot());
     tx.phase = Phase::Healthy;
     tx.save()?;
-    let _ = fs::remove_file(tx.snapshot());
     let _ = fs::remove_file(tx.backup());
     // Windows cannot remove the helper while it is executing. The next normal
     // launch cleans the remaining directory after observing Healthy.
@@ -862,6 +917,35 @@ mod tests {
         assert!(tx.phase == Phase::Staged);
         assert_eq!(hash(&tx.paths.target).unwrap(), tx.old_hash);
         assert_eq!(hash(&tx.candidate()).unwrap(), tx.new_hash);
+    }
+    #[test]
+    fn downgrade_to_staged_scrubs_session_snapshot() {
+        let mut fixture = Fixture::new();
+        let tx = &mut fixture.tx;
+        tx.phase = Phase::Prepared;
+        tx.restart = true;
+        tx.save().unwrap();
+        write_json(&tx.snapshot(), &"unsent draft").unwrap();
+        reconcile(tx).unwrap();
+        assert!(tx.phase == Phase::Staged);
+        assert!(!tx.restart);
+        assert!(!tx.snapshot().exists());
+    }
+    #[test]
+    fn tampered_candidate_fails_reverification() {
+        let fixture = Fixture::new();
+        verify_candidate(&fixture.tx).unwrap();
+        fs::write(fixture.tx.candidate(), b"swapped executable").unwrap();
+        assert!(verify_candidate(&fixture.tx).is_err());
+    }
+    #[cfg(unix)]
+    #[test]
+    fn failed_helper_start_scrubs_session_snapshot() {
+        let fixture = Fixture::new();
+        write_json(&fixture.tx.snapshot(), &"unsent draft").unwrap();
+        // The fixture helper is not executable, so spawning it fails.
+        assert!(arm(fixture.tx.clone(), None).is_err());
+        assert!(!fixture.tx.snapshot().exists());
     }
     #[test]
     fn interruption_after_replace_recovers_from_bytes_even_with_old_journal_phase() {
@@ -1007,6 +1091,21 @@ mod tests {
         assert!(fixture.tx.phase == Phase::Replaced);
         assert_eq!(hash(&fixture.tx.paths.target).unwrap(), fixture.tx.new_hash);
         assert_eq!(hash(&fixture.tx.backup()).unwrap(), fixture.tx.old_hash);
+    }
+    #[cfg(unix)]
+    #[test]
+    fn candidate_swapped_during_probe_is_never_installed() {
+        use std::os::unix::fs::PermissionsExt;
+        let mut fixture = probe_fixture(true);
+        let script =
+            "#!/bin/sh\nprintf 'tampered executable' > \"$0.tmp\"\nmv \"$0.tmp\" \"$0\"\nexit 0\n";
+        fs::write(fixture.tx.candidate(), script).unwrap();
+        fs::set_permissions(fixture.tx.candidate(), fs::Permissions::from_mode(0o700)).unwrap();
+        fixture.tx.new_hash = hash(&fixture.tx.candidate()).unwrap();
+        fixture.tx.save().unwrap();
+        assert!(apply_transaction(&mut fixture.tx).is_err());
+        assert_eq!(hash(&fixture.tx.paths.target).unwrap(), fixture.tx.old_hash);
+        assert!(!fixture.tx.backup().exists());
     }
     #[cfg(unix)]
     #[test]

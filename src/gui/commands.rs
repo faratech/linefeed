@@ -392,7 +392,7 @@ impl IrcApp {
             }
 
             "REPLY" => {
-                let mut parts = args.splitn(2, ' ');
+                let mut parts = args.splitn(2, char::is_whitespace);
                 let msgid = parts.next().unwrap_or("");
                 let content = parts.next().unwrap_or("");
                 if let Some(target) = self.current_channel.clone()
@@ -418,7 +418,7 @@ impl IrcApp {
             }
 
             "REACT" => {
-                let mut parts = args.splitn(2, ' ');
+                let mut parts = args.splitn(2, char::is_whitespace);
                 let msgid = parts.next().unwrap_or("");
                 let reaction = parts.next().unwrap_or("");
                 if let Some(target) = self.current_channel.clone()
@@ -453,7 +453,7 @@ impl IrcApp {
             }
 
             "LABEL" => {
-                let mut parts = args.splitn(2, ' ');
+                let mut parts = args.splitn(2, char::is_whitespace);
                 let label = parts.next().unwrap_or("");
                 let command = parts.next().unwrap_or("");
                 if self.enabled_caps.contains("labeled-response")
@@ -512,7 +512,7 @@ impl IrcApp {
             }
 
             "REDACT" => {
-                let mut parts = args.splitn(3, ' ');
+                let mut parts = args.splitn(3, char::is_whitespace);
                 let first = parts.next().unwrap_or("");
                 let (target, msgid, reason) = if self.is_channel_name(first) {
                     (
@@ -539,7 +539,7 @@ impl IrcApp {
             }
 
             "RENAME" => {
-                let mut parts = args.splitn(2, ' ');
+                let mut parts = args.splitn(2, char::is_whitespace);
                 let new_name = parts.next().unwrap_or("");
                 if let Some(old_name) = self.current_channel.clone()
                     && self.is_channel_name(&old_name)
@@ -559,7 +559,7 @@ impl IrcApp {
             }
 
             "RELOCATE" => {
-                let mut parts = args.splitn(2, ' ');
+                let mut parts = args.splitn(2, char::is_whitespace);
                 let new_name = parts.next().unwrap_or("");
                 if let Some(old_name) = self.current_channel.clone()
                     && self.is_channel_name(&old_name)
@@ -785,7 +785,7 @@ impl IrcApp {
 
             "CTCP" => {
                 // /ctcp <nick> <command> [args]
-                let parts: Vec<&str> = args.splitn(3, ' ').collect();
+                let parts: Vec<&str> = args.splitn(3, char::is_whitespace).collect();
                 if parts.len() >= 2 {
                     let target = parts[0];
                     let ctcp_cmd = parts[1].to_uppercase();
@@ -2641,6 +2641,58 @@ mod tests {
         assert_eq!(
             rx.try_recv().unwrap(),
             IrcCommand::Raw("@+typing=active TAGMSG #room".into())
+        );
+    }
+
+    #[test]
+    fn tab_separated_args_parse_like_spaces_in_tag_and_channel_commands() {
+        let (mut app, mut rx) = connected_command_app();
+        app.current_channel = Some("#room".into());
+        app.channels.insert("#room".into(), Channel::new());
+        app.handle_cap_message("ACK", &["message-tags labeled-response".into()]);
+
+        app.process_command("/reply abc\thello there");
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            IrcCommand::Raw("@+reply=abc PRIVMSG #room :hello there".into())
+        );
+        app.process_command("/react abc\t👍");
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            IrcCommand::Raw("@+draft/react=👍;+reply=abc TAGMSG #room".into())
+        );
+        app.process_command("/label lbl1\tWHOIS alice");
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            IrcCommand::Raw("@label=lbl1 WHOIS alice".into())
+        );
+        app.process_command("/redact abc123\tspam");
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            IrcCommand::Redact("#room".into(), "abc123".into(), Some("spam".into()))
+        );
+        app.process_command("/rename #newroom\trenamed reason");
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            IrcCommand::Rename(
+                "#room".into(),
+                "#newroom".into(),
+                Some("renamed reason".into())
+            )
+        );
+        app.process_command("/relocate #otherroom\tmoved reason");
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            IrcCommand::Relocate(
+                "#room".into(),
+                "#otherroom".into(),
+                Some("moved reason".into())
+            )
+        );
+        app.process_command("/ctcp bob\tVERSION");
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            IrcCommand::Privmsg("bob".into(), "\x01VERSION\x01".into())
         );
     }
 
