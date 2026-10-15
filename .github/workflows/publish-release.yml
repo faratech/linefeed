@@ -37,3 +37,12 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'Release download failed' }
       - name: Verify final assets and publish
         run: python .github/scripts/release-assets.py publish
+
+      - name: Publish to WinGet
+        if: env.WINGET_TOKEN != ''
+        uses: vedantmgoyal2009/winget-releaser@v2
+        env:
+          WINGET_TOKEN: ${{ secrets.WINGET_TOKEN }}
+        with:
+          identifier: faratech.linefeed
+          token: ${{ secrets.WINGET_TOKEN }}
