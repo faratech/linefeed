@@ -11,24 +11,27 @@ pub fn private_dir(path: &Path) -> io::Result<()> {
 
 #[cfg(windows)]
 pub fn private_dir(path: &Path) -> io::Result<()> {
-    use windows::{
-        Win32::{
-            Foundation::{HLOCAL, LocalFree},
-            Security::{
-                Authorization::{
-                    ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
-                },
-                PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES,
+    use windows::Win32::{
+        Foundation::{HLOCAL, LocalFree},
+        Security::{
+            Authorization::{
+                ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
             },
-            Storage::FileSystem::CreateDirectoryW,
+            PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES,
         },
-        core::w,
+        Storage::FileSystem::CreateDirectoryW,
     };
-    // Protected DACL; only the owner and SYSTEM, including inherited children.
+    // Protected DACL; only this user and SYSTEM, including inherited children.
+    // Name the user's SID rather than OWNER RIGHTS: an elevated administrator
+    // creates objects owned by BUILTIN\Administrators, which would lock the
+    // same user's later non-elevated runs out of the directory.
+    let user = current_user_sid()?;
+    let sddl =
+        windows::core::HSTRING::from(format!("O:{user}D:P(A;OICI;FA;;;{user})(A;OICI;FA;;;SY)"));
     unsafe {
         let mut descriptor = PSECURITY_DESCRIPTOR::default();
         ConvertStringSecurityDescriptorToSecurityDescriptorW(
-            w!("D:P(A;OICI;FA;;;OW)(A;OICI;FA;;;SY)"),
+            &sddl,
             SDDL_REVISION_1,
             &mut descriptor,
             None,
@@ -42,6 +45,45 @@ pub fn private_dir(path: &Path) -> io::Result<()> {
         let result = CreateDirectoryW(&wide(path), Some(&attributes));
         LocalFree(Some(HLOCAL(descriptor.0)));
         result.map_err(|error| io::Error::from_raw_os_error(error.code().0 & 0xffff))
+    }
+}
+
+/// The current process user's SID in string form (e.g. `S-1-5-21-…`).
+#[cfg(windows)]
+fn current_user_sid() -> io::Result<String> {
+    use windows::{
+        Win32::{
+            Foundation::{CloseHandle, HANDLE, HLOCAL, LocalFree},
+            Security::{
+                Authorization::ConvertSidToStringSidW, GetTokenInformation, TOKEN_QUERY,
+                TOKEN_USER, TokenUser,
+            },
+            System::Threading::{GetCurrentProcess, OpenProcessToken},
+        },
+        core::PWSTR,
+    };
+    unsafe {
+        let mut token = HANDLE::default();
+        OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token).map_err(io::Error::other)?;
+        let mut needed = 0u32;
+        let _ = GetTokenInformation(token, TokenUser, None, 0, &mut needed);
+        // u64 storage keeps the TOKEN_USER header suitably aligned.
+        let mut buffer = vec![0u64; (needed as usize).div_ceil(size_of::<u64>())];
+        let queried = GetTokenInformation(
+            token,
+            TokenUser,
+            Some(buffer.as_mut_ptr().cast()),
+            needed,
+            &mut needed,
+        );
+        let _ = CloseHandle(token);
+        queried.map_err(io::Error::other)?;
+        let user = &*buffer.as_ptr().cast::<TOKEN_USER>();
+        let mut text = PWSTR::null();
+        ConvertSidToStringSidW(user.User.Sid, &mut text).map_err(io::Error::other)?;
+        let sid = text.to_string().map_err(io::Error::other);
+        LocalFree(Some(HLOCAL(text.0.cast())));
+        sid
     }
 }
 
