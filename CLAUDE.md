@@ -71,11 +71,11 @@ so they are the ones to extend for protocol/connection behavior changes.
 ## Releases
 
 Pushing a `v*` tag triggers `.github/workflows/release.yml`, which creates a draft and builds
-the binaries that cannot be cross-compiled locally — Linux x86_64
-(ubuntu-22.04 for a low glibc floor) and a macOS universal binary (lipo of
-aarch64 + x86_64) — and attaches them to the release. Re-run against an
+the binaries that cannot be cross-compiled locally — Linux x86_64 and ARM64
+(ubuntu-22.04 runners, for a low glibc and OpenSSL 3 floor) and a macOS
+universal binary (lipo of aarch64 + x86_64) — and attaches them to the release. Re-run against an
 existing release with `gh workflow run release.yml -f tag=<tag>`.
-Windows and native-Linux binaries are built locally via `build.py --all`
+Windows binaries are built locally via `build.py --arm64 --x64 --x86`
 and uploaded to the draft with `gh release upload`. After all six assets exist,
 run `sign-release.yml` to sign Windows files and generate final `SHA256SUMS`,
 then `publish-release.yml` to verify and publish. Published assets cannot be
