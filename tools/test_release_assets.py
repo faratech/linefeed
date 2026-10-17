@@ -37,6 +37,22 @@ class PublicationTests(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 release_assets.require_draft("faratech/linefeed", "v1.2.3")
 
+    def test_ensure_draft_waits_for_a_new_draft_to_be_listed(self):
+        # The release listing lags creation: empty before the create, still
+        # empty right after it, then the draft appears.
+        draft = {"tag_name": "v1.2.3", "draft": True}
+        listings = iter([[], [], [draft], [draft]])
+        with patch.dict(os.environ, RELEASE_TAG="v1.2.3", GITHUB_REPOSITORY="faratech/linefeed"), \
+            patch("sys.argv", [str(SCRIPT), "ensure-draft"]), \
+            patch.object(release_assets, "validate_tag"), \
+            patch.object(release_assets, "list_releases", side_effect=lambda repo: next(listings)), \
+            patch.object(release_assets.time, "sleep") as sleep, \
+            patch.object(release_assets, "run") as run:
+            release_assets.main()
+        run.assert_called_once()
+        self.assertEqual(run.call_args.args[:3], ("gh", "release", "create"))
+        sleep.assert_called_once_with(1)
+
     def test_publication_fails_before_edit_for_missing_digest_or_wrong_checksum(self):
         for failure in ("digest", "checksums", None):
             with self.subTest(failure=failure), tempfile.TemporaryDirectory() as directory:
