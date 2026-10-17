@@ -204,6 +204,41 @@ fn ensure_single_instance() -> bool {
     true // No single-instance check on non-Windows
 }
 
+/// Whether this process can show windows (Windows only). Session 0 and other
+/// non-interactive window stations (services, headless launch harnesses such
+/// as winget's validation) have no visible desktop, so wgpu cannot configure
+/// a surface and eframe would panic.
+#[cfg(windows)]
+fn has_interactive_desktop() -> bool {
+    use windows::Win32::Foundation::HANDLE;
+    use windows::Win32::System::StationsAndDesktops::{
+        GetProcessWindowStation, GetUserObjectInformationW, UOI_FLAGS, USEROBJECTFLAGS,
+    };
+    use windows::Win32::UI::WindowsAndMessaging::WSF_VISIBLE;
+
+    unsafe {
+        // If the station cannot be queried, assume a desktop and let eframe
+        // report any real failure.
+        let Ok(station) = GetProcessWindowStation() else {
+            return true;
+        };
+        let mut flags = USEROBJECTFLAGS::default();
+        let queried = GetUserObjectInformationW(
+            HANDLE(station.0),
+            UOI_FLAGS,
+            Some((&raw mut flags).cast()),
+            size_of::<USEROBJECTFLAGS>() as u32,
+            None,
+        );
+        queried.is_err() || flags.dwFlags & WSF_VISIBLE as u32 != 0
+    }
+}
+
+#[cfg(not(windows))]
+fn has_interactive_desktop() -> bool {
+    true
+}
+
 /// Whether startup may proceed past the single-instance gate (issue #199).
 /// A normal launch checks before updater recovery, which can otherwise block
 /// on the transaction lock or downgrade a `Prepared` transaction. A supervised
@@ -219,6 +254,13 @@ fn main() -> eframe::Result<()> {
             eprintln!("Linefeed updater: {error}");
         }
         std::process::exit(if result.is_ok() { 0 } else { 1 });
+    }
+    // A GUI launched without a desktop has nothing to show: say so and exit
+    // cleanly instead of panicking in surface setup. Updater modes above stay
+    // headless-capable.
+    if !has_interactive_desktop() {
+        eprintln!("Linefeed is a desktop application and needs an interactive session.");
+        return Ok(());
     }
     let supervised =
         updater::install::supervised_args().map_err(|e| eframe::Error::AppCreation(Box::new(e)))?;
@@ -513,10 +555,7 @@ impl eframe::App for LinefeedApp {
     }
 
     // eframe passes a glow context only on Linux; other targets use wgpu.
-    fn on_exit(
-        &mut self,
-        #[cfg(target_os = "linux")] _gl: Option<&eframe::glow::Context>,
-    ) {
+    fn on_exit(&mut self, #[cfg(target_os = "linux")] _gl: Option<&eframe::glow::Context>) {
         self.app.prepare_update_shutdown();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
         if let Some(thread) = self.connection_thread.take() {
