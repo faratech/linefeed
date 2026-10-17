@@ -62,11 +62,11 @@ Existing users need one manual upgrade to the first updater-capable release.
 Future releases must finish assembling before they become public:
 
 1. Bump the package version, commit, and push its matching `vX.Y.Z` tag.
-   The release workflow creates a draft, tests the updater, builds Linux x64
-   and macOS, validates their embedded versions, and attaches their binaries.
-2. Build Windows ARM64/x64/x86 and Linux ARM64 locally. Validate the Linux
-   binary with `--internal-update-probe X.Y.Z`, and upload these four assets
-   to that draft with `gh release upload`.
+   The release workflow creates a draft, tests the updater, builds Linux
+   x64/ARM64 (on ubuntu-22.04, for a low glibc and OpenSSL 3 floor) and macOS,
+   validates their embedded versions, and attaches their binaries.
+2. Build Windows ARM64/x64/x86 locally and upload these three assets to that
+   draft with `gh release upload`.
 3. After all six assets are present, dispatch **Sign Release Binaries** for
    that tag. It signs all Windows executables, regenerates `SHA256SUMS` over
    the final six files, and uploads the signed bytes and checksums to the draft.

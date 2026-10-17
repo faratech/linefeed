@@ -1,8 +1,9 @@
 name: Release builds
 
 # Builds the release binaries this project cannot cross-compile locally:
-# Linux x86_64 and a macOS universal binary (Apple Silicon + Intel).
-# Windows (ARM64/x64/x86) and Linux ARM64 are built locally via build.py.
+# Linux x86_64 and ARM64 (on ubuntu-22.04 runners, for a low glibc/OpenSSL
+# floor) and a macOS universal binary (Apple Silicon + Intel).
+# Windows (ARM64/x64/x86) is built locally via build.py.
 #
 # Runs on tag push, or manually via workflow_dispatch to attach binaries
 # to an existing release tag.
@@ -41,10 +42,18 @@ jobs:
           RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
         run: python .github/scripts/release-assets.py ensure-draft
 
-  linux-x64:
+  linux:
     needs: prepare-release
-    # ubuntu-22.04 keeps the glibc requirement low (2.35) for wider compatibility
-    runs-on: ubuntu-22.04
+    # ubuntu-22.04 keeps the glibc (2.35) and OpenSSL (libssl.so.3)
+    # requirements low for wider compatibility, on both architectures.
+    strategy:
+      matrix:
+        include:
+          - arch: x64
+            runner: ubuntu-22.04
+          - arch: arm64
+            runner: ubuntu-22.04-arm
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
@@ -66,18 +75,18 @@ jobs:
           TAG: ${{ inputs.tag || github.ref_name }}
       - name: Package
         run: |
-          cp target/dist/linefeed linefeed_linux_x64
-          upx --best -q linefeed_linux_x64
+          cp target/dist/linefeed linefeed_linux_${{ matrix.arch }}
+          upx --best -q linefeed_linux_${{ matrix.arch }}
       - name: Generate artifact attestation
         uses: actions/attest-build-provenance@v4
         continue-on-error: true
         with:
-          subject-path: linefeed_linux_x64
+          subject-path: linefeed_linux_${{ matrix.arch }}
 
       - uses: actions/upload-artifact@v7
         with:
-          name: linefeed_linux_x64
-          path: linefeed_linux_x64
+          name: linefeed_linux_${{ matrix.arch }}
+          path: linefeed_linux_${{ matrix.arch }}
 
   macos:
     needs: prepare-release
@@ -117,7 +126,7 @@ jobs:
           path: linefeed_macos
 
   attach-to-release:
-    needs: [linux-x64, macos]
+    needs: [linux, macos]
     runs-on: ubuntu-22.04
     timeout-minutes: 10
     steps:
@@ -137,5 +146,5 @@ jobs:
           RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
         run: |
           python .github/scripts/release-assets.py guard
-          gh release upload "$TAG" linefeed_linux_x64 linefeed_macos \
+          gh release upload "$TAG" linefeed_linux_x64 linefeed_linux_arm64 linefeed_macos \
             --clobber --repo "$GITHUB_REPOSITORY"
