@@ -31,8 +31,10 @@ DEFAULT_TARGETS = ["arm64"]
 # UPX-compatible targets
 UPX_SUPPORTED = {
     LINUX_BINARY: True,
-    "linefeed_x86.exe": True,
-    "linefeed_x64.exe": True,
+    # Windows binaries ship unpacked: UPX-packed executables trip Defender
+    # heuristics (winget's installer scan flagged the packed v0.1.1).
+    "linefeed_x86.exe": False,
+    "linefeed_x64.exe": False,
     "linefeed_arm64.exe": False,  # UPX doesn't support win64/arm64
 }
 

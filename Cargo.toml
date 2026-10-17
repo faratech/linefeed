@@ -1,6 +1,6 @@
 [package]
 name = "linefeed"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 rust-version = "1.97"
 description = "Linefeed IRC Client"
@@ -43,8 +43,11 @@ eframe = { version = "0.36.2", default-features = false, features = ["glow", "pe
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
+# wgpu (DX12/Vulkan/GL, with the WARP software adapter) instead of glow-only:
+# glow cannot create a context on GPU-less Windows VMs, which only offer GDI's
+# OpenGL 1.1, so the app exited or crashed there before showing a window.
 [target.'cfg(not(target_os = "linux"))'.dependencies]
-eframe = { version = "0.36.2", default-features = false, features = ["glow", "persistence"] }
+eframe = { version = "0.36.2", default-features = false, features = ["wgpu", "persistence"] }
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.62.2", features = [

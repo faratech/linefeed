@@ -512,7 +512,11 @@ impl eframe::App for LinefeedApp {
         // When disconnected and not connecting, no need to poll - egui handles UI events
     }
 
-    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+    // eframe passes a glow context only on Linux; other targets use wgpu.
+    fn on_exit(
+        &mut self,
+        #[cfg(target_os = "linux")] _gl: Option<&eframe::glow::Context>,
+    ) {
         self.app.prepare_update_shutdown();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
         if let Some(thread) = self.connection_thread.take() {
