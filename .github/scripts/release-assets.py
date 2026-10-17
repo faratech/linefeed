@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 import re
 import subprocess
+import time
 import tomllib
 
 ASSETS = (
@@ -99,6 +100,13 @@ def main():
         if not any(release["tag_name"] == tag for release in releases):
             run("gh", "release", "create", tag, "--repo", repo, "--draft", "--verify-tag",
                 "--title", f"Linefeed {tag[1:]}", "--generate-notes")
+            # The release listing is eventually consistent: a draft created a
+            # moment ago can be missing from it, which require_draft below
+            # would report as "Expected exactly one release" (v0.1.2).
+            for delay in (1, 2, 4, 8):
+                if any(r["tag_name"] == tag for r in list_releases(repo)):
+                    break
+                time.sleep(delay)
     release = require_draft(repo, tag)
     if args.command in ("ensure-draft", "guard"):
         return
