@@ -62,6 +62,24 @@ pub fn ensure_private_dir(path: &Path) -> io::Result<()> {
                         "Update directory cannot be a reparse point",
                     ));
                 }
+                // Repair directories created with the pre-0.1.3 OWNER RIGHTS
+                // ACL. A non-elevated run cannot rewrite an Administrators-
+                // owned directory, so say how to recover instead of failing
+                // later with a bare "Access is denied".
+                if let Err(e) = platform::secure_existing_dir(path) {
+                    if e.kind() == io::ErrorKind::PermissionDenied {
+                        return Err(io::Error::new(
+                            e.kind(),
+                            format!(
+                                "Linefeed's update data at {} was created by a run as \
+                                 administrator. Run Linefeed once as administrator to \
+                                 repair it, or delete that folder.",
+                                path.display()
+                            ),
+                        ));
+                    }
+                    tracing::warn!("Could not re-secure {}: {e}", path.display());
+                }
             }
             #[cfg(unix)]
             {
