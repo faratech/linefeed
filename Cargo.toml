@@ -37,7 +37,7 @@ semver = "1.0.28"
 
 # Platform-specific: eframe with x11/wayland only on Linux
 [target.'cfg(target_os = "linux")'.dependencies]
-eframe = { version = "0.36.2", default-features = false, features = ["glow", "persistence", "x11", "wayland"] }
+eframe = { version = "0.37.0", default-features = false, features = ["glow", "persistence", "x11", "wayland"] }
 
 # Used by cfg(unix) code paths (local time conversion), so macOS needs it too
 [target.'cfg(unix)'.dependencies]
