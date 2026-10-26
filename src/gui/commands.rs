@@ -1202,16 +1202,17 @@ impl IrcApp {
             }
 
             "SILENCE" => {
-                // Server-side ignore (supported by some networks)
-                if args.is_empty() {
+                // Server-side ignore (supported by some networks). The argument
+                // goes out as typed: +mask/-mask edit the list, and Bahamut/ircu
+                // define a bare nick as querying that user's silence list.
+                if self.isupport_lacks(&["SILENCE"]) {
+                    self.add_message_to_current(ChatMessage::system(
+                        "Server does not advertise SILENCE support",
+                    ));
+                } else if args.is_empty() {
                     // List silence entries
                     self.send_command(IrcCommand::Raw("SILENCE".to_string()));
-                } else if args.starts_with('-') || args.starts_with('+') {
-                    // Add/remove silence entry
-                    self.send_command(IrcCommand::Raw(format!("SILENCE {}", args)));
                 } else {
-                    // Bahamut/ircu define a bare nick as querying that user's
-                    // silence list. Adding is explicitly `+mask`.
                     self.send_command(IrcCommand::Raw(format!("SILENCE {}", args)));
                 }
             }
@@ -1625,6 +1626,11 @@ impl IrcApp {
                     self.add_message_to_current(ChatMessage::system(
                         "       /monitor S - Show status of monitored nicks",
                     ));
+                } else if self.isupport_lacks(&["MONITOR", "WATCH"]) {
+                    // Nothing is sent, so nothing is tracked locally either.
+                    self.add_message_to_current(ChatMessage::system(
+                        "Server supports neither MONITOR nor WATCH",
+                    ));
                 } else {
                     let (subcmd, targets) = monitor_args(args);
                     match subcmd.as_str() {
@@ -1647,11 +1653,13 @@ impl IrcApp {
                         "C" => self.monitored_users.clear(),
                         _ => {}
                     }
+                    // MONITOR wins when both are advertised; WATCH is the
+                    // legacy fallback. With no ISUPPORT yet, MONITOR is assumed.
                     if self.network_support.has_isupport("MONITOR")
                         || !self.network_support.has_isupport("WATCH")
                     {
                         self.send_command(IrcCommand::Monitor(subcmd, targets));
-                    } else if self.network_support.has_isupport("WATCH") {
+                    } else {
                         let wire = match targets {
                             Some(targets) if subcmd == "+" || subcmd == "-" => targets
                                 .split(',')
@@ -1662,10 +1670,6 @@ impl IrcApp {
                             _ => subcmd,
                         };
                         self.send_command(IrcCommand::Raw(format!("WATCH {wire}")));
-                    } else {
-                        self.add_message_to_current(ChatMessage::system(
-                            "Server supports neither MONITOR nor WATCH",
-                        ));
                     }
                 }
             }
@@ -2049,6 +2053,17 @@ impl IrcApp {
                     .without_logging(),
             );
         }
+    }
+
+    /// True once the server's ISUPPORT has arrived and advertises none of
+    /// `tokens`. Before that nothing is known (an early /perform line can run
+    /// ahead of the 005 burst), so callers keep sending rather than claim the
+    /// feature is missing.
+    fn isupport_lacks(&self, tokens: &[&str]) -> bool {
+        !self.network_support.isupport.is_empty()
+            && !tokens
+                .iter()
+                .any(|token| self.network_support.has_isupport(token))
     }
 
     fn ban_mask_for(&self, value: &str) -> String {
@@ -2985,6 +3000,66 @@ mod tests {
         assert_eq!(
             rx.try_recv().unwrap(),
             IrcCommand::Raw("WATCH +alice +bob".into())
+        );
+    }
+
+    #[test]
+    fn monitor_and_silence_report_unsupported_instead_of_sending() {
+        let (mut app, mut rx) = connected_command_app();
+        // The server's ISUPPORT is known and advertises neither feature.
+        app.network_support
+            .isupport
+            .insert("CHANTYPES".into(), Some("#".into()));
+
+        app.process_command("/monitor +alice");
+        app.process_command("/monitor L");
+        app.process_command("/silence +*!*@spam.example");
+        app.process_command("/silence");
+        assert!(rx.try_recv().is_err(), "nothing may reach the wire");
+        assert!(
+            app.monitored_users.is_empty(),
+            "an unsent add must not be tracked"
+        );
+        let rows: Vec<&str> = app
+            .server_messages
+            .iter()
+            .map(|message| message.content.as_str())
+            .collect();
+        assert_eq!(rows.iter().filter(|row| row.contains("MONITOR")).count(), 2);
+        assert_eq!(rows.iter().filter(|row| row.contains("SILENCE")).count(), 2);
+
+        // Advertised support sends as before.
+        app.network_support
+            .isupport
+            .insert("MONITOR".into(), Some("100".into()));
+        app.network_support
+            .isupport
+            .insert("SILENCE".into(), Some("15".into()));
+        app.process_command("/monitor +alice");
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(IrcCommand::Monitor(sub, Some(targets))) if sub == "+" && targets == "alice"
+        ));
+        app.process_command("/silence +*!*@spam.example");
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            IrcCommand::Raw("SILENCE +*!*@spam.example".into())
+        );
+        app.process_command("/silence");
+        assert_eq!(rx.try_recv().unwrap(), IrcCommand::Raw("SILENCE".into()));
+    }
+
+    #[test]
+    fn monitor_and_silence_still_send_before_isupport_arrives() {
+        // An early /perform line can run before the 005 burst: with nothing
+        // known yet the commands keep going to the server.
+        let (mut app, mut rx) = connected_command_app();
+        app.process_command("/monitor +alice");
+        assert!(matches!(rx.try_recv(), Ok(IrcCommand::Monitor(..))));
+        app.process_command("/silence -*!*@spam.example");
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            IrcCommand::Raw("SILENCE -*!*@spam.example".into())
         );
     }
 
