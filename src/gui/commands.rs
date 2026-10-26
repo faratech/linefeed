@@ -9,7 +9,22 @@ impl IrcApp {
         // "//text" is an escaped slash: it sends the literal message "/text"
         // instead of running a command (the same as "/say /text", #263).
         if input.starts_with("//") {
-            self.process_command(&format!("/say {}", &input[1..]));
+            let text = &input[1..];
+            // A mistyped "//ns identify pw" must not go out as the public
+            // message "/ns identify pw" (or be echoed and logged in a
+            // NickServ tab, where the leading slash hides the keyword).
+            // /say remains the deliberate way to send such text.
+            if command_line_contains_credentials(text) {
+                self.add_message_to_current(
+                    ChatMessage::system(
+                        "Not sent: this looks like a credential command typed with a doubled \
+                         slash. Use a single slash to run it, or /say to send it as text.",
+                    )
+                    .without_logging(),
+                );
+                return;
+            }
+            self.process_command(&format!("/say {text}"));
             return;
         }
         // Whitespace separator (not just ' '): the credential filter splits
@@ -1364,9 +1379,11 @@ impl IrcApp {
 
             "SAY" => {
                 // Force send as message (even if starts with /)
-                if let Some(channel) = &self.current_channel.clone()
-                    && !args.is_empty()
-                {
+                if args.is_empty() {
+                    self.add_message_to_current(
+                        ChatMessage::system("Usage: /say <message>").without_logging(),
+                    );
+                } else if let Some(channel) = &self.current_channel.clone() {
                     if self.connected {
                         if self.send_privmsg_text(channel, args) {
                             let msg =
@@ -1387,6 +1404,13 @@ impl IrcApp {
                             .without_logging(),
                         );
                     }
+                } else {
+                    // The server tab has no target: say so rather than
+                    // silently dropping the text (also reached via "//text").
+                    self.add_message_to_current(
+                        ChatMessage::system("No channel or query selected - message not sent")
+                            .without_logging(),
+                    );
                 }
             }
 
@@ -3052,6 +3076,71 @@ mod tests {
                 .iter()
                 .all(|row| !row.content.contains("Invalid command"))
         );
+    }
+
+    #[test]
+    fn double_slash_refuses_a_mistyped_credential_command() {
+        // "//ns identify hunter2" would otherwise go out as the public message
+        // "/ns identify hunter2" (or be echoed in a NickServ query tab). /say
+        // stays the deliberate way to send such text.
+        let (mut app, mut rx) = connected_command_app();
+        let mut channel = Channel::new();
+        channel.joined = true;
+        app.channels.insert("#room".into(), channel);
+        app.current_channel = Some("#room".into());
+
+        for input in [
+            "//ns identify hunter2",
+            "//NS IDENTIFY hunter2",
+            "///ns identify hunter2",
+            "//identify hunter2",
+            "//msg NickServ identify hunter2",
+            "//raw PASS hunter2",
+        ] {
+            app.process_command(input);
+            assert!(rx.try_recv().is_err(), "{input} must not be sent");
+        }
+        let shown: Vec<&str> = app.channels["#room"]
+            .messages
+            .iter()
+            .map(|row| row.content.as_str())
+            .collect();
+        assert!(
+            shown.iter().any(|row| row.contains("/say")),
+            "the refusal names /say: {shown:?}"
+        );
+        assert!(
+            shown.iter().all(|row| !row.contains("hunter2")),
+            "the secret is never echoed: {shown:?}"
+        );
+
+        // An ordinary escaped command still goes out, as does a deliberate /say.
+        app.process_command("//nsfw is fine");
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            IrcCommand::Privmsg("#room".into(), "/nsfw is fine".into())
+        );
+        app.process_command("/say /ns identify literal");
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            IrcCommand::Privmsg("#room".into(), "/ns identify literal".into())
+        );
+    }
+
+    #[test]
+    fn double_slash_and_say_report_when_there_is_no_target() {
+        let (mut app, mut rx) = connected_command_app();
+        assert!(app.current_channel.is_none());
+        for input in ["//shrug", "/say hello"] {
+            let before = app.server_messages.len();
+            app.process_command(input);
+            assert!(rx.try_recv().is_err(), "{input}");
+            assert_eq!(
+                app.server_messages.len(),
+                before + 1,
+                "{input} must report an error instead of doing nothing"
+            );
+        }
     }
 
     #[test]
