@@ -2555,6 +2555,7 @@ pub(super) fn content_has_auth_command(message: &str) -> bool {
             | "SETPASS"
             | "RESETPASS"
             | "NEWPASS"
+            | "VERIFY"
     ) {
         return true;
     }
@@ -2624,6 +2625,8 @@ pub(super) fn command_line_contains_credentials(line: &str) -> bool {
             service_message_contains_credentials(target, content)
         }
         "ME" | "SAY" => content_has_auth_command(args),
+        // /reply <msgid> <text> sends the text to the current target like /say.
+        "REPLY" => content_has_auth_command(split_word(args).1),
         "RAW" | "QUOTE" => {
             // A raw line may lead with IRCv3 tags ("@label=1 PRIVMSG ..."):
             // without skipping them the tag token reads as the command.
@@ -3865,6 +3868,59 @@ mod tests {
             "/ns saset alice password x"
         ));
         assert!(!command_line_contains_credentials("/ns set email a@b.test"));
+    }
+
+    #[test]
+    fn verify_and_reply_credential_lines_are_redacted_and_kept_out_of_history() {
+        // Service shorthand: the account-verification code is a secret.
+        assert!(content_has_auth_command("verify register acct KEY"));
+        assert!(service_message_contains_credentials(
+            "NickServ",
+            "VERIFY REGISTER acct KEY"
+        ));
+        assert!(command_line_contains_credentials(
+            "/ns verify register acct KEY"
+        ));
+        let echo = outgoing_local_echo("NickServ", "me", "verify register acct KEY", "short");
+        assert_eq!(echo.content, "<credential command sent>");
+        assert!(echo.no_log);
+
+        // /reply sends its text to the current target like /say.
+        assert!(command_line_contains_credentials(
+            "/reply abc123 identify hunter2"
+        ));
+        assert!(command_line_contains_credentials(
+            "/reply  abc123   IDENTIFY hunter2"
+        ));
+        assert!(!command_line_contains_credentials("/reply abc123 hello"));
+        assert!(!command_line_contains_credentials("/reply abc123"));
+
+        let (mut app, mut rx) = connected_command_app();
+        app.set_session_nick("me".into(), true);
+        app.handle_cap_message("ACK", &["message-tags".into()]);
+        assert!(app.open_query("NickServ"));
+        for input in [
+            "/reply abc123 identify hunter17",
+            "/ns verify register acct KEY18",
+        ] {
+            app.input_text = input.into();
+            app.process_input();
+        }
+        // Positive control: an ordinary command is stored.
+        app.input_text = "/join #x".into();
+        app.process_input();
+        assert_eq!(app.command_history, vec!["/join #x".to_string()]);
+        let query = &app.channels["NickServ"];
+        for secret in ["hunter17", "KEY18"] {
+            assert!(
+                query
+                    .messages
+                    .iter()
+                    .all(|message| !message.content.contains(secret)),
+                "{secret} must not appear in the tab"
+            );
+        }
+        while rx.try_recv().is_ok() {}
     }
 
     #[test]
