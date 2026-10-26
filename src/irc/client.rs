@@ -2649,12 +2649,13 @@ mod tests {
                     )
                     .await
                     .unwrap();
-                assert_eq!(
-                    read_wire_line(&mut reader).await,
-                    "PRIVMSG #chan :queued during connect"
-                );
-                // Hold the socket open long enough for the client to read.
-                tokio::time::sleep(Duration::from_millis(500)).await;
+                // Hand the queued line back to the test body instead of
+                // asserting here: the test joins this task, so a command that
+                // never reaches the wire fails the test (#276) rather than
+                // being masked by an aborted task.
+                timeout(Duration::from_secs(2), read_wire_line(&mut reader))
+                    .await
+                    .ok()
             });
 
             let config = ServerConfig {
@@ -2708,7 +2709,12 @@ mod tests {
             assert!(saw_spaced_message, "trailing message spaces were lost");
             assert!(saw_kick, "KICK was not forwarded");
 
-            server.abort();
+            let queued = server.await.expect("fake server task failed");
+            assert_eq!(
+                queued.as_deref(),
+                Some("PRIVMSG #chan :queued during connect"),
+                "command queued during connect never reached the wire"
+            );
             client_task.abort();
         });
     }
