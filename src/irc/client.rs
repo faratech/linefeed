@@ -1945,9 +1945,13 @@ impl IrcClient {
                 .await?
             {
                 SaslServerEvent::Challenge(challenge) => {
-                    let Some(expected) = expected_server_signature.as_deref() else {
-                        // Out-of-protocol second challenge: abort the live
-                        // exchange before falling back (#176/#181).
+                    let Some(expected) = expected_server_signature
+                        .as_deref()
+                        .filter(|_| !server_verified)
+                    else {
+                        // Out-of-protocol extra challenge (a second one, or
+                        // any after the server signature verified): abort
+                        // the live exchange before falling back (#176/#181).
                         self.abort_sasl_exchange(writer).await?;
                         return Ok(SaslAttemptOutcome::Failed);
                     };
@@ -1965,6 +1969,11 @@ impl IrcClient {
                         self.abort_sasl_exchange(writer).await?;
                         return Ok(SaslAttemptOutcome::Failed);
                     }
+                    // IRCv3 SASL 3.1: when the mechanism ends with a non-empty
+                    // server challenge (SCRAM's server-final message) the
+                    // client MUST still send an empty response; spec-following
+                    // servers hold the 903 until it arrives (#230).
+                    Self::write_sasl_payload(writer, b"").await?;
                 }
                 SaslServerEvent::Success if server_verified => {
                     let _ = incoming_tx.try_send(IrcMessage {
@@ -3294,6 +3303,224 @@ mod tests {
                 .expect("SASL registration timed out")
                 .unwrap();
             server.await.unwrap();
+        });
+    }
+
+    fn authenticate_payload(line: &str) -> String {
+        let encoded = line
+            .strip_prefix("AUTHENTICATE ")
+            .unwrap_or_else(|| panic!("expected AUTHENTICATE, got {line:?}"));
+        String::from_utf8(BASE64_STANDARD.decode(encoded).unwrap()).unwrap()
+    }
+
+    #[derive(Clone, Copy, PartialEq)]
+    enum ScramServerMode {
+        Normal,
+        ForgedSignature,
+        RepeatedFinal,
+    }
+
+    /// Scripted SCRAM-SHA-256 server: CAP/SASL negotiation, then the full
+    /// RFC 5802/7677 exchange with the server side computed independently of
+    /// `scram_sha256_response` (verifying the client proof and deriving the
+    /// server signature). Like a spec-following IRCv3 server it waits for the
+    /// client's empty `AUTHENTICATE +` after the server-final message before
+    /// reporting 903. Returns the line the client sent in answer to the
+    /// server-final message (or a marker if it sent nothing in time); in
+    /// `RepeatedFinal` mode, the line it sent in answer to the repeat.
+    async fn scram_fake_server(
+        listener: tokio::net::TcpListener,
+        password: String,
+        mode: ScramServerMode,
+    ) -> String {
+        let (stream, _) = listener.accept().await.unwrap();
+        let (read_half, mut write_half) = stream.into_split();
+        let mut reader = BufReader::new(read_half);
+        assert_eq!(read_wire_line(&mut reader).await, "CAP LS 302");
+        assert_eq!(read_wire_line(&mut reader).await, "NICK tester");
+        assert!(read_wire_line(&mut reader).await.starts_with("USER "));
+        write_half
+            .write_all(b":srv CAP * LS :sasl=PLAIN,SCRAM-SHA-256\r\n")
+            .await
+            .unwrap();
+        assert_eq!(read_wire_line(&mut reader).await, "CAP REQ :sasl");
+        write_half
+            .write_all(b":srv CAP * ACK :sasl\r\n")
+            .await
+            .unwrap();
+        assert_eq!(
+            read_wire_line(&mut reader).await,
+            "AUTHENTICATE SCRAM-SHA-256"
+        );
+        write_half.write_all(b"AUTHENTICATE +\r\n").await.unwrap();
+
+        let client_first = authenticate_payload(&read_wire_line(&mut reader).await);
+        let client_first_bare = client_first.strip_prefix("n,,").unwrap().to_string();
+        assert!(client_first_bare.starts_with("n=user,r="));
+        let client_nonce = client_first_bare.split_once(",r=").unwrap().1;
+        let salt = b"0123456789abcdef";
+        let server_first = format!(
+            "r={client_nonce}srvnonce,s={},i=4096",
+            BASE64_STANDARD.encode(salt)
+        );
+        let line = format!(
+            "AUTHENTICATE {}\r\n",
+            BASE64_STANDARD.encode(server_first.as_bytes())
+        );
+        write_half.write_all(line.as_bytes()).await.unwrap();
+
+        let client_final = authenticate_payload(&read_wire_line(&mut reader).await);
+        let (without_proof, proof) = client_final.rsplit_once(",p=").unwrap();
+        assert_eq!(without_proof, format!("c=biws,r={client_nonce}srvnonce"));
+        let auth_message = format!("{client_first_bare},{server_first},{without_proof}");
+        let mut salted = [0u8; 32];
+        pbkdf2_hmac::<Sha256>(password.as_bytes(), salt, 4096, &mut salted);
+        let client_key = hmac_sha256(&salted, b"Client Key");
+        let client_signature = hmac_sha256(&Sha256::digest(&client_key), auth_message.as_bytes());
+        let expected_proof: Vec<u8> = client_key
+            .iter()
+            .zip(client_signature)
+            .map(|(key, signature)| key ^ signature)
+            .collect();
+        assert_eq!(proof, BASE64_STANDARD.encode(expected_proof));
+
+        let mut server_signature = hmac_sha256(
+            &hmac_sha256(&salted, b"Server Key"),
+            auth_message.as_bytes(),
+        );
+        if mode == ScramServerMode::ForgedSignature {
+            server_signature[0] ^= 0x01;
+        }
+        let server_final = format!("v={}", BASE64_STANDARD.encode(server_signature));
+        let line = format!(
+            "AUTHENTICATE {}\r\n",
+            BASE64_STANDARD.encode(server_final.as_bytes())
+        );
+        write_half.write_all(line.as_bytes()).await.unwrap();
+        if mode == ScramServerMode::RepeatedFinal {
+            write_half.write_all(line.as_bytes()).await.unwrap();
+        }
+
+        // IRCv3 SASL 3.1: the client must answer the non-empty final
+        // challenge with an empty response; only then does the server finish.
+        let Ok(response) = timeout(Duration::from_secs(1), read_wire_line(&mut reader)).await
+        else {
+            return "<no response to the server-final message>".to_string();
+        };
+        if mode == ScramServerMode::RepeatedFinal {
+            // Only the first server-final is acknowledged; the repeat is out
+            // of protocol and must abort the exchange, not draw a second '+'.
+            assert_eq!(response, "AUTHENTICATE +");
+            return timeout(Duration::from_secs(1), read_wire_line(&mut reader))
+                .await
+                .unwrap_or_else(|_| "<no response to the repeated server-final>".to_string());
+        }
+        if response == "AUTHENTICATE +" {
+            write_half
+                .write_all(b":srv 903 tester :SASL authentication successful\r\n")
+                .await
+                .unwrap();
+            assert_eq!(read_wire_line(&mut reader).await, "CAP END");
+            write_half
+                .write_all(b":srv 001 tester :Welcome\r\n")
+                .await
+                .unwrap();
+        }
+        response
+    }
+
+    fn scram_test_config(port: u16) -> ServerConfig {
+        ServerConfig {
+            host: "127.0.0.1".into(),
+            port,
+            use_tls: false,
+            nick: "tester".into(),
+            sasl_username: Some("user".into()),
+            sasl_password: Some("pencil".into()),
+            sasl_mechanism: SaslMechanism::ScramSha256,
+            sasl_required: true,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn scram_sha256_exchange_sends_the_empty_ack_before_903() {
+        test_runtime().block_on(async {
+            // #230: the full exchange against a server that holds 903 until
+            // it receives the empty AUTHENTICATE + after server-final.
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let server = tokio::spawn(scram_fake_server(
+                listener,
+                "pencil".into(),
+                ScramServerMode::Normal,
+            ));
+            let (msg_tx, mut msg_rx) = mpsc::channel(100);
+            let (_cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+            let mut client = IrcClient::new(scram_test_config(addr.port()));
+            let result = timeout(Duration::from_secs(5), client.connect(msg_tx, cmd_rx))
+                .await
+                .expect("SCRAM registration timed out");
+            let response = server.await.unwrap();
+            assert_eq!(
+                response, "AUTHENTICATE +",
+                "client must send an empty AUTHENTICATE + after the SCRAM server-final message"
+            );
+            result.unwrap();
+            assert!(
+                std::iter::from_fn(|| msg_rx.try_recv().ok()).any(|msg| matches!(
+                    msg.command,
+                    IrcCommand::Notice(_, ref text) if text.contains("SCRAM-SHA-256 authentication successful")
+                ))
+            );
+        });
+    }
+
+    #[test]
+    fn scram_sha256_bad_server_signature_aborts_without_the_ack() {
+        test_runtime().block_on(async {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let server = tokio::spawn(scram_fake_server(
+                listener,
+                "pencil".into(),
+                ScramServerMode::ForgedSignature,
+            ));
+            let (msg_tx, _msg_rx) = mpsc::channel(100);
+            let (_cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+            let mut client = IrcClient::new(scram_test_config(addr.port()));
+            let result = timeout(Duration::from_secs(5), client.connect(msg_tx, cmd_rx))
+                .await
+                .expect("SCRAM registration timed out");
+            // A forged server signature must abort the exchange, never be
+            // acknowledged as a success.
+            assert_eq!(server.await.unwrap(), "AUTHENTICATE *");
+            let error = result.unwrap_err();
+            assert!(
+                error.to_string().contains("Required SASL"),
+                "unexpected error: {error}"
+            );
+        });
+    }
+
+    #[test]
+    fn scram_sha256_acknowledges_the_server_final_message_only_once() {
+        test_runtime().block_on(async {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let server = tokio::spawn(scram_fake_server(
+                listener,
+                "pencil".into(),
+                ScramServerMode::RepeatedFinal,
+            ));
+            let (msg_tx, _msg_rx) = mpsc::channel(100);
+            let (_cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+            let mut client = IrcClient::new(scram_test_config(addr.port()));
+            let result = timeout(Duration::from_secs(5), client.connect(msg_tx, cmd_rx))
+                .await
+                .expect("SCRAM registration timed out");
+            assert_eq!(server.await.unwrap(), "AUTHENTICATE *");
+            assert!(result.is_err());
         });
     }
 
