@@ -894,8 +894,9 @@ impl IrcApp {
 
     /// Send a desktop notification
     pub fn send_notification(&mut self, title: &str, body: &str, force: bool) {
-        // Always log the notification
-        tracing::info!("Notification: {} - {}", title, body);
+        // Title only, at debug: the body is message text, which must not reach
+        // the default-level log whether or not notifications are enabled (#228).
+        tracing::debug!("Notification requested: {}", title);
 
         if !self.notifications_enabled {
             tracing::debug!("Notifications disabled, skipping");
@@ -7087,6 +7088,29 @@ mod tests {
             assert!(!app.send_command(IrcCommand::Pass("hunter2".into())));
         });
         assert!(!logs.contains("hunter2"), "{logs}");
+    }
+
+    #[test]
+    fn notifications_never_log_message_text() {
+        // Skipped notifications (disabled or focused) must not leak the body
+        // to the default-level log either (#228).
+        let mut app = test_app();
+        app.notifications_enabled = false;
+        let logs = capture_logs(|| {
+            app.send_notification("PM from alice", "meet me at the secret place", true);
+        });
+        assert!(!logs.contains("secret place"), "{logs}");
+
+        app.notifications_enabled = true;
+        app.window_focused = true;
+        let logs = capture_logs(|| {
+            app.send_notification(
+                "bob mentioned you in #room",
+                "the password is swordfish",
+                false,
+            );
+        });
+        assert!(!logs.contains("swordfish"), "{logs}");
     }
 
     #[test]
