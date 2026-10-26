@@ -850,7 +850,10 @@ impl IrcApp {
             }
             let busy = self.updater.busy();
             if ui
-                .add_enabled(!busy, egui::Button::new("Check for updates"))
+                .add_enabled(
+                    !busy && self.updater.available(),
+                    egui::Button::new("Check for updates"),
+                )
                 .clicked()
             {
                 self.updater.check();

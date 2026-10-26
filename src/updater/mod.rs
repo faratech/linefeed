@@ -109,7 +109,17 @@ pub struct Controller {
 }
 
 impl Controller {
-    pub fn start(&mut self, paths: Paths, context: egui::Context, automatic: bool) {
+    pub fn start(&mut self, paths: Option<Paths>, context: egui::Context, automatic: bool) {
+        let Some(paths) = paths else {
+            // The updater could not initialize but the app still runs: leave
+            // it disabled and say why in About (#272).
+            self.status = Status::Error(
+                self.install_reason
+                    .clone()
+                    .unwrap_or_else(|| "The updater is unavailable".into()),
+            );
+            return;
+        };
         self.automatic.store(automatic, Ordering::Relaxed);
         let recovery_error = self.install_reason.is_some();
         if recovery_error {
@@ -179,8 +189,12 @@ impl Controller {
             Status::Checking | Status::Downloading { .. } | Status::Applying
         )
     }
+    /// False when the updater failed to initialize and has no worker.
+    pub fn available(&self) -> bool {
+        self.sender.is_some()
+    }
     pub fn check(&mut self) {
-        if !self.busy() {
+        if !self.busy() && self.available() {
             self.send(Command::Check);
             self.status = Status::Checking;
         }
@@ -306,11 +320,7 @@ fn worker(
             match command {
                 Command::Check => {
                     emit(&events, &context, Event::Status(Status::Checking));
-                    let lock = paths.transaction_lock()?;
-                    // Serialize cadence and staging across running instances.
-                    lock.try_lock().map_err(io::Error::other)?;
-                    let checked = now();
-                    install::write_json(&paths.state.join("last-check.json"), &checked)?;
+                    let checked = record_check(&paths)?;
                     emit(&events, &context, Event::Checked(checked));
                     offer = check_release()?;
                     emit(&events, &context, Event::Offer(offer.clone()));
@@ -333,8 +343,6 @@ fn worker(
                     let offer = offer
                         .as_ref()
                         .ok_or_else(|| io::Error::other("Check for an update first"))?;
-                    let lock = paths.transaction_lock()?;
-                    lock.try_lock().map_err(io::Error::other)?;
                     let tx = download(&paths, offer, &events, &context, &canceled)?;
                     emit(&events, &context, Event::Staged(tx));
                 }
@@ -359,6 +367,17 @@ fn worker(
 
 /// Release metadata and the checksum manifest are small, so a slow body is a
 /// stuck one and keeps the short limit.
+/// Stamp the check cadence for all running instances. The transaction lock is
+/// held only for this write, never across the network requests that follow:
+/// another launch would otherwise wait on it until its own timeout (#272).
+fn record_check(paths: &Paths) -> io::Result<u64> {
+    let lock = paths.transaction_lock()?;
+    lock.try_lock().map_err(io::Error::other)?;
+    let checked = now();
+    install::write_json(&paths.state.join("last-check.json"), &checked)?;
+    Ok(checked)
+}
+
 fn agent() -> ureq::Agent {
     build_agent(Some(Duration::from_secs(30)), true)
 }
@@ -576,24 +595,43 @@ fn download(
         platform::verify_signature(&tx.candidate())?;
         install::executable_copy(&paths.target, &tx.helper())?;
         platform::sync_dir(&directory)?;
-        tx.save()?;
-        // Preserve the old stage until the new candidate is verified and the
-        // journal points to it. Then remove old helper bytes and credentials.
-        if let Some(old) = &previous
-            && old.paths.target == paths.target
-            && old.paths.state == paths.state
-            && old.directory != tx.directory
-            && old.validate().is_ok()
-        {
-            let _ = fs::remove_file(old.snapshot());
-            let _ = fs::remove_dir_all(&old.directory);
-        }
+        publish_staged(paths, &tx)?;
         Ok(tx)
     })();
     if result.is_err() {
         let _ = fs::remove_dir_all(directory);
     }
     result
+}
+
+/// Point the journal at a fully verified candidate. This is the only step of a
+/// download that holds the transaction lock, so other launches and exits never
+/// wait on network I/O (#272).
+fn publish_staged(paths: &Paths, tx: &Transaction) -> io::Result<()> {
+    let lock = paths.transaction_lock()?;
+    install::timed_lock(&lock, false, Duration::from_secs(30))?;
+    // Re-read under the lock: an install may have started during the download.
+    let previous = install::read_json::<Transaction>(&paths.journal()).ok();
+    if let Some(old) = &previous
+        && matches!(old.phase, Phase::Prepared | Phase::Replaced)
+    {
+        return Err(io::Error::other(
+            "An update is awaiting installation or startup confirmation",
+        ));
+    }
+    tx.save()?;
+    // Preserve the old stage until the new candidate is verified and the
+    // journal points to it. Then remove old helper bytes and credentials.
+    if let Some(old) = &previous
+        && old.paths.target == paths.target
+        && old.paths.state == paths.state
+        && old.directory != tx.directory
+        && old.validate().is_ok()
+    {
+        let _ = fs::remove_file(old.snapshot());
+        let _ = fs::remove_dir_all(&old.directory);
+    }
+    Ok(())
 }
 
 fn copy_download(
@@ -833,11 +871,82 @@ mod tests {
         let failure = "Update could not complete: Update validation failed";
         install::write_json(&paths.state.join("result.json"), &failure).unwrap();
         let mut controller = Controller::default();
-        controller.start(paths, egui::Context::default(), false);
+        controller.start(Some(paths), egui::Context::default(), false);
         assert!(matches!(&controller.status, Status::Error(message) if message == failure));
         assert!(controller.staged.is_some());
         drop(controller);
         let _ = fs::remove_dir_all(root);
+    }
+    /// A second verified candidate for the fixture's installation.
+    fn newer_candidate(paths: &Paths) -> Transaction {
+        let (attempt, directory) = install::stage_directory(paths).unwrap();
+        let tx = Transaction {
+            paths: paths.clone(),
+            attempt,
+            directory,
+            version: "0.0.11".into(),
+            old_hash: install::hash(&paths.target).unwrap(),
+            new_hash: install::hex(&Sha256::digest(b"newer executable")),
+            phase: Phase::Staged,
+            restart: false,
+            working_directory: paths.state.clone(),
+        };
+        fs::write(tx.candidate(), b"newer executable").unwrap();
+        install::executable_copy(&paths.target, &tx.helper()).unwrap();
+        tx
+    }
+    #[test]
+    fn publishing_replaces_the_previous_stage_and_releases_the_lock() {
+        let (root, paths, old) = staged_fixture("0.0.10");
+        let newer = newer_candidate(&paths);
+        publish_staged(&paths, &newer).unwrap();
+        let journal: Transaction = install::read_json(&paths.journal()).unwrap();
+        assert_eq!(journal.attempt, newer.attempt);
+        assert!(!old.directory.exists());
+        // Nothing keeps holding the lock once the commit is done (waiting
+        // briefly: a concurrently forked child can keep a closed handle's lock
+        // alive until it execs).
+        let lock = paths.transaction_lock().unwrap();
+        install::timed_lock(&lock, false, Duration::from_secs(5)).unwrap();
+        let _ = fs::remove_dir_all(root);
+    }
+    #[test]
+    fn publishing_never_overwrites_a_journal_that_began_installing() {
+        let (root, paths, mut old) = staged_fixture("0.0.10");
+        // An arm moved the journal on while the newer candidate downloaded.
+        old.phase = Phase::Prepared;
+        old.save().unwrap();
+        let newer = newer_candidate(&paths);
+        assert!(publish_staged(&paths, &newer).is_err());
+        let journal: Transaction = install::read_json(&paths.journal()).unwrap();
+        assert_eq!(journal.attempt, old.attempt);
+        assert!(old.directory.exists());
+        let _ = fs::remove_dir_all(root);
+    }
+    #[test]
+    fn checking_for_updates_does_not_hold_the_lock_during_the_request() {
+        // check_release() runs after record_check returns; a launch or another
+        // instance's commit must be able to take the lock meanwhile (#272).
+        let (root, paths, _tx) = staged_fixture("0.0.10");
+        let checked = record_check(&paths).unwrap();
+        assert_eq!(
+            install::read_json::<u64>(&paths.state.join("last-check.json")).unwrap(),
+            checked
+        );
+        let lock = paths.transaction_lock().unwrap();
+        install::timed_lock(&lock, false, Duration::from_secs(5)).unwrap();
+        let _ = fs::remove_dir_all(root);
+    }
+    #[test]
+    fn controller_without_updater_state_stays_disabled_and_explains_why() {
+        let mut controller = Controller::default();
+        controller.install_reason = Some("The updater could not start".into());
+        controller.start(None, egui::Context::default(), true);
+        assert!(!controller.available());
+        assert!(matches!(&controller.status, Status::Error(m) if m.contains("could not start")));
+        controller.check();
+        controller.download();
+        assert!(matches!(controller.status, Status::Error(_)));
     }
     /// Loopback HTTP server: headers at once, then one body byte per `pause`.
     fn slow_body_server(parts: usize, pause: Duration) -> String {

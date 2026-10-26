@@ -284,21 +284,52 @@ pub fn executable_copy(source: &Path, destination: &Path) -> io::Result<()> {
 // Held by main until process exit. Helpers acquire an exclusive lock only
 // after all running instances have released their shared locks.
 pub struct Startup {
-    pub paths: Paths,
-    pub running: File,
+    /// None when the updater could not initialize (see `update_error`).
+    pub paths: Option<Paths>,
+    pub running: Option<File>,
     pub acknowledgment: Option<Transaction>,
     pub snapshot: Option<crate::gui::UpdateSession>,
     pub update_error: Option<String>,
 }
 
 pub fn startup(supervised: Option<(PathBuf, String)>) -> io::Result<Startup> {
-    let paths = Paths::discover()?;
+    startup_with(Paths::discover(), supervised, Duration::from_secs(90))
+}
+
+/// A normal launch must open the app even when the updater cannot start
+/// (unusable update directory, lock contention): disable installation and say
+/// why in About. A supervised update launch still fails closed so the helper
+/// rolls back (#272).
+fn startup_with(
+    discovered: io::Result<Paths>,
+    supervised: Option<(PathBuf, String)>,
+    lock_wait: Duration,
+) -> io::Result<Startup> {
+    match discovered.and_then(|paths| start_updater(paths, supervised.as_ref(), lock_wait)) {
+        Err(error) if supervised.is_none() => Ok(Startup {
+            paths: None,
+            running: None,
+            acknowledgment: None,
+            snapshot: None,
+            update_error: Some(format!(
+                "The updater could not start: {error}. Download a release manually."
+            )),
+        }),
+        result => result,
+    }
+}
+
+fn start_updater(
+    paths: Paths,
+    supervised: Option<&(PathBuf, String)>,
+    lock_wait: Duration,
+) -> io::Result<Startup> {
     let lock = paths.transaction_lock()?;
     if supervised.is_none() {
-        timed_lock(&lock, false, Duration::from_secs(90))?;
+        timed_lock(&lock, false, lock_wait)?;
     }
     let (acknowledgment, snapshot, update_error) =
-        match recover_startup(&paths, supervised.as_ref()) {
+        match recover_startup(&paths, supervised) {
             Ok((acknowledgment, snapshot)) => (acknowledgment, snapshot, None),
             // A manually replaced executable or damaged journal must not strand a
             // working app. Preserve all recovery files and disable installation.
@@ -315,8 +346,8 @@ pub fn startup(supervised: Option<(PathBuf, String)>) -> io::Result<Startup> {
     running.lock_shared()?;
     drop(lock);
     Ok(Startup {
-        paths,
-        running,
+        paths: Some(paths),
+        running: Some(running),
         acknowledgment,
         snapshot,
         update_error,
@@ -422,6 +453,12 @@ pub fn timed_lock(file: &File, shared: bool, timeout: Duration) -> io::Result<()
             Ok(()) => return Ok(()),
             Err(std::fs::TryLockError::WouldBlock) if Instant::now() < deadline => {
                 std::thread::sleep(Duration::from_millis(100))
+            }
+            Err(std::fs::TryLockError::WouldBlock) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "another Linefeed instance is busy updating",
+                ));
             }
             Err(e) => return Err(io::Error::other(e)),
         }
@@ -1166,6 +1203,38 @@ mod tests {
             fs::read(fixture.tx.paths.journal()).unwrap(),
             b"invalid journal"
         );
+    }
+    #[test]
+    fn updater_infrastructure_failure_does_not_stop_a_normal_launch() {
+        // e.g. a 0755 or foreign-owned update directory (#272).
+        let failure = || Err(io::Error::other("Update directory is not private to this user"));
+        let startup = startup_with(failure(), None, Duration::from_secs(1)).unwrap();
+        assert!(startup.paths.is_none() && startup.running.is_none());
+        assert!(startup.update_error.unwrap().contains("not private"));
+        // A supervised update launch still fails closed so the helper rolls back.
+        let supervised = Some((PathBuf::from("transaction.json"), "token".to_owned()));
+        assert!(startup_with(failure(), supervised, Duration::from_secs(1)).is_err());
+    }
+    #[test]
+    fn busy_transaction_lock_does_not_stop_a_normal_launch() {
+        let fixture = Fixture::new();
+        let held = fixture.tx.paths.transaction_lock().unwrap();
+        held.lock().unwrap();
+        let paths = fixture.tx.paths.clone();
+        let startup = startup_with(Ok(paths), None, Duration::from_millis(200)).unwrap();
+        assert!(startup.paths.is_none());
+        assert!(startup.update_error.is_some());
+    }
+    #[test]
+    fn healthy_startup_keeps_the_updater_and_holds_no_transaction_lock() {
+        let fixture = Fixture::new();
+        let paths = fixture.tx.paths.clone();
+        let startup = startup_with(Ok(paths.clone()), None, Duration::from_secs(1)).unwrap();
+        assert!(startup.paths.is_some() && startup.running.is_some());
+        assert!(startup.update_error.is_none());
+        // A concurrently forked child (other tests spawn probes) can briefly
+        // keep the closed handle's lock alive, so wait rather than try once.
+        timed_lock(&paths.transaction_lock().unwrap(), false, Duration::from_secs(5)).unwrap();
     }
     #[test]
     fn rollback_preserves_snapshot_and_suppresses_failed_version() {
