@@ -90,6 +90,8 @@ struct TextSpan {
     reverse: bool,
     strikethrough: bool,
     monospace: bool,
+    /// A reset (`\x0F`) came between the previous span and this one.
+    after_reset: bool,
 }
 
 /// Get a consistent color for a nick based on hash
@@ -193,6 +195,10 @@ fn parse_irc_colors(input: &str) -> Vec<TextSpan> {
     let mut reverse = false;
     let mut strikethrough = false;
     let mut monospace = false;
+    // `reset_seen`: a \x0F came since the last flushed span. A span records
+    // it when its first character arrives (`span_after_reset`).
+    let mut reset_seen = false;
+    let mut span_after_reset = false;
 
     let mut chars = input.chars().peekable();
 
@@ -211,6 +217,7 @@ fn parse_irc_colors(input: &str) -> Vec<TextSpan> {
                         reverse,
                         strikethrough,
                         monospace,
+                        after_reset: span_after_reset,
                     });
                     current_text.clear();
                 }
@@ -277,6 +284,7 @@ fn parse_irc_colors(input: &str) -> Vec<TextSpan> {
                         reverse,
                         strikethrough,
                         monospace,
+                        after_reset: span_after_reset,
                     });
                     current_text.clear();
                 }
@@ -295,6 +303,7 @@ fn parse_irc_colors(input: &str) -> Vec<TextSpan> {
                         reverse,
                         strikethrough,
                         monospace,
+                        after_reset: span_after_reset,
                     });
                     current_text.clear();
                 }
@@ -313,6 +322,7 @@ fn parse_irc_colors(input: &str) -> Vec<TextSpan> {
                         reverse,
                         strikethrough,
                         monospace,
+                        after_reset: span_after_reset,
                     });
                     current_text.clear();
                 }
@@ -331,6 +341,7 @@ fn parse_irc_colors(input: &str) -> Vec<TextSpan> {
                         reverse,
                         strikethrough,
                         monospace,
+                        after_reset: span_after_reset,
                     });
                     current_text.clear();
                 }
@@ -349,6 +360,7 @@ fn parse_irc_colors(input: &str) -> Vec<TextSpan> {
                         reverse,
                         strikethrough,
                         monospace,
+                        after_reset: span_after_reset,
                     });
                     current_text.clear();
                 }
@@ -360,6 +372,7 @@ fn parse_irc_colors(input: &str) -> Vec<TextSpan> {
                 reverse = false;
                 strikethrough = false;
                 monospace = false;
+                reset_seen = true;
             }
             '\x1E' | '\x11' | '\x04' => {
                 // Strikethrough / monospace toggles and the hex colour
@@ -374,6 +387,7 @@ fn parse_irc_colors(input: &str) -> Vec<TextSpan> {
                         reverse,
                         strikethrough,
                         monospace,
+                        after_reset: span_after_reset,
                     });
                     current_text.clear();
                 }
@@ -396,6 +410,9 @@ fn parse_irc_colors(input: &str) -> Vec<TextSpan> {
                 }
             }
             _ => {
+                if current_text.is_empty() {
+                    span_after_reset = std::mem::take(&mut reset_seen);
+                }
                 current_text.push(c);
             }
         }
@@ -413,6 +430,7 @@ fn parse_irc_colors(input: &str) -> Vec<TextSpan> {
             reverse,
             strikethrough,
             monospace,
+            after_reset: span_after_reset,
         });
     }
 
@@ -432,14 +450,78 @@ fn url_trailing_punctuation(c: char) -> bool {
     matches!(c, ',' | '.' | '!' | '?' | ';' | ':')
 }
 
-/// Byte length of the URL at the start of `text`. It runs to the first
+/// Where one formatting span ends and the next begins in the concatenated
+/// visible text of a message.
+struct SpanBreak {
+    /// Byte offset in the visible text at which the next span starts.
+    at: usize,
+    /// A reset (`\x0F`) separates the two spans.
+    reset: bool,
+}
+
+const URL_PREFIXES: [&str; 3] = ["http://", "https://", "www."];
+
+/// A character that may continue a URL across a formatting control. Stricter
+/// than what a plain run of text may hold (`url_length`): a control is no
+/// licence to glue arbitrary punctuation such as `|` onto a link.
+fn url_plain_char(c: char) -> bool {
+    c.is_alphanumeric()
+        || matches!(
+            c,
+            '-' | '.'
+                | '_'
+                | '~'
+                | ':'
+                | '/'
+                | '?'
+                | '#'
+                | '['
+                | ']'
+                | '@'
+                | '!'
+                | '$'
+                | '&'
+                | '('
+                | ')'
+                | '*'
+                | '+'
+                | ','
+                | ';'
+                | '='
+                | '%'
+        )
+}
+
+/// Whether the URL being scanned ends at the span break `brk`, where `rest`
+/// is the visible text from the break on. A formatting control may cut a
+/// URL mid-word ("\x02https://ex\x02ample.com" is one link), but not after a
+/// reset, before a character a URL cannot hold, or before a new link prefix.
+fn break_ends_url(rest: &str, brk: &SpanBreak) -> bool {
+    brk.reset
+        || !rest.chars().next().is_some_and(url_plain_char)
+        || URL_PREFIXES.iter().any(|prefix| rest.starts_with(prefix))
+}
+
+/// Byte length of the URL at the start of `text` (which begins at offset
+/// `base` of the visible text that `breaks` index). It runs to the first
 /// terminator or unmatched closing bracket, so a Wikipedia-style
 /// `/Rust_(programming_language)` keeps its parentheses while the `)` of
 /// "(see https://example.com)" is left out, and loses trailing punctuation.
-fn url_length(text: &str) -> usize {
+fn url_length(text: &str, base: usize, breaks: &[SpanBreak]) -> usize {
     let (mut parens, mut squares) = (0usize, 0usize);
     let mut end = text.len();
+    // `text` starts at offset `base` of the visible text the breaks refer to.
+    let mut next_break = breaks.partition_point(|brk| brk.at <= base);
     for (index, c) in text.char_indices() {
+        if let Some(brk) = breaks.get(next_break)
+            && brk.at == base + index
+        {
+            next_break += 1;
+            if break_ends_url(&text[index..], brk) {
+                end = index;
+                break;
+            }
+        }
         match c {
             '(' => parens += 1,
             '[' => squares += 1,
@@ -459,23 +541,25 @@ fn url_length(text: &str) -> usize {
     text[..end].trim_end_matches(url_trailing_punctuation).len()
 }
 
-/// Byte ranges of the URLs in `text`, in order.
-fn find_urls(text: &str) -> Vec<(usize, usize)> {
+/// Byte ranges of the URLs in `text`, in order. `breaks` are the span
+/// boundaries inside `text` (see `SpanBreak`).
+fn find_urls(text: &str, breaks: &[SpanBreak]) -> Vec<(usize, usize)> {
     let mut ranges = Vec::new();
     let mut from = 0;
 
     while from < text.len() {
         // Find the start of a URL. A match only counts at the start of a word
-        // (start of text or after whitespace/punctuation) so e.g. the "www." in
-        // "awww.so cute" is not turned into a bogus hyperlink.
-        let url_starts = ["http://", "https://", "www."];
+        // (start of text, a formatting control, or after whitespace/punctuation)
+        // so e.g. the "www." in "awww.so cute" is not turned into a bogus
+        // hyperlink.
         let mut earliest_url: Option<(usize, usize)> = None;
 
-        for prefix in &url_starts {
+        for prefix in &URL_PREFIXES {
             let mut search_from = from;
             while let Some(rel) = text[search_from..].find(prefix) {
                 let pos = search_from + rel;
                 let at_word_start = pos == 0
+                    || breaks.binary_search_by_key(&pos, |brk| brk.at).is_ok()
                     || text[..pos].chars().next_back().is_some_and(|c| {
                         c.is_whitespace()
                             || matches!(c, '(' | '[' | '<' | '{' | '"' | '\'' | ',' | ';' | ':')
@@ -493,7 +577,7 @@ fn find_urls(text: &str) -> Vec<(usize, usize)> {
         let Some((start, prefix_len)) = earliest_url else {
             break;
         };
-        let end = start + url_length(&text[start..]);
+        let end = start + url_length(&text[start..], start, breaks);
         if end > start + prefix_len {
             ranges.push((start, end));
             from = end;
@@ -546,9 +630,21 @@ pub fn layout_irc_text(text: &str) -> Vec<RenderSegment> {
     // control can cut a URL mid-domain ("\x02https://ex\x02ample.com"): the
     // visible characters continue into the next span with no separator on the
     // wire, so the pieces are glued onto the still-open hyperlink instead of
-    // rendering a truncated link to the wrong host.
+    // rendering a truncated link to the wrong host. A control only glues when
+    // it plausibly sits inside one word: see `break_ends_url`.
     let visible: String = spans.iter().map(|span| span.text.as_str()).collect();
-    let urls = find_urls(&visible);
+    let mut breaks = Vec::with_capacity(spans.len().saturating_sub(1));
+    let mut offset = 0;
+    for (index, span) in spans.iter().enumerate() {
+        if index > 0 {
+            breaks.push(SpanBreak {
+                at: offset,
+                reset: span.after_reset,
+            });
+        }
+        offset += span.text.len();
+    }
+    let urls = find_urls(&visible, &breaks);
 
     let mut segments: Vec<RenderSegment> = Vec::new();
     let mut url_open = false;
@@ -891,6 +987,58 @@ mod tests {
         let segs = layout_irc_text("see \u{3}12https://a\u{3}b.test/c now");
         let url = segs.iter().find(|s| s.is_url).unwrap();
         assert_eq!(url.text, "https://ab.test/c");
+    }
+
+    fn plain_text_in(text: &str) -> String {
+        layout_irc_text(text)
+            .iter()
+            .filter(|segment| !segment.is_url)
+            .map(|segment| segment.text.as_str())
+            .collect()
+    }
+
+    #[test]
+    fn a_reset_or_a_non_url_character_ends_a_url_at_a_control() {
+        // \x0F is a reset: the next visible text is a new word.
+        assert_eq!(urls_in("https://a.test\x0F|more"), ["https://a.test"]);
+        assert_eq!(plain_text_in("https://a.test\x0F|more"), "|more");
+        assert_eq!(urls_in("https://a.test\x0Fmore"), ["https://a.test"]);
+        assert_eq!(plain_text_in("https://a.test\x0Fmore"), "more");
+        // A character a URL cannot hold ends it even after a plain toggle.
+        assert_eq!(urls_in("\x02https://a.test\x02|more"), ["https://a.test"]);
+        assert_eq!(plain_text_in("\x02https://a.test\x02|more"), "|more");
+        // Mid-word cuts still glue (the #265 behaviour).
+        assert_eq!(
+            urls_in("https://a.test/x\x02y\x02z"),
+            ["https://a.test/xyz"]
+        );
+    }
+
+    #[test]
+    fn a_piece_starting_with_a_url_prefix_begins_a_new_link() {
+        assert_eq!(
+            urls_in("\x02https://a.test\x02\x1Fhttps://b.test"),
+            ["https://a.test", "https://b.test"]
+        );
+        assert_eq!(
+            urls_in("\x02http://a.test\x02www.b.test"),
+            ["http://a.test", "www.b.test"]
+        );
+        // Without a control between them nothing changes.
+        assert_eq!(
+            urls_in("https://a.testhttps://b.test"),
+            ["https://a.testhttps://b.test"]
+        );
+    }
+
+    #[test]
+    fn a_control_right_before_a_url_is_a_word_boundary() {
+        assert_eq!(urls_in("See\x02https://a.test"), ["https://a.test"]);
+        assert_eq!(plain_text_in("See\x02https://a.test"), "See");
+        assert_eq!(urls_in("See\x0312www.a.test now"), ["www.a.test"]);
+        // No control, no boundary: "awww.so" is still not a link.
+        assert!(urls_in("awww.so cute").is_empty());
+        assert!(urls_in("Seehttps://a.test").is_empty());
     }
 }
 
