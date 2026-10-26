@@ -527,7 +527,8 @@ fn unescape_tag_value(value: &str) -> String {
 impl fmt::Display for IrcCommand {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            IrcCommand::Pass(pass) => write!(f, "PASS {}", pass),
+            // Trailing form so a space or leading ':' in the password survives.
+            IrcCommand::Pass(pass) => write!(f, "PASS :{}", pass),
             IrcCommand::Nick(nick) => write!(f, "NICK {}", nick),
             IrcCommand::User { username, realname } => {
                 write!(f, "USER {} 0 * :{}", username, realname)
@@ -970,5 +971,19 @@ mod tests {
         assert_eq!(message.get_account().as_deref(), Some("alice"));
         assert_eq!(message.get_oper().as_deref(), Some("netadmin"));
         assert_eq!(message.get_reply().as_deref(), Some("prior"));
+    }
+
+    #[test]
+    fn pass_is_sent_as_a_trailing_parameter() {
+        // #231: a space or a leading ':' in the password must survive intact.
+        assert_eq!(
+            IrcCommand::Pass("secret".into()).to_string(),
+            "PASS :secret"
+        );
+        assert_eq!(
+            IrcCommand::Pass("my secret".into()).to_string(),
+            "PASS :my secret"
+        );
+        assert_eq!(IrcCommand::Pass(":abc".into()).to_string(), "PASS ::abc");
     }
 }

@@ -2609,7 +2609,7 @@ mod tests {
                 let (read_half, mut write_half) = stream.into_split();
                 let mut reader = tokio::io::BufReader::new(read_half);
                 assert_eq!(read_wire_line(&mut reader).await, "CAP LS 302");
-                assert_eq!(read_wire_line(&mut reader).await, "PASS server-pass");
+                assert_eq!(read_wire_line(&mut reader).await, "PASS :server-pass");
                 assert_eq!(read_wire_line(&mut reader).await, "NICK tester");
                 assert!(read_wire_line(&mut reader).await.starts_with("USER "));
 
@@ -2700,6 +2700,48 @@ mod tests {
 
             server.abort();
             client_task.abort();
+        });
+    }
+
+    #[test]
+    fn server_password_reaches_the_wire_as_one_trailing_parameter() {
+        test_runtime().block_on(async {
+            // #231: spaces and a leading ':' must not be cut or eaten by the
+            // server's parameter parsing.
+            for password in ["my secret", ":abc"] {
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let addr = listener.local_addr().unwrap();
+                let server = tokio::spawn(async move {
+                    let (stream, _) = listener.accept().await.unwrap();
+                    let (read_half, mut write_half) = stream.into_split();
+                    let mut reader = BufReader::new(read_half);
+                    assert_eq!(read_wire_line(&mut reader).await, "CAP LS 302");
+                    let pass = read_wire_line(&mut reader).await;
+                    assert_eq!(read_wire_line(&mut reader).await, "NICK tester");
+                    assert!(read_wire_line(&mut reader).await.starts_with("USER "));
+                    write_half
+                        .write_all(b":srv 001 tester :Welcome\r\n")
+                        .await
+                        .unwrap();
+                    pass
+                });
+                let config = ServerConfig {
+                    host: "127.0.0.1".into(),
+                    port: addr.port(),
+                    use_tls: false,
+                    nick: "tester".into(),
+                    password: Some(password.into()),
+                    ..Default::default()
+                };
+                let (msg_tx, _msg_rx) = mpsc::channel(100);
+                let (_cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+                let mut client = IrcClient::new(config);
+                timeout(Duration::from_secs(2), client.connect(msg_tx, cmd_rx))
+                    .await
+                    .expect("registration with a server password timed out")
+                    .unwrap();
+                assert_eq!(server.await.unwrap(), format!("PASS :{password}"));
+            }
         });
     }
 
