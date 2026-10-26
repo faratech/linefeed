@@ -6892,7 +6892,7 @@ impl IrcApp {
             previous
         });
         if previous_size != Some(output.content_size)
-            && (output.state.offset.y - painted_offset).abs() > 0.5
+            && (output.state.clamped_offset().y - painted_offset).abs() > 0.5
         {
             ui.ctx()
                 .request_discard("history changed the scrollback extent");
@@ -8253,6 +8253,7 @@ mod tests {
                 // Positive Y moves content down, revealing older rows above.
                 delta: egui::vec2(0.0, 80.0),
                 phase: egui::TouchPhase::Move,
+                source: egui::MouseWheelSource::Wheel,
                 modifiers: egui::Modifiers::default(),
             }],
             ..Default::default()

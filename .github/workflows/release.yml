@@ -65,7 +65,7 @@ jobs:
           sudo apt-get install -y libssl-dev pkg-config libxcb-render0-dev \
             libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-dev libwayland-dev upx-ucl
       - name: Install Rust
-        run: rustup toolchain install stable --profile minimal && rustup default stable
+        run: rustup toolchain install 1.99.1 --profile minimal && rustup default 1.99.1
       - name: Build
         run: |
           cargo test --locked updater::
@@ -101,7 +101,7 @@ jobs:
           ref: ${{ inputs.tag || github.ref }}
       - name: Install Rust
         run: |
-          rustup toolchain install stable --profile minimal && rustup default stable
+          rustup toolchain install 1.99.1 --profile minimal && rustup default 1.99.1
           rustup target add aarch64-apple-darwin x86_64-apple-darwin
       - name: Build both architectures
         run: |
