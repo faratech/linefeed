@@ -6,6 +6,12 @@ use crate::irc::IrcCommand;
 
 impl IrcApp {
     pub fn process_command(&mut self, input: &str) {
+        // "//text" is an escaped slash: it sends the literal message "/text"
+        // instead of running a command (the same as "/say /text", #263).
+        if input.starts_with("//") {
+            self.process_command(&format!("/say {}", &input[1..]));
+            return;
+        }
         // Whitespace separator (not just ' '): the credential filter splits
         // on any whitespace, so the command token must too — a tab after the
         // command word would otherwise become an unknown command (#148).
@@ -83,8 +89,9 @@ impl IrcApp {
                 // Whitespace separator (not just ' '): the credential filter
                 // splits on any whitespace, so dispatch must agree or a
                 // tab-pasted target dodges the service redaction (#148).
-                let msg_parts: Vec<&str> = args.splitn(2, char::is_whitespace).collect();
-                if let (Some(target), Some(message)) = (msg_parts.first(), msg_parts.get(1)) {
+                // split_word also drops the whole run of separators.
+                let (target, message) = split_word(args);
+                if !target.is_empty() && !message.is_empty() {
                     if self.connected {
                         if self.send_privmsg_text(target, message) {
                             let chat_msg = outgoing_local_echo(
@@ -118,52 +125,43 @@ impl IrcApp {
 
             "QUERY" | "Q" => {
                 // Whitespace separator: see the MSG arm (#148).
-                let msg_parts: Vec<&str> = args.splitn(2, char::is_whitespace).collect();
-                if let Some(&target) = msg_parts.first() {
-                    if target.is_empty() {
-                        self.add_server_message(ChatMessage::system(
-                            "Usage: /query <nick> [message]",
-                        ));
-                        return;
-                    }
-                    if !self.open_query(target) {
-                        self.add_server_message(ChatMessage::system_fmt(
-                            "Unable to open query window",
-                            &self.timestamp_format,
-                        ));
-                        return;
-                    }
-                    // If there's a message, send it
-                    if let Some(&message) = msg_parts.get(1)
-                        && !message.is_empty()
-                    {
-                        if self.connected {
-                            if self.send_privmsg_text(target, message) {
-                                let chat_msg = outgoing_local_echo(
-                                    target,
-                                    &self.my_nick,
-                                    message,
-                                    &self.timestamp_format,
-                                );
-                                self.add_message_to_channel(target, chat_msg);
-                            } else {
-                                self.add_message_to_current(
-                                    ChatMessage::system_fmt(
-                                        "Message not sent",
-                                        &self.timestamp_format,
-                                    )
-                                    .without_logging(),
-                                );
-                            }
+                let (target, message) = split_word(args);
+                if target.is_empty() {
+                    self.add_server_message(ChatMessage::system("Usage: /query <nick> [message]"));
+                    return;
+                }
+                if !self.open_query(target) {
+                    self.add_server_message(ChatMessage::system_fmt(
+                        "Unable to open query window",
+                        &self.timestamp_format,
+                    ));
+                    return;
+                }
+                // If there's a message, send it
+                if !message.is_empty() {
+                    if self.connected {
+                        if self.send_privmsg_text(target, message) {
+                            let chat_msg = outgoing_local_echo(
+                                target,
+                                &self.my_nick,
+                                message,
+                                &self.timestamp_format,
+                            );
+                            self.add_message_to_channel(target, chat_msg);
                         } else {
                             self.add_message_to_current(
-                                ChatMessage::system_fmt(
-                                    "Not connected - message not sent",
-                                    &self.timestamp_format,
-                                )
-                                .without_logging(),
+                                ChatMessage::system_fmt("Message not sent", &self.timestamp_format)
+                                    .without_logging(),
                             );
                         }
+                    } else {
+                        self.add_message_to_current(
+                            ChatMessage::system_fmt(
+                                "Not connected - message not sent",
+                                &self.timestamp_format,
+                            )
+                            .without_logging(),
+                        );
                     }
                 }
             }
@@ -384,9 +382,7 @@ impl IrcApp {
             }
 
             "REPLY" => {
-                let mut parts = args.splitn(2, char::is_whitespace);
-                let msgid = parts.next().unwrap_or("");
-                let content = parts.next().unwrap_or("");
+                let (msgid, content) = split_word(args);
                 if let Some(target) = self.current_channel.clone()
                     && self.enabled_caps.contains("message-tags")
                     && valid_message_reference(msgid)
@@ -410,9 +406,7 @@ impl IrcApp {
             }
 
             "REACT" => {
-                let mut parts = args.splitn(2, char::is_whitespace);
-                let msgid = parts.next().unwrap_or("");
-                let reaction = parts.next().unwrap_or("");
+                let (msgid, reaction) = split_word(args);
                 if let Some(target) = self.current_channel.clone()
                     && self.enabled_caps.contains("message-tags")
                     && valid_message_reference(msgid)
@@ -445,9 +439,7 @@ impl IrcApp {
             }
 
             "LABEL" => {
-                let mut parts = args.splitn(2, char::is_whitespace);
-                let label = parts.next().unwrap_or("");
-                let command = parts.next().unwrap_or("");
+                let (label, command) = split_word(args);
                 if self.enabled_caps.contains("labeled-response")
                     && valid_message_reference(label)
                     && !command.is_empty()
@@ -534,8 +526,7 @@ impl IrcApp {
             }
 
             "RENAME" => {
-                let mut parts = args.splitn(2, char::is_whitespace);
-                let new_name = parts.next().unwrap_or("");
+                let (new_name, reason) = split_word(args);
                 if let Some(old_name) = self.current_channel.clone()
                     && self.is_channel_name(&old_name)
                     && self.is_channel_name(new_name)
@@ -543,7 +534,7 @@ impl IrcApp {
                     let sent = self.send_command(IrcCommand::Rename(
                         old_name,
                         new_name.to_string(),
-                        parts.next().map(str::to_string),
+                        Some(reason).filter(|r| !r.is_empty()).map(str::to_string),
                     ));
                     self.report_send_failure(sent, "Not connected - server command not sent");
                 } else {
@@ -554,8 +545,7 @@ impl IrcApp {
             }
 
             "RELOCATE" => {
-                let mut parts = args.splitn(2, char::is_whitespace);
-                let new_name = parts.next().unwrap_or("");
+                let (new_name, reason) = split_word(args);
                 if let Some(old_name) = self.current_channel.clone()
                     && self.is_channel_name(&old_name)
                     && self.is_channel_name(new_name)
@@ -563,7 +553,7 @@ impl IrcApp {
                     let sent = self.send_command(IrcCommand::Relocate(
                         old_name,
                         new_name.to_string(),
-                        parts.next().map(str::to_string),
+                        Some(reason).filter(|r| !r.is_empty()).map(str::to_string),
                     ));
                     self.report_send_failure(sent, "Not connected - server command not sent");
                 } else {
@@ -780,11 +770,10 @@ impl IrcApp {
 
             "CTCP" => {
                 // /ctcp <nick> <command> [args]
-                let parts: Vec<&str> = args.splitn(3, char::is_whitespace).collect();
-                if parts.len() >= 2 {
-                    let target = parts[0];
-                    let ctcp_cmd = parts[1].to_uppercase();
-                    let ctcp_args = parts.get(2).copied().unwrap_or("");
+                let (target, rest) = split_word(args);
+                let (ctcp_command, ctcp_args) = split_word(rest);
+                if !target.is_empty() && !ctcp_command.is_empty() {
+                    let ctcp_cmd = ctcp_command.to_uppercase();
                     let ctcp_msg = if ctcp_args.is_empty() {
                         format!("\x01{}\x01", ctcp_cmd)
                     } else {
@@ -958,8 +947,7 @@ impl IrcApp {
 
             // === Channel Operator Commands ===
             "KICK" | "K" => {
-                let parts: Vec<&str> = args.splitn(2, char::is_whitespace).collect();
-                let nick = parts.first().copied().unwrap_or("");
+                let (nick, reason) = split_word(args);
                 if nick.is_empty() {
                     self.add_message_to_current(ChatMessage::system(
                         "Usage: /kick <nick> [reason]",
@@ -967,7 +955,7 @@ impl IrcApp {
                 } else if let Some(channel) = &self.current_channel.clone()
                     && self.is_channel_name(channel)
                 {
-                    let reason = parts.get(1).map(|s| s.to_string());
+                    let reason = Some(reason).filter(|r| !r.is_empty()).map(str::to_string);
                     self.send_command(IrcCommand::Kick(channel.clone(), nick.to_string(), reason));
                 }
             }
@@ -1016,8 +1004,7 @@ impl IrcApp {
             }
 
             "KICKBAN" | "KB" => {
-                let parts: Vec<&str> = args.splitn(2, char::is_whitespace).collect();
-                let target = parts.first().copied().unwrap_or("");
+                let (target, reason) = split_word(args);
                 if target.is_empty() {
                     self.add_message_to_current(ChatMessage::system(
                         "Usage: /kickban <nick> [reason]",
@@ -1044,7 +1031,7 @@ impl IrcApp {
                             "Ban set. /kickban with a hostmask cannot kick - use /kick <nick>.",
                         ));
                     } else {
-                        let reason = parts.get(1).map(|s| s.to_string());
+                        let reason = Some(reason).filter(|r| !r.is_empty()).map(str::to_string);
                         self.send_command(IrcCommand::Kick(
                             channel.clone(),
                             target.to_string(),
@@ -1230,8 +1217,8 @@ impl IrcApp {
             // === Messaging Commands ===
             "NOTICE" | "N" => {
                 // Whitespace separator: see the MSG arm (#148).
-                let parts: Vec<&str> = args.splitn(2, char::is_whitespace).collect();
-                if let (Some(target), Some(message)) = (parts.first(), parts.get(1)) {
+                let (target, message) = split_word(args);
+                if !target.is_empty() && !message.is_empty() {
                     if self.connected {
                         if self.send_notice_text(target, message) {
                             let confirmation =
@@ -1406,8 +1393,8 @@ impl IrcApp {
             "DESCRIBE" => {
                 // Send action to specific target: /describe <target> <action>
                 // Whitespace separator: see the MSG arm (#148).
-                let parts: Vec<&str> = args.splitn(2, char::is_whitespace).collect();
-                if let (Some(target), Some(action_text)) = (parts.first(), parts.get(1)) {
+                let (target, action_text) = split_word(args);
+                if !target.is_empty() && !action_text.is_empty() {
                     if self.connected {
                         if self.send_action_text(target, action_text) {
                             let msg = ChatMessage::action_fmt(
@@ -1440,11 +1427,10 @@ impl IrcApp {
 
             // === Channel Management ===
             "INVITE" => {
-                let parts: Vec<&str> = args.splitn(2, char::is_whitespace).collect();
-                let nick = parts.first().copied().unwrap_or("");
-                let channel = parts
-                    .get(1)
-                    .map(|s| s.to_string())
+                let (nick, channel) = split_word(args);
+                let channel = Some(channel)
+                    .filter(|channel| !channel.is_empty())
+                    .map(str::to_string)
                     .or_else(|| self.current_channel.clone())
                     .unwrap_or_default();
                 if nick.is_empty() || channel.is_empty() {
@@ -1962,10 +1948,8 @@ impl IrcApp {
             }
 
             "CPRIVMSG" | "CNOTICE" => {
-                let mut parts = args.splitn(3, char::is_whitespace);
-                let target = parts.next().unwrap_or("");
-                let channel = parts.next().unwrap_or("");
-                let text = parts.next().unwrap_or("").trim_start();
+                let (target, rest) = split_word(args);
+                let (channel, text) = split_word(rest);
                 if target.is_empty() || channel.is_empty() || text.is_empty() {
                     self.add_message_to_current(ChatMessage::system(&format!(
                         "Usage: /{} <nick> <channel> <message>",
@@ -1979,9 +1963,7 @@ impl IrcApp {
             }
 
             "WALLCHOPS" | "WALLVOICES" => {
-                let mut parts = args.splitn(2, char::is_whitespace);
-                let channel = parts.next().unwrap_or("");
-                let text = parts.next().unwrap_or("").trim_start();
+                let (channel, text) = split_word(args);
                 if channel.is_empty() || text.is_empty() {
                     self.add_message_to_current(ChatMessage::system(&format!(
                         "Usage: /{} <channel> <message>",
@@ -2193,7 +2175,7 @@ impl IrcApp {
                     "/onotice <message>  - Notice to channel ops",
                     "/amsg <message>     - Message all channels",
                     "/ame <action>       - Action to all channels",
-                    "/say <text>         - Send as message (even if /)",
+                    "/say <text>         - Send as message (even if /; also //text)",
                     "/describe <t> <act> - Send action to target",
                 ],
             ),
@@ -2899,6 +2881,94 @@ mod tests {
         // A wildcard inside the extban must not be completed either.
         app.process_command("/ban $a:tro*");
         expect_mode(&mut rx, "+b", "$a:tro*");
+    }
+
+    #[test]
+    fn double_slash_sends_a_literal_leading_slash() {
+        let (mut app, mut rx) = connected_command_app();
+        let mut channel = Channel::new();
+        channel.joined = true;
+        app.channels.insert("#room".into(), channel);
+        app.current_channel = Some("#room".into());
+
+        for (input, text) in [
+            ("//me hi", "/me hi"),
+            ("//shrug", "/shrug"),
+            ("//", "/"),
+            ("///etc/hosts", "//etc/hosts"),
+        ] {
+            app.process_command(input);
+            assert_eq!(
+                rx.try_recv().unwrap(),
+                IrcCommand::Privmsg("#room".into(), text.into()),
+                "{input}"
+            );
+        }
+        assert!(rx.try_recv().is_err());
+        assert!(
+            app.server_messages
+                .iter()
+                .all(|row| !row.content.contains("Invalid command"))
+        );
+    }
+
+    #[test]
+    fn runs_of_whitespace_between_arguments_are_one_separator() {
+        let (mut app, mut rx) = connected_command_app();
+        app.current_channel = Some("#room".into());
+        app.channels.insert("#room".into(), Channel::new());
+        app.handle_cap_message("ACK", &["message-tags labeled-response".into()]);
+
+        app.process_command("/ctcp bob  VERSION");
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            IrcCommand::Privmsg("bob".into(), "\x01VERSION\x01".into())
+        );
+        app.process_command("/ctcp bob \t ping   1  2");
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            IrcCommand::Privmsg("bob".into(), "\x01PING 1  2\x01".into())
+        );
+        app.process_command("/cprivmsg bob  #room  hello there");
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            IrcCommand::Raw("CPRIVMSG bob #room :hello there".into())
+        );
+        app.process_command("/invite bob   #elsewhere");
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            IrcCommand::Invite("bob".into(), "#elsewhere".into())
+        );
+        app.process_command("/react abc   👍");
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            IrcCommand::Raw("@+draft/react=👍;+reply=abc TAGMSG #room".into())
+        );
+        app.process_command("/reply abc   hello there");
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            IrcCommand::Raw("@+reply=abc PRIVMSG #room :hello there".into())
+        );
+        app.process_command("/label lbl1   WHOIS alice");
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            IrcCommand::Raw("@label=lbl1 WHOIS alice".into())
+        );
+        app.process_command("/msg alice   hi there");
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            IrcCommand::Privmsg("alice".into(), "hi there".into())
+        );
+        app.process_command("/kick bob   too loud");
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            IrcCommand::Kick("#room".into(), "bob".into(), Some("too loud".into()))
+        );
+        app.process_command("/rename #new   moved");
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            IrcCommand::Rename("#room".into(), "#new".into(), Some("moved".into()))
+        );
     }
 
     #[test]
