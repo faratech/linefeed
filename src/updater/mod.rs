@@ -137,7 +137,11 @@ impl Controller {
             if tx.phase == Phase::Staged
                 && install::hash(&paths.target).ok().as_deref() == Some(&tx.old_hash)
             {
-                self.status = Status::Ready;
+                // A failure the helper recorded stays visible; the staged
+                // update remains installable below it.
+                if !matches!(self.status, Status::Error(_)) {
+                    self.status = Status::Ready;
+                }
                 self.staged = Some(tx);
             } else if tx.phase == Phase::Healthy {
                 // The snapshot lives in the state dir, outside the
@@ -793,6 +797,47 @@ mod tests {
         )
         .unwrap();
         assert_eq!(output, bytes);
+    }
+    /// A valid Staged transaction on disk beside a stand-in executable.
+    fn staged_fixture(version: &str) -> (std::path::PathBuf, Paths, Transaction) {
+        let root = std::env::temp_dir().join(format!("linefeed-updater-test-{}", install::nonce().unwrap()));
+        platform::private_dir(&root).unwrap();
+        let paths = Paths {
+            target: root.join("app"),
+            state: root.join("state"),
+        };
+        platform::private_dir(&paths.state).unwrap();
+        fs::write(&paths.target, b"original executable").unwrap();
+        let (attempt, directory) = install::stage_directory(&paths).unwrap();
+        let tx = Transaction {
+            paths: paths.clone(),
+            attempt,
+            directory,
+            version: version.into(),
+            old_hash: install::hash(&paths.target).unwrap(),
+            new_hash: install::hex(&Sha256::digest(b"new executable")),
+            phase: Phase::Staged,
+            restart: false,
+            working_directory: root.clone(),
+        };
+        fs::write(tx.candidate(), b"new executable").unwrap();
+        install::executable_copy(&paths.target, &tx.helper()).unwrap();
+        tx.save().unwrap();
+        (root, paths, tx)
+    }
+    #[test]
+    fn recorded_update_failure_stays_visible_over_a_ready_staged_update() {
+        // The helper records why an install failed; the still-valid staged
+        // journal must not replace that message with "downloaded and verified".
+        let (root, paths, _tx) = staged_fixture("0.0.10");
+        let failure = "Update could not complete: Update validation failed";
+        install::write_json(&paths.state.join("result.json"), &failure).unwrap();
+        let mut controller = Controller::default();
+        controller.start(paths, egui::Context::default(), false);
+        assert!(matches!(&controller.status, Status::Error(message) if message == failure));
+        assert!(controller.staged.is_some());
+        drop(controller);
+        let _ = fs::remove_dir_all(root);
     }
     /// Loopback HTTP server: headers at once, then one body byte per `pause`.
     fn slow_body_server(parts: usize, pause: Duration) -> String {

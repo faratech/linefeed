@@ -684,23 +684,39 @@ fn helper(journal: &Path, parent: u32) -> io::Result<()> {
             &tx.paths.state.join("result.json"),
             &format!("Update could not complete: {error}"),
         );
-        // A failure before replacement must reopen the old app when restart
-        // was requested. All locks in apply_transaction have now been released.
-        let recovery_lock = tx.paths.transaction_lock()?;
-        timed_lock(&recovery_lock, false, Duration::from_secs(30))?;
-        let latest: Option<Transaction> = read_json(journal).ok();
-        if tx.restart
-            && latest.as_ref().is_some_and(|latest| {
-                latest.attempt == tx.attempt && latest.phase != Phase::Healthy
-            })
-            && hash(&tx.paths.target).ok().as_deref() == Some(&tx.old_hash)
-        {
-            tx.phase = Phase::RolledBack;
-            tx.save()?;
-            launch_fallback(&tx)?;
-        }
+        relaunch_after_failure(&mut tx, journal)?;
     }
     result
+}
+
+/// A failure before replacement must reopen the old app when restart was
+/// requested. All locks in apply_transaction have been released by now.
+fn relaunch_after_failure(tx: &mut Transaction, journal: &Path) -> io::Result<()> {
+    let recovery_lock = tx.paths.transaction_lock()?;
+    timed_lock(&recovery_lock, false, Duration::from_secs(30))?;
+    let latest: Option<Transaction> = read_json(journal).ok();
+    if tx.restart
+        && latest
+            .as_ref()
+            .is_some_and(|latest| latest.attempt == tx.attempt && latest.phase != Phase::Healthy)
+        && hash(&tx.paths.target).ok().as_deref() == Some(&tx.old_hash)
+    {
+        tx.phase = Phase::RolledBack;
+        tx.save()?;
+        launch_fallback(tx)?;
+    }
+    Ok(())
+}
+
+/// Return an unreplaced transaction to Staged after a failure. When a restart
+/// was requested, keep that intent and its session snapshot: `helper` reopens
+/// the old app with them (#239). Otherwise nothing will consume the snapshot,
+/// so erase it (#200).
+fn abandon_before_replace(tx: &mut Transaction) {
+    if !tx.restart {
+        scrub_session_snapshot(tx);
+    }
+    tx.phase = Phase::Staged;
 }
 
 fn apply_transaction(tx: &mut Transaction) -> io::Result<()> {
@@ -708,8 +724,7 @@ fn apply_transaction(tx: &mut Transaction) -> io::Result<()> {
     timed_lock(&transaction_lock, false, Duration::from_secs(30))?;
     let running = tx.paths.run_lock()?;
     if timed_lock(&running, false, Duration::from_secs(30)).is_err() {
-        scrub_session_snapshot(tx);
-        tx.phase = Phase::Staged;
+        abandon_before_replace(tx);
         tx.save()?;
         return Err(io::Error::other(
             "Another instance is still running; update deferred",
@@ -735,8 +750,7 @@ fn apply_transaction(tx: &mut Transaction) -> io::Result<()> {
         .stderr(Stdio::null());
     quiet(&mut probe);
     if !wait_child(&mut probe.spawn()?, Duration::from_secs(30))? {
-        scrub_session_snapshot(tx);
-        tx.phase = Phase::Staged;
+        abandon_before_replace(tx);
         tx.save()?;
         write_json(&tx.paths.state.join("failed.json"), &tx.version)?;
         return Err(io::Error::other("Update validation failed"));
@@ -1268,6 +1282,61 @@ mod tests {
             read_json::<String>(&fixture.tx.paths.state.join("failed.json")).unwrap(),
             fixture.tx.version
         );
+    }
+    #[cfg(unix)]
+    #[test]
+    fn failed_probe_after_restart_request_reopens_old_app_with_its_session() {
+        use std::os::unix::fs::PermissionsExt;
+        let mut fixture = probe_fixture(false);
+        let tx = &mut fixture.tx;
+        // Stand-in for the old app: records how it was launched.
+        let marker = fixture.root.join("old-app-launched");
+        let old_app = format!(
+            "#!/bin/sh\nprintf '%s ' \"$@\" > '{}'\n",
+            marker.display()
+        );
+        for path in [tx.paths.target.clone(), tx.helper()] {
+            fs::write(&path, &old_app).unwrap();
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        tx.old_hash = hash(&tx.paths.target).unwrap();
+        tx.restart = true;
+        write_json(&tx.snapshot(), &"unsent draft").unwrap();
+        tx.save().unwrap();
+        // The old app's startup confirmation, which the relaunch waits for.
+        let healthy = (tx.attempt.clone(), tx.old_hash.clone());
+        write_json(&tx.directory.join("healthy.json"), &healthy).unwrap();
+
+        assert!(apply_transaction(tx).is_err());
+        // The candidate never replaced anything, but the user asked to restart:
+        // the snapshot and intent survive so the old app can be reopened (#239).
+        assert!(tx.restart);
+        assert!(tx.snapshot().exists());
+        assert_eq!(hash(&tx.paths.target).unwrap(), tx.old_hash);
+
+        relaunch_after_failure(tx, &tx.paths.journal()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !marker.exists() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            fs::read_to_string(&marker)
+                .unwrap()
+                .starts_with("--internal-update-launch ")
+        );
+        let journal: Transaction = read_json(&tx.paths.journal()).unwrap();
+        assert!(journal.phase == Phase::Healthy);
+        assert!(!tx.snapshot().exists());
+    }
+    #[cfg(unix)]
+    #[test]
+    fn failed_probe_without_restart_request_erases_the_snapshot() {
+        let mut fixture = probe_fixture(false);
+        write_json(&fixture.tx.snapshot(), &"unsent draft").unwrap();
+        assert!(apply_transaction(&mut fixture.tx).is_err());
+        assert!(!fixture.tx.restart);
+        assert!(!fixture.tx.snapshot().exists());
+        assert!(fixture.tx.phase == Phase::Staged);
     }
     #[cfg(unix)]
     #[test]
