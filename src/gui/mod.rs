@@ -2220,6 +2220,10 @@ impl IrcApp {
     }
 
     pub fn request_manual_disconnect(&mut self, reason: Option<String>) {
+        // A /reconnect or /server still closing the connection has already
+        // queued its own QUIT (and dropped the sender this call would queue
+        // another through): that QUIT is just as much in need of flushing.
+        let quit_in_flight = self.connection_intent == ConnectionIntent::ReconnectAfterClose;
         self.connection_intent = ConnectionIntent::ManualDisconnect;
         // A manual disconnect cancels an in-flight explicit server switch. If
         // the old worker exits later it must not unexpectedly activate the
@@ -2241,9 +2245,11 @@ impl IrcApp {
         // lost (#243). When one is on its way, retire the receiver instead: the
         // worker exits on its own once QUIT is flushed (or, before the writer
         // exists, on seeing the queued QUIT), and release_closing_connection
-        // drops the receiver then. Nothing read from it is processed.
+        // drops the receiver then. Nothing read from it is processed. The
+        // same goes for a QUIT queued by an earlier reconnect or server
+        // switch that this disconnect interrupts.
         if let Some(rx) = self.msg_rx.take()
-            && quit_queued
+            && (quit_queued || quit_in_flight)
         {
             self.closing_rx = Some((rx, std::time::Instant::now()));
         }
@@ -2592,6 +2598,45 @@ mod connection_lifecycle_tests {
         assert_eq!(app.highlight_words_lower, ["foo{away}"]);
         assert!(app.is_ignored("Foo{away}", None));
         assert!(app.is_ignored("FOO[AWAY]", None));
+    }
+
+    #[test]
+    fn disconnect_right_after_reconnect_or_server_switch_keeps_the_quit_flushable() {
+        for switch_server in [false, true] {
+            let mut app = lifecycle_app();
+            let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel();
+            let (msg_tx, msg_rx) = mpsc::channel(4);
+            app.cmd_tx = Some(cmd_tx);
+            app.msg_rx = Some(msg_rx);
+            app.connected = true;
+
+            // /reconnect and /server queue the old connection's QUIT and keep
+            // its receiver open until the worker exits...
+            if switch_server {
+                app.server_host = "other.example".into();
+                assert!(app.switch_session_from_form("Changing servers"));
+            } else {
+                app.request_reconnect_after_close("Reconnecting");
+            }
+            assert!(matches!(cmd_rx.try_recv(), Ok(IrcCommand::Quit(_))));
+            assert!(!msg_tx.is_closed());
+
+            // ...so a /disconnect right behind them, which finds no command
+            // sender left to queue a QUIT of its own, must not drop that
+            // receiver: that would cancel the writer before the first QUIT is
+            // flushed to the server.
+            app.request_manual_disconnect(None);
+            assert!(
+                !msg_tx.is_closed(),
+                "switch_server={switch_server}: the receiver was dropped with a QUIT in flight"
+            );
+            assert!(app.msg_rx.is_none());
+            assert!(app.closing_rx.is_some());
+            assert!(app.pending_session.is_none());
+
+            app.release_closing_connection(true);
+            assert!(msg_tx.is_closed());
+        }
     }
 
     #[test]
