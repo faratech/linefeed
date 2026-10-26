@@ -53,9 +53,10 @@ impl IrcApp {
                 // the command token already splits on any whitespace (#148),
                 // so a tab-pasted argument must not be glued into a single
                 // mangled token here (#159).
-                let join_parts: Vec<&str> = args.splitn(2, char::is_whitespace).collect();
-                let channel_arg = join_parts.first().copied().unwrap_or("");
-                let key = join_parts.get(1).map(|k| k.to_string());
+                // split_word drops the whole run of separators, so a doubled
+                // space never becomes part of the stored key.
+                let (channel_arg, key) = split_word(args);
+                let key = Some(key).filter(|k| !k.is_empty()).map(str::to_string);
                 if channel_arg.is_empty() {
                     self.add_message_to_current(ChatMessage::system_fmt(
                         "Usage: /join <#channel> [key]",
@@ -76,10 +77,12 @@ impl IrcApp {
                 let (channel, inline_reason) = if args.is_empty() {
                     (self.current_channel.clone(), None)
                 } else {
-                    let mut it = args.splitn(2, char::is_whitespace);
-                    let first = it.next().unwrap_or("");
+                    let (first, rest) = split_word(args);
                     if self.is_channel_name(first) {
-                        (Some(first.to_string()), it.next().map(|r| r.to_string()))
+                        (
+                            Some(first.to_string()),
+                            Some(rest).filter(|r| !r.is_empty()).map(str::to_string),
+                        )
                     } else {
                         (self.current_channel.clone(), Some(args.to_string()))
                     }
@@ -3360,6 +3363,54 @@ mod tests {
         assert_eq!(
             rx.try_recv().unwrap(),
             IrcCommand::Privmsg("#room".into(), "/ns identify literal".into())
+        );
+    }
+
+    #[test]
+    fn join_and_part_treat_a_run_of_whitespace_as_one_separator() {
+        let (mut app, mut rx) = connected_command_app();
+
+        app.process_command("/join #chan  secret");
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            IrcCommand::Join("#chan".into(), Some("secret".into()), None, None)
+        );
+        assert_eq!(
+            app.pending_channel_keys
+                .get(&app.network_support.canonicalize("#chan"))
+                .map(String::as_str),
+            Some("secret"),
+            "the stored key has no leading whitespace"
+        );
+        app.process_command("/join #other \t key2");
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            IrcCommand::Join("#other".into(), Some("key2".into()), None, None)
+        );
+        // No key stays no key.
+        app.process_command("/join #plain");
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            IrcCommand::Join("#plain".into(), None, None, None)
+        );
+
+        app.process_command("/part #chan  bye now");
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            IrcCommand::Part("#chan".into(), Some("bye now".into()))
+        );
+        app.process_command("/part #chan");
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            IrcCommand::Part("#chan".into(), None)
+        );
+        // Without a channel token the whole argument is the reason.
+        app.channels.insert("#room".into(), Channel::new());
+        app.current_channel = Some("#room".into());
+        app.process_command("/part  gone   fishing");
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            IrcCommand::Part("#room".into(), Some("gone   fishing".into()))
         );
     }
 
