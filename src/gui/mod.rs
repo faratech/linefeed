@@ -5441,6 +5441,23 @@ impl IrcApp {
         line.len() <= base_limit
     }
 
+    /// Verb and wire size of a command, for logs. The parameters can carry
+    /// credentials (PASS, NickServ IDENTIFY, AUTHENTICATE), so they are never
+    /// logged (#227).
+    fn command_log_summary(cmd: &IrcCommand) -> String {
+        let line = cmd.to_string();
+        let untagged = line
+            .strip_prefix('@')
+            .and_then(|tagged| tagged.split_once(' '))
+            .map_or(line.as_str(), |(_, rest)| rest);
+        let verb: String = untagged
+            .chars()
+            .take_while(char::is_ascii_alphanumeric)
+            .take(16)
+            .collect();
+        format!("{verb} ({} bytes)", line.len())
+    }
+
     fn client_tag_is_denied(&self, command: &IrcCommand) -> Option<String> {
         let deny = self.network_support.client_tag_deny.as_deref()?;
         let line = command.to_string();
@@ -5681,7 +5698,10 @@ impl IrcApp {
             .saturating_sub(2)
             .max(IRC_MAX_LINE_BYTES);
         if !Self::command_fits_limits(&cmd, base_limit) {
-            tracing::warn!("Outgoing command not sent (line too long): {:?}", cmd);
+            tracing::warn!(
+                "Outgoing command not sent (line too long): {}",
+                Self::command_log_summary(&cmd)
+            );
             self.add_message_to_current(
                 ChatMessage::system_fmt(
                     "Command not sent - IRC line is too long",
@@ -5703,7 +5723,10 @@ impl IrcApp {
         }
         if let Some(tx) = &self.cmd_tx {
             if let Err(e) = tx.send(cmd) {
-                tracing::warn!("Outgoing command not sent (disconnected): {:?}", e);
+                tracing::warn!(
+                    "Outgoing command not sent (disconnected): {}",
+                    Self::command_log_summary(&e.0)
+                );
                 return false;
             }
             true
@@ -7013,6 +7036,57 @@ mod tests {
         app.cmd_tx = Some(tx);
         app.connected = true;
         (app, rx)
+    }
+
+    /// Run `f` under a TRACE-level subscriber and return everything it logged.
+    fn capture_logs(f: impl FnOnce()) -> String {
+        use std::sync::{Arc, Mutex};
+
+        #[derive(Clone, Default)]
+        struct SharedBuffer(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for SharedBuffer {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let buffer = SharedBuffer::default();
+        let writer = buffer.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::TRACE)
+            .with_writer(move || writer.clone())
+            .finish();
+        tracing::subscriber::with_default(subscriber, f);
+        let bytes = buffer.0.lock().unwrap().clone();
+        String::from_utf8(bytes).unwrap()
+    }
+
+    #[test]
+    fn rejected_commands_never_log_their_contents() {
+        // Too long: a credential command must be summarized, not dumped (#227).
+        let (mut app, _rx) = test_app_connected();
+        let secret = "hunter2-".repeat(100);
+        let logs = capture_logs(|| {
+            assert!(!app.send_command(IrcCommand::Privmsg(
+                "NickServ".into(),
+                format!("IDENTIFY {secret}")
+            )));
+        });
+        assert!(!logs.contains("hunter2"), "{logs}");
+        assert!(!logs.contains("IDENTIFY"), "{logs}");
+        assert!(logs.contains("PRIVMSG"), "verb is still logged: {logs}");
+
+        // Disconnected channel: the SendError wraps the whole command.
+        let (mut app, rx) = test_app_connected();
+        drop(rx);
+        let logs = capture_logs(|| {
+            assert!(!app.send_command(IrcCommand::Pass("hunter2".into())));
+        });
+        assert!(!logs.contains("hunter2"), "{logs}");
     }
 
     #[test]
