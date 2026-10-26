@@ -3142,13 +3142,18 @@ impl IrcApp {
                         msg.get_account(),
                     );
 
-                if routed_target == "*" || !self.connected {
+                // A prefix without `!`/`@` (or none) names a server, not a user.
+                let from_server = msg
+                    .prefix
+                    .as_deref()
+                    .is_none_or(|prefix| !prefix.contains('!') && !prefix.contains('@'));
+                let is_private = !self.is_channel_name(&routed_target)
+                    && self.identifiers_equal(&routed_target, &self.my_nick);
+                if routed_target == "*" || !self.connected || (is_private && from_server) {
                     self.add_server_message(chat_msg);
                 } else {
                     // For private notices (target is our nick), route to sender's window
                     // This handles NickServ, X3, and other service responses
-                    let is_private = !self.is_channel_name(&routed_target)
-                        && self.identifiers_equal(&routed_target, &self.my_nick);
                     let target_name = if is_private {
                         sender.clone() // Route to sender's query window
                     } else {
@@ -10054,6 +10059,35 @@ mod tests {
         );
         assert_eq!(app.pending_invites.len(), 1);
         assert_eq!(app.channels["#room"].messages.len(), 2);
+    }
+
+    #[test]
+    fn server_prefixed_notice_to_our_nick_goes_to_the_server_buffer() {
+        let (mut app, _rx) = test_app_connected();
+        app.set_session_nick("me".into(), true);
+
+        // Post-registration server notice: no `!`/`@` in the prefix.
+        app.handle_incoming_message(
+            IrcMessage::parse(":irc.example.net NOTICE me :*** Server restart soon").unwrap(),
+        );
+        // And one with no prefix at all.
+        app.handle_incoming_message(IrcMessage::parse("NOTICE me :bare server notice").unwrap());
+
+        assert!(app.channels.is_empty(), "no query tab named after a server");
+        assert_eq!(app.server_messages.len(), 2);
+        assert!(
+            app.server_messages[0]
+                .content
+                .contains("-irc.example.net- *** Server restart soon")
+        );
+
+        // Services and other users still get their own query window.
+        app.handle_incoming_message(
+            IrcMessage::parse(":NickServ!NickServ@services.example.net NOTICE me :Welcome")
+                .unwrap(),
+        );
+        assert!(app.channels.contains_key("NickServ"));
+        assert_eq!(app.server_messages.len(), 2);
     }
 
     #[test]
