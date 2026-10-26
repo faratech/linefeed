@@ -6179,21 +6179,35 @@ impl IrcApp {
         self.select_tab(tabs[next].clone());
     }
 
-    pub(crate) fn close_current_tab(&mut self) {
-        let Some(channel_name) = self.current_channel.clone() else {
-            return;
-        };
-        let should_part = self.is_channel_name(&channel_name)
+    /// Whether closing this tab has to PART first. Only a joined channel does;
+    /// queries and kicked/disconnected channel tabs are closed locally (#256).
+    fn tab_close_needs_part(&self, name: &str) -> bool {
+        self.is_channel_name(name)
             && self
-                .channel_key(&channel_name)
+                .channel_key(name)
                 .and_then(|key| self.channels.get(&key))
-                .is_some_and(|channel| channel.joined);
-        if should_part && self.send_command(IrcCommand::Part(channel_name.clone(), None)) {
+                .is_some_and(|channel| channel.joined)
+    }
+
+    pub(crate) fn close_current_tab(&mut self) {
+        if let Some(channel_name) = self.current_channel.clone() {
+            self.close_tab(&channel_name);
+        }
+    }
+
+    /// Close a tab by name: PART a joined channel, otherwise drop the tab.
+    fn close_tab(&mut self, name: &str) {
+        if self.tab_close_needs_part(name)
+            && self.send_command(IrcCommand::Part(name.to_string(), None))
+        {
             // Keep the tab until the server confirms our PART.
             return;
         }
-        self.remove_channel(&channel_name);
-        self.current_channel = self.channels.keys().next().cloned();
+        let was_current = self.current_target_is(name);
+        self.remove_channel(name);
+        if was_current {
+            self.current_channel = self.channels.keys().next().cloned();
+        }
     }
 
     /// Handle CTCP request and send reply if applicable
@@ -6620,7 +6634,7 @@ impl eframe::App for IrcApp {
 
                 // Channel list
                 let mut part_channel: Option<String> = None;
-                let mut close_query: Option<String> = None;
+                let mut close_target: Option<String> = None;
                 ScrollArea::vertical().show(ui, |ui| {
                     let channels: Vec<_> = self.channels.keys().cloned().collect();
                     for channel_name in channels {
@@ -6677,6 +6691,7 @@ impl eframe::App for IrcApp {
 
                         // Context menu for channels
                         let chan_for_menu = channel_name.clone();
+                        let needs_part = self.tab_close_needs_part(&chan_for_menu);
                         response.context_menu(|ui| {
                             if self.is_channel_name(&chan_for_menu) {
                                 if ui.button("Channel Info").clicked() {
@@ -6689,14 +6704,21 @@ impl eframe::App for IrcApp {
                                     ));
                                     ui.close();
                                 }
-                                if ui.button("Part Channel").clicked() {
-                                    part_channel = Some(chan_for_menu.clone());
+                                if needs_part {
+                                    if ui.button("Part Channel").clicked() {
+                                        part_channel = Some(chan_for_menu.clone());
+                                        ui.close();
+                                    }
+                                } else if ui.button("Close").clicked() {
+                                    // Kicked/disconnected tab: a PART would
+                                    // only draw a 442 and keep the tab (#256).
+                                    close_target = Some(chan_for_menu.clone());
                                     ui.close();
                                 }
                             } else {
                                 // Query window (private message)
                                 if ui.button("Close").clicked() {
-                                    close_query = Some(chan_for_menu.clone());
+                                    close_target = Some(chan_for_menu.clone());
                                     ui.close();
                                 }
                             }
@@ -6708,11 +6730,8 @@ impl eframe::App for IrcApp {
                 if let Some(channel) = part_channel {
                     self.send_command(IrcCommand::Part(channel, None));
                 }
-                if let Some(query) = close_query {
-                    self.channels.remove(&query);
-                    if self.current_channel.as_ref() == Some(&query) {
-                        self.current_channel = self.channels.keys().next().cloned();
-                    }
+                if let Some(target) = close_target {
+                    self.close_tab(&target);
                 }
             });
 
@@ -7687,6 +7706,42 @@ mod tests {
         disconnected.current_channel = Some("#stale".to_string());
         disconnected.close_current_tab();
         assert!(!disconnected.channels.contains_key("#stale"));
+    }
+
+    #[test]
+    fn context_menu_close_removes_unjoined_tabs_without_sending_part() {
+        let (mut app, mut rx) = test_app_connected();
+        let mut live = Channel::new();
+        live.joined = true;
+        app.channels.insert("#live".to_string(), live);
+        app.channels.insert("#kicked".to_string(), Channel::new());
+        app.channels.insert("alice".to_string(), Channel::new());
+        app.current_channel = Some("#live".to_string());
+
+        // The tab menu offers Close (not Part Channel) exactly when no PART
+        // is needed: kicked/disconnected channels and queries (#256).
+        assert!(app.tab_close_needs_part("#live"));
+        assert!(!app.tab_close_needs_part("#kicked"));
+        assert!(!app.tab_close_needs_part("alice"));
+
+        app.close_tab("#kicked");
+        app.close_tab("alice");
+        assert!(rx.try_recv().is_err(), "unjoined tabs close locally");
+        assert!(!app.channels.contains_key("#kicked"));
+        assert!(!app.channels.contains_key("alice"));
+        assert_eq!(app.current_channel.as_deref(), Some("#live"));
+
+        // A live channel is parted and kept until the server confirms.
+        app.close_tab("#live");
+        assert!(matches!(rx.try_recv(), Ok(IrcCommand::Part(channel, None)) if channel == "#live"));
+        assert!(app.channels.contains_key("#live"));
+
+        // Closing the selected stale tab moves the selection off it.
+        app.channels.insert("#kicked".to_string(), Channel::new());
+        app.current_channel = Some("#kicked".to_string());
+        app.close_tab("#kicked");
+        assert!(!app.channels.contains_key("#kicked"));
+        assert_eq!(app.current_channel.as_deref(), Some("#live"));
     }
 
     #[test]
