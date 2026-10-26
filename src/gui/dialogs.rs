@@ -919,6 +919,22 @@ impl IrcApp {
             if let Some(reason) = &self.updater.install_reason {
                 ui.label(RichText::new(reason).small());
             }
+            if self.updater.reset_available() {
+                if ui
+                    .button("Reset update state")
+                    .on_hover_text(
+                        "Deletes Linefeed's saved update recovery files, including any \
+                         downloaded update and the backup of the previous version. Use it \
+                         after installing a release yourself.",
+                    )
+                    .clicked()
+                {
+                    self.updater.reset_recovery();
+                }
+                ui.label(
+                    RichText::new("Restart Linefeed afterwards to re-enable updates.").small(),
+                );
+            }
             ui.hyperlink_to(
                 "Download releases",
                 "https://github.com/faratech/linefeed/releases",

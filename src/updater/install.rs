@@ -437,6 +437,13 @@ fn recover_startup(
     if paths.journal().exists() {
         let mut tx: Transaction = read_json(&paths.journal())?;
         if tx.paths.target != paths.target || tx.paths.state != paths.state {
+            // A moved or copied profile or data directory leaves a journal for
+            // paths this installation cannot vouch for. When nothing in it
+            // needs recovering it is stale, not damaged (#238).
+            if supervised.is_none() && !matches!(tx.phase, Phase::Prepared | Phase::Replaced) {
+                discard_foreign(paths, &tx)?;
+                return Ok((None, None));
+            }
             return Err(io::Error::other(
                 "Update state belongs to another installation",
             ));
@@ -513,6 +520,75 @@ fn discard_stale(paths: &Paths, tx: &Transaction) -> io::Result<()> {
         let _ = fs::remove_dir_all(&tx.directory);
     }
     fs::remove_file(paths.journal())
+}
+
+/// Drop a spent journal recorded for other paths. Nothing it names can be
+/// vouched for, so only the journal file goes, plus the snapshot of that
+/// attempt in this installation's own state directory. A staging directory it
+/// points to is never touched.
+fn discard_foreign(paths: &Paths, tx: &Transaction) -> io::Result<()> {
+    remove_own_snapshot(paths, &tx.attempt);
+    fs::remove_file(paths.journal())
+}
+
+/// Remove the session snapshot of `attempt` from this installation's state
+/// directory. The attempt comes from a file, so it must be a bare nonce.
+fn remove_own_snapshot(paths: &Paths, attempt: &str) {
+    if attempt.len() == 32 && attempt.bytes().all(|b| b.is_ascii_hexdigit()) {
+        let _ = fs::remove_file(paths.state.join(format!("{attempt}.session.json")));
+    }
+}
+
+/// The user's explicit way out of a recovery error. A journal that fails
+/// closed (a Prepared or Replaced one that matches neither executable, or one
+/// that cannot be read) is never cleared automatically, because it may hold the
+/// only copy of the old executable. Once the user has installed a release
+/// themselves, this discards it so the updater can start again on the next
+/// launch (#238). Only a journal recorded for this installation vouches for its
+/// staging directory, and that is removed only if it is a real directory at
+/// the path this installation would have created: an unreadable or foreign
+/// journal costs just its own file.
+pub fn reset_recovery(paths: &Paths) -> io::Result<()> {
+    reset_recovery_within(paths, Duration::from_secs(5))
+}
+
+fn reset_recovery_within(paths: &Paths, wait: Duration) -> io::Result<()> {
+    let lock = paths.transaction_lock()?;
+    timed_lock(&lock, false, wait)?;
+    match read_json::<Transaction>(&paths.journal()) {
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(_) => {}
+        Ok(tx) => {
+            let ours = tx.paths.target == paths.target && tx.paths.state == paths.state;
+            if ours && tx.validate_paths().is_ok() {
+                let _ = fs::remove_file(tx.snapshot());
+                if is_real_dir(&tx.directory) {
+                    let _ = fs::remove_dir_all(&tx.directory);
+                }
+            } else {
+                remove_own_snapshot(paths, &tx.attempt);
+            }
+        }
+    }
+    match fs::remove_file(paths.journal()) {
+        Err(e) if e.kind() != io::ErrorKind::NotFound => Err(e),
+        _ => Ok(()),
+    }
+}
+
+/// A real directory, not a link or reparse point that leads somewhere else.
+fn is_real_dir(path: &Path) -> bool {
+    let Ok(meta) = fs::symlink_metadata(path) else {
+        return false;
+    };
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        if meta.file_attributes() & 0x400 != 0 {
+            return false;
+        }
+    }
+    meta.is_dir() && !meta.file_type().is_symlink()
 }
 
 pub fn timed_lock(file: &File, shared: bool, timeout: Duration) -> io::Result<()> {
@@ -1277,6 +1353,149 @@ mod tests {
             fs::read(fixture.tx.paths.journal()).unwrap(),
             b"invalid journal"
         );
+    }
+    /// The fixture's journal as another profile would have recorded it: the
+    /// same staging beside the same executable, but with its paths changed
+    /// (moved or copied data directory, renamed executable).
+    fn write_foreign_journal(fixture: &Fixture, phase: Phase, move_target: bool) {
+        let mut foreign = fixture.tx.clone();
+        foreign.phase = phase;
+        if move_target {
+            foreign.paths.target = fixture.root.join("moved app");
+        } else {
+            foreign.paths.state = fixture.root.join("old-profile-state");
+        }
+        write_json(&fixture.tx.paths.journal(), &foreign).unwrap();
+    }
+    #[test]
+    fn spent_journal_recorded_for_other_paths_is_discarded_without_touching_its_directory() {
+        // The data directory moved or was copied, so the journal names paths
+        // this installation cannot vouch for. It is stale, not damaged (#238).
+        for move_target in [false, true] {
+            for phase in [Phase::Staged, Phase::Healthy, Phase::RolledBack] {
+                let fixture = Fixture::new();
+                write_foreign_journal(&fixture, phase, move_target);
+                write_json(&fixture.tx.snapshot(), &"unsent draft").unwrap();
+                let (acknowledgment, snapshot) = recover_startup(&fixture.tx.paths, None).unwrap();
+                assert!(acknowledgment.is_none() && snapshot.is_none());
+                assert!(!fixture.tx.paths.journal().exists());
+                // Only the journal file goes (and a snapshot of that attempt in
+                // our own state directory); the directory it names is not ours
+                // to delete.
+                assert!(!fixture.tx.snapshot().exists());
+                assert!(fixture.tx.directory.exists() && fixture.tx.candidate().exists());
+                assert_eq!(hash(&fixture.tx.paths.target).unwrap(), fixture.tx.old_hash);
+            }
+        }
+    }
+    #[test]
+    fn live_journal_recorded_for_other_paths_still_fails_closed() {
+        for phase in [Phase::Prepared, Phase::Replaced] {
+            let fixture = Fixture::new();
+            write_foreign_journal(&fixture, phase, false);
+            assert!(recover_startup(&fixture.tx.paths, None).is_err());
+            assert!(fixture.tx.paths.journal().exists());
+            assert!(fixture.tx.directory.exists());
+        }
+    }
+    #[test]
+    fn supervised_launch_never_discards_a_journal_for_other_paths() {
+        let fixture = Fixture::new();
+        write_foreign_journal(&fixture, Phase::Staged, false);
+        let supervised = (fixture.tx.paths.journal(), fixture.tx.attempt.clone());
+        assert!(recover_startup(&fixture.tx.paths, Some(&supervised)).is_err());
+        assert!(fixture.tx.paths.journal().exists());
+    }
+    fn lock_wait() -> Duration {
+        Duration::from_millis(300)
+    }
+    #[test]
+    fn reset_recovery_clears_a_fail_closed_journal_with_its_staging_and_snapshot() {
+        // A newer release installed by hand leaves Prepared/Replaced journals
+        // failing closed forever; the user's explicit reset is the way out (#238).
+        for phase in [Phase::Prepared, Phase::Replaced] {
+            let mut fixture = Fixture::new();
+            fixture.tx.phase = phase;
+            fixture.tx.save().unwrap();
+            write_json(&fixture.tx.snapshot(), &"unsent draft").unwrap();
+            fs::write(&fixture.tx.paths.target, b"manual installation").unwrap();
+            let paths = &fixture.tx.paths;
+            assert!(recover_startup(paths, None).is_err());
+            // Failing closed keeps every recovery file until the user resets.
+            assert!(paths.journal().exists() && fixture.tx.directory.exists());
+
+            reset_recovery_within(paths, lock_wait()).unwrap();
+            assert!(!paths.journal().exists());
+            assert!(!fixture.tx.directory.exists());
+            assert!(!fixture.tx.snapshot().exists());
+            assert_eq!(fs::read(&paths.target).unwrap(), b"manual installation");
+            let (acknowledgment, snapshot) = recover_startup(paths, None).unwrap();
+            assert!(acknowledgment.is_none() && snapshot.is_none());
+            // Nothing left to reset is not an error.
+            reset_recovery_within(paths, lock_wait()).unwrap();
+        }
+    }
+    #[test]
+    fn reset_recovery_of_an_unreadable_journal_removes_only_the_journal() {
+        let fixture = Fixture::new();
+        let paths = &fixture.tx.paths;
+        fs::write(paths.journal(), b"invalid journal").unwrap();
+        write_json(&paths.state.join("last-check.json"), &1u64).unwrap();
+        assert!(recover_startup(paths, None).is_err());
+        reset_recovery_within(paths, lock_wait()).unwrap();
+        assert!(!paths.journal().exists());
+        // Nothing in an unreadable journal can be trusted, so no staging
+        // directory is removed on its say-so.
+        assert!(fixture.tx.directory.exists());
+        assert!(paths.state.join("last-check.json").exists());
+        recover_startup(paths, None).unwrap();
+    }
+    #[test]
+    fn reset_recovery_trusts_only_a_journal_recorded_for_this_installation() {
+        // Another profile's journal, and one whose directory was edited to point
+        // elsewhere: neither may delete what it names.
+        let fixture = Fixture::new();
+        let outside = fixture.root.join("outside");
+        fs::create_dir(&outside).unwrap();
+        fs::write(outside.join("precious"), b"data").unwrap();
+        write_foreign_journal(&fixture, Phase::Prepared, false);
+        reset_recovery_within(&fixture.tx.paths, lock_wait()).unwrap();
+        assert!(!fixture.tx.paths.journal().exists());
+        assert!(fixture.tx.directory.exists());
+
+        let mut hostile = fixture.tx.clone();
+        hostile.phase = Phase::Replaced;
+        hostile.directory = outside.clone();
+        hostile.save().unwrap();
+        reset_recovery_within(&fixture.tx.paths, lock_wait()).unwrap();
+        assert!(!fixture.tx.paths.journal().exists());
+        assert!(outside.join("precious").exists());
+    }
+    #[cfg(unix)]
+    #[test]
+    fn reset_recovery_never_follows_a_symlinked_staging_directory() {
+        let mut fixture = Fixture::new();
+        let outside = fixture.root.join("outside");
+        fs::create_dir(&outside).unwrap();
+        fs::write(outside.join("precious"), b"data").unwrap();
+        fs::remove_dir_all(&fixture.tx.directory).unwrap();
+        std::os::unix::fs::symlink(&outside, &fixture.tx.directory).unwrap();
+        fixture.tx.phase = Phase::Replaced;
+        fixture.tx.save().unwrap();
+        reset_recovery_within(&fixture.tx.paths, lock_wait()).unwrap();
+        assert!(!fixture.tx.paths.journal().exists());
+        assert!(outside.join("precious").exists());
+    }
+    #[test]
+    fn reset_recovery_gives_up_while_another_instance_holds_the_transaction_lock() {
+        let mut fixture = Fixture::new();
+        fixture.tx.phase = Phase::Replaced;
+        fixture.tx.save().unwrap();
+        let held = fixture.tx.paths.transaction_lock().unwrap();
+        held.lock().unwrap();
+        let error = reset_recovery_within(&fixture.tx.paths, Duration::from_millis(100));
+        assert_eq!(error.unwrap_err().kind(), io::ErrorKind::TimedOut);
+        assert!(fixture.tx.paths.journal().exists() && fixture.tx.directory.exists());
     }
     /// Sweep until `directory` disappears: a handle another test's fork keeps
     /// alive for an instant can make a just-released claim look busy.

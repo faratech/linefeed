@@ -102,6 +102,9 @@ pub struct Controller {
     pub closing: bool,
     pub(crate) staged: Option<Transaction>,
     pub(crate) armed: Option<install::Armed>,
+    /// Set while a recovery error blocks the updater: the paths whose update
+    /// state "Reset update state" would clear (#238).
+    recovery: Option<Paths>,
     sender: Option<mpsc::Sender<Command>>,
     events: Option<mpsc::Receiver<Event>>,
     automatic: Arc<AtomicBool>,
@@ -124,6 +127,7 @@ impl Controller {
         let recovery_error = self.install_reason.is_some();
         if recovery_error {
             self.status = Status::Error(self.install_reason.clone().unwrap());
+            self.recovery = Some(paths.clone());
         } else if cfg!(debug_assertions) {
             self.install_reason = Some(
                 "Development build: install a release binary to enable automatic installation"
@@ -179,6 +183,30 @@ impl Controller {
                 can_install,
             )
         });
+    }
+    /// Whether "Reset update state" applies: startup found update recovery
+    /// files it will not touch on its own.
+    pub fn reset_available(&self) -> bool {
+        self.recovery.is_some()
+    }
+    /// Discard the update recovery files after the user has dealt with the
+    /// installation themselves. No live re-plumbing: the updater stays off
+    /// until the next launch, which says so.
+    pub fn reset_recovery(&mut self) {
+        let Some(paths) = self.recovery.take() else {
+            return;
+        };
+        match install::reset_recovery(&paths) {
+            Ok(()) => {
+                self.status = Status::Idle;
+                self.install_reason =
+                    Some("Update state was reset. Restart Linefeed to re-enable updates.".into());
+            }
+            Err(e) => {
+                self.status = Status::Error(format!("Could not reset update state: {e}"));
+                self.recovery = Some(paths);
+            }
+        }
     }
     pub fn set_automatic(&self, enabled: bool) {
         self.automatic.store(enabled, Ordering::Relaxed);
@@ -997,6 +1025,41 @@ mod tests {
         controller.check();
         controller.download();
         assert!(matches!(controller.status, Status::Error(_)));
+    }
+    #[test]
+    fn recovery_error_offers_a_reset_that_clears_the_journal_and_asks_for_a_restart() {
+        // A Prepared journal beside a manually installed newer release fails
+        // closed; the only way out is the user's explicit reset (#238).
+        let (root, paths, mut tx) = staged_fixture("0.0.10");
+        tx.phase = Phase::Prepared;
+        tx.save().unwrap();
+        fs::write(&paths.target, b"manual installation").unwrap();
+        let mut controller = Controller::default();
+        controller.install_reason = Some("Update recovery needs attention".into());
+        controller.start(Some(paths.clone()), egui::Context::default(), false);
+        assert!(controller.reset_available());
+
+        controller.reset_recovery();
+        assert!(!paths.journal().exists() && !tx.directory.exists());
+        assert!(!controller.reset_available());
+        assert!(!matches!(controller.status, Status::Error(_)));
+        // The updater stays off until a restart re-reads the (now clean) state.
+        assert!(controller.install_reason.as_deref().unwrap().contains("Restart"));
+        drop(controller);
+        let _ = fs::remove_dir_all(root);
+    }
+    #[test]
+    fn reset_is_offered_only_for_a_recovery_error() {
+        let (root, paths, _tx) = staged_fixture("0.0.10");
+        let mut controller = Controller::default();
+        controller.start(Some(paths), egui::Context::default(), false);
+        assert!(!controller.reset_available());
+        // An updater that could not start has no state to reset either.
+        let mut controller = Controller::default();
+        controller.install_reason = Some("The updater could not start".into());
+        controller.start(None, egui::Context::default(), false);
+        assert!(!controller.reset_available());
+        let _ = fs::remove_dir_all(root);
     }
     /// Loopback HTTP server: headers at once, then one body byte per `pause`.
     fn slow_body_server(parts: usize, pause: Duration) -> String {
