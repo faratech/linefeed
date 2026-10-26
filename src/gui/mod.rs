@@ -883,6 +883,11 @@ impl IrcApp {
     /// Minimal update when window is minimized - drains messages without rendering UI
     /// This prevents the message buffer from filling up while keeping CPU usage near zero
     pub fn update_minimal(&mut self) {
+        // Only the minimized/tray-hidden path runs this, and no frame refreshes
+        // the focus flag meanwhile: a stale `true` would suppress highlight,
+        // kick and invite notifications and mark unseen messages read (#237).
+        self.window_focused = false;
+
         // Drain all pending messages to prevent buffer overflow
         let messages: Vec<_> = if let Some(rx) = &mut self.msg_rx {
             std::iter::from_fn(|| rx.try_recv().ok()).collect()
@@ -895,6 +900,52 @@ impl IrcApp {
             self.handle_incoming_message(msg);
         }
         self.log_manager.flush_all();
+        self.run_timed_tasks();
+    }
+
+    /// Time-based work that must keep running whether or not a frame is
+    /// drawn: queued auto-perform commands, the auto-away idle check and the
+    /// lag ping. Called from `ui()` and from `update_minimal()`, which is all
+    /// that runs while minimized or hidden to the tray (#237).
+    fn run_timed_tasks(&mut self) {
+        // Execute pending auto-perform commands (one per frame to avoid flooding)
+        if let Some(ref mut commands) = self.pending_auto_perform.take()
+            && let Some(cmd) = commands.first().cloned()
+        {
+            // Process command (add / prefix if not present)
+            let cmd = if cmd.starts_with('/') {
+                cmd
+            } else {
+                format!("/{}", cmd)
+            };
+            self.process_command(&cmd);
+
+            // Put remaining commands back
+            let remaining: Vec<_> = commands.iter().skip(1).cloned().collect();
+            if !remaining.is_empty() {
+                self.pending_auto_perform = Some(remaining);
+            }
+        }
+
+        // Check for idle timeout and set auto-away
+        if self.connected && self.away_status.is_none() && self.auto_away_enabled {
+            let idle_duration = self.last_activity.elapsed();
+            let timeout = std::time::Duration::from_secs(self.auto_away_minutes as u64 * 60);
+            if idle_duration >= timeout {
+                let msg = self.auto_away_message.clone();
+                self.send_command(IrcCommand::Away(Some(msg.clone())));
+                self.away_status = Some(msg.clone());
+                self.auto_away_triggered = true;
+                self.add_server_message(ChatMessage::system(&format!("Auto-away: {}", msg)));
+            }
+        }
+
+        // Lag meter - send PING every 30 seconds when connected
+        if self.connected && self.last_lag_check.elapsed().as_secs() >= 30 {
+            self.last_lag_check = std::time::Instant::now();
+            self.ping_sent_time = Some(std::time::Instant::now());
+            self.send_command(IrcCommand::Ping("LAG".to_string()));
+        }
     }
 
     /// Send a desktop notification
@@ -2491,6 +2542,50 @@ mod connection_lifecycle_tests {
         app.apply_unprofiled_endpoint("other.example", "7000", false);
         assert!(app.switch_session_from_form("Changing servers"));
         assert_eq!(app.reconnect_attempts, 0);
+    }
+
+    #[test]
+    fn background_tick_runs_the_time_based_work_and_marks_the_window_unfocused() {
+        let mut app = lifecycle_app();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        app.cmd_tx = Some(tx);
+        app.connected = true;
+        // Focus as last seen by a drawn frame, before the window went away.
+        app.window_focused = true;
+        app.auto_away_enabled = true;
+        app.auto_away_minutes = 5;
+        app.last_activity = std::time::Instant::now() - std::time::Duration::from_secs(600);
+        app.last_lag_check = std::time::Instant::now() - std::time::Duration::from_secs(31);
+        app.pending_auto_perform = Some(vec!["/echo identified".to_string()]);
+
+        app.update_minimal();
+
+        assert!(!app.window_focused);
+        assert!(app.auto_away_triggered);
+        assert!(app.away_status.is_some());
+        assert!(matches!(rx.try_recv(), Ok(IrcCommand::Away(Some(_)))));
+        assert!(matches!(rx.try_recv(), Ok(IrcCommand::Ping(token)) if token == "LAG"));
+        assert!(app.pending_auto_perform.is_none());
+        assert!(
+            app.server_messages
+                .iter()
+                .any(|message| message.content.contains("identified"))
+        );
+    }
+
+    #[test]
+    fn background_tick_does_not_flap_away_when_the_user_is_active() {
+        let mut app = lifecycle_app();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        app.cmd_tx = Some(tx);
+        app.connected = true;
+        app.auto_away_enabled = true;
+        app.auto_away_minutes = 5;
+
+        app.update_minimal();
+
+        assert!(app.away_status.is_none());
+        assert!(rx.try_recv().is_err());
     }
 
     fn history_request(placement: HistoryPlacement) -> PendingHistoryRequest {
@@ -6805,25 +6900,6 @@ impl eframe::App for IrcApp {
         // one flush syscall per message.
         self.log_manager.flush_all();
 
-        // Execute pending auto-perform commands (one per frame to avoid flooding)
-        if let Some(ref mut commands) = self.pending_auto_perform.take()
-            && let Some(cmd) = commands.first().cloned()
-        {
-            // Process command (add / prefix if not present)
-            let cmd = if cmd.starts_with('/') {
-                cmd
-            } else {
-                format!("/{}", cmd)
-            };
-            self.process_command(&cmd);
-
-            // Put remaining commands back
-            let remaining: Vec<_> = commands.iter().skip(1).cloned().collect();
-            if !remaining.is_empty() {
-                self.pending_auto_perform = Some(remaining);
-            }
-        }
-
         // Handle keyboard shortcuts
         self.handle_keyboard_shortcuts(ctx);
 
@@ -6847,25 +6923,8 @@ impl eframe::App for IrcApp {
             }
         }
 
-        // Check for idle timeout and set auto-away
-        if self.connected && self.away_status.is_none() && self.auto_away_enabled {
-            let idle_duration = self.last_activity.elapsed();
-            let timeout = std::time::Duration::from_secs(self.auto_away_minutes as u64 * 60);
-            if idle_duration >= timeout {
-                let msg = self.auto_away_message.clone();
-                self.send_command(IrcCommand::Away(Some(msg.clone())));
-                self.away_status = Some(msg.clone());
-                self.auto_away_triggered = true;
-                self.add_server_message(ChatMessage::system(&format!("Auto-away: {}", msg)));
-            }
-        }
-
-        // Lag meter - send PING every 30 seconds when connected
-        if self.connected && self.last_lag_check.elapsed().as_secs() >= 30 {
-            self.last_lag_check = std::time::Instant::now();
-            self.ping_sent_time = Some(std::time::Instant::now());
-            self.send_command(IrcCommand::Ping("LAG".to_string()));
-        }
+        // Queued auto-perform, auto-away idle check and lag ping
+        self.run_timed_tasks();
 
         // Connect dialog
         if self.show_connect_dialog && !self.connected && !self.connecting {
