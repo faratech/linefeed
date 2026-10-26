@@ -766,6 +766,16 @@ impl IrcClient {
                 return Err(format!("{field} is too long"));
             }
         }
+        // Each field fits on its own, but the formatted USER line (plus CRLF)
+        // must also fit the 512-byte wire limit or the server truncates it.
+        let user_line = IrcCommand::User {
+            username: username.to_string(),
+            realname: realname.to_string(),
+        }
+        .to_string();
+        if user_line.len() + 2 > IRC_WIRE_LINE_BYTES {
+            return Err("Username and realname are too long together".into());
+        }
         Ok(())
     }
 
@@ -2773,6 +2783,7 @@ mod tests {
                 ("a\nb", "", ""),
                 ("a\0b", "", ""),
                 ("ok", &"r".repeat(401), ""),
+                (&"u".repeat(300), &"r".repeat(300), ""),
                 ("ok", "", "p\r\nOPER x y"),
             ] {
                 let config = ServerConfig {
@@ -2797,6 +2808,44 @@ mod tests {
                 );
             }
         });
+    }
+
+    #[test]
+    fn combined_user_line_must_fit_the_irc_line_limit() {
+        // #232: each field is capped at 400 bytes on its own, but the
+        // formatted "USER <u> 0 * :<r>\r\n" must also fit in 512 bytes, i.e.
+        // username + realname <= 499 bytes.
+        let check = |username_len: usize, realname_len: usize| {
+            IrcClient::validate_registration_fields(
+                "tester",
+                &"u".repeat(username_len),
+                &"r".repeat(realname_len),
+                "",
+            )
+        };
+        assert!(check(250, 249).is_ok());
+        assert!(check(300, 199).is_ok());
+        assert!(check(1, 400).is_ok());
+        for (username_len, realname_len) in [(250, 250), (300, 300), (400, 400)] {
+            let error = check(username_len, realname_len).unwrap_err();
+            assert!(error.contains("too long"), "{error}");
+        }
+        // The accepted boundary really is a legal wire line.
+        let user = IrcCommand::User {
+            username: "u".repeat(250),
+            realname: "r".repeat(249),
+        };
+        assert_eq!(format!("{user}\r\n").len(), IRC_WIRE_LINE_BYTES);
+        // Multi-byte realnames count bytes, not characters.
+        assert!(
+            IrcClient::validate_registration_fields(
+                "tester",
+                &"u".repeat(100),
+                &"é".repeat(200),
+                ""
+            )
+            .is_err()
+        );
     }
 
     #[test]
