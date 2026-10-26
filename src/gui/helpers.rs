@@ -1,19 +1,18 @@
 //! Helper utilities for the GUI module
 
 /// Whether `value` is an extended ban ("$a:account", "$j:#chan", "~a:account",
-/// "m:mask"): server-defined matching syntax, not a nick or a hostmask. It must
-/// reach MODE unchanged. A nick can never start with `$` or contain ':', so
-/// these forms cannot be mistaken for one.
+/// "m:mask", and the named forms "~account:troll" / "account:troll"):
+/// server-defined matching syntax, not a nick or a hostmask. It must reach
+/// MODE unchanged. A nick can never start with `$` or contain ':', so a ':'
+/// before any '!' or '@' marks an extban; a ':' after one is part of a host
+/// (an IPv6 address such as `*@2001:db8::1`).
 pub fn is_extended_ban(value: &str) -> bool {
-    let mut chars = value.chars();
-    match chars.next() {
-        Some('$') => true,
-        Some('~') => {
-            matches!((chars.next(), chars.next()), (Some(kind), Some(':')) if kind.is_ascii_alphabetic())
-        }
-        Some(kind) if kind.is_ascii_alphabetic() => chars.next() == Some(':'),
-        _ => false,
+    if value.starts_with('$') {
+        return true;
     }
+    value
+        .find(':')
+        .is_some_and(|colon| colon > 0 && !value[..colon].contains(['!', '@']))
 }
 
 /// Convert a nick or partial mask into a complete `nick!user@host` ban mask.
@@ -291,6 +290,13 @@ mod tests {
             "~t:5:*!*@host",
             "R:account",
             "m:*!*@host",
+            // Named extbans (UnrealIRCd, Solanum, InspIRCd 4).
+            "~account:troll",
+            "$account:troll",
+            "account:troll",
+            "~quiet:*!*@host",
+            "~timedban:5:*!*@host",
+            "~1:x",
         ] {
             assert!(is_extended_ban(extban), "{extban}");
             assert_eq!(nick_to_mask(extban), extban);
@@ -299,11 +305,13 @@ mod tests {
             "nick",
             "a",
             "~",
-            "~1:x",
             "nick!user@host",
             "*!*@host",
             "*@2001:db8::1",
             "x!*@2001:db8::1",
+            "nick!user@2001:db8::1",
+            "*!user@host:6667",
+            ":",
             "",
         ] {
             assert!(!is_extended_ban(plain), "{plain}");

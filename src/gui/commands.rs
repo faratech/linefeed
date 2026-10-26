@@ -3244,6 +3244,9 @@ mod tests {
             "$~a",
             "~q:*!*@bad.host",
             "m:*!*@x",
+            "~account:troll",
+            "$account:troll",
+            "account:troll",
         ] {
             app.process_command(&format!("/ban {extban}"));
             expect_mode(&mut rx, "+b", extban);
@@ -3256,6 +3259,12 @@ mod tests {
         // A wildcard inside the extban must not be completed either.
         app.process_command("/ban $a:tro*");
         expect_mode(&mut rx, "+b", "$a:tro*");
+
+        // A colon in an IPv6 host is a hostmask, not an extban.
+        app.process_command("/ban *@2001:db8::1");
+        expect_mode(&mut rx, "+b", "*!*@2001:db8::1");
+        app.process_command("/kickban bob@2001:db8::1 go");
+        expect_mode(&mut rx, "+b", "bob!*@2001:db8::1");
     }
 
     #[test]
