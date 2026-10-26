@@ -3994,6 +3994,12 @@ mod tests {
             app.process_input();
         }
         assert!(app.command_history.is_empty(), "{:?}", app.command_history);
+
+        // Positive control: history does record an ordinary command, so the
+        // emptiness above cannot be a vacuous pass.
+        app.input_text = "/join #x".into();
+        app.process_input();
+        assert_eq!(app.command_history, vec!["/join #x".to_string()]);
         while rx.try_recv().is_ok() {}
     }
 
