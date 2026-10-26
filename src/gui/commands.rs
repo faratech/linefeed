@@ -2309,13 +2309,22 @@ pub(super) fn content_has_auth_command(message: &str) -> bool {
             | "GROUP"
             | "SETPASS"
             | "RESETPASS"
+            | "NEWPASS"
     ) {
         return true;
     }
-    command.eq_ignore_ascii_case("SET")
-        && words.next().is_some_and(|word| {
+    match command.as_str() {
+        // Atheme `DROP <nick> <password>`. DROP is an ordinary word, so a
+        // bare one stays unredacted; any argument may be the password.
+        "DROP" => words.next().is_some(),
+        // `SET PASSWORD <pw>`, `SET #chan PASSWORD <pw>` and Anope's
+        // `SASET <nick> PASSWORD <pw>`: the keyword is the first or second
+        // word after the command.
+        "SET" | "SASET" => words.take(2).any(|word| {
             word.eq_ignore_ascii_case("PASSWORD") || word.eq_ignore_ascii_case("PASS")
-        })
+        }),
+        _ => false,
+    }
 }
 
 pub(super) fn service_message_contains_credentials(target: &str, message: &str) -> bool {
@@ -2865,6 +2874,66 @@ mod tests {
             "CS",
             "IDENTIFY #chan key123"
         ));
+    }
+
+    #[test]
+    fn password_bearing_service_commands_are_redacted_everywhere() {
+        // (target, text, credential?) — Atheme DROP, Undernet X / QuakeNet Q
+        // NEWPASS, Anope SASET, and ChanServ-style `SET #chan PASSWORD` (#225).
+        let cases: &[(&str, &str, bool)] = &[
+            ("NickServ", "DROP mynick hunter2", true),
+            ("NickServ", "drop mynick hunter2", true),
+            ("ChanServ", "DROP #chan", true),
+            ("NickServ", "DROP", false),
+            ("Q@CServe.quakenet.org", "NEWPASS old new new", true),
+            ("X", "newpass hunter2 hunter3 hunter3", true),
+            ("NickServ", "SASET alice PASSWORD hunter2", true),
+            ("NickServ", "SET PASSWORD hunter2", true),
+            ("ChanServ", "SET #chan PASSWORD hunter2", true),
+            ("ChanServ", "set #chan pass hunter2", true),
+            ("ChanServ", "SET #chan TOPICLOCK ON", false),
+            ("NickServ", "SET EMAIL me@example.test", false),
+            ("NickServ", "SASET alice EMAIL me@example.test", false),
+            ("NickServ", "INFO alice", false),
+            // Not a service target: ordinary chat is never touched.
+            ("alice", "DROP mynick hunter2", false),
+        ];
+        for &(target, text, expected) in cases {
+            // Echo redaction.
+            let echo = outgoing_local_echo(target, "me", text, "short");
+            assert_eq!(
+                echo.content == "<credential command sent>",
+                expected,
+                "{target} {text}"
+            );
+            assert_eq!(echo.no_log, expected, "{target} {text}");
+            // Log suppression / replay filtering use the same predicate.
+            assert_eq!(
+                service_message_contains_credentials(target, text),
+                expected,
+                "{target} {text}"
+            );
+            // Input-history predicate, through the service shorthands and /msg.
+            let command_line = format!("/msg {target} {text}");
+            assert_eq!(
+                command_line_contains_credentials(&command_line),
+                expected,
+                "{command_line}"
+            );
+        }
+
+        // Targetless senders (/me, /say) and the service shorthands.
+        assert!(content_has_auth_command("DROP mynick hunter2"));
+        assert!(!content_has_auth_command("drop"));
+        assert!(content_has_auth_command("NEWPASS old new new"));
+        assert!(content_has_auth_command("SET #chan PASSWORD hunter2"));
+        assert!(command_line_contains_credentials("/ns drop mynick hunter2"));
+        assert!(command_line_contains_credentials("/ns newpass a b b"));
+        assert!(command_line_contains_credentials(
+            "/cs set #chan password hunter2"
+        ));
+        assert!(command_line_contains_credentials("/ns saset alice password x"));
+        assert!(!command_line_contains_credentials("/ns set email a@b.test"));
     }
 
     #[test]
