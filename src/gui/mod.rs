@@ -3162,6 +3162,10 @@ impl IrcApp {
                 let sender = msg
                     .get_sender_nick()
                     .unwrap_or_else(|| "Server".to_string());
+                if msg.prefix.is_some() && self.is_ignored(&sender, msg.prefix.as_deref()) {
+                    tracing::debug!("Ignoring status message from {}", sender);
+                    return;
+                }
                 let target = self.strip_status_prefix(target).to_string();
                 let label = match status {
                     '@' => "ops",
@@ -3187,6 +3191,10 @@ impl IrcApp {
                 // to printing protocol noise into the conversation.
                 if let Some(reaction) = msg.get_tag("+draft/react") {
                     let sender = msg.get_sender_nick().unwrap_or_else(|| "???".to_string());
+                    if msg.prefix.is_some() && self.is_ignored(&sender, msg.prefix.as_deref()) {
+                        tracing::debug!("Ignoring reaction from {}", sender);
+                        return;
+                    }
                     let reply_to = msg
                         .get_reply()
                         .map(|id| format!(" to {id}"))
@@ -3713,6 +3721,10 @@ impl IrcApp {
                 let sender = msg
                     .get_sender_nick()
                     .unwrap_or_else(|| "Someone".to_string());
+                if msg.prefix.is_some() && self.is_ignored(&sender, msg.prefix.as_deref()) {
+                    tracing::debug!("Ignoring invite from {}", sender);
+                    return;
+                }
                 if !self.identifiers_equal(target, &self.my_nick) {
                     self.add_message_to_channel(
                         channel,
@@ -10003,6 +10015,45 @@ mod tests {
             !app.channels.contains_key("#room"),
             "#192: ignored multiline dropped"
         );
+    }
+
+    #[test]
+    fn ignored_sender_invite_reaction_and_status_message_are_dropped() {
+        let mut app = test_app();
+        app.set_session_nick("me".into(), true);
+        app.ignore_list = vec!["Troll".to_string()];
+        app.update_cached_lowercase();
+        let mut channel = Channel::new();
+        channel.joined = true;
+        app.channels.insert("#room".to_string(), channel);
+
+        // INVITE to us: no pending invite, server-buffer line or notification.
+        app.handle_incoming_message(IrcMessage::parse(":Troll!u@h INVITE me #elsewhere").unwrap());
+        // invite-notify line about someone else.
+        app.handle_incoming_message(IrcMessage::parse(":Troll!u@h INVITE bob #room").unwrap());
+        // Reaction and ops-only message (WALLCHOPS).
+        app.handle_incoming_message(
+            IrcMessage::parse("@+draft/react=:+1: :Troll!u@h TAGMSG #room").unwrap(),
+        );
+        app.handle_incoming_message(
+            IrcMessage::parse(":Troll!u@h WALLCHOPS #room :ops only").unwrap(),
+        );
+
+        assert!(app.pending_invites.is_empty());
+        assert!(app.server_messages.is_empty());
+        assert!(app.channels["#room"].messages.is_empty());
+        assert!(!app.channels.contains_key("#elsewhere"));
+
+        // The same events from a peer are still shown.
+        app.handle_incoming_message(IrcMessage::parse(":alice!u@h INVITE me #elsewhere").unwrap());
+        app.handle_incoming_message(
+            IrcMessage::parse("@+draft/react=:+1: :alice!u@h TAGMSG #room").unwrap(),
+        );
+        app.handle_incoming_message(
+            IrcMessage::parse(":alice!u@h WALLCHOPS #room :ops only").unwrap(),
+        );
+        assert_eq!(app.pending_invites.len(), 1);
+        assert_eq!(app.channels["#room"].messages.len(), 2);
     }
 
     #[test]
