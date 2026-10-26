@@ -88,6 +88,8 @@ struct TextSpan {
     underline: bool,
     italic: bool,
     reverse: bool,
+    strikethrough: bool,
+    monospace: bool,
 }
 
 /// Get a consistent color for a nick based on hash
@@ -98,6 +100,41 @@ pub fn nick_color(nick: &str) -> Color32 {
     NICK_COLORS[(hash as usize) % NICK_COLORS.len()]
 }
 
+/// Consume exactly six hex digits (`RRGGBB`) from the front of `chars`. When
+/// fewer follow, nothing is consumed and the digits stay literal text.
+fn take_hex_color(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) -> Option<Color32> {
+    let mut lookahead = chars.clone();
+    let mut rgb = 0u32;
+    for _ in 0..6 {
+        rgb = rgb << 4 | lookahead.next()?.to_digit(16)?;
+    }
+    *chars = lookahead;
+    Some(Color32::from_rgb(
+        (rgb >> 16) as u8,
+        (rgb >> 8) as u8,
+        rgb as u8,
+    ))
+}
+
+/// Consume the `[RRGGBB[,RRGGBB]]` that follows a `\x04` hex-color control.
+/// A background is only valid after a foreground, and the comma is only
+/// consumed when a full background follows it (as for `\x03`).
+fn take_hex_colors(
+    chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
+) -> (Option<Color32>, Option<Color32>) {
+    let Some(fg) = take_hex_color(chars) else {
+        return (None, None);
+    };
+    let mut lookahead = chars.clone();
+    if lookahead.next() == Some(',')
+        && let Some(bg) = take_hex_color(&mut lookahead)
+    {
+        *chars = lookahead;
+        return (Some(fg), Some(bg));
+    }
+    (Some(fg), None)
+}
+
 /// Strip IRC color codes and formatting from text, returning plain text
 pub fn strip_irc_formatting(input: &str) -> String {
     let mut result = String::with_capacity(input.len());
@@ -105,8 +142,13 @@ pub fn strip_irc_formatting(input: &str) -> String {
 
     while let Some(c) = chars.next() {
         match c {
-            '\x02' | '\x1D' | '\x1F' | '\x16' | '\x0F' => {
-                // Bold, italic, underline, reverse, reset - skip
+            '\x02' | '\x1D' | '\x1F' | '\x16' | '\x0F' | '\x1E' | '\x11' => {
+                // Bold, italic, underline, reverse, reset, strikethrough,
+                // monospace - skip
+            }
+            '\x04' => {
+                // Hex color: \x04[RRGGBB[,RRGGBB]]
+                take_hex_colors(&mut chars);
             }
             '\x03' => {
                 // Color code - skip digits
@@ -149,6 +191,8 @@ fn parse_irc_colors(input: &str) -> Vec<TextSpan> {
     let mut underline = false;
     let mut italic = false;
     let mut reverse = false;
+    let mut strikethrough = false;
+    let mut monospace = false;
 
     let mut chars = input.chars().peekable();
 
@@ -165,6 +209,8 @@ fn parse_irc_colors(input: &str) -> Vec<TextSpan> {
                         underline,
                         italic,
                         reverse,
+                        strikethrough,
+                        monospace,
                     });
                     current_text.clear();
                 }
@@ -229,6 +275,8 @@ fn parse_irc_colors(input: &str) -> Vec<TextSpan> {
                         underline,
                         italic,
                         reverse,
+                        strikethrough,
+                        monospace,
                     });
                     current_text.clear();
                 }
@@ -245,6 +293,8 @@ fn parse_irc_colors(input: &str) -> Vec<TextSpan> {
                         underline,
                         italic,
                         reverse,
+                        strikethrough,
+                        monospace,
                     });
                     current_text.clear();
                 }
@@ -261,6 +311,8 @@ fn parse_irc_colors(input: &str) -> Vec<TextSpan> {
                         underline,
                         italic,
                         reverse,
+                        strikethrough,
+                        monospace,
                     });
                     current_text.clear();
                 }
@@ -277,6 +329,8 @@ fn parse_irc_colors(input: &str) -> Vec<TextSpan> {
                         underline,
                         italic,
                         reverse,
+                        strikethrough,
+                        monospace,
                     });
                     current_text.clear();
                 }
@@ -293,6 +347,8 @@ fn parse_irc_colors(input: &str) -> Vec<TextSpan> {
                         underline,
                         italic,
                         reverse,
+                        strikethrough,
+                        monospace,
                     });
                     current_text.clear();
                 }
@@ -302,6 +358,42 @@ fn parse_irc_colors(input: &str) -> Vec<TextSpan> {
                 underline = false;
                 italic = false;
                 reverse = false;
+                strikethrough = false;
+                monospace = false;
+            }
+            '\x1E' | '\x11' | '\x04' => {
+                // Strikethrough / monospace toggles and the hex colour
+                if !current_text.is_empty() {
+                    spans.push(TextSpan {
+                        text: current_text.clone(),
+                        fg_color,
+                        bg_color,
+                        bold,
+                        underline,
+                        italic,
+                        reverse,
+                        strikethrough,
+                        monospace,
+                    });
+                    current_text.clear();
+                }
+                match c {
+                    '\x1E' => strikethrough = !strikethrough,
+                    '\x11' => monospace = !monospace,
+                    _ => match take_hex_colors(&mut chars) {
+                        (Some(fg), bg) => {
+                            fg_color = Some(fg);
+                            if bg.is_some() {
+                                bg_color = bg;
+                            }
+                        }
+                        // A bare \x04 resets colors, like a bare \x03.
+                        (None, _) => {
+                            fg_color = None;
+                            bg_color = None;
+                        }
+                    },
+                }
             }
             _ => {
                 current_text.push(c);
@@ -319,6 +411,8 @@ fn parse_irc_colors(input: &str) -> Vec<TextSpan> {
             underline,
             italic,
             reverse,
+            strikethrough,
+            monospace,
         });
     }
 
@@ -402,6 +496,8 @@ pub struct RenderSegment {
     pub underline: bool,
     pub italic: bool,
     pub reverse: bool,
+    pub strikethrough: bool,
+    pub monospace: bool,
     pub is_url: bool,
 }
 
@@ -414,6 +510,8 @@ fn render_segment(span: &TextSpan, text: String, is_url: bool) -> RenderSegment 
         underline: span.underline,
         italic: span.italic,
         reverse: span.reverse,
+        strikethrough: span.strikethrough,
+        monospace: span.monospace,
         is_url,
     }
 }
@@ -504,6 +602,12 @@ pub fn render_segments(ui: &mut egui::Ui, segments: &[RenderSegment], default_co
                 if span.italic {
                     rich_text = rich_text.italics();
                 }
+                if span.strikethrough {
+                    rich_text = rich_text.strikethrough();
+                }
+                if span.monospace {
+                    rich_text = rich_text.monospace();
+                }
 
                 if let Some(bg) = bg_color {
                     rich_text = rich_text.background_color(bg);
@@ -541,6 +645,70 @@ mod tests {
         // "\x03042026" = color 04 followed by the literal text "2026".
         assert_eq!(strip_irc_formatting("\x03042026 party"), "2026 party");
         assert_eq!(strip_irc_formatting("\x034,051234"), "1234");
+    }
+
+    #[test]
+    fn hex_color_monospace_and_strikethrough_are_parsed_not_shown() {
+        // \x04RRGGBB[,RRGGBB] sets an exact foreground / background (#264).
+        let spans = parse_irc_colors("\x04FF0000red\x04 plain");
+        assert_eq!(spans[0].text, "red");
+        assert_eq!(spans[0].fg_color, Some(Color32::from_rgb(0xff, 0, 0)));
+        assert_eq!(spans[1].text, " plain");
+        assert_eq!(spans[1].fg_color, None);
+
+        let spans = parse_irc_colors("\x04ff8000,0000FFboth\x04,1 tail");
+        assert_eq!(spans[0].text, "both");
+        assert_eq!(spans[0].fg_color, Some(Color32::from_rgb(0xff, 0x80, 0)));
+        assert_eq!(spans[0].bg_color, Some(Color32::from_rgb(0, 0, 0xff)));
+        // A bare \x04 resets both; the comma and digit stay literal.
+        assert_eq!(spans[1].text, ",1 tail");
+        assert_eq!((spans[1].fg_color, spans[1].bg_color), (None, None));
+
+        // Fewer than six hex digits is a reset followed by literal text.
+        let spans = parse_irc_colors("\x04FF00 not a color");
+        assert_eq!(spans[0].text, "FF00 not a color");
+        assert_eq!(spans[0].fg_color, None);
+        // A background needs all six digits too.
+        let spans = parse_irc_colors("\x04112233,4455 x");
+        assert_eq!(spans[0].text, ",4455 x");
+        assert_eq!(spans[0].fg_color, Some(Color32::from_rgb(0x11, 0x22, 0x33)));
+        assert_eq!(spans[0].bg_color, None);
+
+        let spans = parse_irc_colors("\x11code\x11 \x1Estruck\x1E");
+        assert_eq!(spans[0].text, "code");
+        assert!(spans[0].monospace && !spans[0].strikethrough);
+        assert_eq!(spans[1].text, " ");
+        assert!(!spans[1].monospace && !spans[1].strikethrough);
+        assert_eq!(spans[2].text, "struck");
+        assert!(spans[2].strikethrough && !spans[2].monospace);
+
+        // Reset clears both new attributes along with the old ones.
+        let spans = parse_irc_colors("\x11\x1Ex\x0Fy");
+        assert!(spans[0].monospace && spans[0].strikethrough);
+        assert_eq!(spans[1].text, "y");
+        assert!(!spans[1].monospace && !spans[1].strikethrough);
+
+        // The flags reach the render segments, and no control char is left.
+        let segs = layout_irc_text("\x04FF0000\x1Edone\x1E");
+        assert_eq!(segs.len(), 1);
+        assert!(segs[0].strikethrough);
+        assert_eq!(segs[0].text, "done");
+        assert!(segs.iter().all(|seg| !seg.text.contains(char::is_control)));
+    }
+
+    #[test]
+    fn strip_removes_hex_color_monospace_and_strikethrough() {
+        assert_eq!(strip_irc_formatting("\x04FF0000red\x04"), "red");
+        assert_eq!(strip_irc_formatting("\x04FF0000,00ff00bg\x04 ok"), "bg ok");
+        assert_eq!(
+            strip_irc_formatting("\x1Estruck\x1E \x11mono\x11"),
+            "struck mono"
+        );
+        // Not six hex digits: only the control goes, the text stays.
+        assert_eq!(strip_irc_formatting("\x04FF00 text"), "FF00 text");
+        assert_eq!(strip_irc_formatting("\x04112233,4455 x"), ",4455 x");
+        // Digits beyond the six belong to the text.
+        assert_eq!(strip_irc_formatting("\x04FF000012"), "12");
     }
 
     #[test]
