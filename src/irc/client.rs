@@ -317,21 +317,16 @@ fn redact_for_log(line: &str) -> std::borrow::Cow<'_, str> {
     trimmed.into()
 }
 
-/// Read the next protocol message during the registration handshake: parse it,
-/// forward a copy to the GUI, and transparently answer server PINGs (which can
-/// arrive mid-handshake, before the writer task that normally handles them
-/// exists). Reads exactly one line: PINGs are answered inline (returning
-/// `None` so the caller re-arms its fresh per-step budget), and any other
-/// message is returned for the caller's state machine.
-/// connection closes.
-async fn read_handshake_msg<W, R>(
-    writer: &mut W,
+/// Wait for one complete line from the server and leave it in `buf`.
+/// Cancellation-safe: callers race this against NICK write-through and the
+/// step timeout, and dropping it loses nothing because partial bytes stay in
+/// `buf` for the next call to resume (see `read_until_lf_bounded`).
+async fn read_handshake_line<R>(
     reader: &mut R,
     buf: &mut Vec<u8>,
     incoming_tx: &mpsc::Sender<IrcMessage>,
-) -> Result<Option<IrcMessage>, Box<dyn std::error::Error + Send + Sync>>
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
 where
-    W: tokio::io::AsyncWrite + Unpin,
     R: tokio::io::AsyncBufRead + Unpin,
 {
     // The GUI dropping its receiver is a disconnect request; honor it even
@@ -350,6 +345,26 @@ where
         // complete message (mirrors the main read loop).
         return Err("Connection closed during registration".into());
     }
+    Ok(())
+}
+
+/// Consume the complete line in `buf`: parse it, forward a copy to the GUI,
+/// and transparently answer a server PING (which can arrive mid-handshake,
+/// before the writer task that normally handles them exists). PINGs and
+/// unparseable lines return `None` so the caller re-arms its fresh per-step
+/// budget; any other message is returned for the caller's state machine.
+///
+/// Deliberately NOT cancellation-safe: the line has already left the socket,
+/// so dropping this future mid-PONG or mid-forward would lose it (#277).
+/// Callers run it to completion, outside any select! arm or timeout.
+async fn handle_handshake_line<W>(
+    writer: &mut W,
+    buf: &mut Vec<u8>,
+    incoming_tx: &mpsc::Sender<IrcMessage>,
+) -> Result<Option<IrcMessage>, Box<dyn std::error::Error + Send + Sync>>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+{
     let trimmed = bytes_to_string_lossy(buf);
     buf.clear();
     tracing::debug!("< {}", trimmed);
@@ -374,6 +389,9 @@ where
     }
 }
 
+/// Read the next protocol message of interest during the registration
+/// handshake (see `handle_handshake_line`). Returns `None` when the per-step
+/// budget expires with nothing received.
 async fn read_handshake_msg_timed<W, R>(
     writer: &mut W,
     reader: &mut R,
@@ -392,6 +410,10 @@ where
     // A queued NICK (the GUI's 433 walkaway retry) is written through on
     // arrival — registration state, so no budget is consumed for it (#173).
     loop {
+        // Only the wait for a line races the NICK write-through and the step
+        // budget; that wait is cancellation-safe. Handling the line (PONG,
+        // forward to the GUI) runs to completion below: it has already been
+        // consumed from the socket, so a cancel there would lose it (#277).
         tokio::select! {
             biased;
             Some(nick) = nick_rx.recv() => {
@@ -403,14 +425,16 @@ where
             }
             outcome = timeout(
                 HANDSHAKE_STEP_TIMEOUT,
-                read_handshake_msg(writer, reader, buf, incoming_tx),
+                read_handshake_line(reader, buf, incoming_tx),
             ) => match outcome {
-                Ok(Ok(Some(msg))) => return Ok(Some(msg)),
-                // PING answered (or junk line skipped): re-arm a fresh budget.
-                Ok(Ok(None)) => continue,
+                Ok(Ok(())) => {}
                 Ok(Err(e)) => return Err(e),
                 Err(_) => return Ok(None),
             }
+        }
+        // PING answered (or junk line skipped): re-arm a fresh budget.
+        if let Some(msg) = handle_handshake_line(writer, buf, incoming_tx).await? {
+            return Ok(Some(msg));
         }
     }
 }
@@ -2480,6 +2504,72 @@ mod tests {
             drop(msg_tx);
             drain.await.unwrap();
             server.await.unwrap();
+        });
+    }
+
+    #[test]
+    fn handshake_line_survives_a_nick_arriving_while_it_is_forwarded() {
+        test_runtime().block_on(async {
+            // #277: the line is consumed from the socket before it is
+            // forwarded to the GUI. If the forward is blocked (full channel)
+            // and a queued NICK wakes the select, the forward must still
+            // finish; dropping it would lose the line (CAP LS, 001, ...) and
+            // stall the handshake.
+            let (client_io, server_io) = tokio::io::duplex(4096);
+            let (client_read, mut client_write) = tokio::io::split(client_io);
+            let mut client_read = BufReader::new(client_read);
+            let (_server_read, mut server_write) = tokio::io::split(server_io);
+            let (incoming_tx, mut incoming_rx) = mpsc::channel(1);
+            incoming_tx
+                .send(IrcMessage {
+                    tags: None,
+                    prefix: None,
+                    command: IrcCommand::Notice("*".to_string(), "filler".to_string()),
+                    raw: String::new(),
+                })
+                .await
+                .unwrap();
+            let (nick_tx, mut nick_rx) = mpsc::unbounded_channel::<String>();
+            server_write
+                .write_all(b":srv CAP * LS :multi-prefix\r\n")
+                .await
+                .unwrap();
+
+            let reader_task = tokio::spawn(async move {
+                let mut buf = Vec::new();
+                read_handshake_msg_timed(
+                    &mut client_write,
+                    &mut client_read,
+                    &mut buf,
+                    &incoming_tx,
+                    &mut nick_rx,
+                )
+                .await
+                .map_err(|error| error.to_string())
+            });
+            // Let the reader consume the line and block on the full channel,
+            // then wake it with a NICK.
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            nick_tx.send("tester_".to_string()).unwrap();
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            assert!(matches!(
+                incoming_rx.recv().await.unwrap().command,
+                IrcCommand::Notice(..)
+            ));
+
+            let message = timeout(Duration::from_secs(1), reader_task)
+                .await
+                .expect("handshake line lost: its forward was cancelled")
+                .unwrap()
+                .unwrap()
+                .expect("expected the CAP LS message");
+            assert!(matches!(message.command, IrcCommand::Cap(..)));
+            let forwarded = timeout(Duration::from_secs(1), incoming_rx.recv())
+                .await
+                .expect("CAP LS was never forwarded")
+                .unwrap();
+            assert!(matches!(forwarded.command, IrcCommand::Cap(..)));
+            drop(server_write);
         });
     }
 
