@@ -783,7 +783,7 @@ pub fn arm(mut tx: Transaction, snapshot: Option<&crate::gui::UpdateSession>) ->
         .stdout(Stdio::null())
         .stderr(Stdio::null());
     quiet(&mut command);
-    let mut child = match command.spawn() {
+    let mut child = match spawn(&mut command) {
         Ok(child) => child,
         Err(error) => {
             scrub_session_snapshot(&mut tx);
@@ -826,6 +826,27 @@ pub fn arm(mut tx: Transaction, snapshot: Option<&crate::gui::UpdateSession>) ->
     tx.save()?;
     drop(lock);
     Ok(Armed { child, input })
+}
+
+/// `Command::spawn`, retrying briefly on ETXTBSY ("Text file busy"). An
+/// executable written moments ago can still be open for writing in a child
+/// that another thread forked and has not exec'd yet; that clears within
+/// milliseconds.
+fn spawn(command: &mut Command) -> io::Result<Child> {
+    #[cfg(unix)]
+    {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            match command.spawn() {
+                Err(e) if e.raw_os_error() == Some(libc::ETXTBSY) && Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                result => return result,
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    command.spawn()
 }
 
 pub fn quiet(command: &mut Command) {
@@ -1008,7 +1029,7 @@ fn apply_transaction_within(tx: &mut Transaction, running_wait: Duration) -> io:
         .stdout(Stdio::null())
         .stderr(Stdio::null());
     quiet(&mut probe);
-    if !wait_child(&mut probe.spawn()?, Duration::from_secs(30))? {
+    if !wait_child(&mut spawn(&mut probe)?, Duration::from_secs(30))? {
         abandon_before_replace(tx);
         tx.save()?;
         write_json(&tx.paths.state.join("failed.json"), &tx.version)?;
@@ -1086,8 +1107,7 @@ fn apply_transaction_within(tx: &mut Transaction, running_wait: Duration) -> io:
             .stdout(Stdio::null())
             .stderr(Stdio::null());
         quiet(&mut probe);
-        let good = probe
-            .spawn()
+        let good = spawn(&mut probe)
             .and_then(|mut c| wait_child(&mut c, Duration::from_secs(30)))
             .unwrap_or(false);
         if !good {
@@ -1113,7 +1133,7 @@ fn launch(tx: &Transaction) -> io::Result<Child> {
         .stdout(Stdio::null())
         .stderr(Stdio::null());
     quiet(&mut command);
-    command.spawn()
+    spawn(&mut command)
 }
 fn wait_healthy(tx: &Transaction, child: &mut Child) -> io::Result<bool> {
     let deadline = Instant::now() + Duration::from_secs(60);
@@ -1861,17 +1881,27 @@ mod tests {
                 .is_some_and(|x| x == "tmp"))
         );
     }
+    /// Write an executable script and close it before anything runs it, so a
+    /// still-open write handle never makes the exec fail with ETXTBSY. (A child
+    /// forked by another test thread may briefly hold a copy of it; `spawn`
+    /// retries that.)
+    #[cfg(unix)]
+    fn write_script(path: &Path, body: &str) {
+        use std::os::unix::fs::PermissionsExt;
+        let mut file = File::create(path).unwrap();
+        file.write_all(body.as_bytes()).unwrap();
+        file.set_permissions(fs::Permissions::from_mode(0o700)).unwrap();
+        file.sync_all().unwrap();
+    }
     #[cfg(unix)]
     fn probe_fixture(success: bool) -> Fixture {
-        use std::os::unix::fs::PermissionsExt;
         let mut fixture = Fixture::new();
         let code = if success {
             "#!/bin/sh\nif [ \"$1\" = --internal-update-probe ] && [ \"$2\" = 0.0.10 ]; then exit 0; fi\nexit 1\n"
         } else {
             "#!/bin/sh\nexit 1\n"
         };
-        fs::write(fixture.tx.candidate(), code).unwrap();
-        fs::set_permissions(fixture.tx.candidate(), fs::Permissions::from_mode(0o700)).unwrap();
+        write_script(&fixture.tx.candidate(), code);
         fixture.tx.new_hash = hash(&fixture.tx.candidate()).unwrap();
         fixture.tx.phase = Phase::Prepared;
         fixture.tx.save().unwrap();
@@ -1889,12 +1919,10 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn candidate_swapped_during_probe_is_never_installed() {
-        use std::os::unix::fs::PermissionsExt;
         let mut fixture = probe_fixture(true);
         let script =
             "#!/bin/sh\nprintf 'tampered executable' > \"$0.tmp\"\nmv \"$0.tmp\" \"$0\"\nexit 0\n";
-        fs::write(fixture.tx.candidate(), script).unwrap();
-        fs::set_permissions(fixture.tx.candidate(), fs::Permissions::from_mode(0o700)).unwrap();
+        write_script(&fixture.tx.candidate(), script);
         fixture.tx.new_hash = hash(&fixture.tx.candidate()).unwrap();
         fixture.tx.save().unwrap();
         assert!(apply_transaction(&mut fixture.tx).is_err());
@@ -1916,26 +1944,34 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn failed_probe_after_restart_request_reopens_old_app_with_its_session() {
-        use std::os::unix::fs::PermissionsExt;
         let mut fixture = probe_fixture(false);
         let tx = &mut fixture.tx;
-        // Stand-in for the old app: records how it was launched.
-        let marker = fixture.root.join("old-app-launched");
+        // Stand-in for the old app. At launch it records its arguments and
+        // what the supervised startup would read (the journal and the session
+        // snapshot), then confirms startup like a healthy GUI would.
+        let seen = |name: &str| fixture.root.join(name);
+        let healthy = tx.directory.join("healthy.json");
         let old_app = format!(
-            "#!/bin/sh\nprintf '%s ' \"$@\" > '{}'\n",
-            marker.display()
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{args}'\ncp '{snapshot}' '{snapshot_seen}'\n\
+             cp '{journal}' '{journal_seen}'\ncp '{ready}' '{healthy}.tmp' && mv '{healthy}.tmp' '{healthy}'\n",
+            args = seen("args").display(),
+            snapshot = tx.snapshot().display(),
+            snapshot_seen = seen("snapshot-seen").display(),
+            journal = tx.paths.journal().display(),
+            journal_seen = seen("journal-seen").display(),
+            ready = seen("healthy-ready").display(),
+            healthy = healthy.display(),
         );
         for path in [tx.paths.target.clone(), tx.helper()] {
-            fs::write(&path, &old_app).unwrap();
-            fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+            write_script(&path, &old_app);
         }
         tx.old_hash = hash(&tx.paths.target).unwrap();
         tx.restart = true;
         write_json(&tx.snapshot(), &"unsent draft").unwrap();
         tx.save().unwrap();
-        // The old app's startup confirmation, which the relaunch waits for.
-        let healthy = (tx.attempt.clone(), tx.old_hash.clone());
-        write_json(&tx.directory.join("healthy.json"), &healthy).unwrap();
+        // The confirmation the relaunch waits for, published by the old app only
+        // once it has captured what it was handed.
+        write_json(&seen("healthy-ready"), &(tx.attempt.clone(), tx.old_hash.clone())).unwrap();
 
         assert!(apply_transaction(tx).is_err());
         // The candidate never replaced anything, but the user asked to restart:
@@ -1945,18 +1981,51 @@ mod tests {
         assert_eq!(hash(&tx.paths.target).unwrap(), tx.old_hash);
 
         relaunch_after_failure(tx, &tx.paths.journal()).unwrap();
-        let deadline = Instant::now() + Duration::from_secs(10);
-        while !marker.exists() && Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(20));
-        }
-        assert!(
-            fs::read_to_string(&marker)
-                .unwrap()
-                .starts_with("--internal-update-launch ")
+        let args = fs::read_to_string(seen("args")).unwrap();
+        let journal_path = tx.paths.journal();
+        assert_eq!(
+            args.lines().collect::<Vec<_>>(),
+            [
+                "--internal-update-launch",
+                journal_path.to_str().unwrap(),
+                &tx.attempt
+            ]
         );
+        // The relaunched app found its session snapshot and a journal saying to
+        // restore it, exactly what recover_startup hands to the GUI.
+        assert_eq!(
+            read_json::<String>(&seen("snapshot-seen")).unwrap(),
+            "unsent draft"
+        );
+        let launched: Transaction = read_json(&seen("journal-seen")).unwrap();
+        assert!(launched.phase == Phase::RolledBack && launched.restart);
+        assert_eq!(launched.attempt, tx.attempt);
         let journal: Transaction = read_json(&tx.paths.journal()).unwrap();
         assert!(journal.phase == Phase::Healthy);
         assert!(!tx.snapshot().exists());
+    }
+    #[cfg(unix)]
+    #[test]
+    fn spawn_waits_out_an_executable_that_is_still_open_for_writing() {
+        let fixture = Fixture::new();
+        let script = fixture.root.join("script");
+        write_script(&script, "#!/bin/sh\nexit 0\n");
+        // Exec fails with ETXTBSY while any handle open for writing exists.
+        let writer = OpenOptions::new().write(true).open(&script).unwrap();
+        let busy = Command::new(&script).spawn();
+        if !matches!(&busy, Err(e) if e.raw_os_error() == Some(libc::ETXTBSY)) {
+            if let Ok(mut child) = busy {
+                let _ = child.wait();
+            }
+            return; // this filesystem does not enforce it
+        }
+        let closer = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(200));
+            drop(writer);
+        });
+        let mut child = spawn(&mut Command::new(&script)).unwrap();
+        assert!(child.wait().unwrap().success());
+        closer.join().unwrap();
     }
     #[cfg(unix)]
     #[test]
