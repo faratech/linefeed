@@ -465,20 +465,19 @@ fn start_updater(
     if supervised.is_none() {
         timed_lock(&lock, false, lock_wait)?;
     }
-    let (acknowledgment, snapshot, update_error) =
-        match recover_startup(&paths, supervised) {
-            Ok((acknowledgment, snapshot)) => (acknowledgment, snapshot, None),
-            // A manually replaced executable or damaged journal must not strand a
-            // working app. Preserve all recovery files and disable installation.
-            Err(error) if supervised.is_none() => (
-                None,
-                None,
-                Some(format!(
-                    "Update recovery needs attention: {error}. Download a release manually."
-                )),
-            ),
-            Err(error) => return Err(error),
-        };
+    let (acknowledgment, snapshot, update_error) = match recover_startup(&paths, supervised) {
+        Ok((acknowledgment, snapshot)) => (acknowledgment, snapshot, None),
+        // A manually replaced executable or damaged journal must not strand a
+        // working app. Preserve all recovery files and disable installation.
+        Err(error) if supervised.is_none() => (
+            None,
+            None,
+            Some(format!(
+                "Update recovery needs attention: {error}. Download a release manually."
+            )),
+        ),
+        Err(error) => return Err(error),
+    };
     if update_error.is_none() && supervised.is_none() {
         sweep_orphans(&paths);
     }
@@ -1291,9 +1290,17 @@ mod tests {
     #[test]
     fn tampered_candidate_fails_reverification() {
         let fixture = Fixture::new();
-        verify_candidate(&fixture.tx).unwrap();
+        if cfg!(windows) {
+            // The fixture is not a signed executable: with matching bytes the
+            // check gets as far as the signature stage and fails there.
+            let error = verify_candidate(&fixture.tx).unwrap_err();
+            assert!(error.to_string().contains("Windows signature"), "{error}");
+        } else {
+            verify_candidate(&fixture.tx).unwrap();
+        }
         fs::write(fixture.tx.candidate(), b"swapped executable").unwrap();
-        assert!(verify_candidate(&fixture.tx).is_err());
+        let error = verify_candidate(&fixture.tx).unwrap_err();
+        assert_eq!(error.to_string(), "Update bytes changed");
     }
     #[cfg(unix)]
     #[test]
@@ -1681,12 +1688,17 @@ mod tests {
         platform::private_dir(&directory).unwrap();
         let owner = fixture.tx.paths.state.clone();
         let mut at_lock = None;
+        // Sizes, not contents: Windows locks are mandatory, so a second handle
+        // cannot read the claim while it is held.
+        let claim_len = || fs::metadata(directory.join(CLAIM)).unwrap().len();
         let claim = claim_directory(&directory, &owner, |file| {
-            at_lock = Some(fs::read(directory.join(CLAIM)).unwrap());
+            at_lock = Some(claim_len());
             file.lock()
         })
         .unwrap();
-        assert_eq!(at_lock, Some(Vec::new()));
+        assert_eq!(at_lock, Some(0));
+        assert_eq!(claim_len(), owner.to_string_lossy().len() as u64);
+        #[cfg(unix)]
         assert_eq!(
             fs::read(directory.join(CLAIM)).unwrap(),
             owner.to_string_lossy().as_bytes()
@@ -1758,7 +1770,11 @@ mod tests {
     #[test]
     fn updater_infrastructure_failure_does_not_stop_a_normal_launch() {
         // e.g. a 0755 or foreign-owned update directory (#272).
-        let failure = || Err(io::Error::other("Update directory is not private to this user"));
+        let failure = || {
+            Err(io::Error::other(
+                "Update directory is not private to this user",
+            ))
+        };
         let startup = startup_with(failure(), None, Duration::from_secs(1)).unwrap();
         assert!(startup.paths.is_none() && startup.running.is_none());
         assert!(startup.update_error.unwrap().contains("not private"));
@@ -1818,7 +1834,12 @@ mod tests {
         assert!(startup.update_error.is_none());
         // A concurrently forked child (other tests spawn probes) can briefly
         // keep the closed handle's lock alive, so wait rather than try once.
-        timed_lock(&paths.transaction_lock().unwrap(), false, Duration::from_secs(5)).unwrap();
+        timed_lock(
+            &paths.transaction_lock().unwrap(),
+            false,
+            Duration::from_secs(5),
+        )
+        .unwrap();
     }
     #[test]
     fn rollback_preserves_snapshot_and_suppresses_failed_version() {
@@ -1893,7 +1914,8 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         let mut file = File::create(path).unwrap();
         file.write_all(body.as_bytes()).unwrap();
-        file.set_permissions(fs::Permissions::from_mode(0o700)).unwrap();
+        file.set_permissions(fs::Permissions::from_mode(0o700))
+            .unwrap();
         file.sync_all().unwrap();
     }
     #[cfg(unix)]
@@ -1974,7 +1996,11 @@ mod tests {
         tx.save().unwrap();
         // The confirmation the relaunch waits for, published by the old app only
         // once it has captured what it was handed.
-        write_json(&seen("healthy-ready"), &(tx.attempt.clone(), tx.old_hash.clone())).unwrap();
+        write_json(
+            &seen("healthy-ready"),
+            &(tx.attempt.clone(), tx.old_hash.clone()),
+        )
+        .unwrap();
 
         assert!(apply_transaction(tx).is_err());
         // The candidate never replaced anything, but the user asked to restart:

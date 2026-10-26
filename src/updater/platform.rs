@@ -230,6 +230,21 @@ pub fn verify_signature(_path: &Path, _revocation: Revocation) -> io::Result<()>
 
 #[cfg(windows)]
 pub fn verify_signature(path: &Path, revocation: Revocation) -> io::Result<()> {
+    verify_signature_with(
+        path,
+        revocation,
+        windows::Win32::Security::WinTrust::WTD_REVOCATION_CHECK_CHAIN_EXCLUDE_ROOT,
+    )
+}
+
+/// `first_attempt` is the provider flags of the first WinVerifyTrust call;
+/// tests vary it to simulate revocation servers that cannot be reached.
+#[cfg(windows)]
+fn verify_signature_with(
+    path: &Path,
+    revocation: Revocation,
+    first_attempt: windows::Win32::Security::WinTrust::WINTRUST_DATA_PROVIDER_FLAGS,
+) -> io::Result<()> {
     use windows::{
         Win32::{
             Foundation::HWND,
@@ -334,12 +349,7 @@ pub fn verify_signature(path: &Path, revocation: Revocation) -> io::Result<()> {
     };
     // Enumerate secondary signatures, then verify each expected signing leaf.
     for (index, expected) in ["Fara Technologies LLC", "Mike Fara"].iter().enumerate() {
-        let mut outcome = verify_one(
-            &mut info,
-            index,
-            expected,
-            WTD_REVOCATION_CHECK_CHAIN_EXCLUDE_ROOT,
-        );
+        let mut outcome = verify_one(&mut info, index, expected, first_attempt);
         if !outcome.matches
             && revocation == Revocation::TolerateUnavailable
             && revocation_unavailable(outcome.status)
@@ -387,6 +397,62 @@ mod tests {
             ("TRUST_E_SUBJECT_NOT_TRUSTED", 0x800B_0004),
         ] {
             assert!(!revocation_unavailable(status as i32), "{name}");
+        }
+    }
+
+    /// Needs an executable with embedded Authenticode signatures in
+    /// LINEFEED_SIGNED_FIXTURE (a release build for the full check) and runs
+    /// `certutil -urlcache * delete` (the current user's CryptNet URL cache,
+    /// which Windows repopulates). Cache-only retrieval with an empty cache is
+    /// what unreachable revocation servers look like to WinVerifyTrust. The
+    /// property checked holds for any fixture: tolerance applies exactly when
+    /// the strict failure is a revocation-unavailable status, and never turns
+    /// another failure into success.
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "Requires LINEFEED_SIGNED_FIXTURE pointing to a signed executable"]
+    fn tolerance_applies_only_to_revocation_unavailable_failures() {
+        use super::{Revocation, verify_signature_with};
+        use windows::Win32::Security::WinTrust::{
+            WTD_CACHE_ONLY_URL_RETRIEVAL, WTD_REVOCATION_CHECK_CHAIN_EXCLUDE_ROOT,
+        };
+        let path = std::env::var_os("LINEFEED_SIGNED_FIXTURE").expect("signed fixture");
+        let path = std::path::Path::new(&path);
+        let status_of = |text: &str| {
+            let hex = &text.split("status ").nth(1).expect("status in message")[..8];
+            u32::from_str_radix(hex, 16).unwrap() as i32
+        };
+        let _ = std::process::Command::new("certutil")
+            .args(["-urlcache", "*", "delete"])
+            .output();
+        for (label, flags) in [
+            ("online", WTD_REVOCATION_CHECK_CHAIN_EXCLUDE_ROOT),
+            (
+                "cache-only",
+                WTD_REVOCATION_CHECK_CHAIN_EXCLUDE_ROOT | WTD_CACHE_ONLY_URL_RETRIEVAL,
+            ),
+        ] {
+            let strict = verify_signature_with(path, Revocation::Strict, flags);
+            let tolerant = verify_signature_with(path, Revocation::TolerateUnavailable, flags);
+            match &strict {
+                Ok(()) => {
+                    eprintln!("{label}: strict accepted the fixture");
+                    assert!(
+                        tolerant.is_ok(),
+                        "{label}: tolerance rejected what strict accepts"
+                    );
+                }
+                Err(error) => {
+                    let status = status_of(&error.to_string());
+                    eprintln!("{label}: strict failed with {status:08x}: {error}");
+                    assert_eq!(
+                        tolerant.is_ok(),
+                        revocation_unavailable(status),
+                        "{label}: tolerance must apply exactly to revocation-unavailable \
+                         failures (status {status:08x})"
+                    );
+                }
+            }
         }
     }
 }
