@@ -1056,27 +1056,61 @@ mod tests {
 
     #[test]
     fn manual_disconnect_cancels_a_connection_that_never_registers() {
-        // Accepts the connection and then says nothing, like a wedged server.
+        // Reads the client's opening line and then says nothing, like a wedged
+        // server. Waiting for that line puts the worker in the registration
+        // phase, where the QUIT is consumed, not an earlier connect phase.
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         let (accepted_tx, accepted_rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
-            let (_stream, _) = listener.accept().unwrap();
-            let _ = accepted_tx.send(());
+            use std::io::BufRead;
+            let (stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                .unwrap();
+            let mut reader = std::io::BufReader::new(stream);
+            let mut line = String::new();
+            if reader.read_line(&mut line).unwrap_or(0) > 0 {
+                let _ = accepted_tx.send(());
+            }
             std::thread::sleep(std::time::Duration::from_secs(30));
         });
         let mut linefeed = linefeed_for_port(port);
-        tick_until(&mut linefeed, "connection to be accepted", |_| {
+        tick_until(&mut linefeed, "registration to start", |_| {
             accepted_rx.try_recv().is_ok()
         });
 
         // The retired receiver stays open, so cancellation has to come from the
         // queued QUIT alone, long before the registration deadline.
         linefeed.app.request_manual_disconnect(None);
-        tick_until(&mut linefeed, "wedged worker to exit", |l| {
+        assert!(linefeed.app.closing_rx.is_some());
+        // Wait for the worker without running the lifecycle: its pass drops the
+        // retired receiver once the grace period is over, and closing that
+        // receiver cancels the worker by itself, which would let this test
+        // pass even with QUIT-based cancellation broken.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !linefeed
+            .connection_thread
+            .as_ref()
+            .is_some_and(|handle| handle.is_finished())
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the queued QUIT did not cancel the wedged worker"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(
+            linefeed.app.closing_rx.is_some(),
+            "the worker only exited once its receiver was dropped"
+        );
+
+        // The lifecycle then observes the exit as an ordinary disconnect.
+        tick_until(&mut linefeed, "worker exit to be observed", |l| {
             l.connection_thread.is_none()
         });
         assert!(!linefeed.app.connecting && !linefeed.app.connected);
+        assert!(linefeed.app.closing_rx.is_none());
     }
 
     #[test]

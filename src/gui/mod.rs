@@ -342,7 +342,7 @@ pub struct IrcApp {
     // Receiver of a connection that was told to QUIT, kept (unread) until its
     // worker has flushed the QUIT and exited, so the worker is not cancelled
     // before the QUIT reaches the wire. See request_manual_disconnect.
-    closing_rx: Option<(mpsc::Receiver<IrcMessage>, std::time::Instant)>,
+    pub(crate) closing_rx: Option<(mpsc::Receiver<IrcMessage>, std::time::Instant)>,
 
     // UI state
     pub show_settings: bool,
