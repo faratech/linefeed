@@ -199,6 +199,24 @@ impl Controller {
             self.status = Status::Checking;
         }
     }
+    /// Whether "Download update" applies: an offer exists and is not staged
+    /// yet. A staged older update stays installable but must not block a
+    /// newer release (#271).
+    pub fn download_available(&self) -> bool {
+        let Some(offer) = &self.offer else {
+            return false;
+        };
+        match &self.staged {
+            None => true,
+            Some(tx) => matches!(
+                (
+                    semver::Version::parse(&offer.version),
+                    semver::Version::parse(&tx.version)
+                ),
+                (Ok(offered), Ok(staged)) if offered > staged
+            ),
+        }
+    }
     pub fn download(&mut self) {
         if !self.busy() && self.install_reason.is_none() {
             self.send(Command::Download);
@@ -866,6 +884,34 @@ mod tests {
         install::executable_copy(&paths.target, &tx.helper()).unwrap();
         tx.save().unwrap();
         (root, paths, tx)
+    }
+    #[test]
+    fn a_staged_older_update_does_not_block_downloading_a_newer_offer() {
+        // With automatic updates off, a staged 0.0.10 persists across launches;
+        // when 0.0.11 appears the user must be able to fetch it (#271).
+        let (root, _paths, staged) = staged_fixture("0.0.10");
+        let offer = |tag: &str| {
+            select_release(release(tag), "0.0.9", Some("linefeed_x64.exe"))
+                .unwrap()
+                .unwrap()
+        };
+        let mut controller = Controller::default();
+        assert!(!controller.download_available());
+        controller.offer = Some(offer("v0.0.11"));
+        assert!(controller.download_available());
+        controller.staged = Some(staged.clone());
+        assert!(controller.download_available());
+        // The same release is already staged; an older one is not an upgrade.
+        controller.offer = Some(offer("v0.0.10"));
+        assert!(!controller.download_available());
+        controller.staged = Some(Transaction {
+            version: "0.0.12".into(),
+            ..staged
+        });
+        controller.offer = Some(offer("v0.0.11"));
+        assert!(!controller.download_available());
+        drop(controller);
+        let _ = fs::remove_dir_all(root);
     }
     #[test]
     fn recorded_update_failure_stays_visible_over_a_ready_staged_update() {

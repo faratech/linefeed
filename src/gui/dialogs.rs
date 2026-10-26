@@ -897,7 +897,7 @@ impl IrcApp {
             if let Some(offer) = &self.updater.offer {
                 ui.label(format!("Version {} is available", offer.version));
                 ui.hyperlink_to("Release notes", offer.release_url());
-                if self.updater.staged.is_none()
+                if self.updater.download_available()
                     && self.updater.install_reason.is_none()
                     && ui
                         .add_enabled(!busy, egui::Button::new("Download update"))
