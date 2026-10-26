@@ -2347,6 +2347,10 @@ pub(super) fn command_line_contains_credentials(line: &str) -> bool {
     match command.to_ascii_uppercase().as_str() {
         "PASS" | "AUTH" | "LOGIN" | "AUTHENTICATE" | "OPER" | "REGISTER" | "VERIFY" | "WEBPUSH"
         | "AUTHTOKEN" | "BOUNCER" => true,
+        // Bare service commands (/identify pw, /ghost nick pw, ...) fall
+        // through to the catch-all arm and reach the wire as-is (#226).
+        "IDENTIFY" | "ID" | "SIDENTIFY" | "GHOST" | "RECOVER" | "RELEASE" | "REGAIN" | "GROUP"
+        | "SETPASS" => true,
         "TOKEN" => args
             .split_whitespace()
             .next()
@@ -2354,16 +2358,26 @@ pub(super) fn command_line_contains_credentials(line: &str) -> bool {
         "NS" | "NICKSERV" => service_message_contains_credentials("NickServ", args),
         "CS" | "CHANSERV" => service_message_contains_credentials("ChanServ", args),
         "AS" | "AUTHSERV" => service_message_contains_credentials("AuthServ", args),
-        "MSG" | "PRIVMSG" | "QUERY" | "Q" | "NOTICE" | "N" | "DESCRIBE" => {
+        "MSG" | "PRIVMSG" | "QUERY" | "Q" | "NOTICE" | "N" | "DESCRIBE" | "SQUERY" => {
             // First word is the target, rest is the text (DESCRIBE sends it
-            // as a CTCP ACTION).
+            // as a CTCP ACTION; SQUERY addresses a service by name).
             let mut message = args.splitn(2, char::is_whitespace);
             let target = message.next().unwrap_or("");
             let content = message.next().unwrap_or("").trim_start();
             service_message_contains_credentials(target, content)
         }
         "ME" | "SAY" => content_has_auth_command(args),
-        "RAW" | "QUOTE" => command_line_contains_credentials(args),
+        "RAW" | "QUOTE" => {
+            // A raw line may lead with IRCv3 tags ("@label=1 PRIVMSG ..."):
+            // without skipping them the tag token reads as the command.
+            let untagged = if args.starts_with('@') {
+                args.split_once(char::is_whitespace)
+                    .map_or("", |(_, rest)| rest.trim_start())
+            } else {
+                args
+            };
+            command_line_contains_credentials(untagged)
+        }
         "LABEL" => {
             let nested = args
                 .split_once(char::is_whitespace)
@@ -2934,6 +2948,59 @@ mod tests {
         ));
         assert!(command_line_contains_credentials("/ns saset alice password x"));
         assert!(!command_line_contains_credentials("/ns set email a@b.test"));
+    }
+
+    #[test]
+    fn service_alias_squery_and_tagged_raw_credential_lines_never_enter_history() {
+        // Bare service commands reach the wire through the catch-all arm, so
+        // the history filter has to know them as top-level commands (#226).
+        for line in [
+            "/identify hunter2",
+            "/IDENTIFY hunter2",
+            "/id hunter2",
+            "/sidentify hunter2",
+            "/ghost oldnick hunter2",
+            "/recover oldnick hunter2",
+            "/release oldnick hunter2",
+            "/regain oldnick hunter2",
+            "/group hunter2",
+            "/setpass hunter2",
+            "/squery NickServ :identify hunter2",
+            "/squery NickServ identify hunter2",
+            "/squery ChanServ :identify #chan key123",
+            "/quote @label=1 PRIVMSG NickServ :identify hunter2",
+            "/raw @label=1;+draft/x=y NOTICE NickServ :identify hunter2",
+            "/raw   @label=1   PRIVMSG   NS   :id hunter2",
+            "/quote @label=1 PASS hunter2",
+            "/perform /quote @label=1 PRIVMSG NickServ :identify hunter2",
+        ] {
+            assert!(command_line_contains_credentials(line), "{line}");
+        }
+        for line in [
+            "/squery HostServ :help",
+            "/squery NickServ :info alice",
+            "/quote @label=1 PRIVMSG #chan :hello",
+            "/quote @label=1 WHOIS alice",
+            "/quote @label=1",
+            "/raw @",
+            "/version alice",
+        ] {
+            assert!(!command_line_contains_credentials(line), "{line}");
+        }
+
+        let (mut app, mut rx) = connected_command_app();
+        app.set_session_nick("me".into(), true);
+        for input in [
+            "/identify hunter12",
+            "/ghost oldnick hunter12",
+            "/squery NickServ :identify hunter12",
+            "/quote @label=1 PRIVMSG NickServ :identify hunter12",
+        ] {
+            app.input_text = input.into();
+            app.process_input();
+        }
+        assert!(app.command_history.is_empty(), "{:?}", app.command_history);
+        while rx.try_recv().is_ok() {}
     }
 
     #[test]
