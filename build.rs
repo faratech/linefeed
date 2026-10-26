@@ -1,10 +1,14 @@
 use std::env;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 /// The year the project started, for the LegalCopyright range.
 const FIRST_YEAR: i64 = 2025;
+
+/// The last year of the LegalCopyright range when the build is not pinned by
+/// SOURCE_DATE_EPOCH. A constant, not the build clock, so one commit always
+/// builds to the same bytes. Bump it with the first release of a new year.
+const FALLBACK_YEAR: i64 = 2026;
 
 fn llvm_mingw_tool(tool: &str) -> String {
     if let Ok(home) = env::var("LLVM_MINGW_HOME") {
@@ -63,6 +67,13 @@ fn year_from_epoch(seconds: u64) -> i64 {
     year_of_era + era * 400 + i64::from(month_index >= 10)
 }
 
+/// Year for the copyright range: SOURCE_DATE_EPOCH when it is set and valid.
+fn build_year(source_date_epoch: Option<&str>) -> i64 {
+    source_date_epoch
+        .and_then(|v| v.parse::<u64>().ok())
+        .map_or(FALLBACK_YEAR, year_from_epoch)
+}
+
 fn main() {
     // Only compile resources when targeting Windows
     let target = env::var("TARGET").unwrap_or_default();
@@ -94,21 +105,13 @@ fn main() {
             .and_then(|v| v.parse::<u16>().ok())
             .unwrap_or(0)
     });
-    // Honor SOURCE_DATE_EPOCH so a rebuild of the same source stays reproducible.
-    let seconds = env::var("SOURCE_DATE_EPOCH")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .unwrap_or_else(|| {
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map_or(0, |d| d.as_secs())
-        });
+    let year = build_year(env::var("SOURCE_DATE_EPOCH").ok().as_deref());
     let rc_path = Path::new(&out_dir).join("linefeed.rc");
     let rc_content = resource_script(
         &manifest_dir.replace('\\', "/"),
         &version,
         numeric,
-        year_from_epoch(seconds),
+        year,
     );
     std::fs::write(&rc_path, rc_content).unwrap();
 
@@ -151,7 +154,7 @@ fn main() {
     // silently reusing the resource-less result until `cargo clean`.
     println!("cargo:rerun-if-env-changed=LLVM_MINGW_HOME");
     println!("cargo:rerun-if-env-changed=PATH");
-    // The copyright year follows the build date unless pinned.
+    // The copyright year is fixed unless SOURCE_DATE_EPOCH pins a build date.
     println!("cargo:rerun-if-env-changed=SOURCE_DATE_EPOCH");
 }
 
@@ -173,6 +176,18 @@ mod tests {
         assert!(resource_script("/src", "1.0.0", [1, 0, 0], 2025).contains("\"Copyright 2025\""));
         assert!(
             resource_script("/src", "1.0.0", [1, 0, 0], 2027).contains("\"Copyright 2025-2027\"")
+        );
+    }
+
+    #[test]
+    fn copyright_year_is_fixed_unless_the_build_is_pinned() {
+        // The same commit must build to the same bytes whatever the clock says.
+        assert_eq!(build_year(None), FALLBACK_YEAR);
+        assert_eq!(build_year(Some("not a number")), FALLBACK_YEAR);
+        assert_eq!(build_year(Some("1798761600")), 2027); // 2027-01-01 00:00:00
+        assert!(
+            resource_script("/src", "1.0.0", [1, 0, 0], build_year(None))
+                .contains("\"Copyright 2025-2026\"")
         );
     }
 
