@@ -12,6 +12,10 @@ use std::path::PathBuf;
 /// target for the process lifetime; reopening in append mode is cheap.
 const MAX_OPEN_LOG_WRITERS: usize = 32;
 
+/// Longest readable log file name prefix in bytes; with the `~<16 hex>.log`
+/// suffix it leaves comfortable room under the common 255-byte name limit.
+const MAX_LOG_NAME_PREFIX_BYTES: usize = 200;
+
 struct CachedWriter {
     writer: std::io::BufWriter<File>,
     identity: same_file::Handle,
@@ -486,7 +490,16 @@ fn encoded_path_component(name: &str) -> String {
     }
 
     let readable = sanitize_filename(name);
-    let prefix: String = readable.chars().take(80).collect();
+    // Cap the prefix in bytes as well as characters: file names top out at 255
+    // bytes on common filesystems, and 80 multi-byte characters plus the
+    // "~<hash>.log" suffix overshoot that (ENAMETOOLONG silently stops the log).
+    let mut prefix = String::new();
+    for c in readable.chars().take(80) {
+        if prefix.len() + c.len_utf8() > MAX_LOG_NAME_PREFIX_BYTES {
+            break;
+        }
+        prefix.push(c);
+    }
     format!("{prefix}~{hash:016x}")
 }
 
@@ -820,6 +833,47 @@ mod tests {
         assert_ne!(
             manager.log_path("tls:IRC.example:6697", "#room"),
             manager.log_path("tls:irc.example:6697", "#room")
+        );
+        fs::remove_dir_all(dir).expect("remove temporary log directory");
+    }
+
+    #[test]
+    fn long_non_ascii_targets_get_file_names_within_the_filesystem_limit() {
+        let (manager, dir) = test_manager("long-names");
+        let network = "tls:irc.example:6697";
+        for ch in ["é", "漢", "😀"] {
+            let channel = format!("#{}", ch.repeat(100));
+            let path = manager.log_path(network, &channel);
+            let file_name = path.file_name().unwrap();
+            assert!(file_name.len() <= 255, "{ch}: {} bytes", file_name.len());
+            assert!(path.parent().unwrap().file_name().unwrap().len() <= 255);
+
+            // The point of the cap: the file can actually be created.
+            manager.log_message(
+                network,
+                &channel,
+                &msg("[09:30]", "alice", "hello", false, false),
+            );
+            manager.flush_all();
+            assert!(path.is_file(), "{ch}: log file was not created");
+            let history = manager.load_history_with_legacy(network, network, &channel, 10, false);
+            assert_eq!(history.len(), 1, "{ch}");
+            assert_eq!(history[0].content, "hello");
+
+            // Names that differ only past the cut keep distinct files (the
+            // hash covers the whole raw name, #88).
+            let other = format!("#{}x", ch.repeat(100));
+            assert_ne!(path, manager.log_path(network, &other), "{ch}");
+        }
+
+        // Ordinary names keep their readable prefix.
+        let short = manager.log_path(network, "#room");
+        assert!(
+            short
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("#room~")
         );
         fs::remove_dir_all(dir).expect("remove temporary log directory");
     }
