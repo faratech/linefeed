@@ -811,13 +811,16 @@ impl IrcApp {
             }
 
             "VERSION" => {
-                // Convenience: /version <nick> is shorthand for /ctcp <nick> VERSION
-                if !args.is_empty() {
+                // Convenience: /version <nick> is shorthand for /ctcp <nick> VERSION.
+                // Only the first word is the target; trailing words would
+                // otherwise become the message text of the PRIVMSG (#261).
+                let (target, _) = split_word(args);
+                if !target.is_empty() {
                     let ctcp_msg = "\x01VERSION\x01".to_string();
-                    if self.send_command(IrcCommand::Privmsg(args.to_string(), ctcp_msg)) {
+                    if self.send_command(IrcCommand::Privmsg(target.to_string(), ctcp_msg)) {
                         self.add_message_to_current(ChatMessage::system(&format!(
                             "[CTCP] Sent VERSION to {}",
-                            args
+                            target
                         )));
                     } else {
                         self.add_message_to_current(
@@ -833,17 +836,19 @@ impl IrcApp {
             }
 
             "PING" if !args.is_empty() && !args.starts_with('#') => {
-                // /ping <nick> - Send CTCP PING to measure latency
+                // /ping <nick> - Send CTCP PING to measure latency (first word
+                // only is the target, as for /version).
                 use std::time::{SystemTime, UNIX_EPOCH};
+                let (target, _) = split_word(args);
                 let timestamp = SystemTime::now()
                     .duration_since(UNIX_EPOCH)
                     .unwrap_or_default()
                     .as_millis();
                 let ctcp_msg = format!("\x01PING {}\x01", timestamp);
-                if self.send_command(IrcCommand::Privmsg(args.to_string(), ctcp_msg)) {
+                if self.send_command(IrcCommand::Privmsg(target.to_string(), ctcp_msg)) {
                     self.add_message_to_current(ChatMessage::system(&format!(
                         "[CTCP] Sent PING to {}",
-                        args
+                        target
                     )));
                 } else {
                     self.add_message_to_current(
@@ -2879,6 +2884,42 @@ mod tests {
         // A wildcard inside the extban must not be completed either.
         app.process_command("/ban $a:tro*");
         expect_mode(&mut rx, "+b", "$a:tro*");
+    }
+
+    #[test]
+    fn version_and_ping_target_only_the_first_word() {
+        let (mut app, mut rx) = connected_command_app();
+
+        app.process_command("/version alice hello");
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            IrcCommand::Privmsg("alice".into(), "\x01VERSION\x01".into())
+        );
+        app.process_command("/version  alice\tignored words");
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            IrcCommand::Privmsg("alice".into(), "\x01VERSION\x01".into())
+        );
+        app.process_command("/ping alice x");
+        match rx.try_recv().unwrap() {
+            IrcCommand::Privmsg(target, ctcp) => {
+                assert_eq!(target, "alice");
+                assert!(ctcp.starts_with("\x01PING ") && ctcp.ends_with('\x01'));
+                assert!(!ctcp.contains('x'), "{ctcp:?}");
+            }
+            other => panic!("expected Privmsg, got {other:?}"),
+        }
+        let confirmations: Vec<&str> = app
+            .server_messages
+            .iter()
+            .map(|message| message.content.as_str())
+            .collect();
+        assert!(
+            confirmations
+                .iter()
+                .all(|row| !row.contains("hello") && !row.contains("ignored")),
+            "{confirmations:?}"
+        );
     }
 
     #[test]
