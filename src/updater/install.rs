@@ -937,10 +937,10 @@ fn relaunch_after_failure(tx: &mut Transaction, journal: &Path) -> io::Result<()
     Ok(())
 }
 
-/// Return an unreplaced transaction to Staged after a failure. When a restart
-/// was requested, keep that intent and its session snapshot: `helper` reopens
-/// the old app with them (#239). Otherwise nothing will consume the snapshot,
-/// so erase it (#200).
+/// Return an unreplaced transaction to Staged after the candidate failed
+/// validation. When a restart was requested, keep that intent and its session
+/// snapshot: `helper` reopens the old app with them (#239). Otherwise nothing
+/// will consume the snapshot, so erase it (#200).
 fn abandon_before_replace(tx: &mut Transaction) {
     if !tx.restart {
         scrub_session_snapshot(tx);
@@ -949,11 +949,20 @@ fn abandon_before_replace(tx: &mut Transaction) {
 }
 
 fn apply_transaction(tx: &mut Transaction) -> io::Result<()> {
+    apply_transaction_within(tx, Duration::from_secs(30))
+}
+
+fn apply_transaction_within(tx: &mut Transaction, running_wait: Duration) -> io::Result<()> {
     let transaction_lock = tx.paths.transaction_lock()?;
     timed_lock(&transaction_lock, false, Duration::from_secs(30))?;
     let running = tx.paths.run_lock()?;
-    if timed_lock(&running, false, Duration::from_secs(30)).is_err() {
-        abandon_before_replace(tx);
+    if timed_lock(&running, false, running_wait).is_err() {
+        // The candidate is fine; it waits for the next exit. Relaunching the
+        // old app would only get it marked Healthy and its staging deleted, and
+        // on Windows the relaunch can exit at the single-instance mutex with the
+        // snapshot still on disk. So no restart intent and no snapshot (#200).
+        scrub_session_snapshot(tx);
+        tx.phase = Phase::Staged;
         tx.save()?;
         return Err(io::Error::other(
             "Another instance is still running; update deferred",
@@ -1894,6 +1903,34 @@ mod tests {
         let journal: Transaction = read_json(&tx.paths.journal()).unwrap();
         assert!(journal.phase == Phase::Healthy);
         assert!(!tx.snapshot().exists());
+    }
+    #[cfg(unix)]
+    #[test]
+    fn deferred_update_with_another_instance_running_stays_staged_and_erases_the_snapshot() {
+        // Unlike a failed probe, nothing is wrong with the candidate: it must
+        // stay staged for the next exit, not be relaunched around and lost to
+        // the Healthy cleanup (#239).
+        let mut fixture = probe_fixture(true);
+        let tx = &mut fixture.tx;
+        tx.restart = true;
+        write_json(&tx.snapshot(), &"unsent draft").unwrap();
+        tx.save().unwrap();
+        let other_instance = tx.paths.run_lock().unwrap();
+        other_instance.lock_shared().unwrap();
+
+        let error = apply_transaction_within(tx, Duration::from_millis(200)).unwrap_err();
+        assert!(error.to_string().contains("update deferred"));
+        assert!(!tx.restart && tx.phase == Phase::Staged);
+        assert!(!tx.snapshot().exists());
+        let journal: Transaction = read_json(&tx.paths.journal()).unwrap();
+        assert!(journal.phase == Phase::Staged && !journal.restart);
+
+        // The helper's follow-up has nothing to reopen.
+        relaunch_after_failure(tx, &tx.paths.journal()).unwrap();
+        let journal: Transaction = read_json(&tx.paths.journal()).unwrap();
+        assert!(journal.phase == Phase::Staged);
+        assert_eq!(hash(&tx.candidate()).unwrap(), tx.new_hash);
+        assert_eq!(hash(&tx.paths.target).unwrap(), tx.old_hash);
     }
     #[cfg(unix)]
     #[test]
