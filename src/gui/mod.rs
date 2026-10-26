@@ -1762,11 +1762,14 @@ impl IrcApp {
         let Some(channel) = self.channel_mut(target) else {
             return false;
         };
+        // Echoes arrive in send order, so pair with the oldest unconfirmed
+        // matching row inside the recent window; searching newest-first would
+        // swap msgid/time between identical consecutive sends.
+        let window_start = channel.messages.len().saturating_sub(32);
         let Some(local) = channel
             .messages
             .iter_mut()
-            .rev()
-            .take(32)
+            .skip(window_start)
             .find(|candidate| {
                 !candidate.is_system
                     && candidate.msgid.is_none()
@@ -8432,6 +8435,42 @@ mod tests {
             .filter(|message| message.content.contains("op hello"))
             .count();
         assert_eq!(hits, 1, "status-prefixed confirmation must match");
+    }
+
+    #[test]
+    fn identical_consecutive_sends_pair_with_echoes_in_send_order() {
+        let (mut app, _rx) = test_app_connected();
+        app.set_session_nick("me".into(), true);
+        app.handle_cap_message("ACK", &["echo-message".into()]);
+        let mut channel = Channel::new();
+        channel.joined = true;
+        app.channels.insert("#chan".to_string(), channel);
+        app.current_channel = Some("#chan".to_string());
+
+        app.process_command("/say lol");
+        app.process_command("/say lol");
+        assert_eq!(app.channels["#chan"].messages.len(), 2);
+
+        // Echoes come back in send order; the first must confirm the first row.
+        app.handle_incoming_message(
+            IrcMessage::parse(
+                "@msgid=one;time=2026-10-25T12:00:00.000Z :me!u@h PRIVMSG #chan :lol",
+            )
+            .unwrap(),
+        );
+        app.handle_incoming_message(
+            IrcMessage::parse(
+                "@msgid=two;time=2026-10-25T12:00:01.000Z :me!u@h PRIVMSG #chan :lol",
+            )
+            .unwrap(),
+        );
+
+        let msgids: Vec<_> = app.channels["#chan"]
+            .messages
+            .iter()
+            .map(|message| message.msgid.as_deref())
+            .collect();
+        assert_eq!(msgids, vec![Some("one"), Some("two")]);
     }
 
     #[test]
