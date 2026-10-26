@@ -1306,6 +1306,10 @@ impl IrcApp {
 
     fn reset_connection_support(&mut self) {
         self.network_support = NetworkSupport::default();
+        // The ignore/highlight keys were folded under the old network's
+        // CASEMAPPING; a new network that advertises the default never
+        // triggers refresh_case_mapping_state, so rebuild them here (#249).
+        self.update_cached_lowercase();
         self.enabled_caps.clear();
         self.chathistory_enabled = false;
         self.chathistory_limit = None;
@@ -2290,6 +2294,40 @@ mod update_session_tests {
         after.restore_update_session(before.update_session());
         assert!(!after.connecting);
         assert!(!after.connected);
+    }
+}
+
+#[cfg(test)]
+mod connection_lifecycle_tests {
+    use super::*;
+
+    fn lifecycle_app() -> IrcApp {
+        IrcApp::with_settings(Settings {
+            // Keep unit tests from writing chat logs to the real config dir.
+            logging_enabled: false,
+            ..Settings::default()
+        })
+    }
+
+    #[test]
+    fn switching_networks_refreshes_casemapped_ignore_and_highlight_caches() {
+        let mut app = lifecycle_app();
+        app.ignore_list = vec!["Foo[away]".to_string()];
+        app.highlight_words = "Foo[away]".to_string();
+        // The old network folds ASCII only, so `[` and `{` are distinct there.
+        app.network_support.case_mapping = CaseMapping::Ascii;
+        app.update_cached_lowercase();
+        assert_eq!(app.ignore_list_lower, ["foo[away]"]);
+
+        // A new network that never advertises CASEMAPPING is rfc1459, so
+        // the cached keys must follow the reset default.
+        app.reset_session_state();
+
+        assert_eq!(app.network_support.case_mapping, CaseMapping::Rfc1459);
+        assert_eq!(app.ignore_list_lower, ["foo{away}"]);
+        assert_eq!(app.highlight_words_lower, ["foo{away}"]);
+        assert!(app.is_ignored("Foo{away}", None));
+        assert!(app.is_ignored("FOO[AWAY]", None));
     }
 }
 
