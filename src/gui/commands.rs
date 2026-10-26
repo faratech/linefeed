@@ -31,7 +31,17 @@ impl IrcApp {
         // on any whitespace, so the command token must too — a tab after the
         // command word would otherwise become an unknown command (#148).
         let parts: Vec<&str> = input[1..].splitn(2, char::is_whitespace).collect();
-        let cmd = parts[0].to_uppercase();
+        let word = parts[0];
+        // ASCII only: full Unicode upper-casing maps the dotless i and the
+        // long s to I and S, so "/ıdentify pw" would dispatch as the raw
+        // IDENTIFY service command behind the credential filter's back.
+        if !word.is_ascii() {
+            self.add_message_to_current(ChatMessage::system(&format!(
+                "Invalid command: {word}. Type /help for list."
+            )));
+            return;
+        }
+        let cmd = word.to_ascii_uppercase();
         // trim_start: a doubled space after the command ("/msg  alice hi") must
         // not produce an empty first argument (which silently sent messages to
         // an empty target and opened a phantom blank-named tab).
@@ -2576,7 +2586,15 @@ pub(super) fn command_line_contains_credentials(line: &str) -> bool {
     let mut parts = line.splitn(2, char::is_whitespace);
     let command = parts.next().unwrap_or("");
     let args = parts.next().unwrap_or("").trim_start();
-    match command.to_ascii_uppercase().as_str() {
+    // A non-ASCII command word never dispatches (process_command refuses it),
+    // but the unsent line still holds whatever the user typed: fold it fully
+    // so the secret stays out of history.
+    let command = if command.is_ascii() {
+        command.to_ascii_uppercase()
+    } else {
+        command.to_uppercase()
+    };
+    match command.as_str() {
         "PASS" | "AUTH" | "LOGIN" | "AUTHENTICATE" | "OPER" | "REGISTER" | "VERIFY" | "WEBPUSH"
         | "AUTHTOKEN" | "BOUNCER" => true,
         // Bare service commands (/identify pw, /ghost nick pw, ...) fall
@@ -3845,6 +3863,40 @@ mod tests {
         }
         assert!(app.command_history.is_empty(), "{:?}", app.command_history);
         while rx.try_recv().is_ok() {}
+    }
+
+    #[test]
+    fn non_ascii_command_words_never_dispatch_as_service_commands() {
+        // Full Unicode upper-casing turns the dotless i and the long s into
+        // plain I and S, so "/ıdentify" used to dispatch as the raw IDENTIFY
+        // while the ASCII-only credential filter let it into history.
+        let (mut app, mut rx) = connected_command_app();
+        app.set_session_nick("me".into(), true);
+        for input in [
+            "/ıdentify hunter13",
+            "/ıd hunter13",
+            "/ghoſt oldnick hunter13",
+            "/nſ identify hunter13",
+            "/ſquery NickServ :identify hunter13",
+        ] {
+            app.input_text = input.into();
+            app.process_input();
+            assert!(rx.try_recv().is_err(), "{input} must not reach the wire");
+        }
+        assert!(
+            app.server_messages
+                .iter()
+                .any(|row| row.content.contains("Invalid command")),
+            "the user is told the command is unknown"
+        );
+        // The typed secret still stays out of Up-arrow history.
+        assert!(app.command_history.is_empty(), "{:?}", app.command_history);
+        // ASCII spellings dispatch as before, in any case.
+        app.process_command("/IdEnTiFy hunter13");
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            IrcCommand::Raw("IDENTIFY hunter13".into())
+        );
     }
 
     #[test]
