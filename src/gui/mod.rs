@@ -1181,7 +1181,29 @@ impl IrcApp {
 
     fn remove_channel(&mut self, name: &str) -> Option<Channel> {
         let key = self.channel_key(name)?;
-        self.channels.remove(&key)
+        let removed = self.channels.remove(&key);
+        self.prune_known_users();
+        removed
+    }
+
+    /// Drop identities that nothing references any more: users who share no
+    /// channel with us, have no query tab, and are not monitored. Run when we
+    /// stop sharing a channel (own PART, kick, tab close) so a long session
+    /// does not keep every nick from every channel it ever joined (#257).
+    fn prune_known_users(&mut self) {
+        let mut referenced = self.monitored_users.clone();
+        referenced.insert(self.network_support.canonicalize(&self.my_nick));
+        for (name, channel) in &self.channels {
+            // A query tab is named after its partner.
+            referenced.insert(self.network_support.canonicalize(name));
+            referenced.extend(
+                channel
+                    .users
+                    .iter()
+                    .map(|user| self.network_support.canonicalize(&user.nick)),
+            );
+        }
+        self.known_users.retain(|key, _| referenced.contains(key));
     }
 
     /// Open a query through the same initialization path used by incoming
@@ -3591,6 +3613,7 @@ impl IrcApp {
                             max,
                         );
                     }
+                    self.prune_known_users();
                     self.send_notification(
                         &format!("Kicked from {}", channel),
                         &format!("by {} ({})", sender, reason_str),
@@ -9877,6 +9900,68 @@ mod tests {
             app.known_users
                 .contains_key(&app.network_support.canonicalize("eve"))
         );
+    }
+
+    #[test]
+    fn known_users_are_pruned_when_leaving_channels() {
+        let mut app = test_app();
+        app.notifications_enabled = false;
+        app.set_session_nick("me".to_string(), true);
+        let know = |app: &mut IrcApp, nick: &str| {
+            app.update_user_identity(nick, None, None, None, None, None, None, Some(true));
+        };
+        let is_known = |app: &IrcApp, nick: &str| {
+            app.known_users
+                .contains_key(&app.network_support.canonicalize(nick))
+        };
+        for (name, users) in [
+            ("#a", vec!["me", "bob", "carol", "frank"]),
+            ("#b", vec!["me", "carol", "dave"]),
+            ("#c", vec!["me", "gina"]),
+        ] {
+            let mut channel = Channel::new();
+            channel.joined = true;
+            for user in users {
+                channel.add_user(user, UserMode::Normal);
+                know(&mut app, user);
+            }
+            app.channels.insert(name.to_string(), channel);
+        }
+        // A query partner, a monitored friend, and a nick only seen in a
+        // WHO reply: only the first two are referenced by anything.
+        app.channels.insert("erin".to_string(), Channel::new());
+        know(&mut app, "erin");
+        app.monitored_users
+            .insert(app.network_support.canonicalize("frank"));
+        know(&mut app, "stranger");
+
+        // Leaving #b orphans dave (and the stray WHO entry), not carol.
+        app.handle_incoming_message(IrcMessage::parse(":me!u@h PART #b :bye").unwrap());
+        assert!(
+            !is_known(&app, "dave"),
+            "#257: PART evicts the channel's users"
+        );
+        assert!(!is_known(&app, "stranger"), "#257: unreferenced entry");
+        for kept in ["me", "bob", "carol", "frank", "erin", "gina"] {
+            assert!(is_known(&app, kept), "{kept} is still referenced");
+        }
+
+        // Being kicked from #c clears its users from the retained tab.
+        app.handle_incoming_message(IrcMessage::parse(":op!u@h KICK #c me :bye").unwrap());
+        assert!(app.channels.contains_key("#c"));
+        assert!(!is_known(&app, "gina"), "#257: self-kick evicts users");
+
+        // Leaving #a keeps the monitored friend, drops everyone else there.
+        app.handle_incoming_message(IrcMessage::parse(":me!u@h PART #a :bye").unwrap());
+        assert!(!is_known(&app, "bob"));
+        assert!(!is_known(&app, "carol"));
+        assert!(is_known(&app, "frank"), "monitored users are retained");
+        assert!(is_known(&app, "erin"), "open query tabs are retained");
+
+        // Closing the query tab releases its partner.
+        app.close_tab("erin");
+        assert!(!is_known(&app, "erin"));
+        assert!(is_known(&app, "frank"));
     }
 
     #[test]
