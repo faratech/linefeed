@@ -538,6 +538,19 @@ pub enum CaseMapping {
 }
 
 impl CaseMapping {
+    /// Fold one character under the ASCII-based IRC mappings. Shared by
+    /// `canonicalize` and `eq` so the two can never disagree.
+    fn fold_char(self, c: char) -> char {
+        match c {
+            'A'..='Z' => c.to_ascii_lowercase(),
+            '[' if self != CaseMapping::Ascii => '{',
+            ']' if self != CaseMapping::Ascii => '}',
+            '\\' if self != CaseMapping::Ascii => '|',
+            '^' if self == CaseMapping::Rfc1459 => '~',
+            other => other,
+        }
+    }
+
     /// Produce a stable key for an IRC nickname or channel. IRC casemapping is
     /// deliberately ASCII-only; Unicode text outside the IRC identifier range
     /// must not acquire locale- or Unicode-dependent equivalences.
@@ -551,21 +564,19 @@ impl CaseMapping {
                 .map(|value| value.into_owned())
                 .unwrap_or_else(|_| value.to_ascii_lowercase());
         }
-        value
-            .chars()
-            .map(|c| match c {
-                'A'..='Z' => c.to_ascii_lowercase(),
-                '[' if self != CaseMapping::Ascii => '{',
-                ']' if self != CaseMapping::Ascii => '}',
-                '\\' if self != CaseMapping::Ascii => '|',
-                '^' if self == CaseMapping::Rfc1459 => '~',
-                other => other,
-            })
-            .collect()
+        value.chars().map(|c| self.fold_char(c)).collect()
     }
 
+    /// Compare two identifiers without building canonical keys: the ASCII
+    /// mappings fold on the fly, so a comparison allocates nothing.
     pub fn eq(self, left: &str, right: &str) -> bool {
-        self.canonicalize(left) == self.canonicalize(right)
+        if self == CaseMapping::Utf8Rfc8265 {
+            // PRECIS enforcement has no streaming form.
+            return self.canonicalize(left) == self.canonicalize(right);
+        }
+        left.chars()
+            .map(|c| self.fold_char(c))
+            .eq(right.chars().map(|c| self.fold_char(c)))
     }
 }
 
@@ -848,7 +859,13 @@ pub struct Channel {
     case_mapping: CaseMapping,
     prefix_modes: String,
     prefix_symbols: String,
+    /// Canonical nick key -> position in `users`, so lookups cost one hash
+    /// instead of a case-mapped scan. `users` is only mutated inside
+    /// `Channel`, which keeps this in step with every reorder.
+    user_index: HashMap<String, usize>,
     names_snapshot: Option<Vec<ChannelUser>>,
+    /// Canonical nick key -> position in `names_snapshot`.
+    names_index: HashMap<String, usize>,
     /// When the newest 353 of the pending burst arrived; a 353 arriving long
     /// after it means the previous burst was abandoned and must not be
     /// appended to.
@@ -879,14 +896,22 @@ impl Channel {
             case_mapping: CaseMapping::Rfc1459,
             prefix_modes: "qaohv".to_string(),
             prefix_symbols: "~&@%+".to_string(),
+            user_index: HashMap::new(),
             names_snapshot: None,
+            names_index: HashMap::new(),
             burst_activity: None,
             mode_parameters: HashMap::new(),
         }
     }
 
     pub fn set_case_mapping(&mut self, case_mapping: CaseMapping) {
+        if self.case_mapping == case_mapping {
+            return;
+        }
         self.case_mapping = case_mapping;
+        // Sort order and both lookup indexes are derived from the mapping.
+        self.sort_users();
+        self.rebuild_names_index();
     }
 
     /// Replace the topic together with its attribution so a stale setter or
@@ -989,39 +1014,153 @@ impl Channel {
         if clean_nick.is_empty() {
             return;
         }
-        if let Some(user) = self
-            .users
-            .iter_mut()
-            .find(|u| self.case_mapping.eq(&u.nick, clean_nick))
-        {
-            if let Some(letter) = mode.mode_letter() {
-                user.add_status_mode(letter, &self.prefix_modes, &self.prefix_symbols);
+        let letters: Vec<char> = mode.mode_letter().into_iter().collect();
+        let key = self.case_mapping.canonicalize(clean_nick);
+        if let Some(pos) = self.user_index.get(&key).copied() {
+            if !letters.is_empty() {
+                for letter in &letters {
+                    self.users[pos].add_status_mode(
+                        *letter,
+                        &self.prefix_modes,
+                        &self.prefix_symbols,
+                    );
+                }
+                self.reposition_user(clean_nick);
             }
         } else {
             let mut user = ChannelUser::new(clean_nick.to_string(), UserMode::Normal);
-            if let Some(letter) = mode.mode_letter() {
-                user.add_status_mode(letter, &self.prefix_modes, &self.prefix_symbols);
+            for letter in &letters {
+                user.add_status_mode(*letter, &self.prefix_modes, &self.prefix_symbols);
             }
-            self.users.push(user);
-            self.sort_users();
+            self.insert_user_sorted(key, user);
         }
 
         // A JOIN can interleave with a multi-line NAMES response. Mirror that
         // membership into the pending snapshot so it is not lost at 366.
-        if let Some(snapshot) = &mut self.names_snapshot {
-            if let Some(user) = snapshot
-                .iter_mut()
-                .find(|u| self.case_mapping.eq(&u.nick, clean_nick))
-            {
-                if let Some(letter) = mode.mode_letter() {
-                    user.add_status_mode(letter, &self.prefix_modes, &self.prefix_symbols);
-                }
-            } else {
-                let mut user = ChannelUser::new(clean_nick.to_string(), UserMode::Normal);
-                if let Some(letter) = mode.mode_letter() {
-                    user.add_status_mode(letter, &self.prefix_modes, &self.prefix_symbols);
-                }
-                snapshot.push(user);
+        self.snapshot_add(clean_nick, &letters);
+    }
+
+    /// Insert `user` at the position that keeps `users` ordered by
+    /// (rank, case-mapped nick): a binary search plus one shift, not a re-sort
+    /// of the whole list, so JOIN storms on a big channel stay cheap.
+    fn insert_user_sorted(&mut self, key: String, user: ChannelUser) {
+        let mapping = self.case_mapping;
+        let pos = self.users.partition_point(|existing| {
+            existing.rank < user.rank
+                || (existing.rank == user.rank && mapping.canonicalize(&existing.nick) < key)
+        });
+        for slot in self.user_index.values_mut() {
+            if *slot >= pos {
+                *slot += 1;
+            }
+        }
+        self.users.insert(pos, user);
+        self.user_index.insert(key, pos);
+    }
+
+    fn remove_user_at(&mut self, pos: usize) -> ChannelUser {
+        let user = self.users.remove(pos);
+        self.user_index
+            .remove(&self.case_mapping.canonicalize(&user.nick));
+        for slot in self.user_index.values_mut() {
+            if *slot > pos {
+                *slot -= 1;
+            }
+        }
+        user
+    }
+
+    /// Move one user to where its current rank and nick belong.
+    fn reposition_user(&mut self, nick: &str) {
+        if let Some(pos) = self.user_position(nick) {
+            let user = self.remove_user_at(pos);
+            let key = self.case_mapping.canonicalize(&user.nick);
+            self.insert_user_sorted(key, user);
+        }
+    }
+
+    fn user_position(&self, nick: &str) -> Option<usize> {
+        self.user_index
+            .get(&self.case_mapping.canonicalize(nick))
+            .copied()
+    }
+
+    /// The pending-NAMES copy of a user, if a burst is in progress.
+    fn snapshot_user_mut(&mut self, nick: &str) -> Option<&mut ChannelUser> {
+        let snapshot = self.names_snapshot.as_mut()?;
+        let slot = *self
+            .names_index
+            .get(&self.case_mapping.canonicalize(nick))?;
+        snapshot.get_mut(slot)
+    }
+
+    /// Add or update a user in the pending NAMES snapshot.
+    fn snapshot_add(&mut self, nick: &str, modes: &[char]) {
+        let Some(snapshot) = self.names_snapshot.as_mut() else {
+            return;
+        };
+        let key = self.case_mapping.canonicalize(nick);
+        let slot = match self.names_index.get(&key).copied() {
+            Some(slot) => slot,
+            None => {
+                snapshot.push(ChannelUser::new(nick.to_string(), UserMode::Normal));
+                self.names_index.insert(key, snapshot.len() - 1);
+                snapshot.len() - 1
+            }
+        };
+        for mode in modes {
+            snapshot[slot].add_status_mode(*mode, &self.prefix_modes, &self.prefix_symbols);
+        }
+    }
+
+    fn snapshot_remove(&mut self, nick: &str) {
+        let Some(snapshot) = self.names_snapshot.as_mut() else {
+            return;
+        };
+        let Some(slot) = self
+            .names_index
+            .remove(&self.case_mapping.canonicalize(nick))
+        else {
+            return;
+        };
+        // Snapshot order is irrelevant (366 sorts), so fill the hole with the
+        // last entry and repoint that entry's index.
+        snapshot.swap_remove(slot);
+        if let Some(moved) = snapshot.get(slot) {
+            self.names_index
+                .insert(self.case_mapping.canonicalize(&moved.nick), slot);
+        }
+    }
+
+    fn snapshot_rename(&mut self, old_nick: &str, new_nick: &str) {
+        if self.names_snapshot.is_none() {
+            return;
+        }
+        let old_key = self.case_mapping.canonicalize(old_nick);
+        let new_key = self.case_mapping.canonicalize(new_nick);
+        let Some(slot) = self.names_index.get(&old_key).copied() else {
+            return;
+        };
+        if old_key != new_key && self.names_index.contains_key(&new_key) {
+            // The new nick is already present: drop the old entry rather than
+            // duplicating a member.
+            self.snapshot_remove(old_nick);
+            return;
+        }
+        if let Some(snapshot) = self.names_snapshot.as_mut() {
+            snapshot[slot].nick = new_nick.to_string();
+        }
+        self.names_index.remove(&old_key);
+        self.names_index.insert(new_key, slot);
+    }
+
+    fn rebuild_names_index(&mut self) {
+        self.names_index.clear();
+        if let Some(snapshot) = &self.names_snapshot {
+            for (slot, user) in snapshot.iter().enumerate() {
+                self.names_index
+                    .entry(self.case_mapping.canonicalize(&user.nick))
+                    .or_insert(slot);
             }
         }
     }
@@ -1038,6 +1177,7 @@ impl Channel {
         let stale = self.burst_activity.is_some_and(|t| t.elapsed() > BURST_GAP);
         if self.names_snapshot.is_none() || stale {
             self.names_snapshot = Some(Vec::new());
+            self.names_index.clear();
         }
     }
 
@@ -1056,21 +1196,7 @@ impl Channel {
         }
         self.begin_user_burst();
         self.burst_activity = Some(std::time::Instant::now());
-        let snapshot = self.names_snapshot.as_mut().expect("burst just started");
-        if let Some(existing) = snapshot
-            .iter_mut()
-            .find(|u| self.case_mapping.eq(&u.nick, clean_nick))
-        {
-            for mode in modes {
-                existing.add_status_mode(*mode, &self.prefix_modes, &self.prefix_symbols);
-            }
-        } else {
-            let mut user = ChannelUser::new(clean_nick.to_string(), UserMode::Normal);
-            for mode in modes {
-                user.add_status_mode(*mode, &self.prefix_modes, &self.prefix_symbols);
-            }
-            snapshot.push(user);
-        }
+        self.snapshot_add(clean_nick, modes);
     }
 
     /// Atomically replace membership with the authoritative NAMES snapshot,
@@ -1080,12 +1206,9 @@ impl Channel {
         let Some(mut snapshot) = self.names_snapshot.take() else {
             return;
         };
+        self.names_index = HashMap::new();
         for fresh in &mut snapshot {
-            if let Some(previous) = self
-                .users
-                .iter()
-                .find(|old| self.case_mapping.eq(&old.nick, &fresh.nick))
-            {
+            if let Some(previous) = self.user_position(&fresh.nick).map(|pos| &self.users[pos]) {
                 fresh.away = previous.away.clone();
                 fresh.account = previous.account.clone();
                 fresh.realname = previous.realname.clone();
@@ -1104,14 +1227,10 @@ impl Channel {
         if let Some(user) = self.get_user_mut(nick) {
             user.add_status_mode(mode, &modes, &symbols);
         }
-        if let Some(snapshot) = &mut self.names_snapshot
-            && let Some(user) = snapshot
-                .iter_mut()
-                .find(|u| self.case_mapping.eq(&u.nick, nick))
-        {
+        if let Some(user) = self.snapshot_user_mut(nick) {
             user.add_status_mode(mode, &modes, &symbols);
         }
-        self.sort_users();
+        self.reposition_user(nick);
     }
 
     #[cfg(test)]
@@ -1128,14 +1247,10 @@ impl Channel {
         if let Some(user) = self.get_user_mut(nick) {
             user.remove_status_mode(mode, &modes, &symbols);
         }
-        if let Some(snapshot) = &mut self.names_snapshot
-            && let Some(user) = snapshot
-                .iter_mut()
-                .find(|u| self.case_mapping.eq(&u.nick, nick))
-        {
+        if let Some(user) = self.snapshot_user_mut(nick) {
             user.remove_status_mode(mode, &modes, &symbols);
         }
-        self.sort_users();
+        self.reposition_user(nick);
     }
 
     pub fn apply_channel_mode_flag(&mut self, sign: char, mode: char) {
@@ -1216,48 +1331,34 @@ impl Channel {
     }
 
     pub fn remove_user(&mut self, nick: &str) {
-        let mapping = self.case_mapping;
-        self.users.retain(|u| !mapping.eq(&u.nick, nick));
-        if let Some(snapshot) = &mut self.names_snapshot {
-            snapshot.retain(|u| !mapping.eq(&u.nick, nick));
+        if let Some(pos) = self.user_position(nick) {
+            self.remove_user_at(pos);
         }
+        self.snapshot_remove(nick);
     }
 
     pub fn clear_users(&mut self) {
         self.users.clear();
+        self.user_index.clear();
         self.names_snapshot = None;
+        self.names_index.clear();
     }
 
     pub fn rename_user(&mut self, old_nick: &str, new_nick: &str) {
         // If the target nick already exists as a different user, drop the old entry
         // rather than creating a duplicate (can happen with out-of-order NICK/JOIN).
         // A pure case change of the same nick still falls through to the rename.
-        if !self.case_mapping.eq(old_nick, new_nick)
-            && self
-                .users
-                .iter()
-                .any(|u| self.case_mapping.eq(&u.nick, new_nick))
-        {
-            let mapping = self.case_mapping;
-            self.users.retain(|u| !mapping.eq(&u.nick, old_nick));
-            self.sort_users();
-            return;
+        let target_exists =
+            !self.case_mapping.eq(old_nick, new_nick) && self.user_position(new_nick).is_some();
+        if let Some(pos) = self.user_position(old_nick) {
+            let mut user = self.remove_user_at(pos);
+            if !target_exists {
+                user.nick = new_nick.to_string();
+                let key = self.case_mapping.canonicalize(new_nick);
+                self.insert_user_sorted(key, user);
+            }
         }
-        if let Some(user) = self
-            .users
-            .iter_mut()
-            .find(|u| self.case_mapping.eq(&u.nick, old_nick))
-        {
-            user.nick = new_nick.to_string();
-            self.sort_users();
-        }
-        if let Some(snapshot) = &mut self.names_snapshot
-            && let Some(user) = snapshot
-                .iter_mut()
-                .find(|u| self.case_mapping.eq(&u.nick, old_nick))
-        {
-            user.nick = new_nick.to_string();
-        }
+        self.snapshot_rename(old_nick, new_nick);
     }
 
     /// Append a message, trimming the scrollback to at most `max` messages.
@@ -1291,20 +1392,19 @@ impl Channel {
     }
 
     pub fn get_user(&self, nick: &str) -> Option<&ChannelUser> {
-        self.users
-            .iter()
-            .find(|u| self.case_mapping.eq(&u.nick, nick))
+        self.user_position(nick).map(|pos| &self.users[pos])
     }
 
-    pub fn get_user_mut(&mut self, nick: &str) -> Option<&mut ChannelUser> {
-        let mapping = self.case_mapping;
-        self.users.iter_mut().find(|u| mapping.eq(&u.nick, nick))
+    fn get_user_mut(&mut self, nick: &str) -> Option<&mut ChannelUser> {
+        let pos = self.user_position(nick)?;
+        self.users.get_mut(pos)
     }
 
     fn sort_users(&mut self) {
         // Decorate-sort-undecorate: canonicalizing inside the comparator would
         // allocate two Strings per comparison; computing each key once makes
-        // this one allocation per user regardless of list size.
+        // this one allocation per user regardless of list size. The keys then
+        // become the lookup index, so no second pass is needed.
         let mapping = self.case_mapping;
         let users = std::mem::take(&mut self.users);
         let mut keyed: Vec<(usize, String, ChannelUser)> = users
@@ -1315,7 +1415,16 @@ impl Channel {
             })
             .collect();
         keyed.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
-        self.users = keyed.into_iter().map(|(_, _, user)| user).collect();
+        self.user_index.clear();
+        self.users = Vec::with_capacity(keyed.len());
+        for (_, key, user) in keyed {
+            // Nicks that collapse to one key (a changed case mapping) are the
+            // same member: keep the first, highest-ranked entry.
+            if let std::collections::hash_map::Entry::Vacant(slot) = self.user_index.entry(key) {
+                slot.insert(self.users.len());
+                self.users.push(user);
+            }
+        }
     }
 
     /// IRCv3 away-notify: update user's away status
@@ -1324,10 +1433,7 @@ impl Channel {
         if let Some(user) = self.get_user_mut(nick) {
             user.away = away_msg.clone();
         }
-        let mapping = self.case_mapping;
-        if let Some(snapshot) = &mut self.names_snapshot
-            && let Some(user) = snapshot.iter_mut().find(|u| mapping.eq(&u.nick, nick))
-        {
+        if let Some(user) = self.snapshot_user_mut(nick) {
             user.away = away_msg;
         }
     }
@@ -1337,10 +1443,7 @@ impl Channel {
         if let Some(user) = self.get_user_mut(nick) {
             user.account = account.clone();
         }
-        let mapping = self.case_mapping;
-        if let Some(snapshot) = &mut self.names_snapshot
-            && let Some(user) = snapshot.iter_mut().find(|u| mapping.eq(&u.nick, nick))
-        {
+        if let Some(user) = self.snapshot_user_mut(nick) {
             user.account = account;
         }
     }
@@ -1350,16 +1453,13 @@ impl Channel {
         if let Some(user) = self.get_user_mut(nick) {
             user.realname = realname.clone();
         }
-        let mapping = self.case_mapping;
-        if let Some(snapshot) = &mut self.names_snapshot
-            && let Some(user) = snapshot.iter_mut().find(|u| mapping.eq(&u.nick, nick))
-        {
+        if let Some(user) = self.snapshot_user_mut(nick) {
             user.realname = realname;
         }
     }
 
     pub fn apply_user_identity(&mut self, identity: &KnownUser) {
-        if let Some(user) = self.get_user_mut(&identity.nick) {
+        fn copy_identity(user: &mut ChannelUser, identity: &KnownUser) {
             user.username = identity.username.clone();
             user.hostname = identity.hostname.clone();
             user.account = identity.account.clone();
@@ -1367,18 +1467,17 @@ impl Channel {
             user.away = identity.away.clone();
             user.bot = identity.bot;
         }
-        let mapping = self.case_mapping;
-        if let Some(snapshot) = &mut self.names_snapshot
-            && let Some(user) = snapshot
-                .iter_mut()
-                .find(|user| mapping.eq(&user.nick, &identity.nick))
+
+        // One key serves both lookups; this runs once per channel for every
+        // NAMES/WHO/WHOX entry, so it must not scan the user list.
+        let key = self.case_mapping.canonicalize(&identity.nick);
+        if let Some(pos) = self.user_index.get(&key).copied() {
+            copy_identity(&mut self.users[pos], identity);
+        }
+        if let Some(snapshot) = self.names_snapshot.as_mut()
+            && let Some(slot) = self.names_index.get(&key).copied()
         {
-            user.username = identity.username.clone();
-            user.hostname = identity.hostname.clone();
-            user.account = identity.account.clone();
-            user.realname = identity.realname.clone();
-            user.away = identity.away.clone();
-            user.bot = identity.bot;
+            copy_identity(&mut snapshot[slot], identity);
         }
     }
 
@@ -1585,6 +1684,180 @@ mod tests {
         assert!(!CaseMapping::StrictRfc1459.eq("nick^", "nick~"));
         assert!(!CaseMapping::Ascii.eq("[nick]", "{nick}"));
         assert!(CaseMapping::Ascii.eq("Alice", "alice"));
+    }
+
+    #[test]
+    fn case_mapping_eq_agrees_with_canonical_keys() {
+        let samples = [
+            "", "alice", "ALICE", "Alice[1]", "alice{1}", "a\\b", "a|b", "n^ick", "n~ick", "Ünï",
+            "ÜNÏ", "#Chan", "#chan",
+        ];
+        for mapping in [
+            CaseMapping::Ascii,
+            CaseMapping::StrictRfc1459,
+            CaseMapping::Rfc1459,
+            CaseMapping::Utf8Rfc8265,
+        ] {
+            for left in samples {
+                for right in samples {
+                    assert_eq!(
+                        mapping.eq(left, right),
+                        mapping.canonicalize(left) == mapping.canonicalize(right),
+                        "{mapping:?}: {left:?} vs {right:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The visible list must stay sorted by (rank, case-mapped nick) and every
+    /// member must be reachable through the case-insensitive lookup.
+    fn assert_users_sorted_and_findable(ch: &Channel) {
+        let mapping = ch.case_mapping;
+        let keys: Vec<(usize, String)> = ch
+            .users
+            .iter()
+            .map(|u| (u.rank, mapping.canonicalize(&u.nick)))
+            .collect();
+        let mut sorted = keys.clone();
+        sorted.sort();
+        assert_eq!(keys, sorted, "users must stay sorted");
+        assert_eq!(
+            ch.user_index.len(),
+            ch.users.len(),
+            "index must cover users"
+        );
+        for (pos, user) in ch.users.iter().enumerate() {
+            assert_eq!(
+                ch.user_index.get(&mapping.canonicalize(&user.nick)),
+                Some(&pos)
+            );
+            let found = ch.get_user(&user.nick.to_uppercase());
+            assert_eq!(found.map(|u| u.nick.as_str()), Some(user.nick.as_str()));
+        }
+    }
+
+    #[test]
+    fn burst_snapshot_tracks_interleaved_removals_and_renames() {
+        let mut ch = Channel::new();
+        ch.begin_user_burst();
+        for nick in ["a", "b", "c", "d", "e"] {
+            ch.add_user_burst_modes(nick, &[]);
+        }
+        // Removing from the middle moves the last entry into its slot; later
+        // lookups must still reach every entry.
+        ch.remove_user("b");
+        ch.rename_user("e", "E2");
+        // Renaming onto an existing member drops the old entry.
+        ch.rename_user("c", "D");
+        ch.add_user_status_mode("A", 'o');
+        ch.set_user_account("e2", Some("acct".to_string()));
+        ch.finish_user_burst();
+
+        let nicks: Vec<&str> = ch.users.iter().map(|u| u.nick.as_str()).collect();
+        assert_eq!(nicks, ["a", "d", "E2"]);
+        assert_eq!(ch.get_user("a").unwrap().mode, UserMode::Op);
+        assert_eq!(ch.get_user("e2").unwrap().account.as_deref(), Some("acct"));
+        assert_users_sorted_and_findable(&ch);
+    }
+
+    #[test]
+    fn membership_changes_keep_the_list_sorted_and_findable() {
+        let mut ch = Channel::new();
+        for nick in ["delta", "Alpha", "charlie", "Bravo"] {
+            ch.add_user(nick, UserMode::Normal);
+        }
+        ch.add_user("echo", UserMode::Op);
+        ch.add_user("Foxtrot", UserMode::Voice);
+        assert_users_sorted_and_findable(&ch);
+        let nicks: Vec<&str> = ch.users.iter().map(|u| u.nick.as_str()).collect();
+        assert_eq!(
+            nicks,
+            ["echo", "Foxtrot", "Alpha", "Bravo", "charlie", "delta"]
+        );
+
+        ch.rename_user("charlie", "Zulu");
+        assert_users_sorted_and_findable(&ch);
+        assert!(ch.has_user("zulu") && !ch.has_user("charlie"));
+
+        // Renaming onto an existing member drops the old entry.
+        ch.rename_user("Bravo", "DELTA");
+        assert_users_sorted_and_findable(&ch);
+        assert!(!ch.has_user("bravo"));
+        assert_eq!(ch.users.len(), 5);
+
+        ch.remove_user("ALPHA");
+        ch.add_user_status_mode("zulu", 'o');
+        assert_users_sorted_and_findable(&ch);
+        assert_eq!(ch.users[0].nick, "echo");
+        assert_eq!(ch.users[1].nick, "Zulu");
+
+        // A changed case mapping changes which nicks are the same member.
+        ch.add_user("Nick[1]", UserMode::Normal);
+        assert!(ch.has_user("nick{1}"));
+        ch.set_case_mapping(CaseMapping::Ascii);
+        assert!(ch.has_user("nick[1]"));
+        assert!(!ch.has_user("nick{1}"));
+        assert_users_sorted_and_findable(&ch);
+    }
+
+    #[test]
+    fn ten_thousand_user_burst_and_identity_updates_are_not_quadratic() {
+        const USERS: usize = 10_000;
+        let started = std::time::Instant::now();
+        let mut ch = Channel::new();
+        ch.begin_user_burst();
+        for i in 0..USERS {
+            let modes: &[char] = if i % 50 == 0 { &['o'] } else { &[] };
+            ch.add_user_burst_status_modes(&format!("User{i}"), modes);
+        }
+        // A later 353 naming the same members (different case) merges into
+        // the snapshot instead of duplicating them.
+        for i in (0..USERS).step_by(2) {
+            ch.add_user_burst_status_modes(&format!("USER{i}"), &['v']);
+        }
+        ch.finish_user_burst();
+        assert_eq!(ch.users.len(), USERS);
+
+        // WHO/WHOX-style identity propagation: one lookup per reply.
+        for i in 0..USERS {
+            ch.apply_user_identity(&KnownUser {
+                nick: format!("user{i}"),
+                username: Some(format!("u{i}")),
+                account: Some(format!("acct{i}")),
+                ..KnownUser::default()
+            });
+        }
+        // A refresh keeps the identity of members who are still present.
+        ch.begin_user_burst();
+        for i in 0..USERS {
+            ch.add_user_burst_status_modes(&format!("user{i}"), &[]);
+        }
+        ch.finish_user_burst();
+        assert_eq!(ch.users.len(), USERS);
+        assert_eq!(
+            ch.get_user("USER4242").unwrap().account.as_deref(),
+            Some("acct4242")
+        );
+
+        // A JOIN/QUIT storm against the full list.
+        for i in 0..1_000 {
+            ch.add_user(&format!("late{i}"), UserMode::Normal);
+        }
+        for i in 0..1_000 {
+            ch.remove_user(&format!("LATE{i}"));
+        }
+        assert_eq!(ch.users.len(), USERS);
+        assert_users_sorted_and_findable(&ch);
+
+        // Quadratic scans with two allocations per comparison take minutes
+        // here; the linear path takes well under a second even in a debug
+        // build. The bound is deliberately generous for slow CI machines.
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_secs(20),
+            "10k-user workload took {elapsed:?}"
+        );
     }
 
     #[test]

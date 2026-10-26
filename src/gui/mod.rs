@@ -4477,10 +4477,13 @@ impl IrcApp {
                         }
                     }
                     for (nick, username, hostname) in identities {
+                        // Without userhost-in-names the entry carries no
+                        // user/host: leave what JOIN prefixes or WHO taught us
+                        // unchanged instead of overwriting it with None.
                         self.update_user_identity(
                             &nick,
-                            Some(username),
-                            Some(hostname),
+                            username.map(Some),
+                            hostname.map(Some),
                             None,
                             None,
                             None,
@@ -8341,6 +8344,139 @@ mod tests {
         let carol = app.channels["#chan"].get_user("carol").unwrap();
         assert_eq!(carol.account.as_deref(), Some("Guest42"));
         assert!(!carol.is_away(), "an account starting with G is not away");
+    }
+
+    #[test]
+    fn names_without_userhost_keeps_the_known_user_and_host() {
+        let (mut app, _rx) = test_app_connected();
+        app.set_session_nick("me".into(), true);
+        for name in ["#a", "#b"] {
+            let mut channel = Channel::new();
+            channel.joined = true;
+            app.channels.insert(name.to_string(), channel);
+        }
+        app.handle_numeric(
+            RPL_NAMREPLY,
+            &["me".into(), "=".into(), "#a".into(), "alice bob".into()],
+        );
+        app.handle_numeric(RPL_ENDOFNAMES, &["me".into(), "#a".into()]);
+        // WHO teaches us alice's user and host.
+        app.handle_numeric(
+            RPL_WHOREPLY,
+            &[
+                "me".into(),
+                "#a".into(),
+                "au".into(),
+                "ahost".into(),
+                "srv".into(),
+                "alice".into(),
+                "H".into(),
+                "0 Alice".into(),
+            ],
+        );
+
+        // Joining a second channel on a server without userhost-in-names.
+        app.handle_numeric(
+            RPL_NAMREPLY,
+            &["me".into(), "=".into(), "#b".into(), "@alice carol".into()],
+        );
+        app.handle_numeric(RPL_ENDOFNAMES, &["me".into(), "#b".into()]);
+
+        for channel in ["#a", "#b"] {
+            let alice = app.channels[channel].get_user("alice").unwrap();
+            assert_eq!(alice.username.as_deref(), Some("au"), "{channel}");
+            assert_eq!(alice.hostname.as_deref(), Some("ahost"), "{channel}");
+        }
+
+        // When the server does send userhost-in-names, it is still applied.
+        app.handle_numeric(
+            RPL_NAMREPLY,
+            &[
+                "me".into(),
+                "=".into(),
+                "#b".into(),
+                "@alice!newu@newhost carol".into(),
+            ],
+        );
+        app.handle_numeric(RPL_ENDOFNAMES, &["me".into(), "#b".into()]);
+        let alice = app.channels["#b"].get_user("alice").unwrap();
+        assert_eq!(alice.username.as_deref(), Some("newu"));
+        assert_eq!(alice.hostname.as_deref(), Some("newhost"));
+    }
+
+    #[test]
+    fn large_names_and_whox_propagation_across_channels_is_not_quadratic() {
+        const USERS: usize = 10_000;
+        let started = std::time::Instant::now();
+        let (mut app, _rx) = test_app_connected();
+        app.set_session_nick("me".into(), true);
+        app.network_support.whox = true;
+        for name in ["#a", "#b"] {
+            let mut channel = Channel::new();
+            channel.joined = true;
+            app.channels.insert(name.to_string(), channel);
+        }
+        let nicks: Vec<String> = (0..USERS).map(|i| format!("user{i}")).collect();
+
+        // The same 10k members are listed in two channels, 100 per 353 line.
+        for name in ["#a", "#b"] {
+            for chunk in nicks.chunks(100) {
+                let line = chunk
+                    .iter()
+                    .enumerate()
+                    .map(|(i, nick)| {
+                        if i % 25 == 0 {
+                            format!("@{nick}")
+                        } else {
+                            nick.clone()
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                app.handle_numeric(RPL_NAMREPLY, &["me".into(), "=".into(), name.into(), line]);
+            }
+            app.handle_numeric(RPL_ENDOFNAMES, &["me".into(), name.into()]);
+        }
+        assert_eq!(app.channels["#a"].users.len(), USERS);
+        assert_eq!(app.channels["#b"].users.len(), USERS);
+
+        // 366 queued a WHOX for each channel; answer #a's for every member.
+        let token = app
+            .pending_whox
+            .iter()
+            .find(|(_, channel)| channel.as_str() == "#a")
+            .map(|(token, _)| token.clone())
+            .expect("WHOX requested after NAMES");
+        for (i, nick) in nicks.iter().enumerate() {
+            app.handle_numeric(
+                RPL_WHOSPCRPL,
+                &[
+                    "me".into(),
+                    token.clone(),
+                    "#a".into(),
+                    format!("u{i}"),
+                    "host".into(),
+                    nick.clone(),
+                    "H".into(),
+                    format!("acct{i}"),
+                    "Real".into(),
+                ],
+            );
+        }
+
+        // The reply for each member reached both channels they share.
+        for channel in ["#a", "#b"] {
+            let user = app.channels[channel].get_user("USER7777").unwrap();
+            assert_eq!(user.account.as_deref(), Some("acct7777"), "{channel}");
+            assert_eq!(user.username.as_deref(), Some("u7777"), "{channel}");
+        }
+        // Quadratic allocation-heavy scans take minutes here; the bound is
+        // generous so slow CI machines do not flake.
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_secs(30),
+            "10k-user NAMES+WHOX took {elapsed:?}"
+        );
     }
 
     #[test]
