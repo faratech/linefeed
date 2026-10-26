@@ -2361,8 +2361,8 @@ impl IrcApp {
                 "=== Connection ===",
                 vec![
                     "/server <host> [[+]port] - Connect to a server (saved settings unchanged)",
-                    "  Port 6697 or +port (e.g. +7000) uses TLS, other ports plain text;",
-                    "  with no port the current port and TLS setting are kept",
+                    "  Port 6697 or +port (e.g. +7000) uses TLS, ports 6660-6669 plain text;",
+                    "  any other port (or no port) keeps the current TLS setting",
                     "/disconnect         - Disconnect",
                     "/reconnect          - Reconnect",
                     "/away [message]     - Set away message",
@@ -2764,11 +2764,17 @@ struct EndpointForm {
 /// The standard TLS port: a `/server` that names it connects with TLS.
 const TLS_PORT: u16 = 6697;
 
-/// The endpoint named by `/server`. `tls` is `Some` only when a port was
-/// typed: `+port` (mIRC's TLS marker) or the standard TLS port means TLS and
-/// any other port means plain text. With no port the form's port and TLS
-/// setting are kept together, so `/server host` cannot pair one with the
-/// other's default (#234).
+/// The conventional plaintext IRC ports: a `/server` that names one connects
+/// without TLS.
+const PLAINTEXT_PORTS: std::ops::RangeInclusive<u16> = 6660..=6669;
+
+/// The endpoint named by `/server`. `tls` is `Some` only when the typed port
+/// decides it: `+port` (mIRC's TLS marker) or the standard TLS port means
+/// TLS, a conventional plaintext port (6660-6669) means plain text, and any
+/// other port leaves the current TLS setting alone, so a TLS session is never
+/// silently downgraded to plain text on a port like 7000. With no port the
+/// form's port and TLS setting are kept together, so `/server host` cannot
+/// pair one with the other's default (#234).
 #[derive(Debug, PartialEq)]
 struct ServerArg {
     host: String,
@@ -2777,19 +2783,19 @@ struct ServerArg {
 }
 
 impl ServerArg {
-    fn new(host: &str, port: Option<(u16, bool)>) -> Self {
+    fn new(host: &str, port: Option<(u16, Option<bool>)>) -> Self {
         Self {
             host: host.to_string(),
             port: port.map(|(port, _)| port.to_string()),
-            tls: port.map(|(_, tls)| tls),
+            tls: port.and_then(|(_, tls)| tls),
         }
     }
 }
 
-/// Parse a port typed after `/server`, returning it with whether it selects
-/// TLS. Errors never echo the input: in mIRC's `/server host port password`
-/// order it can be a password (#226).
-fn parse_server_arg_port(value: &str) -> Result<(u16, bool), String> {
+/// Parse a port typed after `/server`, returning it with the TLS setting it
+/// selects, if any. Errors never echo the input: in mIRC's
+/// `/server host port password` order it can be a password (#226).
+fn parse_server_arg_port(value: &str) -> Result<(u16, Option<bool>), String> {
     let value = value.trim();
     let (marked, digits) = match value.strip_prefix('+') {
         Some(digits) => (true, digits),
@@ -2797,7 +2803,14 @@ fn parse_server_arg_port(value: &str) -> Result<(u16, bool), String> {
     };
     match digits.parse::<u16>() {
         Ok(port) if port > 0 && digits.bytes().all(|byte| byte.is_ascii_digit()) => {
-            Ok((port, marked || port == TLS_PORT))
+            let tls = if marked || port == TLS_PORT {
+                Some(true)
+            } else if PLAINTEXT_PORTS.contains(&port) {
+                Some(false)
+            } else {
+                None
+            };
+            Ok((port, tls))
         }
         _ => Err("Invalid server port; enter a number from 1 to 65535 \
                   (prefix it with + for TLS)"
@@ -4266,11 +4279,31 @@ mod tests {
             let session = app.active_server_config().unwrap();
             (session.port, session.use_tls)
         };
-        // 6697 is TLS even after a plaintext session; other ports are plain.
+        // 6697 is TLS even after a plaintext session; the conventional
+        // plaintext ports 6660-6669 are plain even after a TLS one.
         assert_eq!(tls_of("/server irc.x.net 6697", false), (6697, true));
         assert_eq!(tls_of("/server irc.x.net:6697", false), (6697, true));
         assert_eq!(tls_of("/server irc.x.net 6667", true), (6667, false));
-        assert_eq!(tls_of("/server irc.x.net:7000", true), (7000, false));
+        assert_eq!(tls_of("/server irc.x.net 6660", true), (6660, false));
+        assert_eq!(tls_of("/server irc.x.net:6669", true), (6669, false));
+        // Any other port is ambiguous, so the current TLS setting is kept: a
+        // TLS session must never be silently downgraded to plain text.
+        for port in ["6659", "6670", "7000", "7070", "9999"] {
+            assert_eq!(
+                tls_of(&format!("/server irc.x.net {port}"), true),
+                (port.parse().unwrap(), true),
+                "TLS session on {port} must stay TLS"
+            );
+            assert_eq!(
+                tls_of(&format!("/server irc.x.net:{port}"), true),
+                (port.parse().unwrap(), true)
+            );
+            assert_eq!(
+                tls_of(&format!("/server irc.x.net {port}"), false),
+                (port.parse().unwrap(), false),
+                "plain session on {port} must stay plain"
+            );
+        }
         // mIRC's +port marker forces TLS on any port.
         assert_eq!(tls_of("/server irc.x.net +7000", false), (7000, true));
         assert_eq!(tls_of("/server irc.x.net:+7000", false), (7000, true));
@@ -4402,7 +4435,7 @@ mod tests {
         );
         assert_eq!(
             parse_server_arg("[::1]:7000"),
-            arg("::1", Some("7000"), Some(false))
+            arg("::1", Some("7000"), None)
         );
         assert_eq!(
             parse_server_arg("[2001:db8::1]"),
@@ -4415,6 +4448,10 @@ mod tests {
         assert_eq!(
             parse_server_arg("irc.example.org 6667"),
             arg("irc.example.org", Some("6667"), Some(false))
+        );
+        assert_eq!(
+            parse_server_arg("irc.example.org 7000"),
+            arg("irc.example.org", Some("7000"), None)
         );
         assert_eq!(
             parse_server_arg("irc.example.org +7000"),
