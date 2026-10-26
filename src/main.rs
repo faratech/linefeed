@@ -632,6 +632,13 @@ impl LinefeedApp {
         self.app
             .release_closing_connection(self.connection_thread.is_none());
 
+        // A worker told to close is still exiting. Nothing else schedules a
+        // frame to observe it finish (its own repaint request can land before
+        // the thread is joinable), and the next connect waits for it, so poll.
+        if self.connection_thread.is_some() && !self.app.connected && !self.app.connecting {
+            ctx.request_repaint_after(std::time::Duration::from_millis(100));
+        }
+
         // Auto-reconnect if enabled and connection was lost.
         if self.app.should_reconnect() {
             self.app.start_reconnect();
@@ -690,7 +697,7 @@ impl LinefeedApp {
                 }
             };
 
-            rt.block_on(async {
+            run_worker_runtime(rt, async {
                 let mut client = IrcClient::new(config.clone());
                 match client.connect(msg_tx.clone(), cmd_rx).await {
                     Ok(_) => tracing::info!("Connection closed"),
@@ -709,10 +716,22 @@ impl LinefeedApp {
                             .await;
                     }
                 }
-                ctx.request_repaint();
             });
+            // The thread is done: wake the UI so the lifecycle observes it.
+            ctx.request_repaint();
         }));
     }
+}
+
+/// Run a connection worker's future to completion, then tear its runtime
+/// down. Dropping a tokio `Runtime` waits indefinitely for `spawn_blocking`
+/// work, and connecting resolves the host through one (`getaddrinfo`): with a
+/// stuck resolver the thread would never finish, and `connection_thread`
+/// being set blocks every later connect (#245).
+fn run_worker_runtime<F: std::future::Future>(rt: tokio::runtime::Runtime, future: F) -> F::Output {
+    let output = rt.block_on(future);
+    rt.shutdown_background();
+    output
 }
 
 #[cfg(test)]
@@ -978,6 +997,61 @@ mod tests {
                 .iter()
                 .any(|message| message.content.contains("Connection failed"))
         });
+    }
+
+    #[test]
+    fn an_exiting_worker_is_polled_until_the_lifecycle_observes_it_finish() {
+        let (mut linefeed, release) = linefeed_with_live_worker();
+        linefeed.app.request_manual_disconnect(Some("bye".into()));
+        let (delay_tx, delay_rx) = std::sync::mpsc::channel();
+        let ctx = egui::Context::default();
+        ctx.set_request_repaint_callback(move |info| {
+            let _ = delay_tx.send(info.delay);
+        });
+
+        // Disconnected and not connecting, but the worker has not exited yet:
+        // no other repaint source exists, so the lifecycle must ask for one.
+        linefeed.process_connection_lifecycle(&ctx);
+        assert!(
+            delay_rx
+                .try_recv()
+                .is_ok_and(|delay| delay <= std::time::Duration::from_millis(100)),
+            "no repaint was scheduled for the exiting worker"
+        );
+
+        // Once the worker is gone nothing keeps the idle window repainting.
+        finish_worker_and_tick(&mut linefeed, release);
+        while delay_rx.try_recv().is_ok() {}
+        linefeed.process_connection_lifecycle(&ctx);
+        assert!(delay_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn worker_exit_does_not_wait_for_stuck_blocking_work() {
+        // Stands in for a getaddrinfo that never returns.
+        let (stuck_tx, stuck_rx) = std::sync::mpsc::channel::<()>();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let worker = std::thread::spawn(move || {
+            run_worker_runtime(rt, async move {
+                tokio::task::spawn_blocking(move || {
+                    let _ = stuck_rx.recv();
+                });
+                // Give the blocking task time to start.
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            });
+        });
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while !worker.is_finished() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let finished = worker.is_finished();
+        // Release the stuck task either way so a failure does not hang the run.
+        drop(stuck_tx);
+        assert!(finished, "worker thread blocked on the runtime drop");
     }
 
     #[test]
