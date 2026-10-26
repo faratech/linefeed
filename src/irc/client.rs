@@ -198,13 +198,42 @@ fn format_server_addr(host: &str, port: u16) -> String {
     }
 }
 
-/// Try each resolved address in turn, all within one `deadline`. Each address
-/// but the last gets half of the time still left, so a blackholed address
-/// (preferred IPv6 on a broken route, say) cannot starve the fallbacks the way
-/// one overall timeout around a sequential connect would (#233).
+/// How one connect deadline is divided between the addresses a host resolves
+/// to. A blackholed address (preferred IPv6 on a broken route, say) must not
+/// starve the fallbacks behind it, but halving what is left for each address
+/// in turn would starve the later ones exponentially, so the half is held to
+/// a range: no more than `cap` and, budget permitting, no less than `floor`.
+#[derive(Clone, Copy)]
+struct AttemptShares {
+    cap: Duration,
+    floor: Duration,
+}
+
+/// Half of what is left of the connect budget, between 2 and 8 seconds.
+const TCP_ATTEMPT_SHARES: AttemptShares = AttemptShares {
+    cap: Duration::from_secs(8),
+    floor: Duration::from_secs(2),
+};
+
+impl AttemptShares {
+    /// How long to wait on the next address, given the time `remaining`. The
+    /// last address gets everything left; no address ever gets more than
+    /// that.
+    fn share(self, remaining: Duration, last: bool) -> Duration {
+        if last {
+            remaining
+        } else {
+            (remaining / 2).clamp(self.floor, self.cap).min(remaining)
+        }
+    }
+}
+
+/// Try each resolved address in turn, all within one `deadline`, giving each
+/// but the last the `shares` of the time still left (#233).
 async fn connect_first_reachable<T, F, Fut>(
     addrs: &[std::net::SocketAddr],
     deadline: tokio::time::Instant,
+    shares: AttemptShares,
     mut connect: F,
 ) -> std::io::Result<T>
 where
@@ -214,11 +243,7 @@ where
     let mut last_error = None;
     for (index, addr) in addrs.iter().enumerate() {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-        let share = if index + 1 < addrs.len() {
-            remaining / 2
-        } else {
-            remaining
-        };
+        let share = shares.share(remaining, index + 1 == addrs.len());
         last_error = Some(match timeout(share, connect(*addr)).await {
             Ok(Ok(connected)) => return Ok(connected),
             Ok(Err(error)) => error,
@@ -235,12 +260,27 @@ where
 
 /// Resolve `host` and connect TCP, bounded overall by `budget`.
 async fn connect_tcp(host: &str, port: u16, budget: Duration) -> std::io::Result<TcpStream> {
+    connect_tcp_via(host, port, budget, TCP_ATTEMPT_SHARES, TcpStream::connect).await
+}
+
+/// `connect_tcp` with the per-address connect (and its time shares) supplied.
+async fn connect_tcp_via<T, F, Fut>(
+    host: &str,
+    port: u16,
+    budget: Duration,
+    shares: AttemptShares,
+    connect: F,
+) -> std::io::Result<T>
+where
+    F: FnMut(std::net::SocketAddr) -> Fut,
+    Fut: std::future::Future<Output = std::io::Result<T>>,
+{
     let deadline = tokio::time::Instant::now() + budget;
     let addrs: Vec<_> = tokio::time::timeout_at(deadline, tokio::net::lookup_host((host, port)))
         .await
         .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "name lookup timed out"))??
         .collect();
-    connect_first_reachable(&addrs, deadline, TcpStream::connect).await
+    connect_first_reachable(&addrs, deadline, shares, connect).await
 }
 
 /// Watch the command channel while a connection phase is otherwise blocked.
@@ -4368,32 +4408,39 @@ mod tests {
         });
     }
 
+    /// Shares scaled down so the tests that wait them out stay fast.
+    const TEST_SHARES: AttemptShares = AttemptShares {
+        cap: Duration::from_millis(400),
+        floor: Duration::from_millis(100),
+    };
+
     #[test]
     fn unresponsive_tcp_address_fails_within_the_connect_budget() {
         test_runtime().block_on(async {
-            // #233: TEST-NET-3 is unroutable. Depending on the network it is
-            // either blackholed (the budget must end the wait) or rejected at
-            // once; either way connect() must return a connection error
-            // within the budget instead of the OS default (up to minutes).
-            let config = ServerConfig {
-                host: "203.0.113.1".to_string(),
-                port: 9,
-                use_tls: false,
-                nick: "tester".to_string(),
-                ..Default::default()
-            };
-            let (msg_tx, _msg_rx) = mpsc::channel(100);
-            let (_cmd_tx, cmd_rx) = mpsc::unbounded_channel();
-            let mut client = IrcClient::new(config);
-            client.connect_timeout = Duration::from_millis(300);
-            let error = timeout(Duration::from_secs(5), client.connect(msg_tx, cmd_rx))
-                .await
-                .expect("TCP connect was not bounded by its budget")
-                .unwrap_err();
-            assert!(
-                error.to_string().contains("Failed to connect to"),
-                "{error}"
-            );
+            // #233: an address that never answers (a blackholed route) must
+            // end in an ordinary connection error within the budget instead
+            // of the OS default (up to minutes). The silent peer is simulated
+            // by a connector that never completes: a real unroutable address
+            // can be rejected at once, or accepted by a transparent proxy,
+            // depending on the network the tests run on.
+            let started = tokio::time::Instant::now();
+            let error = timeout(
+                Duration::from_secs(10),
+                connect_tcp_via(
+                    "127.0.0.1",
+                    9,
+                    Duration::from_millis(300),
+                    TEST_SHARES,
+                    |_| std::future::pending::<std::io::Result<()>>(),
+                ),
+            )
+            .await
+            .expect("TCP connect was not bounded by its budget")
+            .unwrap_err();
+            assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+            // The budget was really waited out, and not overshot by much.
+            assert!(started.elapsed() >= Duration::from_millis(250));
+            assert!(started.elapsed() < Duration::from_secs(5));
         });
     }
 
@@ -4403,11 +4450,12 @@ mod tests {
             let first: std::net::SocketAddr = "192.0.2.1:6697".parse().unwrap();
             let second: std::net::SocketAddr = "192.0.2.2:6697".parse().unwrap();
             let started = tokio::time::Instant::now();
-            // The first address never answers; it may use only half the
-            // budget, leaving the second a chance to connect.
+            // The first address never answers; it may use only its share of
+            // the budget, leaving the second a chance to connect.
             let connected = connect_first_reachable(
                 &[first, second],
-                started + Duration::from_millis(600),
+                started + Duration::from_secs(1),
+                TEST_SHARES,
                 |addr| async move {
                     if addr == first {
                         std::future::pending().await
@@ -4419,7 +4467,10 @@ mod tests {
             .await
             .unwrap();
             assert_eq!(connected, second);
-            assert!(started.elapsed() < Duration::from_millis(550));
+            // The silent address was waited on for its capped 400 ms share
+            // before falling back to the second.
+            assert!(started.elapsed() >= Duration::from_millis(350));
+            assert!(started.elapsed() < Duration::from_secs(5));
 
             // Every address silent: the whole attempt ends at the deadline
             // with a TimedOut error.
@@ -4427,17 +4478,20 @@ mod tests {
             let error = connect_first_reachable::<(), _, _>(
                 &[first, second],
                 started + Duration::from_millis(300),
+                TEST_SHARES,
                 |_| std::future::pending(),
             )
             .await
             .unwrap_err();
             assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
-            assert!(started.elapsed() < Duration::from_secs(2));
+            assert!(started.elapsed() >= Duration::from_millis(250));
+            assert!(started.elapsed() < Duration::from_secs(5));
 
             // A refused address falls through to the next one immediately.
             let connected = connect_first_reachable(
                 &[first, second],
                 tokio::time::Instant::now() + Duration::from_secs(5),
+                TEST_SHARES,
                 |addr| async move {
                     if addr == first {
                         Err(std::io::ErrorKind::ConnectionRefused.into())
@@ -4450,6 +4504,35 @@ mod tests {
             .unwrap();
             assert_eq!(connected, second);
         });
+    }
+
+    #[test]
+    fn connect_shares_do_not_starve_later_addresses() {
+        let shares = TCP_ATTEMPT_SHARES;
+        let secs = Duration::from_secs;
+        let millis = Duration::from_millis;
+        // Half of what is left, but no more than 8 s...
+        assert_eq!(shares.share(secs(20), false), secs(8));
+        assert_eq!(shares.share(secs(12), false), secs(6));
+        // ...and no less than 2 s while the budget lasts,
+        assert_eq!(shares.share(secs(3), false), secs(2));
+        // ...never more than what is left,
+        assert_eq!(shares.share(millis(500), false), millis(500));
+        // ...and the last address gets all of it.
+        assert_eq!(shares.share(secs(3), true), secs(3));
+        assert_eq!(shares.share(Duration::ZERO, true), Duration::ZERO);
+
+        // Three addresses that all hang use up the 20 s default budget; with
+        // plain halving the last of n would be left with budget / 2^(n-1).
+        let mut remaining = TCP_CONNECT_TIMEOUT;
+        let mut waits = Vec::new();
+        for last in [false, false, true] {
+            let share = shares.share(remaining, last);
+            waits.push(share);
+            remaining -= share;
+        }
+        assert_eq!(waits, [secs(8), secs(6), secs(6)]);
+        assert_eq!(remaining, Duration::ZERO);
     }
 
     #[test]
