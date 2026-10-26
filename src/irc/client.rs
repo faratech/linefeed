@@ -280,41 +280,74 @@ async fn wait_for_registration_events(
     }
 }
 
+/// Whether a message target names a network service (NickServ and friends,
+/// the QuakeNet Q / Undernet X shorthands), optionally with a status prefix
+/// or an `@network` suffix. Any element of a comma list counts. A local
+/// predicate on purpose: the connection layer must not depend on GUI code,
+/// and for logging over-redaction is the safe direction.
+fn is_service_target(targets: &str) -> bool {
+    targets.split(',').any(|target| {
+        let name = target
+            .trim_start_matches(['~', '&', '@', '%', '+'])
+            .split('@')
+            .next()
+            .unwrap_or("");
+        [
+            "nickserv", "chanserv", "authserv", "hostserv", "memoserv", "botserv", "operserv",
+            "saslserv", "ns", "cs", "as", "hs", "ms", "bs", "os", "q", "x",
+        ]
+        .iter()
+        .any(|service| name.eq_ignore_ascii_case(service))
+    })
+}
+
 /// Redact credentials from an outgoing line before it reaches the log output.
-/// PASS carries the server/bouncer password, AUTHENTICATE carries the base64
-/// SASL payload, and NickServ IDENTIFY/GHOST/REGAIN/RECOVER lines (from
-/// auto-perform or /ns) carry the account password.
+/// Whole-line verbs (PASS, AUTHENTICATE, OPER, REGISTER, bare service
+/// commands, ...) carry passwords or tokens; any PRIVMSG/NOTICE/SQUERY to a
+/// service-shaped target is redacted whatever its text, since the target
+/// alone says the text is a service command.
 fn redact_for_log(line: &str) -> std::borrow::Cow<'_, str> {
     let trimmed = line.trim_end();
-    let upper = trimmed.to_uppercase();
-    if upper.starts_with("PASS ") {
-        return "PASS <redacted>".into();
+    // A tagged line ("@label=1 PRIVMSG ...") carries its command after the tags.
+    let untagged = if trimmed.starts_with('@') {
+        trimmed
+            .split_once(char::is_whitespace)
+            .map_or("", |(_, rest)| rest.trim_start())
+    } else {
+        trimmed
+    };
+    let mut words = untagged.split_whitespace();
+    let verb = words.next().unwrap_or("");
+    match verb.to_ascii_uppercase().as_str() {
+        "PASS" | "AUTH" | "LOGIN" | "OPER" | "WEBPUSH" | "REGISTER" | "VERIFY" | "AUTHTOKEN"
+        | "BOUNCER" | "IDENTIFY" | "ID" | "SIDENTIFY" | "GHOST" | "RECOVER" | "RELEASE"
+        | "REGAIN" | "GROUP" | "SETPASS" | "NS" | "NICKSERV" | "CS" | "CHANSERV" | "AS"
+        | "AUTHSERV" | "HS" | "HOSTSERV" | "MS" | "MEMOSERV" | "BS" | "BOTSERV"
+            if words.next().is_some() =>
+        {
+            format!("{verb} <redacted>").into()
+        }
+        "TOKEN"
+            if words
+                .next()
+                .is_some_and(|sub| sub.eq_ignore_ascii_case("VALIDATE")) =>
+        {
+            format!("{verb} <redacted>").into()
+        }
+        "AUTHENTICATE" => match words.next() {
+            Some(arg) if arg != "+" && !arg.eq_ignore_ascii_case("PLAIN") => {
+                format!("{verb} <redacted>").into()
+            }
+            _ => trimmed.into(),
+        },
+        "PRIVMSG" | "NOTICE" | "SQUERY" => match words.next() {
+            Some(target) if is_service_target(target) => {
+                format!("{verb} {target} :<redacted>").into()
+            }
+            _ => trimmed.into(),
+        },
+        _ => trimmed.into(),
     }
-    if upper.starts_with("AUTH ") || upper.starts_with("LOGIN ") || upper.starts_with("OPER ") {
-        return format!(
-            "{} <redacted>",
-            trimmed.split_whitespace().next().unwrap_or("AUTH")
-        )
-        .into();
-    }
-    if let Some(arg) = trimmed.strip_prefix("AUTHENTICATE ")
-        && arg != "+"
-        && !arg.eq_ignore_ascii_case("PLAIN")
-    {
-        return "AUTHENTICATE <redacted>".into();
-    }
-    let service_auth = upper.starts_with("PRIVMSG NICKSERV")
-        || upper.starts_with("NICKSERV")
-        || upper.starts_with("PRIVMSG Q@")
-        || upper.starts_with("PRIVMSG X@");
-    if service_auth
-        && ["IDENTIFY", "AUTH", "LOGIN", "GHOST", "REGAIN", "RECOVER"]
-            .iter()
-            .any(|w| upper.contains(w))
-    {
-        return "PRIVMSG NickServ :<redacted>".into();
-    }
-    trimmed.into()
 }
 
 /// Wait for one complete line from the server and leave it in `buf`.
@@ -2439,8 +2472,97 @@ mod tests {
         assert_eq!(redact_for_log("AUTH account secret\r\n"), "AUTH <redacted>");
         assert_eq!(
             redact_for_log("PRIVMSG Q@CServe.quakenet.org :AUTH account secret\r\n"),
-            "PRIVMSG NickServ :<redacted>"
+            "PRIVMSG Q@CServe.quakenet.org :<redacted>"
         );
+    }
+
+    #[test]
+    fn debug_log_redaction_covers_credential_verbs_and_service_targets() {
+        // Whole-line verbs.
+        for (line, expected) in [
+            ("PASS hunter2", "PASS <redacted>"),
+            ("pass hunter2", "pass <redacted>"),
+            ("OPER admin hunter2", "OPER <redacted>"),
+            ("WEBPUSH REGISTER endpoint hunter2", "WEBPUSH <redacted>"),
+            (
+                "REGISTER acct me@example.test hunter2",
+                "REGISTER <redacted>",
+            ),
+            ("VERIFY acct 123456", "VERIFY <redacted>"),
+            ("AUTHENTICATE dGVzdA==", "AUTHENTICATE <redacted>"),
+            ("IDENTIFY hunter2", "IDENTIFY <redacted>"),
+            ("GHOST oldnick hunter2", "GHOST <redacted>"),
+            ("NS identify hunter2", "NS <redacted>"),
+            ("CHANSERV identify #chan hunter2", "CHANSERV <redacted>"),
+            ("TOKEN VALIDATE abc.def", "TOKEN <redacted>"),
+            ("@label=1 PASS hunter2", "PASS <redacted>"),
+        ] {
+            assert_eq!(redact_for_log(&format!("{line}\r\n")), expected, "{line}");
+        }
+        // Any message to something service-shaped, whatever the text.
+        for (line, expected) in [
+            (
+                "PRIVMSG NickServ :identify hunter2",
+                "PRIVMSG NickServ :<redacted>",
+            ),
+            (
+                "privmsg nickserv :hunter2 hunter2",
+                "privmsg nickserv :<redacted>",
+            ),
+            ("PRIVMSG NS :id hunter2", "PRIVMSG NS :<redacted>"),
+            (
+                "NOTICE ChanServ :set #c password x",
+                "NOTICE ChanServ :<redacted>",
+            ),
+            (
+                "SQUERY NickServ :identify hunter2",
+                "SQUERY NickServ :<redacted>",
+            ),
+            (
+                "PRIVMSG AuthServ@services.example :auth u hunter2",
+                "PRIVMSG AuthServ@services.example :<redacted>",
+            ),
+            (
+                "PRIVMSG X@channels.undernet.org :login u hunter2",
+                "PRIVMSG X@channels.undernet.org :<redacted>",
+            ),
+            (
+                "PRIVMSG @NickServ :identify hunter2",
+                "PRIVMSG @NickServ :<redacted>",
+            ),
+            (
+                "PRIVMSG #chan,NickServ :identify hunter2",
+                "PRIVMSG #chan,NickServ :<redacted>",
+            ),
+            (
+                "@label=1 PRIVMSG HostServ :request hunter2",
+                "PRIVMSG HostServ :<redacted>",
+            ),
+            (
+                "PRIVMSG MemoServ :send bob hunter2",
+                "PRIVMSG MemoServ :<redacted>",
+            ),
+            (
+                "PRIVMSG BotServ :say hunter2",
+                "PRIVMSG BotServ :<redacted>",
+            ),
+        ] {
+            assert_eq!(redact_for_log(&format!("{line}\r\n")), expected, "{line}");
+        }
+        // Ordinary traffic is logged as-is.
+        for line in [
+            "PRIVMSG #chan :identify the culprit",
+            "PRIVMSG alice :hello",
+            "NOTICE alice :pass the salt",
+            "JOIN #chan",
+            "AUTHENTICATE PLAIN",
+            "AUTHENTICATE +",
+            "TOKEN LIST",
+            "PASSWORD",
+            "@label=1 PRIVMSG #chan :hi",
+        ] {
+            assert_eq!(redact_for_log(&format!("{line}\r\n")), line, "{line}");
+        }
     }
 
     #[test]
