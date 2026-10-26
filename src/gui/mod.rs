@@ -3685,17 +3685,25 @@ impl IrcApp {
 
             IrcCommand::Topic(channel, topic) => {
                 let max = self.max_scrollback;
+                let sender = msg.get_sender_nick();
+                // Prefer the server's timestamp so a bouncer replay or lagged
+                // delivery is attributed to when the topic actually changed.
+                let set_time = msg.get_server_time().unwrap_or_else(|| {
+                    use std::time::{SystemTime, UNIX_EPOCH};
+                    SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs()
+                });
                 if let Some(ch) = self.channel_mut(channel) {
-                    ch.topic = topic.clone();
-                    let sender = msg.get_sender_nick();
-                    let sys_msg = if let Some(s) = sender {
-                        ChatMessage::system(&format!(
-                            "{} changed the topic to: {}",
-                            s,
-                            topic.as_deref().unwrap_or("")
-                        ))
-                    } else {
-                        ChatMessage::system(&format!("Topic: {}", topic.as_deref().unwrap_or("")))
+                    ch.set_topic(topic.clone(), sender.clone(), Some(set_time));
+                    let sys_msg = match (sender, ch.topic.as_deref()) {
+                        (Some(s), Some(topic)) => {
+                            ChatMessage::system(&format!("{} changed the topic to: {}", s, topic))
+                        }
+                        (Some(s), None) => ChatMessage::system(&format!("{} cleared the topic", s)),
+                        (None, Some(topic)) => ChatMessage::system(&format!("Topic: {}", topic)),
+                        (None, None) => ChatMessage::system("Topic cleared"),
                     };
                     ch.push_trimmed(sys_msg, max);
                 }
@@ -4340,13 +4348,35 @@ impl IrcApp {
                 self.apply_isupport_tokens(params);
             }
 
+            RPL_NOTOPIC => {
+                // Format: 331 <nick> <channel> :No topic is set
+                // Clears a topic left over from before a rejoin or one removed
+                // while we were disconnected.
+                let max = self.max_scrollback;
+                if let Some(channel) = params.get(1) {
+                    if let Some(ch) = self.channel_mut(channel) {
+                        ch.set_topic(None, None, None);
+                        ch.push_trimmed(ChatMessage::system("No topic is set"), max);
+                    } else {
+                        self.add_message_to_current(ChatMessage::system(&format!(
+                            "No topic is set for {}",
+                            channel
+                        )));
+                    }
+                }
+            }
+
             RPL_TOPIC => {
                 let max = self.max_scrollback;
                 if let (Some(channel), Some(topic)) = (params.get(1), params.get(2))
                     && let Some(ch) = self.channel_mut(channel)
                 {
-                    ch.topic = Some(topic.clone());
-                    ch.push_trimmed(ChatMessage::system(&format!("Topic: {}", topic)), max);
+                    // The setter and time arrive in a following 333; drop the
+                    // previous topic's attribution until then.
+                    ch.set_topic(Some(topic.clone()), None, None);
+                    if ch.topic.is_some() {
+                        ch.push_trimmed(ChatMessage::system(&format!("Topic: {}", topic)), max);
+                    }
                 }
             }
 
@@ -8969,6 +8999,104 @@ mod tests {
             rx.try_recv(),
             Ok(IrcCommand::Notice(target, _)) if target == "peer"
         ));
+    }
+
+    fn topic_test_channel(app: &mut IrcApp) {
+        let mut channel = Channel::new();
+        channel.joined = true;
+        channel.topic = Some("old topic".to_string());
+        channel.topic_set_by = Some("olduser".to_string());
+        channel.topic_set_time = Some(1);
+        app.channels.insert("#chan".to_string(), channel);
+    }
+
+    #[test]
+    fn live_topic_change_updates_setter_and_time() {
+        let mut app = test_app();
+        topic_test_channel(&mut app);
+
+        app.handle_incoming_message(
+            IrcMessage::parse("@time=2026-10-25T12:00:00.000Z :alice!u@h TOPIC #chan :new topic")
+                .unwrap(),
+        );
+        let ch = &app.channels["#chan"];
+        assert_eq!(ch.topic.as_deref(), Some("new topic"));
+        assert_eq!(ch.topic_set_by.as_deref(), Some("alice"));
+        assert_eq!(ch.topic_set_time, Some(1792929600));
+
+        // Without server-time the change is stamped with the current time.
+        app.handle_incoming_message(
+            IrcMessage::parse(":bob!u@h TOPIC #chan :newer topic").unwrap(),
+        );
+        let ch = &app.channels["#chan"];
+        assert_eq!(ch.topic_set_by.as_deref(), Some("bob"));
+        assert!(ch.topic_set_time.unwrap() > 1792929600);
+    }
+
+    #[test]
+    fn empty_live_topic_clears_the_topic() {
+        let mut app = test_app();
+        topic_test_channel(&mut app);
+
+        app.handle_incoming_message(IrcMessage::parse(":alice!u@h TOPIC #chan :").unwrap());
+
+        let ch = &app.channels["#chan"];
+        assert_eq!(ch.topic, None);
+        assert_eq!(ch.topic_set_by, None);
+        assert_eq!(ch.topic_set_time, None);
+        let last = ch.messages.back().unwrap();
+        assert!(
+            last.content.contains("cleared the topic"),
+            "{}",
+            last.content
+        );
+    }
+
+    #[test]
+    fn rpl_notopic_clears_a_stale_topic() {
+        let mut app = test_app();
+        topic_test_channel(&mut app);
+
+        app.handle_numeric(
+            RPL_NOTOPIC,
+            &["me".into(), "#chan".into(), "No topic is set".into()],
+        );
+
+        let ch = &app.channels["#chan"];
+        assert_eq!(ch.topic, None);
+        assert_eq!(ch.topic_set_by, None);
+        assert_eq!(ch.topic_set_time, None);
+    }
+
+    #[test]
+    fn rpl_topic_replaces_the_setter_and_ignores_empty_topics() {
+        let mut app = test_app();
+        topic_test_channel(&mut app);
+
+        // 332 starts a fresh topic: the old setter must not linger if the
+        // server omits 333.
+        app.handle_numeric(RPL_TOPIC, &["me".into(), "#chan".into(), "fresh".into()]);
+        let ch = &app.channels["#chan"];
+        assert_eq!(ch.topic.as_deref(), Some("fresh"));
+        assert_eq!(ch.topic_set_by, None);
+        assert_eq!(ch.topic_set_time, None);
+
+        app.handle_numeric(
+            RPL_TOPICWHOTIME,
+            &[
+                "me".into(),
+                "#chan".into(),
+                "carol".into(),
+                "1700000000".into(),
+            ],
+        );
+        let ch = &app.channels["#chan"];
+        assert_eq!(ch.topic_set_by.as_deref(), Some("carol"));
+        assert_eq!(ch.topic_set_time, Some(1700000000));
+
+        // An empty 332 is no topic, not an empty "Topic:" row.
+        app.handle_numeric(RPL_TOPIC, &["me".into(), "#chan".into(), "".into()]);
+        assert_eq!(app.channels["#chan"].topic, None);
     }
 
     #[test]

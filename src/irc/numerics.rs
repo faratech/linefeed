@@ -49,6 +49,7 @@ pub const RPL_CHANNELMODEIS: u16 = 324;
 pub const RPL_CREATIONTIME: u16 = 329;
 
 // Topic
+pub const RPL_NOTOPIC: u16 = 331;
 pub const RPL_TOPIC: u16 = 332;
 pub const RPL_TOPICWHOTIME: u16 = 333;
 

@@ -889,6 +889,24 @@ impl Channel {
         self.case_mapping = case_mapping;
     }
 
+    /// Replace the topic together with its attribution so a stale setter or
+    /// time never outlives the topic it described. An empty topic means none.
+    pub fn set_topic(
+        &mut self,
+        topic: Option<String>,
+        set_by: Option<String>,
+        set_time: Option<u64>,
+    ) {
+        self.topic = topic.filter(|topic| !topic.is_empty());
+        if self.topic.is_some() {
+            self.topic_set_by = set_by;
+            self.topic_set_time = set_time;
+        } else {
+            self.topic_set_by = None;
+            self.topic_set_time = None;
+        }
+    }
+
     pub fn set_prefix_schema(&mut self, modes: &str, symbols: &str) {
         if modes.chars().count() != symbols.chars().count() || symbols.is_empty() {
             return;
