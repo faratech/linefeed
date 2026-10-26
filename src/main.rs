@@ -605,7 +605,9 @@ impl LinefeedApp {
                 }
                 ConnectionIntent::ManualDisconnect => {
                     self.app.connection_intent = ConnectionIntent::None;
-                    self.app.connecting = false;
+                    // request_manual_disconnect already cleared `connecting`,
+                    // so a set flag here is a connect requested while this
+                    // worker was still exiting: keep it so it starts below.
                     self.app.connected = false;
                 }
                 ConnectionIntent::None => {
@@ -811,10 +813,171 @@ mod tests {
         let ctx = egui::Context::default();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         while !done(linefeed) {
-            assert!(std::time::Instant::now() < deadline, "timed out: {what}");
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out: {what}; connecting={} connected={} intent={:?} thread={} messages={:?}",
+                linefeed.app.connecting,
+                linefeed.app.connected,
+                linefeed.app.connection_intent,
+                linefeed.connection_thread.is_some(),
+                linefeed
+                    .app
+                    .server_messages
+                    .iter()
+                    .map(|m| m.content.clone())
+                    .collect::<Vec<_>>()
+            );
             linefeed.background_tick(&ctx);
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
+    }
+
+    /// A stand-in for a live connection worker: alive until `release` is
+    /// dropped or sent to, like a real thread still winding its socket down.
+    fn parked_worker(
+        channel_ends: impl Send + 'static,
+    ) -> (std::thread::JoinHandle<()>, std::sync::mpsc::Sender<()>) {
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let handle = std::thread::spawn(move || {
+            let _channel_ends = channel_ends;
+            let _ = release_rx.recv();
+        });
+        (handle, release_tx)
+    }
+
+    /// Release the parked worker, wait for it to be observably finished, then
+    /// run one lifecycle pass, as the frame loop would.
+    fn finish_worker_and_tick(linefeed: &mut LinefeedApp, release: std::sync::mpsc::Sender<()>) {
+        release.send(()).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !linefeed
+            .connection_thread
+            .as_ref()
+            .is_some_and(|handle| handle.is_finished())
+        {
+            assert!(std::time::Instant::now() < deadline, "worker never exited");
+            std::thread::yield_now();
+        }
+        linefeed.background_tick(&egui::Context::default());
+    }
+
+    /// An app that looks connected through a parked worker. The configured
+    /// endpoint is a closed loopback port, so any worker the lifecycle starts
+    /// afterwards is refused immediately.
+    fn linefeed_with_live_worker() -> (LinefeedApp, std::sync::mpsc::Sender<()>) {
+        let mut linefeed = linefeed_for_port(1);
+        assert!(linefeed.app.start_session_from_form());
+        let (cmd_tx, cmd_rx) = mpsc::unbounded_channel::<IrcCommand>();
+        let (msg_tx, msg_rx) = mpsc::channel::<IrcMessage>(8);
+        // The parked worker owns the far ends so the channels stay open.
+        let (handle, release) = parked_worker((cmd_rx, msg_tx));
+        linefeed.connection_thread = Some(handle);
+        linefeed.app.cmd_tx = Some(cmd_tx);
+        linefeed.app.msg_rx = Some(msg_rx);
+        linefeed.app.connecting = false;
+        linefeed.app.connected = true;
+        (linefeed, release)
+    }
+
+    #[test]
+    fn late_welcome_from_the_closing_connection_does_not_cancel_a_server_switch() {
+        let (mut linefeed, release) = linefeed_with_live_worker();
+        linefeed.app.connected = false;
+        linefeed.app.connecting = true;
+        linefeed
+            .app
+            .apply_unprofiled_endpoint("127.0.0.1", "2", false);
+        assert!(linefeed.app.switch_session_from_form("Changing servers"));
+
+        // Registration finished on the old socket after QUIT was queued.
+        linefeed.app.handle_incoming_message(
+            IrcMessage::parse(":old.example 001 tester :Welcome").unwrap(),
+        );
+        assert!(!linefeed.app.connected);
+        assert_eq!(
+            linefeed.app.connection_intent,
+            ConnectionIntent::ReconnectAfterClose
+        );
+
+        finish_worker_and_tick(&mut linefeed, release);
+
+        // The staged endpoint was promoted and connected to, instead of the
+        // old one being declared lost and auto-reconnected.
+        assert_eq!(linefeed.app.active_server_config().unwrap().port, 2);
+        assert!(linefeed.connection_thread.is_some());
+        assert!(
+            !linefeed
+                .app
+                .server_messages
+                .iter()
+                .any(|message| message.content.contains("Connection lost"))
+        );
+    }
+
+    #[test]
+    fn connect_right_after_a_manual_disconnect_survives_the_old_workers_exit() {
+        let (mut linefeed, release) = linefeed_with_live_worker();
+        linefeed.app.request_manual_disconnect(Some("bye".into()));
+        assert!(linefeed.app.start_session_from_form());
+
+        finish_worker_and_tick(&mut linefeed, release);
+
+        assert!(
+            linefeed.connection_thread.is_some(),
+            "the connect request was silently dropped"
+        );
+        assert_eq!(linefeed.app.connection_intent, ConnectionIntent::None);
+    }
+
+    #[test]
+    fn reconnect_right_after_a_manual_disconnect_is_not_reported_as_a_failure() {
+        let (mut linefeed, release) = linefeed_with_live_worker();
+        linefeed.app.request_manual_disconnect(Some("bye".into()));
+        linefeed.app.request_reconnect_after_close("Reconnecting");
+
+        finish_worker_and_tick(&mut linefeed, release);
+
+        assert!(linefeed.connection_thread.is_some());
+        assert!(
+            !linefeed
+                .app
+                .server_messages
+                .iter()
+                .any(|message| message.content.contains("Connection failed"))
+        );
+    }
+
+    #[test]
+    fn a_stale_manual_disconnect_does_not_hide_the_next_connections_failure() {
+        // A server that hangs up on every connection, so the worker fails fast.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                drop(stream);
+            }
+        });
+
+        // Disconnect with no worker left to consume the intent...
+        let mut linefeed = linefeed_for_port(port);
+        linefeed.app.connecting = false;
+        linefeed.app.request_manual_disconnect(None);
+        assert_eq!(
+            linefeed.app.connection_intent,
+            ConnectionIntent::ManualDisconnect
+        );
+
+        // ...then connect: the new worker owns a fresh intent, so its failure
+        // is reported and retried like any other.
+        assert!(linefeed.app.start_session_from_form());
+        linefeed.background_tick(&egui::Context::default());
+        assert_eq!(linefeed.app.connection_intent, ConnectionIntent::None);
+        tick_until(&mut linefeed, "refused connection to be reported", |l| {
+            l.app
+                .server_messages
+                .iter()
+                .any(|message| message.content.contains("Connection failed"))
+        });
     }
 
     #[test]
@@ -823,7 +986,9 @@ mod tests {
         let mut linefeed = linefeed_for_port(port);
         tick_until(&mut linefeed, "registration", |l| l.app.connected);
 
-        linefeed.app.request_manual_disconnect(Some("bye now".into()));
+        linefeed
+            .app
+            .request_manual_disconnect(Some("bye now".into()));
         tick_until(&mut linefeed, "worker exit", |l| {
             l.connection_thread.is_none()
         });

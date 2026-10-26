@@ -1344,6 +1344,10 @@ impl IrcApp {
     /// Called when a connection worker is about to start, after the previous
     /// worker (if any) has fully exited.
     pub(crate) fn begin_connection_attempt(&mut self) {
+        // The previous worker has exited, so any intent still recorded is
+        // stale (e.g. a disconnect issued while no worker was left to consume
+        // it) and must not be applied to this worker's exit (#247).
+        self.connection_intent = ConnectionIntent::None;
         self.reset_per_connection_state();
     }
 
@@ -2192,6 +2196,8 @@ impl IrcApp {
     }
 
     pub fn request_reconnect_after_close(&mut self, reason: &str) {
+        // An explicit reconnect starts over, even after auto-reconnect gave up.
+        self.reset_reconnect_state();
         if self.cmd_tx.is_some() {
             self.connection_intent = ConnectionIntent::ReconnectAfterClose;
             let _ = self.send_command(IrcCommand::Quit(Self::clamp_quit_reason(Some(
@@ -2202,7 +2208,11 @@ impl IrcApp {
             self.connection_lost = false;
             self.cmd_tx = None;
         } else {
-            self.connection_intent = ConnectionIntent::None;
+            // No live transport to close. The intent is deliberately left
+            // alone: a worker still winding down from an earlier disconnect or
+            // switch keeps the intent that describes it, so its exit is not
+            // mistaken for this attempt failing (#247). A stale intent with no
+            // worker is cleared when the next worker starts.
             self.connected = false;
             self.connecting = true;
             self.connection_lost = false;
@@ -2214,6 +2224,12 @@ impl IrcApp {
 
     fn fail_registration(&mut self, message: String) {
         self.add_server_message(ChatMessage::system_fmt(&message, &self.timestamp_format));
+        // A connection already being closed on purpose (disconnect, /server,
+        // /reconnect) can still deliver a late registration error. It must
+        // not turn a staged switch into a manual disconnect (#246).
+        if self.connection_intent != ConnectionIntent::None {
+            return;
+        }
         self.request_manual_disconnect(Some("Registration failed".to_string()));
     }
 
@@ -2394,7 +2410,11 @@ mod connection_lifecycle_tests {
             .try_send(IrcMessage::parse(":srv NOTICE * :late").unwrap())
             .unwrap();
         app.update_minimal();
-        assert!(app.server_messages.iter().all(|m| !m.content.contains("late")));
+        assert!(
+            app.server_messages
+                .iter()
+                .all(|m| !m.content.contains("late"))
+        );
 
         // Still held while the worker runs and within the grace period...
         app.release_closing_connection(false);
@@ -2424,6 +2444,53 @@ mod connection_lifecycle_tests {
 
         assert!(msg_tx.is_closed());
         assert!(app.closing_rx.is_none());
+    }
+
+    #[test]
+    fn late_registration_error_from_the_closing_connection_keeps_a_staged_switch() {
+        let mut app = lifecycle_app();
+        assert!(app.start_session_from_form());
+        let (tx, _rx) = mpsc::unbounded_channel();
+        app.cmd_tx = Some(tx);
+        app.apply_unprofiled_endpoint("other.example", "7000", false);
+        assert!(app.switch_session_from_form("Changing servers"));
+        assert_eq!(app.connection_intent, ConnectionIntent::ReconnectAfterClose);
+
+        app.handle_numeric(
+            ERR_PASSWDMISMATCH,
+            &["nick".to_string(), "Password incorrect".to_string()],
+        );
+
+        // The error is shown, but the switch the user asked for still happens.
+        assert_eq!(app.connection_intent, ConnectionIntent::ReconnectAfterClose);
+        assert!(app.pending_session.is_some());
+    }
+
+    #[test]
+    fn explicit_connects_start_with_a_fresh_auto_reconnect_budget() {
+        let mut app = lifecycle_app();
+        app.auto_reconnect = true;
+        app.max_reconnect_attempts = 3;
+        // Auto-reconnect gave up: the budget is spent and a retry is stale.
+        app.reconnect_attempts = 3;
+        app.connection_lost = true;
+        app.last_disconnect_time = Some(std::time::Instant::now());
+        assert!(!app.awaiting_reconnect());
+
+        assert!(app.start_session_from_form());
+        assert_eq!(app.reconnect_attempts, 0);
+        assert!(app.last_disconnect_time.is_none());
+
+        // The same holds for /reconnect and /server.
+        app.reconnect_attempts = 3;
+        app.connecting = false;
+        app.request_reconnect_after_close("Reconnecting");
+        assert_eq!(app.reconnect_attempts, 0);
+        app.reconnect_attempts = 3;
+        app.connecting = false;
+        app.apply_unprofiled_endpoint("other.example", "7000", false);
+        assert!(app.switch_session_from_form("Changing servers"));
+        assert_eq!(app.reconnect_attempts, 0);
     }
 
     fn history_request(placement: HistoryPlacement) -> PendingHistoryRequest {
@@ -2462,7 +2529,8 @@ mod connection_lifecycle_tests {
             IrcMessage::parse(":a!u@h BATCH +m1 draft/multiline #chan").unwrap(),
         );
         app.monitored_users.insert("alice".to_string());
-        app.pending_whox.insert("7".to_string(), "#chan".to_string());
+        app.pending_whox
+            .insert("7".to_string(), "#chan".to_string());
         app.next_whox_token = 8;
         app.known_users
             .insert("alice".to_string(), KnownUser::default());
@@ -2903,6 +2971,9 @@ impl IrcApp {
         match self.session_from_form() {
             Ok(session) => {
                 self.activate_session(session);
+                // An explicit connect starts over, even after auto-reconnect
+                // gave up: a stale attempt count would deny it any retries.
+                self.reset_reconnect_state();
                 self.connected = false;
                 self.connecting = true;
                 self.connection_lost = false;
@@ -2950,6 +3021,7 @@ impl IrcApp {
             self.request_reconnect_after_close(reason);
         } else {
             self.activate_session(session);
+            self.reset_reconnect_state();
             self.connected = false;
             self.connecting = true;
             self.connection_lost = false;
@@ -4469,10 +4541,17 @@ impl IrcApp {
             }
 
             RPL_WELCOME => {
+                // A 001 that was already in flight when QUIT was queued
+                // (disconnect, /server, /reconnect) belongs to the connection
+                // being closed. It must neither mark the session connected nor
+                // wipe the intent the lifecycle needs to finish the switch
+                // once that worker exits (#246).
+                if self.connection_intent != ConnectionIntent::None {
+                    return;
+                }
                 self.connected = true;
                 self.connecting = false;
                 self.reset_reconnect_state(); // Reset reconnect attempts on successful connection
-                self.connection_intent = ConnectionIntent::None;
                 self.nick_retry_attempts = 0;
                 // Clear any lag reading left over from a previous connection.
                 self.lag_ms = None;
