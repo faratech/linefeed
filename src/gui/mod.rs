@@ -1405,6 +1405,9 @@ impl IrcApp {
         for channel in self.channels.values_mut() {
             channel.abandon_user_burst();
         }
+        // Keys of JOINs the old socket never confirmed: the new connection's
+        // JOINs carry their own.
+        self.pending_channel_keys.clear();
     }
 
     /// Called when a connection worker is about to start, after the previous
@@ -4888,6 +4891,24 @@ impl IrcApp {
     }
 
     fn handle_numeric(&mut self, num: u16, params: &[String]) {
+        // A refused JOIN ends the attempt the key was sent for. Left in the
+        // map, the key would attach to the tab of whatever later JOIN of that
+        // channel (keyless, from an invite or a bouncer) the server confirms.
+        if matches!(
+            num,
+            ERR_NOSUCHCHANNEL
+                | ERR_TOOMANYCHANNELS
+                | ERR_CHANNELISFULL
+                | ERR_INVITEONLYCHAN
+                | ERR_BANNEDFROMCHAN
+                | ERR_BADCHANNELKEY
+                | ERR_BADCHANMASK
+                | ERR_NEEDREGGEDNICK
+        ) && let Some(channel) = params.get(1)
+        {
+            self.pending_channel_keys
+                .remove(&self.network_support.canonicalize(channel));
+        }
         match num {
             RPL_SAVENICK => {
                 // ircu/IRCnet/Undernet force a rename on nick collision; the
@@ -6214,7 +6235,8 @@ impl IrcApp {
 
     /// Verb and wire size of a command, for logs. The parameters can carry
     /// credentials (PASS, NickServ IDENTIFY, AUTHENTICATE), so they are never
-    /// logged (#227).
+    /// logged (#227), and neither is the size of a credential command: it
+    /// would give away the length of the secret.
     fn command_log_summary(cmd: &IrcCommand) -> String {
         let line = cmd.to_string();
         let untagged = line
@@ -6226,7 +6248,11 @@ impl IrcApp {
             .take_while(char::is_ascii_alphanumeric)
             .take(16)
             .collect();
-        format!("{verb} ({} bytes)", line.len())
+        if commands::command_line_contains_credentials(untagged) {
+            verb
+        } else {
+            format!("{verb} ({} bytes)", line.len())
+        }
     }
 
     fn client_tag_is_denied(&self, command: &IrcCommand) -> Option<String> {
@@ -8388,6 +8414,51 @@ mod tests {
     }
 
     #[test]
+    fn a_refused_join_does_not_leave_its_key_for_a_later_keyless_join() {
+        for refusal in [
+            ERR_NOSUCHCHANNEL,
+            ERR_TOOMANYCHANNELS,
+            ERR_CHANNELISFULL,
+            ERR_INVITEONLYCHAN,
+            ERR_BANNEDFROMCHAN,
+            ERR_BADCHANNELKEY,
+            ERR_BADCHANMASK,
+            ERR_NEEDREGGEDNICK,
+        ] {
+            let (mut app, mut rx) = test_app_connected();
+            app.set_session_nick("me".to_string(), true);
+            app.process_command("/join #sec hunter2");
+            assert_eq!(drain_commands(&mut rx).len(), 1);
+            assert!(!app.pending_channel_keys.is_empty());
+
+            app.handle_numeric(refusal, &["me".into(), "#sec".into(), "Cannot join".into()]);
+            assert!(
+                app.pending_channel_keys.is_empty(),
+                "{refusal}: the refused join's key was kept"
+            );
+
+            // The channel is later joined without a key (an invite, a
+            // bouncer, a keyless auto-join): it must not inherit the old one.
+            app.handle_incoming_message(IrcMessage::parse(":me!u@h JOIN #sec").unwrap());
+            assert_eq!(app.channels["#sec"].key, None, "{refusal}");
+        }
+    }
+
+    #[test]
+    fn a_new_connection_does_not_inherit_keys_of_joins_the_old_one_never_finished() {
+        let (mut app, mut rx) = test_app_connected();
+        app.set_session_nick("me".to_string(), true);
+        app.process_command("/join #sec hunter2");
+        assert_eq!(drain_commands(&mut rx).len(), 1);
+        assert!(!app.pending_channel_keys.is_empty());
+
+        // The connection drops before the server confirms the JOIN.
+        app.begin_connection_attempt();
+
+        assert!(app.pending_channel_keys.is_empty());
+    }
+
+    #[test]
     fn join_with_key_on_retained_tab_updates_the_stored_key() {
         let (mut app, mut rx) = test_app_connected();
         app.set_session_nick("me".to_string(), true);
@@ -9420,6 +9491,42 @@ mod tests {
         assert!(commands::command_line_contains_credentials(
             "/ns PASS hunter2"
         ));
+    }
+
+    #[test]
+    fn log_summaries_of_credential_commands_omit_the_size() {
+        // A logged byte count would give away the length of the secret.
+        for secret in [
+            IrcCommand::Pass("hunter2".into()),
+            IrcCommand::Authenticate("aHVudGVyMg==".into()),
+            IrcCommand::Privmsg("NickServ".into(), "IDENTIFY hunter2".into()),
+            IrcCommand::Notice("ChanServ".into(), "IDENTIFY #room hunter2".into()),
+            IrcCommand::Raw("OPER admin hunter2".into()),
+            IrcCommand::Raw("SQUERY NickServ :IDENTIFY hunter2".into()),
+            IrcCommand::Raw("@label=1 PRIVMSG NickServ :IDENTIFY hunter2".into()),
+        ] {
+            let summary = IrcApp::command_log_summary(&secret);
+            assert!(!summary.contains("bytes"), "{secret:?}: {summary}");
+            assert!(!summary.contains("hunter2"), "{secret:?}: {summary}");
+            assert!(!summary.is_empty());
+        }
+        assert_eq!(
+            IrcApp::command_log_summary(&IrcCommand::Pass("x".into())),
+            "PASS"
+        );
+
+        // Everything else keeps its size, which is what makes the log useful.
+        assert_eq!(
+            IrcApp::command_log_summary(&IrcCommand::Privmsg("#room".into(), "hello".into())),
+            "PRIVMSG (20 bytes)"
+        );
+        assert_eq!(
+            IrcApp::command_log_summary(&IrcCommand::Privmsg(
+                "NickServ".into(),
+                "INFO alice".into()
+            )),
+            "PRIVMSG (28 bytes)"
+        );
     }
 
     #[test]

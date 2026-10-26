@@ -139,6 +139,8 @@ pub const ERR_UNKNOWNMODE: u16 = 472;
 pub const ERR_INVITEONLYCHAN: u16 = 473;
 pub const ERR_BANNEDFROMCHAN: u16 = 474;
 pub const ERR_BADCHANNELKEY: u16 = 475;
+pub const ERR_BADCHANMASK: u16 = 476;
+pub const ERR_NEEDREGGEDNICK: u16 = 477;
 pub const ERR_CHANOPRIVSNEEDED: u16 = 482;
 
 // SASL authentication (IRCv3)
