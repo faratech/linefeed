@@ -2030,15 +2030,19 @@ impl IrcApp {
                 if !row.is_system {
                     // Own-credential chat rows: the local redacted copy has
                     // no msgid; replaying the server's verbatim copy would
-                    // re-render the secret. Keyword-only — the same safe
-                    // over-redaction as the ME/SAY decision (#149) — because
-                    // the original target list is unknowable here (multi-
-                    // target sends) and the sending nick may predate a
+                    // re-render the secret. Only for a service-shaped batch
+                    // target — the keywords (drop, group, login...) are
+                    // ordinary words in a channel, where an own line must
+                    // survive a reconnect replay. The keyword check itself
+                    // is not tied to the current nick, which may predate a
                     // GHOST/REGAIN (#163). Non-own rows are never touched.
                     if !self.sender_is_self(&row.sender) {
                         return true;
                     }
-                    return !commands::content_has_auth_command(&row.content);
+                    return !commands::service_message_contains_credentials(
+                        &batch.target,
+                        &row.content,
+                    );
                 }
                 let Some((nick, text)) = row
                     .content
@@ -2050,13 +2054,11 @@ impl IrcApp {
                 if !self.sender_is_self(nick) {
                     return true;
                 }
-                // A credential command's confirmation was redacted — locally,
-                // or via a multi-target send whose routed target here is not
-                // the service — so replaying the verbatim copy would
-                // re-display the secret. Keyword-only for self rows, matching
-                // the PRIVMSG branch (documented over-redaction; #166
-                // supersedes #157's service gate).
-                if commands::content_has_auth_command(text) {
+                // A credential command's confirmation was redacted locally,
+                // so replaying the verbatim copy would re-display the secret.
+                // Gated on a service-shaped batch target like the PRIVMSG
+                // branch: ordinary channel notices survive the replay.
+                if commands::service_message_contains_credentials(&batch.target, text) {
                     return false;
                 }
                 !confirmations.iter().any(|(target, confirmed_text)| {
@@ -9064,32 +9066,34 @@ mod tests {
     }
 
     #[test]
-    fn own_notice_starting_with_an_auth_keyword_is_dropped_from_replay() {
+    fn own_notice_starting_with_an_auth_keyword_is_dropped_from_service_replay() {
         let (mut app, _rx) = test_app_connected();
         app.set_session_nick("me".into(), true);
         app.handle_cap_message("ACK", &["echo-message".into()]);
         let mut channel = Channel::new();
         channel.joined = true;
-        app.channels.insert("#chan".to_string(), channel);
-        app.current_channel = Some("#chan".to_string());
+        app.channels.insert("NickServ".to_string(), channel);
+        app.current_channel = Some("NickServ".to_string());
 
-        // Multi-target credential notices (e.g. "/notice NickServ,#chan
-        // IDENTIFY pw") replay into a batch whose routed target is not the
-        // service: own rows with auth-keyword text are dropped keyword-only,
-        // mirroring the PRIVMSG branch (documented over-redaction; #166
-        // supersedes #157's service gate).
-        app.handle_incoming_message(IrcMessage::parse(":srv BATCH +r chathistory #chan").unwrap());
+        // An own notice with auth-keyword text replayed from a service query
+        // is dropped (over-redaction is the safe direction there); the
+        // channel counterpart is covered by
+        // replayed_own_channel_chat_with_credential_words_survives.
         app.handle_incoming_message(
-            IrcMessage::parse("@batch=r;msgid=n5 :me!u@h NOTICE #chan :IDENTIFY hunter15").unwrap(),
+            IrcMessage::parse(":srv BATCH +r chathistory NickServ").unwrap(),
+        );
+        app.handle_incoming_message(
+            IrcMessage::parse("@batch=r;msgid=n5 :me!u@h NOTICE NickServ :IDENTIFY hunter15")
+                .unwrap(),
         );
         // Non-auth own notices survive.
         app.handle_incoming_message(
-            IrcMessage::parse("@batch=r;msgid=n6 :me!u@h NOTICE #chan :see you at the vote")
+            IrcMessage::parse("@batch=r;msgid=n6 :me!u@h NOTICE NickServ :see you at the vote")
                 .unwrap(),
         );
         app.handle_incoming_message(IrcMessage::parse(":srv BATCH -r").unwrap());
 
-        let rows: Vec<&str> = app.channels["#chan"]
+        let rows: Vec<&str> = app.channels["NickServ"]
             .messages
             .iter()
             .map(|message| message.content.as_str())
@@ -9209,29 +9213,73 @@ mod tests {
     }
 
     #[test]
-    fn replayed_own_credential_row_is_dropped_for_multi_target_and_former_nick() {
+    fn replayed_own_credential_row_is_dropped_for_service_batches_and_former_nick() {
         let (mut app, _rx) = test_app_connected();
         app.set_session_nick("Guest123".into(), true);
         app.set_session_nick("alice".into(), true); // GHOST/REGAIN: Guest123 is a past nick
         app.handle_cap_message("ACK", &["draft/chathistory".into()]);
         let mut channel = Channel::new();
         channel.joined = true;
-        app.channels.insert("#chan".to_string(), channel);
-        app.current_channel = Some("#chan".to_string());
+        app.channels.insert("NickServ".to_string(), channel);
+        app.current_channel = Some("NickServ".to_string());
 
-        // Multi-target send: locally redacted because the target LIST
-        // contains NickServ, but the #chan replay's routed target is not a
-        // service — the keyword-only own-row drop must still catch it.
-        app.handle_incoming_message(IrcMessage::parse(":srv BATCH +r chathistory #chan").unwrap());
+        // The sending nick predates the GHOST/REGAIN: the keyword check still
+        // runs for any own row replayed from a service query.
         app.handle_incoming_message(
-            IrcMessage::parse("@batch=r;msgid=n7 :Guest123!u@h PRIVMSG #chan :IDENTIFY hunter13")
+            IrcMessage::parse(":srv BATCH +r chathistory NickServ").unwrap(),
+        );
+        app.handle_incoming_message(
+            IrcMessage::parse(
+                "@batch=r;msgid=n7 :Guest123!u@h PRIVMSG NickServ :IDENTIFY hunter13",
+            )
+            .unwrap(),
+        );
+        app.handle_incoming_message(
+            IrcMessage::parse("@batch=r;msgid=n9 :Guest123!u@h NOTICE NickServ :IDENTIFY hunter14")
                 .unwrap(),
         );
         // A non-credential own row under the former nick must survive.
         app.handle_incoming_message(
-            IrcMessage::parse("@batch=r;msgid=n8 :Guest123!u@h PRIVMSG #chan :hello there")
+            IrcMessage::parse("@batch=r;msgid=n8 :Guest123!u@h PRIVMSG NickServ :INFO alice")
                 .unwrap(),
         );
+        app.handle_incoming_message(IrcMessage::parse(":srv BATCH -r").unwrap());
+
+        let rows: Vec<&str> = app.channels["NickServ"]
+            .messages
+            .iter()
+            .map(|message| message.content.as_str())
+            .collect();
+        assert!(
+            rows.iter()
+                .all(|content| !content.contains("hunter13") && !content.contains("hunter14")),
+            "{rows:?}"
+        );
+        assert!(rows.contains(&"INFO alice"), "{rows:?}");
+    }
+
+    #[test]
+    fn replayed_own_channel_chat_with_credential_words_survives() {
+        // "drop me a line", "group chat", "login works" are ordinary words in
+        // a channel: the keyword drop applies only to service-shaped targets.
+        let (mut app, _rx) = test_app_connected();
+        app.set_session_nick("me".into(), true);
+        app.handle_cap_message("ACK", &["draft/chathistory".into()]);
+        let mut channel = Channel::new();
+        channel.joined = true;
+        app.channels.insert("#chan".to_string(), channel);
+        app.current_channel = Some("#chan".to_string());
+
+        app.handle_incoming_message(IrcMessage::parse(":srv BATCH +r chathistory #chan").unwrap());
+        for (id, line) in [
+            ("c1", "PRIVMSG #chan :drop me a line"),
+            ("c2", "PRIVMSG #chan :group chat tonight?"),
+            ("c3", "NOTICE #chan :login works now"),
+        ] {
+            app.handle_incoming_message(
+                IrcMessage::parse(&format!("@batch=r;msgid={id} :me!u@h {line}")).unwrap(),
+            );
+        }
         app.handle_incoming_message(IrcMessage::parse(":srv BATCH -r").unwrap());
 
         let rows: Vec<&str> = app.channels["#chan"]
@@ -9239,11 +9287,14 @@ mod tests {
             .iter()
             .map(|message| message.content.as_str())
             .collect();
+        for expected in ["drop me a line", "group chat tonight?"] {
+            assert!(rows.contains(&expected), "{expected}: {rows:?}");
+        }
         assert!(
-            rows.iter().all(|content| !content.contains("hunter13")),
+            rows.iter()
+                .any(|content| content.contains("login works now")),
             "{rows:?}"
         );
-        assert!(rows.contains(&"hello there"), "{rows:?}");
     }
 
     #[test]

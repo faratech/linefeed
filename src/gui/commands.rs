@@ -2559,9 +2559,13 @@ pub(super) fn content_has_auth_command(message: &str) -> bool {
         return true;
     }
     match command.as_str() {
-        // Atheme `DROP <nick> <password>`. DROP is an ordinary word, so a
-        // bare one stays unredacted; any argument may be the password.
-        "DROP" => words.next().is_some(),
+        // Atheme `DROP <nick> <password>` and Anope `DROP #chan`. DROP is an
+        // ordinary word, so only the service shapes count: a channel
+        // argument, or two or more arguments (one may be the password).
+        "DROP" => match (words.next(), words.next()) {
+            (Some(first), second) => second.is_some() || first.starts_with(['#', '&', '!']),
+            (None, _) => false,
+        },
         // `SET PASSWORD <pw>`, `SET #chan PASSWORD <pw>` and Anope's
         // `SASET <nick> PASSWORD <pw>`: the keyword is the first or second
         // word after the command.
@@ -3861,6 +3865,27 @@ mod tests {
             "/ns saset alice password x"
         ));
         assert!(!command_line_contains_credentials("/ns set email a@b.test"));
+    }
+
+    #[test]
+    fn drop_is_a_credential_command_only_with_a_channel_or_two_arguments() {
+        // Atheme `DROP <nick> <pw>`, Anope `DROP #chan`; one plain word is
+        // ordinary text ("drop it").
+        for (text, expected) in [
+            ("DROP", false),
+            ("drop it", false),
+            ("drop alice", false),
+            ("drop #chan", true),
+            ("DROP &chan", true),
+            ("DROP mynick hunter2", true),
+            ("drop me a line", true),
+        ] {
+            assert_eq!(content_has_auth_command(text), expected, "{text}");
+        }
+        assert!(!service_message_contains_credentials("NickServ", "drop it"));
+        assert!(!command_line_contains_credentials("/say drop it"));
+        assert!(!command_line_contains_credentials("/ns drop alice"));
+        assert!(command_line_contains_credentials("/cs drop #chan"));
     }
 
     #[test]
