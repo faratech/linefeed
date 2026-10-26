@@ -1,6 +1,6 @@
 //! IRC command processing and help system
 
-use super::helpers::nick_to_mask;
+use super::helpers::{is_extended_ban, mask_matches, nick_to_mask};
 use super::{ChatMessage, IrcApp};
 use crate::irc::IrcCommand;
 
@@ -994,12 +994,13 @@ impl IrcApp {
                     if let Some(channel) = &self.current_channel.clone()
                         && self.is_channel_name(channel)
                     {
-                        let mask = nick_to_mask(args);
-                        self.send_command(IrcCommand::Mode(
-                            channel.clone(),
-                            Some("-b".to_string()),
-                            vec![mask],
-                        ));
+                        for mask in self.unban_masks_for(args) {
+                            self.send_command(IrcCommand::Mode(
+                                channel.clone(),
+                                Some("-b".to_string()),
+                                vec![mask],
+                            ));
+                        }
                     }
                 } else {
                     self.add_message_to_current(ChatMessage::system("Usage: /unban <nick|mask>"));
@@ -1019,8 +1020,10 @@ impl IrcApp {
                     // Ban first, then kick. nick_to_mask passes a full/partial
                     // hostmask through and completes a bare nick to nick!*@*
                     // (blindly appending "!*@*" to a mask built a garbage ban).
-                    let is_mask =
-                        target.contains('!') || target.contains('@') || target.contains('*');
+                    let is_mask = is_extended_ban(target)
+                        || target.contains('!')
+                        || target.contains('@')
+                        || target.contains('*');
                     let mask = self.ban_mask_for(target);
                     self.send_command(IrcCommand::Mode(
                         channel.clone(),
@@ -2041,7 +2044,7 @@ impl IrcApp {
     }
 
     fn ban_mask_for(&self, value: &str) -> String {
-        if value.contains(['!', '@', '*']) {
+        if is_extended_ban(value) || value.contains(['!', '@', '*']) {
             return nick_to_mask(value);
         }
         self.current_channel
@@ -2054,6 +2057,54 @@ impl IrcApp {
                 _ => None,
             })
             .unwrap_or_else(|| nick_to_mask(value))
+    }
+
+    /// The masks `/unban <value>` removes. A hostmask or extended ban is used
+    /// as typed. A bare nick is resolved through the channel's ban list to the
+    /// entries that cover it: `/ban nick` sets a mask built from the user's
+    /// host, which `nick!*@*` would never undo (#235). With no match it falls
+    /// back to the mask `/ban` would build.
+    fn unban_masks_for(&self, value: &str) -> Vec<String> {
+        if is_extended_ban(value) || value.contains(['!', '@', '*']) {
+            return vec![nick_to_mask(value)];
+        }
+        let channel = self
+            .current_channel
+            .as_deref()
+            .and_then(|channel| self.channel_key(channel))
+            .and_then(|channel| self.channels.get(&channel));
+        if let Some(channel) = channel {
+            let nick_key = self.network_support.canonicalize(value);
+            let identity =
+                channel
+                    .get_user(value)
+                    .and_then(|user| match (&user.username, &user.hostname) {
+                        (Some(username), Some(hostname)) => Some(
+                            self.network_support
+                                .canonicalize(&format!("{}!{username}@{hostname}", user.nick)),
+                        ),
+                        _ => None,
+                    });
+            let covering: Vec<String> = channel
+                .bans
+                .iter()
+                .filter(|ban| {
+                    let mask = self.network_support.canonicalize(&ban.mask);
+                    // A ban naming this nick (also once the user has left),
+                    // or any ban whose mask matches the user's known host.
+                    mask.split_once('!')
+                        .is_some_and(|(nick, _)| nick == nick_key)
+                        || identity
+                            .as_deref()
+                            .is_some_and(|identity| mask_matches(&mask, identity))
+                })
+                .map(|ban| ban.mask.clone())
+                .collect();
+            if !covering.is_empty() {
+                return covering;
+            }
+        }
+        vec![self.ban_mask_for(value)]
     }
 
     /// Secrets and automation belong to one configured network profile. An
@@ -2102,8 +2153,8 @@ impl IrcApp {
                 "=== Operator Commands ===",
                 vec![
                     "/kick <nick> [why]  - Kick user (alias: /k)",
-                    "/ban <mask>         - Ban user (+b)",
-                    "/unban <mask>       - Remove ban (-b)",
+                    "/ban <nick|mask>    - Ban user or mask/extban (+b)",
+                    "/unban <nick|mask>  - Remove ban (-b)",
                     "/kickban <nick>     - Ban and kick (alias: /kb)",
                     "/op <nick>          - Give ops (+o)",
                     "/deop <nick>        - Remove ops (-o)",
@@ -2320,9 +2371,9 @@ pub(super) fn content_has_auth_command(message: &str) -> bool {
         // `SET PASSWORD <pw>`, `SET #chan PASSWORD <pw>` and Anope's
         // `SASET <nick> PASSWORD <pw>`: the keyword is the first or second
         // word after the command.
-        "SET" | "SASET" => words.take(2).any(|word| {
-            word.eq_ignore_ascii_case("PASSWORD") || word.eq_ignore_ascii_case("PASS")
-        }),
+        "SET" | "SASET" => words
+            .take(2)
+            .any(|word| word.eq_ignore_ascii_case("PASSWORD") || word.eq_ignore_ascii_case("PASS")),
         _ => false,
     }
 }
@@ -2713,6 +2764,109 @@ mod tests {
         );
     }
 
+    /// An app in `#chan` with `alice` (`~alice@host.example`) present.
+    fn ban_command_app() -> (IrcApp, mpsc::UnboundedReceiver<IrcCommand>) {
+        let (mut app, rx) = connected_command_app();
+        let mut channel = Channel::new();
+        channel.joined = true;
+        channel.add_user("alice", crate::gui::types::UserMode::Normal);
+        let alice = channel.get_user_mut("alice").unwrap();
+        alice.username = Some("~alice".into());
+        alice.hostname = Some("host.example".into());
+        app.channels.insert("#chan".into(), channel);
+        app.current_channel = Some("#chan".into());
+        (app, rx)
+    }
+
+    fn expect_mode(rx: &mut mpsc::UnboundedReceiver<IrcCommand>, mode: &str, mask: &str) {
+        match rx.try_recv() {
+            Ok(IrcCommand::Mode(channel, Some(sent_mode), params)) => {
+                assert_eq!(channel, "#chan");
+                assert_eq!(sent_mode, mode);
+                assert_eq!(params, vec![mask.to_string()]);
+            }
+            other => panic!("expected MODE {mode} {mask}, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unban_nick_undoes_the_mask_ban_set() {
+        // /ban resolves alice's host, so /unban alice must remove that mask
+        // rather than the never-set alice!*@* (#235).
+        let (mut app, mut rx) = ban_command_app();
+        app.process_command("/ban alice");
+        expect_mode(&mut rx, "+b", "*!~alice@host.example");
+        app.channels
+            .get_mut("#chan")
+            .unwrap()
+            .apply_mode_list_change('+', 'b', "*!~alice@host.example", "me");
+
+        app.process_command("/unban alice");
+        expect_mode(&mut rx, "-b", "*!~alice@host.example");
+        assert!(rx.try_recv().is_err());
+
+        // Even before the ban list was fetched, the same host mask is used.
+        app.channels.get_mut("#chan").unwrap().bans.clear();
+        app.process_command("/unban alice");
+        expect_mode(&mut rx, "-b", "*!~alice@host.example");
+    }
+
+    #[test]
+    fn unban_nick_matches_broader_bans_and_departed_nicks() {
+        let (mut app, mut rx) = ban_command_app();
+        {
+            let channel = app.channels.get_mut("#chan").unwrap();
+            channel.apply_mode_list_change('+', 'b', "*!*@*.example", "op");
+            channel.apply_mode_list_change('+', 'b', "*!*@other.test", "op");
+            channel.apply_mode_list_change('+', 'b', "carol!*@*", "op");
+        }
+        // Only the ban that actually covers alice is lifted.
+        app.process_command("/unban alice");
+        expect_mode(&mut rx, "-b", "*!*@*.example");
+        assert!(rx.try_recv().is_err());
+
+        // A nick no longer in the channel resolves by the nick part of a ban.
+        app.process_command("/unban CAROL");
+        expect_mode(&mut rx, "-b", "carol!*@*");
+
+        // Unknown nick with no matching entry: the plain nick mask.
+        app.process_command("/unban dave");
+        expect_mode(&mut rx, "-b", "dave!*@*");
+
+        // Masks are used as typed.
+        app.process_command("/unban *!*@other.test");
+        expect_mode(&mut rx, "-b", "*!*@other.test");
+        app.process_command("/unban bob@host");
+        expect_mode(&mut rx, "-b", "bob!*@host");
+    }
+
+    #[test]
+    fn extended_bans_pass_through_ban_kickban_and_unban() {
+        // $a:account, ~a:account and $j:#chan are not nicks: no !*@* suffix,
+        // and /kickban has no nick to kick (#259).
+        let (mut app, mut rx) = ban_command_app();
+        for extban in [
+            "$a:troll",
+            "~a:troll",
+            "$j:#other",
+            "$a",
+            "$~a",
+            "~q:*!*@bad.host",
+            "m:*!*@x",
+        ] {
+            app.process_command(&format!("/ban {extban}"));
+            expect_mode(&mut rx, "+b", extban);
+            app.process_command(&format!("/unban {extban}"));
+            expect_mode(&mut rx, "-b", extban);
+            app.process_command(&format!("/kickban {extban} go away"));
+            expect_mode(&mut rx, "+b", extban);
+            assert!(rx.try_recv().is_err(), "{extban}: no KICK for an extban");
+        }
+        // A wildcard inside the extban must not be completed either.
+        app.process_command("/ban $a:tro*");
+        expect_mode(&mut rx, "+b", "$a:tro*");
+    }
+
     #[test]
     fn unknown_valid_commands_pass_through_without_allowing_line_injection() {
         let (mut app, mut rx) = connected_command_app();
@@ -2946,7 +3100,9 @@ mod tests {
         assert!(command_line_contains_credentials(
             "/cs set #chan password hunter2"
         ));
-        assert!(command_line_contains_credentials("/ns saset alice password x"));
+        assert!(command_line_contains_credentials(
+            "/ns saset alice password x"
+        ));
         assert!(!command_line_contains_credentials("/ns set email a@b.test"));
     }
 

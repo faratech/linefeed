@@ -1,12 +1,31 @@
 //! Helper utilities for the GUI module
 
+/// Whether `value` is an extended ban ("$a:account", "$j:#chan", "~a:account",
+/// "m:mask"): server-defined matching syntax, not a nick or a hostmask. It must
+/// reach MODE unchanged. A nick can never start with `$` or contain ':', so
+/// these forms cannot be mistaken for one.
+pub fn is_extended_ban(value: &str) -> bool {
+    let mut chars = value.chars();
+    match chars.next() {
+        Some('$') => true,
+        Some('~') => {
+            matches!((chars.next(), chars.next()), (Some(kind), Some(':')) if kind.is_ascii_alphabetic())
+        }
+        Some(kind) if kind.is_ascii_alphabetic() => chars.next() == Some(':'),
+        _ => false,
+    }
+}
+
 /// Convert a nick or partial mask into a complete `nick!user@host` ban mask.
-/// A full mask (a '!' followed later by an '@') is returned unchanged; partial
-/// forms like "nick", "nick@host", or "nick!user" are completed with `*`
-/// wildcards so the result is always a valid mask.
+/// A full mask (a '!' followed later by an '@') or an extended ban is returned
+/// unchanged; partial forms like "nick", "nick@host", or "nick!user" are
+/// completed with `*` wildcards so the result is always a valid mask.
 pub fn nick_to_mask(arg: &str) -> String {
     fn or_star(s: &str) -> &str {
         if s.is_empty() { "*" } else { s }
+    }
+    if is_extended_ban(arg) {
+        return arg.to_string();
     }
     // Already a full nick!user@host mask? Pass it through.
     if let Some(bang) = arg.find('!')
@@ -257,6 +276,38 @@ mod tests {
         assert_eq!(nick_to_mask("nick!user"), "nick!user@*");
         assert_eq!(nick_to_mask("*!*@*"), "*!*@*");
         assert_eq!(nick_to_mask("*@host"), "*!*@host");
+    }
+
+    #[test]
+    fn extended_bans_are_recognised_and_left_alone() {
+        for extban in [
+            "$a:account",
+            "$a",
+            "$~a",
+            "$j:#chan",
+            "$a:acc*",
+            "~a:account",
+            "~q:nick!user@host",
+            "~t:5:*!*@host",
+            "R:account",
+            "m:*!*@host",
+        ] {
+            assert!(is_extended_ban(extban), "{extban}");
+            assert_eq!(nick_to_mask(extban), extban);
+        }
+        for plain in [
+            "nick",
+            "a",
+            "~",
+            "~1:x",
+            "nick!user@host",
+            "*!*@host",
+            "*@2001:db8::1",
+            "x!*@2001:db8::1",
+            "",
+        ] {
+            assert!(!is_extended_ban(plain), "{plain}");
+        }
     }
 
     #[test]
