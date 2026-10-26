@@ -553,7 +553,7 @@ fn download(
     if expected != digest(&offer.asset)?.to_ascii_lowercase() {
         return Err(io::Error::other("GitHub and release checksums disagree"));
     }
-    let (attempt, directory) = install::stage_directory(paths)?;
+    let (attempt, directory, claim) = install::stage_directory(paths)?;
     let result = (|| {
         let partial = directory.join("download.part");
         let mut file = install::new_file(&partial)?;
@@ -598,6 +598,10 @@ fn download(
         publish_staged(paths, &tx)?;
         Ok(tx)
     })();
+    // Release the claim first: Windows cannot delete a directory holding an
+    // open handle. A kill before this point leaves the directory for the
+    // startup sweep (#270).
+    drop(claim);
     if result.is_err() {
         let _ = fs::remove_dir_all(directory);
     }
@@ -846,7 +850,7 @@ mod tests {
         };
         platform::private_dir(&paths.state).unwrap();
         fs::write(&paths.target, b"original executable").unwrap();
-        let (attempt, directory) = install::stage_directory(&paths).unwrap();
+        let (attempt, directory, _claim) = install::stage_directory(&paths).unwrap();
         let tx = Transaction {
             paths: paths.clone(),
             attempt,
@@ -879,7 +883,7 @@ mod tests {
     }
     /// A second verified candidate for the fixture's installation.
     fn newer_candidate(paths: &Paths) -> Transaction {
-        let (attempt, directory) = install::stage_directory(paths).unwrap();
+        let (attempt, directory, _claim) = install::stage_directory(paths).unwrap();
         let tx = Transaction {
             paths: paths.clone(),
             attempt,

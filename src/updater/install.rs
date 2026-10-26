@@ -261,7 +261,14 @@ impl Transaction {
     }
 }
 
-pub fn stage_directory(paths: &Paths) -> io::Result<(String, PathBuf)> {
+/// Named inside every staging directory: records which installation owns it
+/// and, while locked, that a live download is still using it.
+const CLAIM: &str = "owner.lock";
+
+/// Create a staging directory and claim it. The returned file keeps the claim
+/// locked until dropped, so a download killed by an exit or crash can later be
+/// told apart from one still in progress (#270).
+pub fn stage_directory(paths: &Paths) -> io::Result<(String, PathBuf, File)> {
     let attempt = nonce()?;
     let directory = paths
         .target
@@ -271,7 +278,71 @@ pub fn stage_directory(paths: &Paths) -> io::Result<(String, PathBuf)> {
     platform::private_dir(&directory).map_err(|_| {
         io::Error::other("Cannot update this location; download the release manually")
     })?;
-    Ok((attempt, directory))
+    let claim = (|| {
+        let mut claim = new_file(&directory.join(CLAIM))?;
+        claim.write_all(paths.state.to_string_lossy().as_bytes())?;
+        claim.lock()?;
+        Ok::<_, io::Error>(claim)
+    })()
+    .inspect_err(|_| {
+        let _ = fs::remove_dir_all(&directory);
+    })?;
+    Ok((attempt, directory, claim))
+}
+
+/// Remove staging directories that downloads abandoned when the app exited or
+/// crashed mid-download (#270). Only a directory carrying this installation's
+/// claim with nothing holding its lock qualifies: the journal's own directory,
+/// other installations' directories beside the same executable folder, and
+/// directories from releases that predate claims are never touched. A damaged
+/// journal skips the sweep because a directory may hold the only recovery copy.
+fn sweep_orphans(paths: &Paths) {
+    let keep = if paths.journal().exists() {
+        match read_json::<Transaction>(&paths.journal()) {
+            Ok(tx) => Some(tx.directory),
+            Err(_) => return,
+        }
+    } else {
+        None
+    };
+    let Some(Ok(entries)) = paths.target.parent().map(fs::read_dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let is_staging = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| name.strip_prefix(".linefeed-update-"))
+            .is_some_and(|attempt| {
+                attempt.len() == 32 && attempt.bytes().all(|b| b.is_ascii_hexdigit())
+            });
+        // file_type() does not follow links, so a link is never swept.
+        let is_directory = entry.file_type().is_ok_and(|t| t.is_dir());
+        let path = entry.path();
+        if is_staging && is_directory && keep.as_ref() != Some(&path) && abandoned(paths, &path)
+        {
+            let _ = fs::remove_dir_all(&path);
+        }
+    }
+}
+
+/// Whether `directory` carries this installation's claim and no live download
+/// holds it. The claim is released before the caller removes the directory.
+fn abandoned(paths: &Paths, directory: &Path) -> bool {
+    let mut options = OpenOptions::new();
+    options.read(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    let Ok(mut claim) = options.open(directory.join(CLAIM)) else {
+        return false;
+    };
+    let mut owner = String::new();
+    claim.try_lock().is_ok()
+        && claim.read_to_string(&mut owner).is_ok()
+        && owner == paths.state.to_string_lossy()
 }
 pub fn executable_copy(source: &Path, destination: &Path) -> io::Result<()> {
     let mut from = File::open(source)?;
@@ -342,6 +413,9 @@ fn start_updater(
             ),
             Err(error) => return Err(error),
         };
+    if update_error.is_none() && supervised.is_none() {
+        sweep_orphans(&paths);
+    }
     let running = paths.run_lock()?;
     running.lock_shared()?;
     drop(lock);
@@ -986,7 +1060,7 @@ mod tests {
             };
             platform::private_dir(&paths.state).unwrap();
             fs::write(&paths.target, b"original executable").unwrap();
-            let (attempt, directory) = stage_directory(&paths).unwrap();
+            let (attempt, directory, _claim) = stage_directory(&paths).unwrap();
             let tx = Transaction {
                 paths,
                 attempt,
@@ -1203,6 +1277,86 @@ mod tests {
             fs::read(fixture.tx.paths.journal()).unwrap(),
             b"invalid journal"
         );
+    }
+    /// Sweep until `directory` disappears: a handle another test's fork keeps
+    /// alive for an instant can make a just-released claim look busy.
+    fn swept_eventually(paths: &Paths, directory: &Path) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while directory.exists() && Instant::now() < deadline {
+            sweep_orphans(paths);
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        !directory.exists()
+    }
+    #[test]
+    fn staging_abandoned_by_an_interrupted_download_is_swept() {
+        // A download killed mid-way (exit or crash) leaves its directory and a
+        // partial file beside the executable (#270).
+        let fixture = Fixture::new();
+        let (_, orphan, claim) = stage_directory(&fixture.tx.paths).unwrap();
+        fs::write(orphan.join("download.part"), vec![0u8; 4096]).unwrap();
+        // While the download is alive its claim protects the directory.
+        sweep_orphans(&fixture.tx.paths);
+        assert!(orphan.join("download.part").exists());
+        drop(claim);
+        assert!(swept_eventually(&fixture.tx.paths, &orphan));
+        // The staged update the journal points to is never swept.
+        assert!(fixture.tx.directory.exists());
+        fixture.tx.validate().unwrap();
+    }
+    #[test]
+    fn startup_sweeps_abandoned_staging_but_not_after_a_damaged_journal() {
+        let fixture = Fixture::new();
+        let (_, orphan, claim) = stage_directory(&fixture.tx.paths).unwrap();
+        drop(claim);
+        let startup = startup_with(Ok(fixture.tx.paths.clone()), None, Duration::from_secs(1));
+        assert!(startup.unwrap().update_error.is_none());
+        assert!(swept_eventually(&fixture.tx.paths, &orphan));
+
+        // A damaged journal means a staging directory may hold the only copy
+        // of the old executable: nothing is deleted.
+        let (_, kept, claim) = stage_directory(&fixture.tx.paths).unwrap();
+        drop(claim);
+        fs::write(fixture.tx.paths.journal(), b"invalid journal").unwrap();
+        let startup = startup_with(Ok(fixture.tx.paths.clone()), None, Duration::from_secs(1));
+        assert!(startup.unwrap().update_error.is_some());
+        sweep_orphans(&fixture.tx.paths);
+        assert!(kept.exists());
+    }
+    #[test]
+    fn sweep_leaves_foreign_unclaimed_and_linked_directories_alone() {
+        let fixture = Fixture::new();
+        let paths = &fixture.tx.paths;
+        let parent = paths.target.parent().unwrap();
+        // Another installation beside the same folder (a renamed copy).
+        let other = Paths {
+            target: paths.target.clone(),
+            state: fixture.root.join("other-state"),
+        };
+        let (_, foreign, claim) = stage_directory(&other).unwrap();
+        drop(claim);
+        // Not created by a claim-aware release: nothing says it is ours.
+        let unclaimed = parent.join(format!(".linefeed-update-{}", nonce().unwrap()));
+        platform::private_dir(&unclaimed).unwrap();
+        // Not a staging name at all.
+        let unrelated = parent.join(".linefeed-update-notes");
+        platform::private_dir(&unrelated).unwrap();
+        // A link to a claimed directory is never followed.
+        let (_, target_dir, claim) = stage_directory(paths).unwrap();
+        drop(claim);
+        #[cfg(unix)]
+        let link = {
+            let link = parent.join(format!(".linefeed-update-{}", nonce().unwrap()));
+            std::os::unix::fs::symlink(&target_dir, &link).unwrap();
+            link
+        };
+        sweep_orphans(paths);
+        for kept in [&foreign, &unclaimed, &unrelated] {
+            assert!(kept.exists());
+        }
+        assert!(swept_eventually(paths, &target_dir));
+        #[cfg(unix)]
+        assert!(fs::symlink_metadata(&link).is_ok());
     }
     #[test]
     fn updater_infrastructure_failure_does_not_stop_a_normal_launch() {
