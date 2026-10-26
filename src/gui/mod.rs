@@ -6144,6 +6144,9 @@ impl IrcApp {
     fn select_tab(&mut self, target: Option<String>) {
         self.current_channel = target;
         self.selected_user = None;
+        // Completion matches belong to the previous tab's users, and the
+        // input text (which normally invalidates them) may be unchanged (#266).
+        self.reset_tab_completion();
         if let Some(channel_name) = &self.current_channel {
             if let Some(channel) = self.channels.get_mut(channel_name) {
                 channel.unread = 0;
@@ -6604,9 +6607,8 @@ impl eframe::App for IrcApp {
                     RichText::new(server_label)
                 };
                 if ui.selectable_label(server_selected, server_text).clicked() {
-                    self.current_channel = None;
-                    self.server_unread = 0;
-                    self.selected_user = None; // Clear user selection when switching
+                    // Clears the unread count, user selection and completion state.
+                    self.select_tab(None);
                 }
 
                 ui.separator();
@@ -7313,6 +7315,36 @@ mod tests {
         app.input_text = "/jo".to_string();
         app.handle_tab_completion();
         assert_eq!(app.input_text, "/join ");
+    }
+
+    #[test]
+    fn switching_tabs_drops_in_progress_tab_completion() {
+        let mut app = test_app();
+        let mut first = Channel::new();
+        first.add_user("Alina", UserMode::Normal);
+        first.add_user("Alice", UserMode::Normal);
+        app.channels.insert("#one".to_string(), first);
+        app.channels.insert("#two".to_string(), Channel::new());
+        app.current_channel = Some("#one".to_string());
+
+        app.input_text = "Al".to_string();
+        app.handle_tab_completion();
+        assert_eq!(app.input_text, "Alice: ");
+
+        // The input is untouched by the switch, so only the tab change can
+        // invalidate the first channel's matches (#266).
+        app.select_tab(Some("#two".to_string()));
+        assert!(app.tab_completion.is_none());
+        app.handle_tab_completion();
+        assert_eq!(app.input_text, "Alice: ", "no stale nick cycling");
+
+        // Selecting the server buffer is a tab change too.
+        app.select_tab(Some("#one".to_string()));
+        app.input_text = "Al".to_string();
+        app.handle_tab_completion();
+        assert!(app.tab_completion.is_some());
+        app.select_tab(None);
+        assert!(app.tab_completion.is_none());
     }
 
     #[test]
