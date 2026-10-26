@@ -699,27 +699,37 @@ fn scram_sha256_response(
 }
 
 /// Also embedded in the update-restart session snapshot, written by the
-/// previous release: `serde(default)` lets fields added since still parse.
+/// previous release. Fields added since default when absent (`Option`s
+/// already do), but those naming the endpoint and the account the credentials
+/// belong to are required: a snapshot missing them must fail to parse, not
+/// restore to the built-in default server and send its passwords there.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
 pub struct ServerConfig {
     pub host: String,
     pub port: u16,
     pub use_tls: bool,
+    #[serde(default)]
     pub accept_invalid_certs: bool,
     pub nick: String,
     pub username: String,
+    #[serde(default = "default_realname")]
     pub realname: String,
     pub password: Option<String>,
     // SASL authentication
     pub sasl_username: Option<String>,
     pub sasl_password: Option<String>,
+    #[serde(default)]
     pub sasl_mechanism: SaslMechanism,
+    #[serde(default)]
     pub sasl_required: bool,
     pub tls_client_cert_path: Option<String>,
     pub tls_client_key_path: Option<String>,
     pub pre_away_message: Option<String>,
     pub persistence_profile: Option<String>,
+}
+
+fn default_realname() -> String {
+    "Linefeed".to_string()
 }
 
 impl Default for ServerConfig {
@@ -731,7 +741,7 @@ impl Default for ServerConfig {
             accept_invalid_certs: false,
             nick: "Linefeed_User".to_string(),
             username: "rustirc".to_string(),
-            realname: "Linefeed".to_string(),
+            realname: default_realname(),
             password: None,
             sasl_username: None,
             sasl_password: None,

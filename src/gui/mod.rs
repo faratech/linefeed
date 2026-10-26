@@ -38,19 +38,25 @@ struct EndpointKey {
 /// editable Settings/Connect fields may change while a socket is active; those
 /// changes must not relabel the session or alter what an automatic reconnect
 /// authenticates with and executes.
-#[derive(Clone, Default, serde::Serialize, serde::Deserialize)]
-#[serde(default)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 struct SessionConfig {
+    /// Required: see `ServerConfig`. Without it credentials would have no
+    /// endpoint to go to.
     server: ServerConfig,
+    #[serde(default)]
     auto_join_channels: String,
+    #[serde(default)]
     auto_perform: String,
+    #[serde(default)]
     set_invisible: bool,
 }
 
 /// Private, short-lived state used only across an explicit update restart.
 /// Deliberately has no Debug implementation: credentials and drafts are secret.
 /// The previous binary writes it and the updated one reads it, so fields added
-/// later must default rather than fail the launch (`serde(default)`).
+/// later must default rather than fail the launch (`serde(default)`). Nothing
+/// here names an endpoint or credentials on its own: the session that does is
+/// an `Option`, and without it nothing is restored.
 #[derive(Default, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
 pub struct UpdateSession {
@@ -2421,6 +2427,39 @@ mod update_session_tests {
         assert!(app.away_status.is_none());
         // An empty object (a snapshot with nothing to restore) also parses.
         assert!(serde_json::from_str::<UpdateSession>("{}").is_ok());
+    }
+
+    #[test]
+    fn snapshot_missing_its_endpoint_fails_instead_of_restoring_a_default_server() {
+        // Credentials that lost the server they belong to must not be sent to
+        // the built-in default one: the launch fails and the update rolls back.
+        let snapshot = |server: &serde_json::Value| {
+            format!(
+                r##"{{"session":{{"server":{server},"auto_join_channels":"",
+                "auto_perform":"/msg NickServ IDENTIFY secret"}},"reconnect":true}}"##
+            )
+        };
+        let server: serde_json::Value = serde_json::from_str(
+            r##"{"host":"h.example","port":6697,"use_tls":true,"nick":"me",
+            "username":"u","password":"secret","sasl_password":"s3"}"##,
+        )
+        .unwrap();
+        assert!(serde_json::from_str::<UpdateSession>(&snapshot(&server)).is_ok());
+        for field in ["host", "port", "use_tls", "nick", "username"] {
+            let mut damaged = server.clone();
+            damaged.as_object_mut().unwrap().remove(field);
+            assert!(
+                serde_json::from_str::<UpdateSession>(&snapshot(&damaged)).is_err(),
+                "a snapshot without server.{field} must not parse"
+            );
+        }
+        // Nor may a session without any server at all.
+        assert!(
+            serde_json::from_str::<UpdateSession>(
+                r##"{"session":{"auto_perform":"x"},"reconnect":true}"##
+            )
+            .is_err()
+        );
     }
 
     #[test]
