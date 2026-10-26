@@ -2225,6 +2225,8 @@ impl IrcApp {
         // the old worker exits later it must not unexpectedly activate the
         // staged endpoint.
         self.pending_session = None;
+        // Disconnecting also cancels an update restore that has not run yet.
+        self.clear_update_restore();
         let quit_queued = self.cmd_tx.is_some()
             && self.send_command(IrcCommand::Quit(Self::clamp_quit_reason(reason)));
         self.connected = false;
@@ -2301,7 +2303,19 @@ impl IrcApp {
         self.request_manual_disconnect(Some("Registration failed".to_string()));
     }
 
+    /// Drop what an update-restart snapshot still has queued for the first
+    /// registration: the memberships (with their channel keys) to rejoin and
+    /// the tab to select. They describe the snapshot's endpoint, so another
+    /// endpoint (or a disconnect that cancels the restore) must never see
+    /// them: B's 001 would otherwise JOIN A's channels with A's keys.
+    fn clear_update_restore(&mut self) {
+        self.update_rejoins = None;
+        self.update_join_targets.clear();
+        self.update_selected = None;
+    }
+
     fn reset_session_state(&mut self) {
+        self.clear_update_restore();
         self.channels.clear();
         self.current_channel = None;
         self.server_messages.clear();
@@ -2410,6 +2424,72 @@ mod update_session_tests {
         after.handle_incoming_message(IrcMessage::parse(":me!u@h JOIN #live").unwrap());
         assert_eq!(after.current_channel.as_deref(), Some("alice"));
         after.handle_incoming_message(IrcMessage::parse(":me!u@h JOIN !custom").unwrap());
+        assert!(after.update_selected.is_none());
+    }
+
+    /// An app restored from an update snapshot of network A: a keyed channel
+    /// to rejoin, a selected tab, and A's session active and connecting.
+    fn restored_from_network_a() -> IrcApp {
+        let settings = Settings {
+            server_host: "a.example".into(),
+            nickname: "me".into(),
+            logging_enabled: false,
+            logging_load_history: false,
+            ..Settings::default()
+        };
+        let mut before = IrcApp::with_settings(settings.clone());
+        assert!(before.start_session_from_form());
+        let mut secret = Channel::new();
+        secret.joined = true;
+        secret.key = Some("a-channel-key".into());
+        before.channels.insert("#secret".into(), secret);
+        before.current_channel = Some("#secret".into());
+        let mut after = IrcApp::with_settings(settings);
+        after.restore_update_session(before.update_session());
+        assert!(after.connecting);
+        assert!(after.update_rejoins.is_some());
+        assert_eq!(after.update_join_targets, ["#secret"]);
+        assert_eq!(after.update_selected.as_deref(), Some("#secret"));
+        after
+    }
+
+    #[test]
+    fn switching_networks_after_an_update_restore_does_not_replay_the_old_memberships() {
+        let mut after = restored_from_network_a();
+
+        // Network A is unreachable, so the user connects to B instead.
+        after.server_host = "b.example".into();
+        after.auto_join_channels = "#b-chan".into();
+        assert!(after.switch_session_from_form("Changing servers"));
+        assert!(after.update_rejoins.is_none());
+        assert!(after.update_join_targets.is_empty());
+        assert!(after.update_selected.is_none());
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        after.cmd_tx = Some(tx);
+        after.handle_numeric(RPL_WELCOME, &["me".into(), "Welcome".into()]);
+        let sent: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        // A's channels and keys never reach B, and B's own auto-join runs.
+        let wire = format!("{sent:?}");
+        assert!(
+            !wire.contains("a-channel-key") && !wire.contains("#secret"),
+            "{wire}"
+        );
+        assert!(
+            sent.iter()
+                .any(|cmd| matches!(cmd, IrcCommand::Join(name, _, _, _) if name == "#b-chan")),
+            "{wire}"
+        );
+    }
+
+    #[test]
+    fn manual_disconnect_cancels_a_pending_update_restore() {
+        let mut after = restored_from_network_a();
+
+        after.request_manual_disconnect(None);
+
+        assert!(after.update_rejoins.is_none());
+        assert!(after.update_join_targets.is_empty());
         assert!(after.update_selected.is_none());
     }
 
