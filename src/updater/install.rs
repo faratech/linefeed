@@ -399,14 +399,21 @@ pub fn executable_copy(source: &Path, destination: &Path) -> io::Result<()> {
 pub struct Startup {
     /// None when the updater could not initialize (see `update_error`).
     pub paths: Option<Paths>,
+    /// The shared run lock, held for the life of the process. Also taken
+    /// (best effort) when the updater could not initialize.
     pub running: Option<File>,
     pub acknowledgment: Option<Transaction>,
     pub snapshot: Option<crate::gui::UpdateSession>,
     pub update_error: Option<String>,
 }
 
+/// How long a normal launch waits for another instance's update work before
+/// opening degraded. Nothing is shown until startup returns, so this stays
+/// short; a helper can hold the lock far longer.
+const STARTUP_LOCK_WAIT: Duration = Duration::from_secs(5);
+
 pub fn startup(supervised: Option<(PathBuf, String)>) -> io::Result<Startup> {
-    startup_with(Paths::discover(), supervised, Duration::from_secs(90))
+    startup_with(Paths::discover(), supervised, STARTUP_LOCK_WAIT)
 }
 
 /// A normal launch must open the app even when the updater cannot start
@@ -418,16 +425,30 @@ fn startup_with(
     supervised: Option<(PathBuf, String)>,
     lock_wait: Duration,
 ) -> io::Result<Startup> {
-    match discovered.and_then(|paths| start_updater(paths, supervised.as_ref(), lock_wait)) {
-        Err(error) if supervised.is_none() => Ok(Startup {
-            paths: None,
-            running: None,
-            acknowledgment: None,
-            snapshot: None,
-            update_error: Some(format!(
-                "The updater could not start: {error}. Download a release manually."
-            )),
-        }),
+    let degraded = |error: io::Error, running: Option<File>| Startup {
+        paths: None,
+        running,
+        acknowledgment: None,
+        snapshot: None,
+        update_error: Some(format!(
+            "The updater could not start: {error}. Download a release manually."
+        )),
+    };
+    let paths = match discovered {
+        Ok(paths) => paths,
+        Err(error) if supervised.is_none() => return Ok(degraded(error, None)),
+        Err(error) => return Err(error),
+    };
+    match start_updater(paths.clone(), supervised.as_ref(), lock_wait) {
+        // Even without a working updater this instance must not have its
+        // executable replaced under it by another instance's helper, so still
+        // take the shared run lock if that is possible without a long wait.
+        Err(error) if supervised.is_none() => {
+            let running = paths.run_lock().ok().filter(|running| {
+                timed_lock(running, true, lock_wait.min(Duration::from_secs(1))).is_ok()
+            });
+            Ok(degraded(error, running))
+        }
         result => result,
     }
 }
@@ -1731,6 +1752,39 @@ mod tests {
         let startup = startup_with(Ok(paths), None, Duration::from_millis(200)).unwrap();
         assert!(startup.paths.is_none());
         assert!(startup.update_error.is_some());
+    }
+    #[test]
+    fn degraded_launch_still_holds_the_shared_run_lock() {
+        // Without it another instance's helper could replace the executable
+        // under this one (#272).
+        let fixture = Fixture::new();
+        let held = fixture.tx.paths.transaction_lock().unwrap();
+        held.lock().unwrap();
+        let paths = fixture.tx.paths.clone();
+        let startup = startup_with(Ok(paths), None, Duration::from_millis(200)).unwrap();
+        assert!(startup.paths.is_none() && startup.running.is_some());
+        let helper = fixture.tx.paths.run_lock().unwrap();
+        assert!(matches!(
+            helper.try_lock(),
+            Err(std::fs::TryLockError::WouldBlock)
+        ));
+        drop(startup);
+    }
+    #[test]
+    fn degraded_launch_does_not_wait_forever_for_the_run_lock() {
+        // A helper mid-replacement holds both locks exclusively; the app opens
+        // anyway, unprotected only for as long as that takes.
+        let fixture = Fixture::new();
+        let transaction = fixture.tx.paths.transaction_lock().unwrap();
+        transaction.lock().unwrap();
+        let run = fixture.tx.paths.run_lock().unwrap();
+        run.lock().unwrap();
+        let started = Instant::now();
+        let paths = fixture.tx.paths.clone();
+        let startup = startup_with(Ok(paths), None, Duration::from_millis(200)).unwrap();
+        assert!(startup.paths.is_none() && startup.running.is_none());
+        assert!(startup.update_error.is_some());
+        assert!(started.elapsed() < Duration::from_secs(5));
     }
     #[test]
     fn healthy_startup_keeps_the_updater_and_holds_no_transaction_lock() {
