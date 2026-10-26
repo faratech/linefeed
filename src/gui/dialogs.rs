@@ -69,6 +69,18 @@ impl IrcApp {
         self.new_favorite_name.clear();
         self.show_save_favorite_dialog = false;
         self.connection_error = None;
+        // The reloaded list can be shorter than the one the selection indexed.
+        self.selected_favorite = None;
+    }
+
+    /// Remove a favorite by index; false when the index is out of range.
+    fn remove_favorite(&mut self, idx: usize) -> bool {
+        if idx < self.server_favorites.len() {
+            self.server_favorites.remove(idx);
+            true
+        } else {
+            false
+        }
     }
 
     /// Cancel the Connect dialog: discard scratch edits so a later unrelated
@@ -187,9 +199,11 @@ impl IrcApp {
                                 // Delete button
                                 if ui.add_enabled(has_selection, egui::Button::new("Delete")).clicked()
                                     && let Some(idx) = self.selected_favorite {
-                                        self.server_favorites.remove(idx);
+                                        let removed = self.remove_favorite(idx);
                                         self.selected_favorite = None;
-                                        self.save_settings();
+                                        if removed {
+                                            self.save_settings();
+                                        }
                                     }
 
                                 // Connect button
@@ -1722,5 +1736,35 @@ mod tests {
         assert_eq!(snapshot.password, "persisted-pass");
         assert_eq!(snapshot.sasl_password, "persisted-sasl");
         assert!(snapshot.auto_perform.is_empty());
+    }
+
+    #[test]
+    fn cancelled_connect_dialog_drops_a_stale_favorite_selection() {
+        let persisted = Settings {
+            server_favorites: vec![ServerFavorite::default()],
+            ..Settings::default()
+        };
+        let mut app = IrcApp::with_settings(persisted.clone());
+        // The in-memory list outgrew the file (a failed save or an external
+        // edit) and the last entry is selected (#268).
+        app.server_favorites.push(ServerFavorite::default());
+        app.selected_favorite = Some(1);
+
+        app.restore_connect_form_from(&persisted);
+
+        assert_eq!(app.server_favorites.len(), 1);
+        assert_eq!(app.selected_favorite, None);
+    }
+
+    #[test]
+    fn deleting_a_favorite_ignores_an_out_of_range_index() {
+        let mut app = IrcApp::with_settings(Settings {
+            server_favorites: vec![ServerFavorite::default()],
+            ..Settings::default()
+        });
+        assert!(!app.remove_favorite(1));
+        assert_eq!(app.server_favorites.len(), 1);
+        assert!(app.remove_favorite(0));
+        assert!(app.server_favorites.is_empty());
     }
 }
