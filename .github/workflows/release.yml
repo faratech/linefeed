@@ -70,13 +70,16 @@ jobs:
         run: |
           cargo test --locked updater::
           cargo build --locked --profile dist
-          target/dist/linefeed --internal-update-probe "${TAG#v}"
-        env:
-          TAG: ${{ inputs.tag || github.ref_name }}
       - name: Package
         run: |
           cp target/dist/linefeed linefeed_linux_${{ matrix.arch }}
           upx --best -q linefeed_linux_${{ matrix.arch }}
+          # Probe the compressed file that is actually shipped, not the
+          # pre-UPX build: UPX could produce a binary that fails to start or
+          # reports another version.
+          ./linefeed_linux_${{ matrix.arch }} --internal-update-probe "${TAG#v}"
+        env:
+          TAG: ${{ inputs.tag || github.ref_name }}
       - name: Generate artifact attestation
         uses: actions/attest-build-provenance@v4
         continue-on-error: true
