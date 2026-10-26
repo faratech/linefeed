@@ -2934,12 +2934,32 @@ pub struct ScrollbackStats {
     pub total_rows: usize,
 }
 
+/// Escape `&`, `<` and `>` for a desktop notification. Many notification
+/// daemons render `<a href>` and `<img>` markup in the body, so message text
+/// must not be able to inject links or images. `&` goes first so the entities
+/// added here are not themselves escaped.
+#[cfg(any(all(unix, not(target_os = "macos")), test))]
+fn notification_markup_escape(text: &str) -> String {
+    text.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+}
+
 /// notify-send arguments. `--` ends option parsing so a title or body that
 /// starts with `-` (a PM beginning `--hint=...`) is shown as text, not parsed
-/// as an option (#269).
+/// as an option (#269). The text is markup-escaped (see
+/// `notification_markup_escape`).
 #[cfg(any(all(unix, not(target_os = "macos")), test))]
-fn notify_send_args<'a>(title: &'a str, body: &'a str) -> [&'a str; 7] {
-    ["-a", "Linefeed", "-t", "5000", "--", title, body]
+fn notify_send_args(title: &str, body: &str) -> [String; 7] {
+    [
+        "-a".to_string(),
+        "Linefeed".to_string(),
+        "-t".to_string(),
+        "5000".to_string(),
+        "--".to_string(),
+        notification_markup_escape(title),
+        notification_markup_escape(body),
+    ]
 }
 
 /// Escape text for an AppleScript string literal. Backslashes go first so the
@@ -7704,6 +7724,25 @@ mod tests {
             ["--urgency=critical", "--hint=string:x:y"]
         );
         assert!(args[..separator].iter().all(|arg| !arg.contains("hint")));
+    }
+
+    #[test]
+    fn notify_send_text_has_markup_escaped() {
+        // Many notification daemons render <a href> / <img> in the body.
+        assert_eq!(
+            notification_markup_escape(r#"<a href="http://evil.test">x</a> & <img src=y>"#),
+            r#"&lt;a href="http://evil.test"&gt;x&lt;/a&gt; &amp; &lt;img src=y&gt;"#
+        );
+        // The ampersand is escaped first, so an entity is not double-decoded.
+        assert_eq!(notification_markup_escape("&lt;"), "&amp;lt;");
+        assert_eq!(notification_markup_escape("plain text"), "plain text");
+
+        let args = notify_send_args("<b>nick</b>", "a < b && c > d");
+        let separator = args.iter().position(|arg| *arg == "--").unwrap();
+        assert_eq!(
+            args[separator + 1..],
+            ["&lt;b&gt;nick&lt;/b&gt;", "a &lt; b &amp;&amp; c &gt; d"]
+        );
     }
 
     #[test]
