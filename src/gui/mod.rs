@@ -38,7 +38,8 @@ struct EndpointKey {
 /// editable Settings/Connect fields may change while a socket is active; those
 /// changes must not relabel the session or alter what an automatic reconnect
 /// authenticates with and executes.
-#[derive(Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Default, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 struct SessionConfig {
     server: ServerConfig,
     auto_join_channels: String,
@@ -48,7 +49,10 @@ struct SessionConfig {
 
 /// Private, short-lived state used only across an explicit update restart.
 /// Deliberately has no Debug implementation: credentials and drafts are secret.
-#[derive(serde::Serialize, serde::Deserialize)]
+/// The previous binary writes it and the updated one reads it, so fields added
+/// later must default rather than fail the launch (`serde(default)`).
+#[derive(Default, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct UpdateSession {
     session: Option<SessionConfig>,
     reconnect: bool,
@@ -2394,6 +2398,29 @@ mod update_session_tests {
         assert_eq!(after.current_channel.as_deref(), Some("alice"));
         after.handle_incoming_message(IrcMessage::parse(":me!u@h JOIN !custom").unwrap());
         assert!(after.update_selected.is_none());
+    }
+
+    #[test]
+    fn snapshot_written_by_an_older_schema_still_restores() {
+        // The previous binary writes the snapshot and the updated one reads it,
+        // so fields added since must default instead of failing the launch (#274).
+        let older = r##"{"session":{"server":{"host":"old.example","port":6697,"use_tls":true,
+            "accept_invalid_certs":false,"nick":"me","username":"u","realname":"r","password":null},
+            "auto_join_channels":"#a","auto_perform":""},
+            "reconnect":true,"tabs":[["#a",null,true]],"selected":"#a"}"##;
+        let snapshot: UpdateSession = serde_json::from_str(older).unwrap();
+        let mut app = IrcApp::with_settings(Settings::default());
+        app.restore_update_session(snapshot);
+        let server = app.active_server_config().unwrap();
+        assert_eq!(server.host, "old.example");
+        assert_eq!(server.sasl_mechanism, SaslMechanism::Auto);
+        assert!(server.sasl_password.is_none());
+        assert!(app.connecting);
+        assert!(app.channels.contains_key("#a"));
+        assert!(app.input_text.is_empty());
+        assert!(app.away_status.is_none());
+        // An empty object (a snapshot with nothing to restore) also parses.
+        assert!(serde_json::from_str::<UpdateSession>("{}").is_ok());
     }
 
     #[test]

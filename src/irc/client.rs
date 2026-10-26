@@ -698,7 +698,10 @@ fn scram_sha256_response(
     ))
 }
 
+/// Also embedded in the update-restart session snapshot, written by the
+/// previous release: `serde(default)` lets fields added since still parse.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct ServerConfig {
     pub host: String,
     pub port: u16,
