@@ -638,7 +638,8 @@ fn download(
                 .unwrap_or_else(|_| paths.target.parent().unwrap().to_owned()),
         };
         fs::rename(partial, tx.candidate())?;
-        platform::verify_signature(&tx.candidate())?;
+        // The machine is online here by construction, so require revocation data.
+        platform::verify_signature(&tx.candidate(), platform::Revocation::Strict)?;
         install::executable_copy(&paths.target, &tx.helper())?;
         platform::sync_dir(&directory)?;
         publish_staged(paths, &tx)?;

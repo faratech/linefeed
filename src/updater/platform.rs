@@ -197,13 +197,39 @@ pub fn wide(path: &Path) -> windows::core::HSTRING {
     windows::core::HSTRING::from_wide(&path.as_os_str().encode_wide().collect::<Vec<_>>())
 }
 
+/// How strictly `verify_signature` treats certificate revocation data.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Revocation {
+    /// Revocation data must be retrievable and clean. Used when a candidate
+    /// first arrives, while the machine is online by construction.
+    Strict,
+    /// Re-check a candidate that already passed `Strict` at download time and
+    /// whose bytes are pinned by hash (exit time, install helper). If Windows
+    /// reports the revocation status as unavailable, e.g. the machine went
+    /// offline, retry without the revocation check. A revoked certificate and
+    /// every other trust failure still fail (#273).
+    TolerateUnavailable,
+}
+
+/// WinVerifyTrust statuses meaning "revocation could not be determined":
+/// CRYPT_E_NO_REVOCATION_DLL, CRYPT_E_NO_REVOCATION_CHECK,
+/// CRYPT_E_REVOCATION_OFFLINE and CERT_E_REVOCATION_FAILURE. CERT_E_REVOKED
+/// and all other failures are deliberately not listed.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) fn revocation_unavailable(status: i32) -> bool {
+    matches!(
+        status as u32,
+        0x8009_2011 | 0x8009_2012 | 0x8009_2013 | 0x800B_010E
+    )
+}
+
 #[cfg(not(windows))]
-pub fn verify_signature(_path: &Path) -> io::Result<()> {
+pub fn verify_signature(_path: &Path, _revocation: Revocation) -> io::Result<()> {
     Ok(())
 }
 
 #[cfg(windows)]
-pub fn verify_signature(path: &Path) -> io::Result<()> {
+pub fn verify_signature(path: &Path, revocation: Revocation) -> io::Result<()> {
     use windows::{
         Win32::{
             Foundation::HWND,
@@ -214,14 +240,21 @@ pub fn verify_signature(path: &Path) -> io::Result<()> {
         },
         core::PCWSTR,
     };
-    let path_w = wide(path);
-    let mut info = WINTRUST_FILE_INFO {
-        cbStruct: size_of::<WINTRUST_FILE_INFO>() as u32,
-        pcwszFilePath: PCWSTR(path_w.as_ptr()),
-        ..Default::default()
-    };
-    // Enumerate secondary signatures, then verify each expected signing leaf.
-    for (index, expected) in ["Fara Technologies LLC", "Mike Fara"].iter().enumerate() {
+
+    struct Outcome {
+        status: i32,
+        secondary_signatures: u32,
+        publisher: String,
+        matches: bool,
+    }
+
+    // Verify signature `index` and require its signing leaf to be `expected`.
+    fn verify_one(
+        info: &mut WINTRUST_FILE_INFO,
+        index: usize,
+        expected: &str,
+        flags: WINTRUST_DATA_PROVIDER_FLAGS,
+    ) -> Outcome {
         let mut signatures = WINTRUST_SIGNATURE_SETTINGS {
             cbStruct: size_of::<WINTRUST_SIGNATURE_SETTINGS>() as u32,
             dwIndex: index as u32,
@@ -232,9 +265,9 @@ pub fn verify_signature(path: &Path) -> io::Result<()> {
             cbStruct: size_of::<WINTRUST_DATA>() as u32,
             dwUIChoice: WTD_UI_NONE,
             dwUnionChoice: WTD_CHOICE_FILE,
-            Anonymous: WINTRUST_DATA_0 { pFile: &mut info },
+            Anonymous: WINTRUST_DATA_0 { pFile: info },
             dwStateAction: WTD_STATEACTION_VERIFY,
-            dwProvFlags: WTD_REVOCATION_CHECK_CHAIN_EXCLUDE_ROOT,
+            dwProvFlags: flags,
             pSignatureSettings: &mut signatures,
             ..Default::default()
         };
@@ -274,7 +307,7 @@ pub fn verify_signature(path: &Path) -> io::Result<()> {
                 if len > 1 && len as usize <= name.len() {
                     publisher = String::from_utf16_lossy(&name[..len as usize - 1]);
                 }
-                publisher == *expected
+                publisher == expected
             }
         };
         trust.dwStateAction = WTD_STATEACTION_CLOSE;
@@ -285,12 +318,75 @@ pub fn verify_signature(path: &Path) -> io::Result<()> {
                 (&mut trust as *mut WINTRUST_DATA).cast(),
             );
         }
-        if !matches {
+        Outcome {
+            status: verified,
+            secondary_signatures: signatures.cSecondarySigs,
+            publisher,
+            matches,
+        }
+    }
+
+    let path_w = wide(path);
+    let mut info = WINTRUST_FILE_INFO {
+        cbStruct: size_of::<WINTRUST_FILE_INFO>() as u32,
+        pcwszFilePath: PCWSTR(path_w.as_ptr()),
+        ..Default::default()
+    };
+    // Enumerate secondary signatures, then verify each expected signing leaf.
+    for (index, expected) in ["Fara Technologies LLC", "Mike Fara"].iter().enumerate() {
+        let mut outcome = verify_one(
+            &mut info,
+            index,
+            expected,
+            WTD_REVOCATION_CHECK_CHAIN_EXCLUDE_ROOT,
+        );
+        if !outcome.matches
+            && revocation == Revocation::TolerateUnavailable
+            && revocation_unavailable(outcome.status)
+        {
+            tracing::warn!(
+                "Revocation status unavailable for signature {index} (status {:08x}); \
+                 re-checking without revocation",
+                outcome.status
+            );
+            outcome = verify_one(&mut info, index, expected, WTD_REVOCATION_CHECK_NONE);
+        }
+        if !outcome.matches {
             return Err(io::Error::other(format!(
-                "Windows signature {index} failed verification (status {verified:08x}, secondary signatures {}, publisher {publisher:?})",
-                signatures.cSecondarySigs
+                "Windows signature {index} failed verification (status {:08x}, secondary signatures {}, publisher {:?})",
+                outcome.status, outcome.secondary_signatures, outcome.publisher
             )));
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::revocation_unavailable;
+
+    #[test]
+    fn only_revocation_unavailable_statuses_are_tolerated() {
+        // CRYPT_E_NO_REVOCATION_DLL, CRYPT_E_NO_REVOCATION_CHECK,
+        // CRYPT_E_REVOCATION_OFFLINE, CERT_E_REVOCATION_FAILURE.
+        for status in [0x8009_2011u32, 0x8009_2012, 0x8009_2013, 0x800B_010E] {
+            assert!(revocation_unavailable(status as i32), "{status:08x}");
+        }
+    }
+
+    #[test]
+    fn revoked_and_other_trust_failures_stay_fatal() {
+        for (name, status) in [
+            ("success", 0u32),
+            ("CERT_E_REVOKED", 0x800B_010C),
+            ("TRUST_E_NOSIGNATURE", 0x800B_0100),
+            ("CERT_E_UNTRUSTEDROOT", 0x800B_0109),
+            ("CERT_E_EXPIRED", 0x800B_0101),
+            ("TRUST_E_BAD_DIGEST", 0x8009_6010),
+            ("CRYPT_E_NOT_IN_REVOCATION_DATABASE", 0x8009_2014),
+            ("TRUST_E_SUBJECT_NOT_TRUSTED", 0x800B_0004),
+        ] {
+            assert!(!revocation_unavailable(status as i32), "{name}");
+        }
+    }
 }

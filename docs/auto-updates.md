@@ -28,6 +28,11 @@ macOS releases remain standalone universal binaries, not application bundles.
 The download must match both GitHub's asset digest and the release checksum
 manifest. Windows also verifies both Authenticode signatures: Fara Technologies
 LLC followed by Mike Fara. A downloaded candidate is never installed partially.
+The download-time check requires certificate revocation data. The re-checks at
+exit and in the install helper repeat the signature and publisher checks and
+tolerate only revocation data being unavailable (for example, the machine went
+offline); a revoked certificate or any other trust failure still blocks the
+update, and the candidate's hash stays pinned by the journal.
 
 Each attempt stages files in a private `.linefeed-update-<attempt>` directory
 beside the executable, on the same filesystem. An independent copy of the old

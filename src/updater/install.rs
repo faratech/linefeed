@@ -125,12 +125,15 @@ pub fn hash(path: &Path) -> io::Result<String> {
 
 /// Re-verify the staged candidate immediately before it is trusted again.
 /// The probe can run for up to 30s, so bytes checked before it may have been
-/// swapped by the time replacement happens (issue #198).
+/// swapped by the time replacement happens (issue #198). The bytes are pinned
+/// by hash and already passed a strict check at download time, so a machine
+/// that is offline at exit or install time must not defer the update just
+/// because revocation data is unreachable (#273).
 fn verify_candidate(tx: &Transaction) -> io::Result<()> {
     if hash(&tx.candidate())? != tx.new_hash {
         return Err(io::Error::other("Update bytes changed"));
     }
-    platform::verify_signature(&tx.candidate())
+    platform::verify_signature(&tx.candidate(), platform::Revocation::TolerateUnavailable)
 }
 
 /// Erase the credential-bearing session snapshot and restart intent when an
@@ -1019,7 +1022,7 @@ fn apply_transaction_within(tx: &mut Transaction, running_wait: Duration) -> io:
         return Err(io::Error::other("Update transaction changed"));
     }
     tx.phase = Phase::Prepared;
-    platform::verify_signature(&tx.candidate())?;
+    platform::verify_signature(&tx.candidate(), platform::Revocation::TolerateUnavailable)?;
     // Check the embedded version and runtime dependencies before touching target.
     let mut probe = Command::new(tx.candidate());
     probe
@@ -2112,13 +2115,24 @@ mod tests {
     #[test]
     fn unsigned_windows_candidate_is_rejected() {
         let fixture = Fixture::new();
-        assert!(platform::verify_signature(&fixture.tx.candidate()).is_err());
+        assert!(
+            platform::verify_signature(&fixture.tx.candidate(), platform::Revocation::Strict)
+                .is_err()
+        );
+        // An unsigned file is not a revocation problem: tolerance must not help it.
+        assert!(
+            platform::verify_signature(
+                &fixture.tx.candidate(),
+                platform::Revocation::TolerateUnavailable
+            )
+            .is_err()
+        );
     }
     #[cfg(windows)]
     #[test]
     #[ignore = "Requires LINEFEED_SIGNED_FIXTURE pointing to a dual-signed release"]
     fn real_windows_release_has_both_expected_publishers() {
         let path = std::env::var_os("LINEFEED_SIGNED_FIXTURE").expect("signed fixture");
-        platform::verify_signature(Path::new(&path)).unwrap();
+        platform::verify_signature(Path::new(&path), platform::Revocation::Strict).unwrap();
     }
 }
