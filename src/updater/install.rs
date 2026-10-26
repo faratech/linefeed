@@ -233,7 +233,10 @@ impl Transaction {
     pub fn save(&self) -> io::Result<()> {
         write_json(&self.paths.journal(), self)
     }
-    pub fn validate(&self) -> io::Result<()> {
+    /// Whether the attempt and staging directory are the ones this installation
+    /// would have created. Anything derived from them is only safe to delete
+    /// when this holds.
+    fn validate_paths(&self) -> io::Result<()> {
         if self.attempt.len() != 32
             || !self.attempt.bytes().all(|b| b.is_ascii_hexdigit())
             || self.directory
@@ -246,6 +249,10 @@ impl Transaction {
         {
             return Err(io::Error::other("Invalid update transaction paths"));
         }
+        Ok(())
+    }
+    pub fn validate(&self) -> io::Result<()> {
+        self.validate_paths()?;
         ensure_private_dir(&self.directory)?;
         if hash(&self.helper())? != self.old_hash {
             return Err(io::Error::other("Update helper changed"));
@@ -329,8 +336,22 @@ fn recover_startup(
                 "Update state belongs to another installation",
             ));
         }
-        tx.validate()?;
         let own_hash = hash(&paths.target)?;
+        let validation = tx.validate();
+        // Staged, Healthy and RolledBack journals hold nothing to recover. One
+        // that no longer names the installed executable (a manual or package-
+        // manager upgrade) or whose staging is gone is stale, not damaged:
+        // discard it instead of failing every launch (#238). Prepared and
+        // Replaced journals may hold the only copy of the old executable, so
+        // they keep failing closed below.
+        if supervised.is_none()
+            && !matches!(tx.phase, Phase::Prepared | Phase::Replaced)
+            && (validation.is_err() || !names_installed(&tx, &own_hash))
+        {
+            discard_stale(paths, &tx)?;
+            return Ok((None, None));
+        }
+        validation?;
         if let Some((journal, token)) = supervised {
             if *journal != paths.journal()
                 || *token != tx.attempt
@@ -365,6 +386,28 @@ fn recover_startup(
         return Err(io::Error::other("Missing update transaction"));
     }
     Ok((acknowledgment, snapshot))
+}
+
+/// Whether a journal in a non-recovery phase still describes the installed
+/// executable.
+fn names_installed(tx: &Transaction, installed: &str) -> bool {
+    match tx.phase {
+        Phase::Healthy => installed == tx.old_hash || installed == tx.new_hash,
+        _ => installed == tx.old_hash,
+    }
+}
+
+/// Drop a stale journal with its session snapshot and staging directory. Both
+/// are derived from the journal, so they are only touched when the journal
+/// names the paths this installation would have created. Directory removal is
+/// best effort, as for a Healthy journal: Windows cannot delete a running
+/// helper, and a leftover directory is collected on a later launch.
+fn discard_stale(paths: &Paths, tx: &Transaction) -> io::Result<()> {
+    if tx.validate_paths().is_ok() {
+        let _ = fs::remove_file(tx.snapshot());
+        let _ = fs::remove_dir_all(&tx.directory);
+    }
+    fs::remove_file(paths.journal())
 }
 
 pub fn timed_lock(file: &File, shared: bool, timeout: Duration) -> io::Result<()> {
@@ -999,16 +1042,105 @@ mod tests {
         assert_eq!(fs::read(&tx.paths.target).unwrap(), b"a newer installation");
     }
     #[test]
-    fn startup_rejects_stale_state_without_deleting_recovery_files() {
+    fn startup_rejects_unrelated_executable_without_deleting_recovery_files() {
+        // Prepared and Replaced journals can hold the only copy of the old
+        // executable, so they keep failing closed.
+        for phase in [Phase::Prepared, Phase::Replaced] {
+            let mut fixture = Fixture::new();
+            fixture.tx.phase = phase;
+            fixture.tx.save().unwrap();
+            fs::write(&fixture.tx.paths.target, b"manual installation").unwrap();
+            assert!(recover_startup(&fixture.tx.paths, None).is_err());
+            assert_eq!(
+                fs::read(&fixture.tx.paths.target).unwrap(),
+                b"manual installation"
+            );
+            assert!(fixture.tx.paths.journal().exists());
+            assert!(fixture.tx.candidate().exists());
+        }
+    }
+    #[test]
+    fn spent_journals_for_a_replaced_executable_are_discarded_not_fatal() {
+        // A manual or package-manager upgrade leaves a journal that matches
+        // neither hash; with nothing to recover it must not disable the
+        // updater on every launch (#238).
+        for phase in [Phase::Staged, Phase::Healthy, Phase::RolledBack] {
+            let mut fixture = Fixture::new();
+            fixture.tx.phase = phase;
+            fixture.tx.save().unwrap();
+            write_json(&fixture.tx.snapshot(), &"unsent draft").unwrap();
+            fs::write(&fixture.tx.paths.target, b"a newer installation").unwrap();
+            let (acknowledgment, snapshot) = recover_startup(&fixture.tx.paths, None).unwrap();
+            assert!(acknowledgment.is_none() && snapshot.is_none());
+            assert_eq!(
+                fs::read(&fixture.tx.paths.target).unwrap(),
+                b"a newer installation"
+            );
+            assert!(!fixture.tx.paths.journal().exists());
+            assert!(!fixture.tx.directory.exists());
+            assert!(!fixture.tx.snapshot().exists());
+        }
+    }
+    #[test]
+    fn journal_matching_the_installed_executable_is_kept() {
+        for (phase, installed) in [
+            (Phase::Staged, "old"),
+            (Phase::RolledBack, "old"),
+            (Phase::Healthy, "old"),
+            (Phase::Healthy, "new"),
+        ] {
+            let mut fixture = Fixture::new();
+            fixture.tx.phase = phase;
+            fixture.tx.save().unwrap();
+            if installed == "new" {
+                fs::write(&fixture.tx.paths.target, b"new executable").unwrap();
+            }
+            recover_startup(&fixture.tx.paths, None).unwrap();
+            assert!(fixture.tx.paths.journal().exists());
+            assert!(fixture.tx.directory.exists());
+        }
+    }
+    #[test]
+    fn staged_journal_for_an_already_installed_candidate_is_discarded() {
         let fixture = Fixture::new();
-        fs::write(&fixture.tx.paths.target, b"manual installation").unwrap();
+        fs::write(&fixture.tx.paths.target, b"new executable").unwrap();
+        recover_startup(&fixture.tx.paths, None).unwrap();
+        assert!(!fixture.tx.paths.journal().exists());
+    }
+    #[test]
+    fn staged_journal_whose_staging_was_deleted_is_discarded() {
+        // The hidden staging directory was removed, or the helper quarantined,
+        // so validate() can never pass again (#238).
+        for remove_directory in [true, false] {
+            let fixture = Fixture::new();
+            if remove_directory {
+                fs::remove_dir_all(&fixture.tx.directory).unwrap();
+            } else {
+                fs::remove_file(fixture.tx.helper()).unwrap();
+            }
+            recover_startup(&fixture.tx.paths, None).unwrap();
+            assert!(!fixture.tx.paths.journal().exists());
+            assert_eq!(hash(&fixture.tx.paths.target).unwrap(), fixture.tx.old_hash);
+        }
+        // A Replaced journal keeps failing closed: its backup lives there.
+        let mut fixture = Fixture::new();
+        fixture.tx.phase = Phase::Replaced;
+        fixture.tx.save().unwrap();
+        fs::remove_file(fixture.tx.helper()).unwrap();
         assert!(recover_startup(&fixture.tx.paths, None).is_err());
-        assert_eq!(
-            fs::read(&fixture.tx.paths.target).unwrap(),
-            b"manual installation"
-        );
         assert!(fixture.tx.paths.journal().exists());
-        assert!(fixture.tx.candidate().exists());
+    }
+    #[test]
+    fn damaged_journal_paths_are_never_discarded() {
+        let mut fixture = Fixture::new();
+        let outside = fixture.root.join("outside");
+        fs::create_dir(&outside).unwrap();
+        fs::write(outside.join("precious"), b"data").unwrap();
+        fixture.tx.directory = outside.clone();
+        fixture.tx.save().unwrap();
+        fs::write(&fixture.tx.paths.target, b"a newer installation").unwrap();
+        let _ = recover_startup(&fixture.tx.paths, None);
+        assert!(outside.join("precious").exists());
     }
     #[test]
     fn corrupt_journal_is_preserved_for_manual_recovery() {
