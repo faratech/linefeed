@@ -6258,6 +6258,13 @@ impl IrcApp {
             return false;
         }
 
+        // Our own request relayed back (echo-message, bouncer): consume it
+        // without replying to ourselves or logging it as an incoming request.
+        // Current nick only, as for the PRIVMSG self check (#168).
+        if self.identifiers_equal(sender, &self.my_nick) {
+            return true;
+        }
+
         // Build the reply based on the CTCP command
         let reply = match ctcp_cmd.as_str() {
             "VERSION" => Some(
@@ -8937,6 +8944,30 @@ mod tests {
             rx.try_recv(),
             Ok(IrcCommand::Notice(target, reply))
                 if target == "peer" && reply.contains("SOURCE")
+        ));
+    }
+
+    #[test]
+    fn echoed_own_ctcp_request_is_not_answered() {
+        let (mut app, mut rx) = test_app_connected();
+        app.set_session_nick("me".into(), true);
+
+        // echo-message (or a bouncer) relays our own `/ctcp bob VERSION`.
+        app.handle_incoming_message(
+            IrcMessage::parse(":me!u@h PRIVMSG bob :\x01VERSION\x01").unwrap(),
+        );
+
+        assert!(rx.try_recv().is_err(), "must not reply to ourselves");
+        assert!(app.server_messages.is_empty(), "no CTCP request notice");
+        assert!(app.channels.is_empty(), "no query tab for the echo");
+
+        // A peer's request is still answered.
+        app.handle_incoming_message(
+            IrcMessage::parse(":peer!u@h PRIVMSG me :\x01VERSION\x01").unwrap(),
+        );
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(IrcCommand::Notice(target, _)) if target == "peer"
         ));
     }
 
