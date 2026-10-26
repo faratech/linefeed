@@ -928,7 +928,7 @@ impl IrcApp {
             let body = body.to_string();
             std::thread::spawn(move || {
                 let mut command = std::process::Command::new("notify-send");
-                command.args(["-a", "Linefeed", "-t", "5000", &title, &body]);
+                command.args(notify_send_args(&title, &body));
                 match wait_for_notification_helper(&mut command) {
                     Ok(status) if !status.success() => {
                         tracing::warn!("notify-send exited with status {}", status)
@@ -941,10 +941,8 @@ impl IrcApp {
 
         #[cfg(target_os = "macos")]
         {
-            let title = title.replace('"', "\\\"");
-            let body = body.replace('"', "\\\"");
+            let script = applescript_notification(title, body);
             std::thread::spawn(move || {
-                let script = format!("display notification \"{}\" with title \"{}\"", body, title);
                 let mut command = std::process::Command::new("osascript");
                 command.args(["-e", &script]);
                 match wait_for_notification_helper(&mut command) {
@@ -2460,6 +2458,31 @@ pub struct ScrollbackStats {
     /// Heights that had to be measured fresh (cold cache or layout change).
     pub measured: usize,
     pub total_rows: usize,
+}
+
+/// notify-send arguments. `--` ends option parsing so a title or body that
+/// starts with `-` (a PM beginning `--hint=...`) is shown as text, not parsed
+/// as an option (#269).
+#[cfg(any(all(unix, not(target_os = "macos")), test))]
+fn notify_send_args<'a>(title: &'a str, body: &'a str) -> [&'a str; 7] {
+    ["-a", "Linefeed", "-t", "5000", "--", title, body]
+}
+
+/// Escape text for an AppleScript string literal. Backslashes go first so the
+/// backslash added before a quote is not itself doubled; a nick ending in a
+/// backslash would otherwise escape the closing quote of the literal (#269).
+#[cfg(any(target_os = "macos", test))]
+fn applescript_escape(text: &str) -> String {
+    text.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn applescript_notification(title: &str, body: &str) -> String {
+    format!(
+        "display notification \"{}\" with title \"{}\"",
+        applescript_escape(body),
+        applescript_escape(title)
+    )
 }
 
 #[cfg(unix)]
@@ -7120,6 +7143,56 @@ mod tests {
         assert_eq!(style.text_styles[&egui::TextStyle::Monospace].size, 20.0);
         assert_eq!(style.text_styles[&egui::TextStyle::Small].size, 17.0);
         assert_eq!(style.text_styles[&egui::TextStyle::Heading].size, 27.0);
+    }
+
+    #[test]
+    fn notify_send_treats_dash_prefixed_text_as_operands() {
+        let args = notify_send_args("--urgency=critical", "--hint=string:x:y");
+        let separator = args.iter().position(|arg| *arg == "--").unwrap();
+        assert_eq!(
+            args[separator + 1..],
+            ["--urgency=critical", "--hint=string:x:y"]
+        );
+        assert!(args[..separator].iter().all(|arg| !arg.contains("hint")));
+    }
+
+    #[test]
+    fn applescript_escape_handles_backslashes_before_quotes() {
+        assert_eq!(applescript_escape(r#"say "hi""#), r#"say \"hi\""#);
+        assert_eq!(applescript_escape(r"evil\"), r"evil\\");
+        // A pre-escaped quote must not terminate the literal: the backslash is
+        // doubled first, then the quote gets its own escape.
+        assert_eq!(applescript_escape(r#"a\"b"#), r#"a\\\"b"#);
+
+        // Every quote in the escaped text is preceded by an odd number of
+        // backslashes, so none ends the literal early.
+        for hostile in [
+            r#"\"#,
+            r#"\""#,
+            r#"\\""#,
+            r#"x\" & (do shell script "id") & ""#,
+        ] {
+            let escaped = applescript_escape(hostile);
+            let chars: Vec<char> = escaped.chars().collect();
+            let mut index = 0;
+            while index < chars.len() {
+                match chars[index] {
+                    '\\' => index += 2,
+                    '"' => panic!("unescaped quote in {escaped:?}"),
+                    _ => index += 1,
+                }
+            }
+            assert_eq!(
+                index,
+                chars.len(),
+                "trailing backslash escapes the closing quote"
+            );
+        }
+
+        assert_eq!(
+            applescript_notification(r"PM from evil\", r#"say "x""#),
+            r#"display notification "say \"x\"" with title "PM from evil\\""#
+        );
     }
 
     #[cfg(unix)]
