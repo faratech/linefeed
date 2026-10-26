@@ -504,21 +504,24 @@ impl IrcApp {
             }
 
             "REDACT" => {
-                let mut parts = args.splitn(3, char::is_whitespace);
-                let first = parts.next().unwrap_or("");
+                // The reason is everything after the message id, however many
+                // words it has (#260).
+                let (first, rest) = split_word(args);
                 let (target, msgid, reason) = if self.is_channel_name(first) {
+                    let (msgid, reason) = split_word(rest);
                     (
                         Some(first.to_string()),
-                        parts.next().unwrap_or("").to_string(),
-                        parts.next().map(str::to_string),
+                        msgid.to_string(),
+                        Some(reason).filter(|reason| !reason.is_empty()),
                     )
                 } else {
                     (
                         self.current_channel.clone(),
                         first.to_string(),
-                        parts.next().map(str::to_string),
+                        Some(rest).filter(|reason| !reason.is_empty()),
                     )
                 };
+                let reason = reason.map(str::to_string);
                 if let Some(target) = target
                     && !msgid.is_empty()
                 {
@@ -2290,6 +2293,17 @@ impl IrcApp {
     }
 }
 
+/// Split off the first whitespace-delimited word. The remainder has its
+/// leading whitespace removed, so a run of spaces or tabs between arguments
+/// never produces an empty argument (#263).
+fn split_word(text: &str) -> (&str, &str) {
+    let text = text.trim_start();
+    match text.split_once(char::is_whitespace) {
+        Some((word, rest)) => (word, rest.trim_start()),
+        None => (text, ""),
+    }
+}
+
 fn valid_message_reference(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= 128
@@ -2865,6 +2879,45 @@ mod tests {
         // A wildcard inside the extban must not be completed either.
         app.process_command("/ban $a:tro*");
         expect_mode(&mut rx, "+b", "$a:tro*");
+    }
+
+    #[test]
+    fn redact_keeps_the_whole_multi_word_reason() {
+        let (mut app, mut rx) = connected_command_app();
+        app.current_channel = Some("#room".into());
+        app.channels.insert("#room".into(), Channel::new());
+
+        for (input, target, reason) in [
+            (
+                "/redact abc123 spam and junk",
+                "#room",
+                Some("spam and junk"),
+            ),
+            (
+                "/redact #other abc123 spam and junk",
+                "#other",
+                Some("spam and junk"),
+            ),
+            ("/redact abc123", "#room", None),
+            ("/redact #other abc123", "#other", None),
+            (
+                "/redact #other  abc123   spam   and junk",
+                "#other",
+                Some("spam   and junk"),
+            ),
+            (
+                "/redact abc123\tspam\tand junk",
+                "#room",
+                Some("spam\tand junk"),
+            ),
+        ] {
+            app.process_command(input);
+            assert_eq!(
+                rx.try_recv().unwrap(),
+                IrcCommand::Redact(target.into(), "abc123".into(), reason.map(str::to_string)),
+                "{input}"
+            );
+        }
     }
 
     #[test]
