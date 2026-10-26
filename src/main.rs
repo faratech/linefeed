@@ -881,8 +881,8 @@ mod tests {
     }
 
     /// An app that looks connected through a parked worker. The configured
-    /// endpoint is a closed loopback port, so any worker the lifecycle starts
-    /// afterwards is refused immediately.
+    /// endpoint is an unused loopback port: the tests that follow only
+    /// observe whether the lifecycle started another worker, never its result.
     fn linefeed_with_live_worker() -> (LinefeedApp, std::sync::mpsc::Sender<()>) {
         let mut linefeed = linefeed_for_port(1);
         assert!(linefeed.app.start_session_from_form());
@@ -1052,6 +1052,31 @@ mod tests {
         // Release the stuck task either way so a failure does not hang the run.
         drop(stuck_tx);
         assert!(finished, "worker thread blocked on the runtime drop");
+    }
+
+    #[test]
+    fn manual_disconnect_cancels_a_connection_that_never_registers() {
+        // Accepts the connection and then says nothing, like a wedged server.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (accepted_tx, accepted_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let (_stream, _) = listener.accept().unwrap();
+            let _ = accepted_tx.send(());
+            std::thread::sleep(std::time::Duration::from_secs(30));
+        });
+        let mut linefeed = linefeed_for_port(port);
+        tick_until(&mut linefeed, "connection to be accepted", |_| {
+            accepted_rx.try_recv().is_ok()
+        });
+
+        // The retired receiver stays open, so cancellation has to come from the
+        // queued QUIT alone, long before the registration deadline.
+        linefeed.app.request_manual_disconnect(None);
+        tick_until(&mut linefeed, "wedged worker to exit", |l| {
+            l.connection_thread.is_none()
+        });
+        assert!(!linefeed.app.connecting && !linefeed.app.connected);
     }
 
     #[test]
