@@ -43,9 +43,36 @@ starts successfully. Explicit restart waits up to 60 seconds for startup and
 restores the old executable if startup fails. Failed versions are not retried
 automatically; a manual restart may retry them.
 
-If a manual binary replacement or damaged journal prevents recovery, a normal
-launch still opens the app, preserves recovery files, and shows the issue in
-About with automatic installation disabled.
+A journal left behind by a manual or package-manager upgrade, or recorded for
+paths that have since moved, holds nothing to recover once its update is
+`Staged`, `Healthy`, or rolled back, and is discarded on the next launch. If
+the executable instead matches neither version of an interrupted (`Prepared` or
+`Replaced`) update, or the journal is unreadable, startup never overwrites
+anything automatically: a normal launch still opens the app, preserves the
+recovery files, and shows the issue in About with automatic installation
+disabled. After installing a release yourself, **Reset update state** in
+Settings → About deletes those files (the journal, its snapshot, and the staging
+directory with any downloaded update and the backup of the previous version).
+Restart Linefeed afterwards to re-enable updates.
+
+Other trouble starting the updater (an unusable update data directory, or
+another instance holding the update lock for more than about five seconds) is
+handled the same way: Linefeed opens after a short wait with installation
+disabled and the reason in About. It still holds the shared run lock where it
+can, so another instance's update cannot replace its executable under it. A
+restart-to-update launch that fails these checks is rolled back instead.
+
+If another instance is still running when an update is due, the update stays
+staged for the next exit and the application is not reopened. If the downloaded
+update fails its validation run, an explicit restart reopens the previous
+version with its session.
+
+A download claims its staging directory with a locked `owner.lock`. At startup,
+staging directories whose claim is no longer held (an exit or crash during a
+download) are renamed to `.deleting` and removed; interrupted removals are
+finished on a later launch. Directories without a claim, which includes
+filesystems that cannot lock files, are never removed automatically; delete a
+stray `.linefeed-update-*` folder by hand when no Linefeed is running.
 
 Installation on ordinary exit validates the new executable without reopening
 the GUI. GUI initialization is confirmed on the next launch. A failure before
