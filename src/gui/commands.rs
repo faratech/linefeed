@@ -1671,10 +1671,10 @@ impl IrcApp {
             // === Connection Commands ===
             "SERVER" => {
                 if !args.is_empty() {
-                    // Handles "host", "host port", "host:port", "[v6::1]:port",
-                    // and bare IPv6 literals (which contain multiple colons and
-                    // must not be split on the first one).
-                    let (host, port) = match parse_server_arg(args) {
+                    // Handles "host", "host [+]port", "host:[+]port",
+                    // "[v6::1]:[+]port", and bare IPv6 literals (which contain
+                    // multiple colons and must not be split on the first one).
+                    let ServerArg { host, port, tls } = match parse_server_arg(args) {
                         Ok(endpoint) => endpoint,
                         Err(error) => {
                             self.add_server_message(ChatMessage::system_fmt(
@@ -1702,17 +1702,28 @@ impl IrcApp {
                     // /server is deliberately unprofiled. /reconnect preserves
                     // the active profile; /server never inherits its secrets,
                     // even if the user names the same host and port again.
+                    // The new session is snapshotted from the form, so the
+                    // form is only borrowed for the switch: afterwards it
+                    // goes back to describing the saved profile, or the next
+                    // save would persist the cleared secrets (and the new
+                    // host next to the old network's credentials) (#234).
+                    let saved_profile = self.take_endpoint_form();
                     self.clear_endpoint_credentials();
                     self.server_host = host;
                     if let Some(port) = port {
                         self.server_port = port;
                     }
-                    if !self.switch_session_from_form("Changing servers") {
+                    if let Some(tls) = tls {
+                        self.use_tls = tls;
+                    }
+                    let target = format!("{}:{}", self.server_host, self.server_port);
+                    let switched = self.switch_session_from_form("Changing servers");
+                    self.restore_endpoint_form(saved_profile);
+                    if !switched {
                         return;
                     }
                     self.add_server_message(ChatMessage::system(&format!(
-                        "Connecting to {}:{}...",
-                        self.server_host, self.server_port
+                        "Connecting to {target}..."
                     )));
                 } else {
                     self.add_message_to_current(ChatMessage::system(&format!(
@@ -2130,6 +2141,46 @@ impl IrcApp {
         self.accept_invalid_certs = false;
     }
 
+    /// Snapshot the connection-form fields that make up the saved network
+    /// profile (endpoint, secrets, automation). Deliberately not `Debug`.
+    fn take_endpoint_form(&self) -> EndpointForm {
+        EndpointForm {
+            server_host: self.server_host.clone(),
+            server_port: self.server_port.clone(),
+            use_tls: self.use_tls,
+            accept_invalid_certs: self.accept_invalid_certs,
+            password: self.password.clone(),
+            sasl_username: self.sasl_username.clone(),
+            sasl_password: self.sasl_password.clone(),
+            sasl_mechanism: self.sasl_mechanism,
+            sasl_required: self.sasl_required,
+            tls_client_cert_path: self.tls_client_cert_path.clone(),
+            tls_client_key_path: self.tls_client_key_path.clone(),
+            auto_join_channels: self.auto_join_channels.clone(),
+            auto_perform: self.auto_perform.clone(),
+            pre_away_message: self.pre_away_message.clone(),
+            persistence_profile: self.persistence_profile.clone(),
+        }
+    }
+
+    fn restore_endpoint_form(&mut self, form: EndpointForm) {
+        self.server_host = form.server_host;
+        self.server_port = form.server_port;
+        self.use_tls = form.use_tls;
+        self.accept_invalid_certs = form.accept_invalid_certs;
+        self.password = form.password;
+        self.sasl_username = form.sasl_username;
+        self.sasl_password = form.sasl_password;
+        self.sasl_mechanism = form.sasl_mechanism;
+        self.sasl_required = form.sasl_required;
+        self.tls_client_cert_path = form.tls_client_cert_path;
+        self.tls_client_key_path = form.tls_client_key_path;
+        self.auto_join_channels = form.auto_join_channels;
+        self.auto_perform = form.auto_perform;
+        self.pre_away_message = form.pre_away_message;
+        self.persistence_profile = form.persistence_profile;
+    }
+
     pub fn show_help(&mut self) {
         let help_sections = vec![
             (
@@ -2203,7 +2254,9 @@ impl IrcApp {
             (
                 "=== Connection ===",
                 vec![
-                    "/server <host:port> - Connect to server",
+                    "/server <host> [[+]port] - Connect to a server (saved settings unchanged)",
+                    "  Port 6697 or +port (e.g. +7000) uses TLS, other ports plain text;",
+                    "  with no port the current port and TLS setting are kept",
                     "/disconnect         - Disconnect",
                     "/reconnect          - Reconnect",
                     "/away [message]     - Set away message",
@@ -2453,6 +2506,7 @@ pub(super) fn command_line_contains_credentials(line: &str) -> bool {
             command_line_contains_credentials(nested)
         }
         "PERFORM" if !args.eq_ignore_ascii_case("clear") => command_line_contains_credentials(args),
+        "SERVER" => server_args_carry_secret(args),
         _ => false,
     }
 }
@@ -2546,29 +2600,111 @@ fn mode_command_args(
     ))
 }
 
-/// Parse the /server argument: "host", "host port", "host:port",
-/// "[v6::addr]:port", or a bare IPv6 literal (multiple colons; must not be
+/// The connection-form fields that make up one saved network profile, held
+/// while `/server` borrows the form for a one-off session. Deliberately not
+/// `Debug`: it carries credentials.
+struct EndpointForm {
+    server_host: String,
+    server_port: String,
+    use_tls: bool,
+    accept_invalid_certs: bool,
+    password: String,
+    sasl_username: String,
+    sasl_password: String,
+    sasl_mechanism: crate::irc::client::SaslMechanism,
+    sasl_required: bool,
+    tls_client_cert_path: String,
+    tls_client_key_path: String,
+    auto_join_channels: String,
+    auto_perform: String,
+    pre_away_message: String,
+    persistence_profile: String,
+}
+
+/// The standard TLS port: a `/server` that names it connects with TLS.
+const TLS_PORT: u16 = 6697;
+
+/// The endpoint named by `/server`. `tls` is `Some` only when a port was
+/// typed: `+port` (mIRC's TLS marker) or the standard TLS port means TLS and
+/// any other port means plain text. With no port the form's port and TLS
+/// setting are kept together, so `/server host` cannot pair one with the
+/// other's default (#234).
+#[derive(Debug, PartialEq)]
+struct ServerArg {
+    host: String,
+    port: Option<String>,
+    tls: Option<bool>,
+}
+
+impl ServerArg {
+    fn new(host: &str, port: Option<(u16, bool)>) -> Self {
+        Self {
+            host: host.to_string(),
+            port: port.map(|(port, _)| port.to_string()),
+            tls: port.map(|(_, tls)| tls),
+        }
+    }
+}
+
+/// Parse a port typed after `/server`, returning it with whether it selects
+/// TLS. Errors never echo the input: in mIRC's `/server host port password`
+/// order it can be a password (#226).
+fn parse_server_arg_port(value: &str) -> Result<(u16, bool), String> {
+    let value = value.trim();
+    let (marked, digits) = match value.strip_prefix('+') {
+        Some(digits) => (true, digits),
+        None => (false, value),
+    };
+    match digits.parse::<u16>() {
+        Ok(port) if port > 0 && digits.bytes().all(|byte| byte.is_ascii_digit()) => {
+            Ok((port, marked || port == TLS_PORT))
+        }
+        _ => Err("Invalid server port; enter a number from 1 to 65535 \
+                  (prefix it with + for TLS)"
+            .to_string()),
+    }
+}
+
+/// True when the text after `/server` carries more than an endpoint, such as
+/// the password of mIRC's `/server host port password`: anything after the
+/// host that is not a single (optionally `+`) port. Such a line must not be
+/// echoed or kept in history (#226).
+pub(super) fn server_args_carry_secret(args: &str) -> bool {
+    let mut parts = args.split_whitespace();
+    parts.next();
+    match (parts.next(), parts.next()) {
+        (None, _) => false,
+        (Some(port), None) => parse_server_arg_port(port).is_err(),
+        (Some(_), Some(_)) => true,
+    }
+}
+
+/// Parse the /server argument: "host", "host [+]port", "host:[+]port",
+/// "[v6::addr]:[+]port", or a bare IPv6 literal (multiple colons; must not be
 /// split on the first one).
-fn parse_server_arg(args: &str) -> Result<(String, Option<String>), String> {
+fn parse_server_arg(args: &str) -> Result<ServerArg, String> {
     let args = args.trim();
     // Space-separated form: "host 6697" (works for any host including IPv6;
     // any whitespace, per the command-token split — #159).
     if let Some((host, port)) = args.split_once(char::is_whitespace) {
         let host = host.trim_matches(['[', ']']);
-        let port = parse_server_port(port)?;
-        return Ok((host.to_string(), Some(port.to_string())));
+        return Ok(ServerArg::new(host, Some(parse_server_arg_port(port)?)));
     }
     // Bracketed IPv6 with optional port: "[::1]:6697" or "[::1]".
     if let Some(rest) = args.strip_prefix('[') {
         if let Some((host, after)) = rest.split_once(']') {
             let port = match after.strip_prefix(':') {
-                Some(port) => Some(parse_server_port(port)?.to_string()),
+                Some(port) => Some(parse_server_arg_port(port)?),
                 None if after.is_empty() => None,
-                None => return Err(format!("Invalid server endpoint: {args}")),
+                None => {
+                    return Err("Invalid server endpoint; use host, host port, host:port \
+                                or [v6::addr]:port"
+                        .to_string());
+                }
             };
-            return Ok((host.to_string(), port));
+            return Ok(ServerArg::new(host, port));
         }
-        return Ok((rest.to_string(), None));
+        return Ok(ServerArg::new(rest, None));
     }
     // "host:port" - only with exactly one colon and a numeric port; an IPv6
     // literal has several colons and falls through as a bare host.
@@ -2578,10 +2714,9 @@ fn parse_server_arg(args: &str) -> Result<(String, Option<String>), String> {
         if host.is_empty() {
             return Err("Server host cannot be empty".to_string());
         }
-        let port = parse_server_port(port)?;
-        return Ok((host.to_string(), Some(port.to_string())));
+        return Ok(ServerArg::new(host, Some(parse_server_arg_port(port)?)));
     }
-    Ok((args.to_string(), None))
+    Ok(ServerArg::new(args, None))
 }
 
 pub(crate) fn parse_server_port(value: &str) -> Result<u16, String> {
@@ -3580,6 +3715,120 @@ mod tests {
         assert!(!app.accept_invalid_certs);
     }
 
+    fn saved_libera_profile_app() -> IrcApp {
+        IrcApp {
+            server_host: "irc.libera.chat".into(),
+            server_port: "6697".into(),
+            use_tls: true,
+            password: "server-pass".into(),
+            sasl_username: "account".into(),
+            sasl_password: "sasl-pass".into(),
+            auto_join_channels: "#private key".into(),
+            auto_perform: "/ns identify nickserv-pass".into(),
+            accept_invalid_certs: true,
+            ..IrcApp::with_settings(crate::gui::Settings {
+                logging_enabled: false,
+                ..crate::gui::Settings::default()
+            })
+        }
+    }
+
+    #[test]
+    fn server_command_never_rewrites_the_saved_profile() {
+        let mut app = saved_libera_profile_app();
+
+        app.process_command("/server irc.oftc.net 6667");
+
+        // The new session starts from nothing: no secret follows the switch.
+        let session = app.active_server_config().unwrap();
+        assert_eq!(session.host, "irc.oftc.net");
+        assert!(session.password.is_none());
+        assert!(session.sasl_username.is_none() && session.sasl_password.is_none());
+        assert!(!session.accept_invalid_certs);
+        // The persisted profile is untouched, so a later save (e.g. /ignore,
+        // /perform, an update restart) cannot erase it or pair its secrets with
+        // the switched-to host.
+        let saved = app.get_settings();
+        assert_eq!(saved.server_host, "irc.libera.chat");
+        assert_eq!(saved.server_port, "6697");
+        assert!(saved.use_tls);
+        assert_eq!(saved.password, "server-pass");
+        assert_eq!(saved.sasl_username, "account");
+        assert_eq!(saved.sasl_password, "sasl-pass");
+        assert_eq!(saved.auto_join_channels, "#private key");
+        assert_eq!(saved.auto_perform, "/ns identify nickserv-pass");
+        assert!(saved.accept_invalid_certs);
+    }
+
+    #[test]
+    fn server_command_picks_tls_from_the_port_it_was_given() {
+        let tls_of = |command: &str, start_tls: bool| {
+            let mut app = saved_libera_profile_app();
+            app.use_tls = start_tls;
+            app.process_command(command);
+            let session = app.active_server_config().unwrap();
+            (session.port, session.use_tls)
+        };
+        // 6697 is TLS even after a plaintext session; other ports are plain.
+        assert_eq!(tls_of("/server irc.x.net 6697", false), (6697, true));
+        assert_eq!(tls_of("/server irc.x.net:6697", false), (6697, true));
+        assert_eq!(tls_of("/server irc.x.net 6667", true), (6667, false));
+        assert_eq!(tls_of("/server irc.x.net:7000", true), (7000, false));
+        // mIRC's +port marker forces TLS on any port.
+        assert_eq!(tls_of("/server irc.x.net +7000", false), (7000, true));
+        assert_eq!(tls_of("/server irc.x.net:+7000", false), (7000, true));
+        assert_eq!(tls_of("/server [2001:db8::1]:+7000", false), (7000, true));
+        // Without a port the current port and TLS setting stay paired.
+        assert_eq!(tls_of("/server irc.x.net", true), (6697, true));
+        assert_eq!(tls_of("/server irc.x.net", false), (6697, false));
+    }
+
+    #[test]
+    fn server_command_does_not_echo_or_remember_a_trailing_password() {
+        let mut app = saved_libera_profile_app();
+        app.input_text = "/server irc.x.net 6667 hunter2".into();
+        app.process_input();
+
+        assert!(!app.connecting);
+        assert_eq!(app.server_host, "irc.libera.chat");
+        assert!(
+            app.server_messages
+                .iter()
+                .all(|message| !message.content.contains("hunter2")),
+            "the password was echoed into the buffer"
+        );
+        assert!(
+            app.server_messages
+                .iter()
+                .any(|message| message.content.contains("1 to 65535"))
+        );
+        assert!(
+            app.command_history
+                .iter()
+                .all(|line| !line.contains("hunter2"))
+        );
+
+        // Ordinary endpoint forms still reach history.
+        for line in [
+            "/server irc.x.net",
+            "/server irc.x.net 6697",
+            "/server irc.x.net:6697",
+            "/server irc.x.net +6697",
+            "/server 2001:db8::1",
+            "/server [2001:db8::1]:6697",
+        ] {
+            assert!(!command_line_contains_credentials(line), "{line}");
+        }
+        for line in [
+            "/server irc.x.net 6667 hunter2",
+            "/server irc.x.net hunter2",
+            "/server irc.x.net:6667 hunter2",
+            "/SERVER irc.x.net +6697 hunter2",
+        ] {
+            assert!(command_line_contains_credentials(line), "{line}");
+        }
+    }
+
     #[test]
     fn server_command_validates_before_mutation_and_never_inherits_a_profile() {
         let mut app = IrcApp {
@@ -3606,16 +3855,18 @@ mod tests {
         let command = format!("/server {} {}", app.server_host, app.server_port);
         app.process_command(&command);
         assert!(app.connecting);
-        assert!(app.password.is_empty());
-        assert!(app.sasl_username.is_empty());
-        assert!(app.sasl_password.is_empty());
-        assert!(app.auto_join_channels.is_empty());
-        assert!(app.auto_perform.is_empty());
-        assert!(!app.accept_invalid_certs);
         let active = app.active_server_config().unwrap();
         assert!(active.password.is_none());
         assert!(active.sasl_username.is_none());
         assert!(active.sasl_password.is_none());
+        assert!(!active.accept_invalid_certs);
+        let session = app.active_session.as_ref().unwrap();
+        assert!(session.auto_join_channels.is_empty());
+        assert!(session.auto_perform.is_empty());
+        // Only the session starts clean: the form keeps describing the saved
+        // profile (see server_command_never_rewrites_the_saved_profile).
+        assert_eq!(app.password, "server-pass");
+        assert_eq!(app.auto_perform, "/ns identify nickserv-pass");
     }
 
     #[test]
@@ -3629,33 +3880,52 @@ mod tests {
 
     #[test]
     fn server_arg_handles_ipv6() {
+        fn arg(host: &str, port: Option<&str>, tls: Option<bool>) -> Result<ServerArg, String> {
+            Ok(ServerArg {
+                host: host.into(),
+                port: port.map(Into::into),
+                tls,
+            })
+        }
         assert_eq!(
             parse_server_arg("irc.libera.chat:6697"),
-            Ok(("irc.libera.chat".into(), Some("6697".into())))
+            arg("irc.libera.chat", Some("6697"), Some(true))
         );
         assert_eq!(
             parse_server_arg("irc.libera.chat 6697"),
-            Ok(("irc.libera.chat".into(), Some("6697".into())))
+            arg("irc.libera.chat", Some("6697"), Some(true))
         );
         assert_eq!(
             parse_server_arg("2001:db8::1 6697"),
-            Ok(("2001:db8::1".into(), Some("6697".into())))
+            arg("2001:db8::1", Some("6697"), Some(true))
         );
         assert_eq!(
             parse_server_arg("2001:db8::1"),
-            Ok(("2001:db8::1".into(), None))
+            arg("2001:db8::1", None, None)
         );
         assert_eq!(
             parse_server_arg("[::1]:7000"),
-            Ok(("::1".into(), Some("7000".into())))
+            arg("::1", Some("7000"), Some(false))
         );
         assert_eq!(
             parse_server_arg("[2001:db8::1]"),
-            Ok(("2001:db8::1".into(), None))
+            arg("2001:db8::1", None, None)
         );
         assert_eq!(
             parse_server_arg("irc.example.org"),
-            Ok(("irc.example.org".into(), None))
+            arg("irc.example.org", None, None)
+        );
+        assert_eq!(
+            parse_server_arg("irc.example.org 6667"),
+            arg("irc.example.org", Some("6667"), Some(false))
+        );
+        assert_eq!(
+            parse_server_arg("irc.example.org +7000"),
+            arg("irc.example.org", Some("7000"), Some(true))
+        );
+        assert_eq!(
+            parse_server_arg("[::1]:+7000"),
+            arg("::1", Some("7000"), Some(true))
         );
         assert!(parse_server_arg("host:junk").is_err());
         assert!(parse_server_arg("host:").is_err());
@@ -3663,6 +3933,19 @@ mod tests {
         assert!(parse_server_arg("host 0").is_err());
         assert!(parse_server_arg("host 70000").is_err());
         assert!(parse_server_arg("host abc").is_err());
+        assert!(parse_server_arg("host +").is_err());
+        assert!(parse_server_arg("host ++6697").is_err());
+        assert!(parse_server_arg("host -6697").is_err());
+        // A rejected argument is never repeated back: it may be a password.
+        for rejected in [
+            "host 6667 hunter2",
+            "host hunter2",
+            "host:hunter2",
+            "[::1]hunter2",
+        ] {
+            let error = parse_server_arg(rejected).unwrap_err();
+            assert!(!error.contains("hunter2"), "{rejected}: {error}");
+        }
         assert_eq!(parse_server_port("1"), Ok(1));
         assert_eq!(parse_server_port("65535"), Ok(65535));
     }
