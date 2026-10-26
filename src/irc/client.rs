@@ -2690,7 +2690,13 @@ mod tests {
             // and a queued NICK wakes the select, the forward must still
             // finish; dropping it would lose the line (CAP LS, 001, ...) and
             // stall the handshake.
-            let (client_io, server_io) = tokio::io::duplex(4096);
+            // The pipe holds exactly one line, so a second write completes
+            // only once the reader has taken that line off it. Awaiting that
+            // second write orders the test after the reader has consumed the
+            // line and, in this single-threaded runtime, parked itself on the
+            // full channel, with no sleep to guess how long that takes.
+            const LINE: &[u8] = b":srv CAP * LS :multi-prefix\r\n";
+            let (client_io, server_io) = tokio::io::duplex(LINE.len());
             let (client_read, mut client_write) = tokio::io::split(client_io);
             let mut client_read = BufReader::new(client_read);
             let (_server_read, mut server_write) = tokio::io::split(server_io);
@@ -2705,10 +2711,7 @@ mod tests {
                 .await
                 .unwrap();
             let (nick_tx, mut nick_rx) = mpsc::unbounded_channel::<String>();
-            server_write
-                .write_all(b":srv CAP * LS :multi-prefix\r\n")
-                .await
-                .unwrap();
+            server_write.write_all(LINE).await.unwrap();
 
             let reader_task = tokio::spawn(async move {
                 let mut buf = Vec::new();
@@ -2722,11 +2725,15 @@ mod tests {
                 .await
                 .map_err(|error| error.to_string())
             });
-            // Let the reader consume the line and block on the full channel,
-            // then wake it with a NICK.
-            tokio::time::sleep(Duration::from_millis(100)).await;
+            // Completes once the reader has consumed the line, which leaves
+            // it blocked forwarding that line to the full channel. The byte
+            // is never read as part of a line: the test ends first.
+            server_write.write_all(b"x").await.unwrap();
+            // Wake it with a NICK, and let every task that wakes run.
             nick_tx.send("tester_".to_string()).unwrap();
-            tokio::time::sleep(Duration::from_millis(100)).await;
+            for _ in 0..8 {
+                tokio::task::yield_now().await;
+            }
             assert!(matches!(
                 incoming_rx.recv().await.unwrap().command,
                 IrcCommand::Notice(..)
