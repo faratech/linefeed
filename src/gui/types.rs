@@ -1170,15 +1170,31 @@ impl Channel {
         self.names_index.insert(new_key, slot);
     }
 
+    /// Re-key the pending NAMES snapshot after the case mapping changed.
+    /// Nicks that now collapse to one key are the same member, so keep only
+    /// the highest-ranked of them, as `sort_users` does for the visible list:
+    /// an entry left in the snapshot but out of the index could no longer be
+    /// reached by a PART, MODE or NICK and would come back at 366 as a ghost.
     fn rebuild_names_index(&mut self) {
         self.names_index.clear();
-        if let Some(snapshot) = &self.names_snapshot {
-            for (slot, user) in snapshot.iter().enumerate() {
-                self.names_index
-                    .entry(self.case_mapping.canonicalize(&user.nick))
-                    .or_insert(slot);
+        let Some(snapshot) = self.names_snapshot.take() else {
+            return;
+        };
+        let mapping = self.case_mapping;
+        let mut keyed: Vec<(String, ChannelUser)> = snapshot
+            .into_iter()
+            .map(|user| (mapping.canonicalize(&user.nick), user))
+            .collect();
+        // Stable, so equal ranks keep the order they were streamed in.
+        keyed.sort_by_key(|(_, user)| user.rank);
+        let mut deduped = Vec::with_capacity(keyed.len());
+        for (key, user) in keyed {
+            if let std::collections::hash_map::Entry::Vacant(slot) = self.names_index.entry(key) {
+                slot.insert(deduped.len());
+                deduped.push(user);
             }
         }
+        self.names_snapshot = Some(deduped);
     }
 
     /// Start an authoritative NAMES snapshot. The visible membership is left
@@ -1815,6 +1831,43 @@ mod tests {
         assert!(ch.has_user("nick[1]"));
         assert!(!ch.has_user("nick{1}"));
         assert_users_sorted_and_findable(&ch);
+    }
+
+    #[test]
+    fn case_mapping_change_mid_burst_leaves_no_ghost_in_the_snapshot() {
+        let mut ch = Channel::new();
+        ch.set_case_mapping(CaseMapping::Ascii);
+        ch.begin_user_burst();
+        // Distinct under ASCII folding...
+        ch.add_user_burst_modes("Nick[1]", &[UserMode::Normal]);
+        ch.add_user_burst_modes("Nick{1}", &[UserMode::Op]);
+        ch.add_user_burst_modes("other", &[UserMode::Normal]);
+        // ...the same member once the network turns out to fold rfc1459.
+        ch.set_case_mapping(CaseMapping::Rfc1459);
+
+        // The member parts mid-burst: every copy of it must go with it, or
+        // the one that was unreachable by lookup resurrects at 366.
+        ch.remove_user("NICK[1]");
+        ch.finish_user_burst();
+
+        let nicks: Vec<&str> = ch.users.iter().map(|user| user.nick.as_str()).collect();
+        assert_eq!(nicks, ["other"], "a parted member came back as a ghost");
+    }
+
+    #[test]
+    fn case_mapping_change_mid_burst_keeps_the_best_ranked_duplicate() {
+        let mut ch = Channel::new();
+        ch.set_case_mapping(CaseMapping::Ascii);
+        ch.begin_user_burst();
+        ch.add_user_burst_modes("Nick[1]", &[UserMode::Normal]);
+        ch.add_user_burst_modes("Nick{1}", &[UserMode::Op]);
+        ch.set_case_mapping(CaseMapping::Rfc1459);
+        ch.finish_user_burst();
+
+        // Same choice sort_users makes for the visible list.
+        assert_eq!(ch.users.len(), 1);
+        assert_eq!(ch.users[0].nick, "Nick{1}");
+        assert_eq!(ch.users[0].mode, UserMode::Op);
     }
 
     #[test]
