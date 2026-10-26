@@ -1005,11 +1005,17 @@ impl IrcApp {
                     if let Some(channel) = &self.current_channel.clone()
                         && self.is_channel_name(channel)
                     {
-                        for mask in self.unban_masks_for(args) {
+                        let plan = self.unban_masks_for(args);
+                        if let Some(note) = plan.note {
+                            self.add_message_to_current(ChatMessage::system(&note));
+                        }
+                        // MODE -bbb m1 m2 m3, at most the server's MODES= per line.
+                        let per_line = self.modes_per_line();
+                        for chunk in plan.masks.chunks(per_line) {
                             self.send_command(IrcCommand::Mode(
                                 channel.clone(),
-                                Some("-b".to_string()),
-                                vec![mask],
+                                Some(format!("-{}", "b".repeat(chunk.len()))),
+                                chunk.to_vec(),
                             ));
                         }
                     }
@@ -2099,22 +2105,45 @@ impl IrcApp {
             .unwrap_or_else(|| nick_to_mask(value))
     }
 
-    /// The masks `/unban <value>` removes. A hostmask or extended ban is used
-    /// as typed. A bare nick is resolved through the channel's ban list to the
-    /// entries that cover it: `/ban nick` sets a mask built from the user's
-    /// host, which `nick!*@*` would never undo (#235). With no match it falls
-    /// back to the mask `/ban` would build.
-    fn unban_masks_for(&self, value: &str) -> Vec<String> {
-        if is_extended_ban(value) || value.contains(['!', '@', '*']) {
-            return vec![nick_to_mask(value)];
+    /// How many mode changes one MODE line may carry: the server's MODES=
+    /// limit (capped), or one when the server never advertised it.
+    fn modes_per_line(&self) -> usize {
+        match self.network_support.isupport.get("MODES") {
+            Some(Some(value)) if !value.is_empty() => value
+                .parse::<usize>()
+                .ok()
+                .filter(|limit| *limit > 0)
+                .map_or(1, |limit| limit.min(MAX_UNBAN_MASKS)),
+            // A bare MODES (or MODES=) means the server sets no limit.
+            Some(_) => MAX_UNBAN_MASKS,
+            None => 1,
         }
+    }
+
+    /// Resolve `/unban <value>` to the masks to remove. A hostmask or extended
+    /// ban is used as typed. A bare nick is looked up in the channel's ban
+    /// list, because `/ban nick` sets a mask built from the user's host, which
+    /// `nick!*@*` would never undo (#235). Exact entries win: bans naming the
+    /// nick, or exactly the mask `/ban` builds. Only when there are none does
+    /// it fall back to the single narrowest ban that merely covers the user,
+    /// and never a catch-all like `*!*@*` that someone else set on purpose.
+    fn unban_masks_for(&self, value: &str) -> UnbanPlan {
+        if is_extended_ban(value) || value.contains(['!', '@', '*']) {
+            return UnbanPlan {
+                masks: vec![nick_to_mask(value)],
+                note: None,
+            };
+        }
+        let built = self.ban_mask_for(value);
         let channel = self
             .current_channel
             .as_deref()
             .and_then(|channel| self.channel_key(channel))
             .and_then(|channel| self.channels.get(&channel));
+        let mut broad_only: Option<String> = None;
         if let Some(channel) = channel {
             let nick_key = self.network_support.canonicalize(value);
+            let built_key = self.network_support.canonicalize(&built);
             let identity =
                 channel
                     .get_user(value)
@@ -2125,26 +2154,66 @@ impl IrcApp {
                         ),
                         _ => None,
                     });
-            let covering: Vec<String> = channel
-                .bans
-                .iter()
-                .filter(|ban| {
-                    let mask = self.network_support.canonicalize(&ban.mask);
-                    // A ban naming this nick (also once the user has left),
-                    // or any ban whose mask matches the user's known host.
-                    mask.split_once('!')
-                        .is_some_and(|(nick, _)| nick == nick_key)
-                        || identity
-                            .as_deref()
-                            .is_some_and(|identity| mask_matches(&mask, identity))
-                })
-                .map(|ban| ban.mask.clone())
-                .collect();
-            if !covering.is_empty() {
-                return covering;
+            let mut exact: Vec<String> = Vec::new();
+            let mut covering: Vec<&str> = Vec::new();
+            for ban in &channel.bans {
+                let mask = self.network_support.canonicalize(&ban.mask);
+                // A ban naming this nick (also once the user has left), the
+                // mask /ban builds, or the user's full identity.
+                if mask
+                    .split_once('!')
+                    .is_some_and(|(nick, _)| nick == nick_key)
+                    || mask == built_key
+                    || identity.as_deref() == Some(mask.as_str())
+                {
+                    exact.push(ban.mask.clone());
+                } else if identity
+                    .as_deref()
+                    .is_some_and(|identity| mask_matches(&mask, identity))
+                {
+                    covering.push(&ban.mask);
+                }
             }
+            if !exact.is_empty() {
+                let extra = exact.len().saturating_sub(MAX_UNBAN_MASKS);
+                exact.truncate(MAX_UNBAN_MASKS);
+                let mut note = format!("Unbanning {value}: {}", exact.join(", "));
+                if extra > 0 {
+                    note.push_str(&format!(" (and {extra} more - run /unban again)"));
+                }
+                return UnbanPlan {
+                    masks: exact,
+                    note: Some(note),
+                };
+            }
+            // min_by_key keeps the first of equally specific entries.
+            if let Some(narrowest) = covering
+                .iter()
+                .copied()
+                .filter(|mask| ban_specificity(mask) > 0)
+                .min_by_key(|mask| std::cmp::Reverse(ban_specificity(mask)))
+            {
+                return UnbanPlan {
+                    masks: vec![narrowest.to_string()],
+                    note: Some(format!(
+                        "No ban names {value} exactly; removing the narrowest ban that covers \
+                         them: {narrowest}"
+                    )),
+                };
+            }
+            broad_only = covering.first().map(|mask| mask.to_string());
         }
-        vec![self.ban_mask_for(value)]
+        let note = match broad_only {
+            Some(broad) => format!(
+                "Only the catch-all ban {broad} covers {value}, so it was left alone. \
+                 Use /unban {broad} to remove it deliberately."
+            ),
+            None => format!("No matching ban in the list; sending MODE -b {built}"),
+        };
+        UnbanPlan {
+            masks: vec![built],
+            note: Some(note),
+        }
     }
 
     /// Secrets and automation belong to one configured network profile. An
@@ -2370,6 +2439,25 @@ impl IrcApp {
             }
         }
     }
+}
+
+/// The outcome of resolving `/unban <nick>`: the masks to remove and a note
+/// telling the user what was chosen (or deliberately left alone).
+struct UnbanPlan {
+    masks: Vec<String>,
+    note: Option<String>,
+}
+
+/// The most masks one `/unban` removes, and the most mode changes it packs
+/// into a single MODE line, whatever the ban list or the server's MODES= says.
+const MAX_UNBAN_MASKS: usize = 12;
+
+/// How many literal characters a ban mask pins down. A mask made only of
+/// wildcards and separators (`*!*@*`, `*!*@*.*`) scores 0: a catch-all.
+fn ban_specificity(mask: &str) -> usize {
+    mask.chars()
+        .filter(|c| !matches!(c, '*' | '?' | '!' | '@' | '.'))
+        .count()
 }
 
 /// Split off the first whitespace-delimited word. The remainder has its
@@ -3020,6 +3108,127 @@ mod tests {
         expect_mode(&mut rx, "-b", "*!*@other.test");
         app.process_command("/unban bob@host");
         expect_mode(&mut rx, "-b", "bob!*@host");
+    }
+
+    fn set_bans(app: &mut IrcApp, masks: &[&str]) {
+        let channel = app.channels.get_mut("#chan").unwrap();
+        channel.bans.clear();
+        for mask in masks {
+            channel.apply_mode_list_change('+', 'b', mask, "op");
+        }
+    }
+
+    fn last_note(app: &IrcApp) -> String {
+        app.channels["#chan"]
+            .messages
+            .back()
+            .map(|row| row.content.clone())
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn unban_nick_prefers_exact_bans_over_broad_ones_set_by_others() {
+        let (mut app, mut rx) = ban_command_app();
+        set_bans(
+            &mut app,
+            &[
+                "*!*@*",
+                "*!*@*.example",
+                "*!*@host.example",
+                "*!~alice@host.example",
+            ],
+        );
+        // The mask /ban builds exists: only it goes, and the user is told.
+        app.process_command("/unban alice");
+        expect_mode(&mut rx, "-b", "*!~alice@host.example");
+        assert!(rx.try_recv().is_err());
+        assert!(
+            last_note(&app).contains("*!~alice@host.example"),
+            "{}",
+            last_note(&app)
+        );
+
+        // A ban naming the nick is exact too; without a MODES limit each
+        // removal is its own MODE.
+        set_bans(&mut app, &["*!*@*", "alice!*@*", "*!~alice@host.example"]);
+        app.process_command("/unban Alice");
+        expect_mode(&mut rx, "-b", "alice!*@*");
+        expect_mode(&mut rx, "-b", "*!~alice@host.example");
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn unban_nick_falls_back_to_the_narrowest_covering_ban_never_a_catch_all() {
+        let (mut app, mut rx) = ban_command_app();
+        // No exact entry: exactly one covering ban goes, the narrowest.
+        set_bans(&mut app, &["*!*@*", "*!*@*.example", "*!*@host.example"]);
+        app.process_command("/unban alice");
+        expect_mode(&mut rx, "-b", "*!*@host.example");
+        assert!(rx.try_recv().is_err());
+        assert!(last_note(&app).contains("*!*@host.example"));
+
+        set_bans(&mut app, &["*!*@*", "*!*@*.example"]);
+        app.process_command("/unban alice");
+        expect_mode(&mut rx, "-b", "*!*@*.example");
+        assert!(rx.try_recv().is_err());
+
+        // Only a catch-all covers alice: it is left alone and the user is
+        // pointed at the explicit mask form.
+        set_bans(&mut app, &["*!*@*", "*!*@*.*"]);
+        app.process_command("/unban alice");
+        while let Ok(command) = rx.try_recv() {
+            match command {
+                IrcCommand::Mode(_, Some(mode), params) => {
+                    assert_eq!(mode, "-b");
+                    assert_eq!(params, vec!["*!~alice@host.example".to_string()]);
+                }
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+        assert!(
+            last_note(&app).contains("/unban *!*@*"),
+            "{}",
+            last_note(&app)
+        );
+    }
+
+    #[test]
+    fn unban_batches_removals_up_to_the_modes_limit() {
+        let (mut app, mut rx) = ban_command_app();
+        set_bans(
+            &mut app,
+            &[
+                "alice!*@*",
+                "alice!~a@one",
+                "alice!~b@two",
+                "*!~alice@host.example",
+            ],
+        );
+        app.network_support
+            .isupport
+            .insert("MODES".into(), Some("3".into()));
+        app.process_command("/unban alice");
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            IrcCommand::Mode(
+                "#chan".into(),
+                Some("-bbb".into()),
+                vec![
+                    "alice!*@*".into(),
+                    "alice!~a@one".into(),
+                    "alice!~b@two".into()
+                ]
+            )
+        );
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            IrcCommand::Mode(
+                "#chan".into(),
+                Some("-b".into()),
+                vec!["*!~alice@host.example".into()]
+            )
+        );
+        assert!(rx.try_recv().is_err());
     }
 
     #[test]
