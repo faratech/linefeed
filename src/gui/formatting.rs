@@ -419,35 +419,70 @@ fn parse_irc_colors(input: &str) -> Vec<TextSpan> {
     spans
 }
 
-/// Split text into URL and non-URL segments
-/// Characters that close a URL: whitespace or common surrounding punctuation.
+/// Characters that end a URL: whitespace or common surrounding punctuation.
+/// Closing brackets are handled separately (see `url_length`): they end the
+/// URL only when no opener inside it balances them.
 fn url_terminates(c: char) -> bool {
-    c.is_whitespace() || matches!(c, '>' | ')' | ']' | '"' | '\'')
+    c.is_whitespace() || matches!(c, '>' | '"' | '\'')
 }
 
-fn split_urls(text: &str) -> Vec<(String, bool)> {
-    let mut result = Vec::new();
-    let mut remaining = text;
+/// Sentence punctuation that is not part of a URL when it comes last
+/// ("see https://example.com/page, thanks").
+fn url_trailing_punctuation(c: char) -> bool {
+    matches!(c, ',' | '.' | '!' | '?' | ';' | ':')
+}
 
-    while !remaining.is_empty() {
+/// Byte length of the URL at the start of `text`. It runs to the first
+/// terminator or unmatched closing bracket, so a Wikipedia-style
+/// `/Rust_(programming_language)` keeps its parentheses while the `)` of
+/// "(see https://example.com)" is left out, and loses trailing punctuation.
+fn url_length(text: &str) -> usize {
+    let (mut parens, mut squares) = (0usize, 0usize);
+    let mut end = text.len();
+    for (index, c) in text.char_indices() {
+        match c {
+            '(' => parens += 1,
+            '[' => squares += 1,
+            ')' if parens > 0 => parens -= 1,
+            ']' if squares > 0 => squares -= 1,
+            ')' | ']' => {
+                end = index;
+                break;
+            }
+            _ if url_terminates(c) => {
+                end = index;
+                break;
+            }
+            _ => {}
+        }
+    }
+    text[..end].trim_end_matches(url_trailing_punctuation).len()
+}
+
+/// Byte ranges of the URLs in `text`, in order.
+fn find_urls(text: &str) -> Vec<(usize, usize)> {
+    let mut ranges = Vec::new();
+    let mut from = 0;
+
+    while from < text.len() {
         // Find the start of a URL. A match only counts at the start of a word
         // (start of text or after whitespace/punctuation) so e.g. the "www." in
         // "awww.so cute" is not turned into a bogus hyperlink.
         let url_starts = ["http://", "https://", "www."];
-        let mut earliest_url: Option<(usize, &str)> = None;
+        let mut earliest_url: Option<(usize, usize)> = None;
 
         for prefix in &url_starts {
-            let mut search_from = 0;
-            while let Some(rel) = remaining[search_from..].find(prefix) {
+            let mut search_from = from;
+            while let Some(rel) = text[search_from..].find(prefix) {
                 let pos = search_from + rel;
                 let at_word_start = pos == 0
-                    || remaining[..pos].chars().next_back().is_some_and(|c| {
+                    || text[..pos].chars().next_back().is_some_and(|c| {
                         c.is_whitespace()
                             || matches!(c, '(' | '[' | '<' | '{' | '"' | '\'' | ',' | ';' | ':')
                     });
                 if at_word_start {
-                    if earliest_url.is_none() || pos < earliest_url.unwrap().0 {
-                        earliest_url = Some((pos, prefix));
+                    if earliest_url.is_none_or(|(earliest, _)| pos < earliest) {
+                        earliest_url = Some((pos, prefix.len()));
                     }
                     break;
                 }
@@ -455,32 +490,20 @@ fn split_urls(text: &str) -> Vec<(String, bool)> {
             }
         }
 
-        match earliest_url {
-            Some((pos, _)) => {
-                // Add text before the URL
-                if pos > 0 {
-                    result.push((remaining[..pos].to_string(), false));
-                }
-
-                // Find the end of the URL (first whitespace or end of string)
-                let url_start = pos;
-                let after_url = &remaining[url_start..];
-                let url_end = after_url.find(url_terminates).unwrap_or(after_url.len());
-
-                let url = &after_url[..url_end];
-                result.push((url.to_string(), true));
-
-                remaining = &remaining[url_start + url_end..];
-            }
-            None => {
-                // No more URLs, add the rest as plain text
-                result.push((remaining.to_string(), false));
-                break;
-            }
+        let Some((start, prefix_len)) = earliest_url else {
+            break;
+        };
+        let end = start + url_length(&text[start..]);
+        if end > start + prefix_len {
+            ranges.push((start, end));
+            from = end;
+        } else {
+            // Nothing but the prefix (and punctuation) after it: not a link.
+            from = start + prefix_len;
         }
     }
 
-    result
+    ranges
 }
 
 /// A fully-parsed segment ready for rendering: formatting controls resolved
@@ -518,37 +541,55 @@ fn render_segment(span: &TextSpan, text: String, is_url: bool) -> RenderSegment 
 
 /// Parse IRC formatting and detect URLs once, producing render-ready segments.
 pub fn layout_irc_text(text: &str) -> Vec<RenderSegment> {
-    let mut segments: Vec<RenderSegment> = Vec::new();
-    // A formatting control can cut a URL mid-domain ("\x02https://ex\x02ample.com"):
-    // the visible characters continue into the next span with no separator on
-    // the wire, so glue them onto the still-open hyperlink instead of
+    let spans = parse_irc_colors(text);
+    // URLs are found in the visible text of the whole message. A formatting
+    // control can cut a URL mid-domain ("\x02https://ex\x02ample.com"): the
+    // visible characters continue into the next span with no separator on the
+    // wire, so the pieces are glued onto the still-open hyperlink instead of
     // rendering a truncated link to the wrong host.
+    let visible: String = spans.iter().map(|span| span.text.as_str()).collect();
+    let urls = find_urls(&visible);
+
+    let mut segments: Vec<RenderSegment> = Vec::new();
     let mut url_open = false;
-    for span in parse_irc_colors(text) {
-        let parts = split_urls(&span.text);
-        let count = parts.len();
-        for (i, (part_text, part_is_url)) in parts.into_iter().enumerate() {
-            if url_open {
-                let prev = segments
-                    .last_mut()
-                    .expect("url_open implies a previous URL segment");
-                let run_end = part_text.find(url_terminates).unwrap_or(part_text.len());
-                prev.text.push_str(&part_text[..run_end]);
-                if run_end < part_text.len() {
-                    // Terminator reached inside this span: the URL closes
-                    // here and the rest renders as plain text.
-                    url_open = false;
-                    segments.push(render_segment(&span, part_text[run_end..].to_string(), false));
+    let mut next_url = 0;
+    let mut span_start = 0;
+    for span in &spans {
+        let span_end = span_start + span.text.len();
+        let mut at = span_start;
+        while at < span_end {
+            while next_url < urls.len() && urls[next_url].1 <= at {
+                next_url += 1;
+            }
+            match urls.get(next_url) {
+                Some(&(start, end)) if start <= at => {
+                    let piece_end = end.min(span_end);
+                    let piece = &visible[at..piece_end];
+                    if url_open {
+                        segments
+                            .last_mut()
+                            .expect("url_open implies a previous URL segment")
+                            .text
+                            .push_str(piece);
+                    } else {
+                        segments.push(render_segment(span, piece.to_string(), true));
+                    }
+                    // The URL runs on into the next span when a control cut it.
+                    url_open = piece_end < end;
+                    at = piece_end;
                 }
-                // Fully absorbed: the link stays open into the next span.
-            } else {
-                segments.push(render_segment(&span, part_text, part_is_url));
-                // split_urls leaves a URL as its span's final part only when
-                // it ran to the end of that span, i.e. it was cut by a
-                // formatting control rather than terminated.
-                url_open = i + 1 == count && part_is_url;
+                next => {
+                    let piece_end = next.map_or(span_end, |&(start, _)| start.min(span_end));
+                    segments.push(render_segment(
+                        span,
+                        visible[at..piece_end].to_string(),
+                        false,
+                    ));
+                    at = piece_end;
+                }
             }
         }
+        span_start = span_end;
     }
     segments
 }
@@ -746,6 +787,85 @@ mod tests {
         assert!(
             segs.iter()
                 .any(|s| s.is_url && s.text == "https://rust-lang.org")
+        );
+    }
+
+    fn urls_in(text: &str) -> Vec<String> {
+        layout_irc_text(text)
+            .into_iter()
+            .filter(|segment| segment.is_url)
+            .map(|segment| segment.text)
+            .collect()
+    }
+
+    #[test]
+    fn urls_drop_trailing_punctuation_and_unmatched_brackets() {
+        for (text, expected) in [
+            (
+                "see https://example.com/page, thanks",
+                "https://example.com/page",
+            ),
+            (
+                "go to https://example.com/page.",
+                "https://example.com/page",
+            ),
+            ("really https://example.com/a?!", "https://example.com/a"),
+            ("a: https://example.com/a; b", "https://example.com/a"),
+            ("or www.example.com.", "www.example.com"),
+            ("(see https://example.com/a)", "https://example.com/a"),
+            ("(see https://example.com/a).", "https://example.com/a"),
+            ("[https://example.com/a]", "https://example.com/a"),
+            ("<https://example.com/a>", "https://example.com/a"),
+            // Balanced brackets belong to the URL.
+            (
+                "https://en.wikipedia.org/wiki/Rust_(programming_language)",
+                "https://en.wikipedia.org/wiki/Rust_(programming_language)",
+            ),
+            (
+                "see https://en.wikipedia.org/wiki/Rust_(language), ok",
+                "https://en.wikipedia.org/wiki/Rust_(language)",
+            ),
+            (
+                "(https://en.wikipedia.org/wiki/Rust_(language))",
+                "https://en.wikipedia.org/wiki/Rust_(language)",
+            ),
+            ("http://[::1]:8080/x.", "http://[::1]:8080/x"),
+        ] {
+            assert_eq!(urls_in(text), [expected], "{text}");
+        }
+        // The dropped characters stay as plain text.
+        let segments = layout_irc_text("see https://example.com/page, thanks");
+        let plain: String = segments
+            .iter()
+            .filter(|segment| !segment.is_url)
+            .map(|segment| segment.text.as_str())
+            .collect();
+        assert_eq!(plain, "see , thanks");
+
+        assert_eq!(
+            urls_in("a https://x.test, b https://y.test."),
+            ["https://x.test", "https://y.test"]
+        );
+        // A bare prefix is not a link.
+        assert!(urls_in("http:// or www. or https://.").is_empty());
+    }
+
+    #[test]
+    fn trimmed_punctuation_applies_to_urls_cut_by_formatting_controls_too() {
+        // The control splits the domain; the sentence dot after the whole URL
+        // is still dropped, while a dot inside it is kept.
+        assert_eq!(
+            urls_in("\u{2}https://exam\u{2}ple.com/x."),
+            ["https://example.com/x"]
+        );
+        assert_eq!(
+            urls_in("\u{2}https://exam\u{2}.\u{2}com\u{2}, then"),
+            ["https://exam.com"]
+        );
+        // Balanced brackets count across the cut.
+        assert_eq!(
+            urls_in("see https://a.test/x_(\u{2}y\u{2}) now"),
+            ["https://a.test/x_(y)"]
         );
     }
 
