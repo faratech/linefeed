@@ -2,6 +2,7 @@
 """Focused regression tests for the repository build helpers."""
 
 import importlib.util
+import shutil
 import subprocess
 import tempfile
 import unittest
@@ -28,6 +29,22 @@ class BuildScriptTests(unittest.TestCase):
         )
         self.assertTrue(failed)
         self.assertEqual(sizes, {"linefeed_linux": (100, 100)})
+
+
+class BuildRsTests(unittest.TestCase):
+    @unittest.skipUnless(shutil.which("rustc"), "rustc is required")
+    def test_resource_script_unit_tests_pass(self):
+        # cargo never runs a build script's own tests, so compile them here:
+        # prerelease versions must keep FILEVERSION numeric (windres rejects
+        # "0,2,0-rc1" and the exe would ship without resources).
+        with tempfile.TemporaryDirectory() as tmp:
+            binary = Path(tmp) / "build-rs-tests"
+            subprocess.run(
+                ["rustc", "--edition=2024", "--test", str(ROOT / "build.rs"), "-o", str(binary)],
+                check=True, capture_output=True, text=True,
+            )
+            result = subprocess.run([str(binary)], capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
 
 class DependencyUpdaterTests(unittest.TestCase):
