@@ -267,7 +267,8 @@ const CLAIM: &str = "owner.lock";
 
 /// Create a staging directory and claim it. The returned file keeps the claim
 /// locked until dropped, so a download killed by an exit or crash can later be
-/// told apart from one still in progress (#270).
+/// told apart from one still in progress (#270). Where the filesystem cannot
+/// lock, the directory stays unclaimed and is never swept.
 pub fn stage_directory(paths: &Paths) -> io::Result<(String, PathBuf, File)> {
     let attempt = nonce()?;
     let directory = paths
@@ -278,16 +279,29 @@ pub fn stage_directory(paths: &Paths) -> io::Result<(String, PathBuf, File)> {
     platform::private_dir(&directory).map_err(|_| {
         io::Error::other("Cannot update this location; download the release manually")
     })?;
-    let claim = (|| {
-        let mut claim = new_file(&directory.join(CLAIM))?;
-        claim.write_all(paths.state.to_string_lossy().as_bytes())?;
-        claim.lock()?;
-        Ok::<_, io::Error>(claim)
-    })()
-    .inspect_err(|_| {
+    let claim = claim_directory(&directory, &paths.state, File::lock).inspect_err(|_| {
         let _ = fs::remove_dir_all(&directory);
     })?;
     Ok((attempt, directory, claim))
+}
+
+/// Lock the claim, then record `owner` in it. A sweep that landed between the
+/// two steps the other way round would see this installation's owner on an
+/// unlocked claim and delete a live download. The directory sits beside the
+/// executable, which may be on NFS/SMB/FUSE/FAT where locking fails
+/// (ENOLCK/ENOTSUP): the download then proceeds with the directory left
+/// unclaimed, which no sweep ever removes - the safe direction.
+fn claim_directory(
+    directory: &Path,
+    owner: &Path,
+    lock: impl FnOnce(&File) -> io::Result<()>,
+) -> io::Result<File> {
+    let mut claim = new_file(&directory.join(CLAIM))?;
+    match lock(&claim) {
+        Ok(()) => claim.write_all(owner.to_string_lossy().as_bytes())?,
+        Err(e) => tracing::warn!("Cannot lock update staging; it will not be reclaimed: {e}"),
+    }
+    Ok(claim)
 }
 
 /// Remove staging directories that downloads abandoned when the app exited or
@@ -309,21 +323,49 @@ fn sweep_orphans(paths: &Paths) {
         return;
     };
     for entry in entries.flatten() {
-        let is_staging = entry
-            .file_name()
+        let name = entry.file_name();
+        let attempt = name
             .to_str()
-            .and_then(|name| name.strip_prefix(".linefeed-update-"))
-            .is_some_and(|attempt| {
-                attempt.len() == 32 && attempt.bytes().all(|b| b.is_ascii_hexdigit())
-            });
+            .and_then(|name| name.strip_prefix(".linefeed-update-"));
+        let is_nonce = |v: &str| v.len() == 32 && v.bytes().all(|b| b.is_ascii_hexdigit());
+        let is_staging = attempt.is_some_and(is_nonce);
+        // What is left of a directory whose deletion was interrupted.
+        let is_tombstone = attempt
+            .and_then(|v| v.strip_suffix(TOMBSTONE))
+            .is_some_and(is_nonce);
         // file_type() does not follow links, so a link is never swept.
         let is_directory = entry.file_type().is_ok_and(|t| t.is_dir());
         let path = entry.path();
-        if is_staging && is_directory && keep.as_ref() != Some(&path) && abandoned(paths, &path)
-        {
+        if is_directory && is_tombstone {
+            // Only a directory found abandoned (or reset by the user) is ever
+            // renamed to one, and its claim may already be gone.
             let _ = fs::remove_dir_all(&path);
+        } else if is_directory
+            && is_staging
+            && keep.as_ref() != Some(&path)
+            && abandoned(paths, &path)
+        {
+            reap(&path);
         }
     }
+}
+
+const TOMBSTONE: &str = ".deleting";
+
+/// Delete a directory that was found abandoned. The rename comes first and is
+/// atomic: a crash while deleting a large download after `owner.lock` is gone
+/// would otherwise leave an unclaimed remainder nothing ever reclaims. The
+/// tombstone name is swept on its own. Returns false if the rename failed
+/// (e.g. a running helper on Windows) and the directory is left intact.
+fn reap(directory: &Path) -> bool {
+    let mut tombstone = directory.as_os_str().to_owned();
+    tombstone.push(TOMBSTONE);
+    let tombstone = PathBuf::from(tombstone);
+    if fs::rename(directory, &tombstone).is_err() {
+        return false;
+    }
+    let _ = fs::remove_dir_all(&tombstone);
+    true
 }
 
 /// Whether `directory` carries this installation's claim and no live download
@@ -562,7 +604,7 @@ fn reset_recovery_within(paths: &Paths, wait: Duration) -> io::Result<()> {
             let ours = tx.paths.target == paths.target && tx.paths.state == paths.state;
             if ours && tx.validate_paths().is_ok() {
                 let _ = fs::remove_file(tx.snapshot());
-                if is_real_dir(&tx.directory) {
+                if is_real_dir(&tx.directory) && !reap(&tx.directory) {
                     let _ = fs::remove_dir_all(&tx.directory);
                 }
             } else {
@@ -1576,6 +1618,89 @@ mod tests {
         assert!(swept_eventually(paths, &target_dir));
         #[cfg(unix)]
         assert!(fs::symlink_metadata(&link).is_ok());
+    }
+    #[test]
+    fn claim_is_locked_before_the_owner_is_written() {
+        // A sweep landing between the two would otherwise see this installation's
+        // owner on an unlocked claim and delete a live download (#270).
+        let fixture = Fixture::new();
+        let directory = fixture.root.join("claimed");
+        platform::private_dir(&directory).unwrap();
+        let owner = fixture.tx.paths.state.clone();
+        let mut at_lock = None;
+        let claim = claim_directory(&directory, &owner, |file| {
+            at_lock = Some(fs::read(directory.join(CLAIM)).unwrap());
+            file.lock()
+        })
+        .unwrap();
+        assert_eq!(at_lock, Some(Vec::new()));
+        assert_eq!(
+            fs::read(directory.join(CLAIM)).unwrap(),
+            owner.to_string_lossy().as_bytes()
+        );
+        assert!(!abandoned(&fixture.tx.paths, &directory));
+        drop(claim);
+        // A handle another test's fork keeps alive for an instant can make a
+        // just-released claim look busy.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !abandoned(&fixture.tx.paths, &directory) {
+            assert!(Instant::now() < deadline, "claim was never released");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+    #[test]
+    fn download_continues_unclaimed_where_the_filesystem_cannot_lock() {
+        // The staging directory sits beside the executable, which may be on
+        // NFS/SMB/FUSE/FAT where locking is unsupported (ENOLCK/ENOTSUP). An
+        // unclaimed directory is never swept, which is the safe direction.
+        let fixture = Fixture::new();
+        let directory = fixture.root.join("unlockable");
+        platform::private_dir(&directory).unwrap();
+        let claim = claim_directory(&directory, &fixture.tx.paths.state, |_| {
+            Err(io::Error::from(io::ErrorKind::Unsupported))
+        })
+        .unwrap();
+        drop(claim);
+        assert!(directory.exists());
+        assert!(!abandoned(&fixture.tx.paths, &directory));
+    }
+    #[test]
+    fn deletion_interrupted_midway_is_finished_by_the_next_sweep() {
+        // A crash while deleting an abandoned directory must not strand the
+        // remainder (up to 128 MiB) once its claim is gone (#270).
+        let fixture = Fixture::new();
+        let paths = &fixture.tx.paths;
+        let parent = paths.target.parent().unwrap();
+        let (attempt, orphan, claim) = stage_directory(paths).unwrap();
+        drop(claim);
+        fs::write(orphan.join("download.part"), vec![0u8; 4096]).unwrap();
+        // reap() renames away from the staging name before deleting anything.
+        let tombstone = parent.join(format!(".linefeed-update-{attempt}.deleting"));
+        assert!(reap(&orphan));
+        assert!(!orphan.exists() && !tombstone.exists());
+        // What a crash right after the rename (or mid-delete) leaves behind.
+        fs::create_dir(&tombstone).unwrap();
+        fs::write(tombstone.join("download.part"), vec![0u8; 4096]).unwrap();
+        // Not a tombstone name, and a link is never followed.
+        let unrelated = parent.join(".linefeed-update-notes.deleting");
+        fs::create_dir(&unrelated).unwrap();
+        #[cfg(unix)]
+        let (outside, link) = {
+            let outside = fixture.root.join("outside");
+            fs::create_dir(&outside).unwrap();
+            fs::write(outside.join("precious"), b"data").unwrap();
+            let link = parent.join(format!(".linefeed-update-{}.deleting", nonce().unwrap()));
+            std::os::unix::fs::symlink(&outside, &link).unwrap();
+            (outside, link)
+        };
+        sweep_orphans(paths);
+        assert!(!tombstone.exists());
+        assert!(unrelated.exists());
+        #[cfg(unix)]
+        {
+            assert!(outside.join("precious").exists());
+            assert!(fs::symlink_metadata(&link).is_ok());
+        }
     }
     #[test]
     fn updater_infrastructure_failure_does_not_stop_a_normal_launch() {
