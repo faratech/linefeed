@@ -3424,6 +3424,12 @@ impl IrcApp {
                     // We joined a channel
                     let existing_key = self.channel_key(channel);
                     let is_new_channel = existing_key.is_none();
+                    // A key sent with our JOIN belongs to the tab whether it is
+                    // new or retained (kicked/disconnected), so consume it
+                    // here rather than only for new tabs (#250).
+                    let pending_key = self
+                        .pending_channel_keys
+                        .remove(&self.network_support.canonicalize(channel));
                     if existing_key.is_none() {
                         let mut new_channel = Channel::new();
                         new_channel.set_case_mapping(self.network_support.case_mapping);
@@ -3431,13 +3437,6 @@ impl IrcApp {
                             &self.network_support.prefix_modes,
                             &self.network_support.user_prefixes,
                         );
-                        // Check for pending key and store it
-                        if let Some(key) = self
-                            .pending_channel_keys
-                            .remove(&self.network_support.canonicalize(channel))
-                        {
-                            new_channel.key = Some(key);
-                        }
                         // Prefer server-backed history when negotiated. It has
                         // authoritative server-time and, on Nefarious +H
                         // channels, is also available without membership.
@@ -3477,6 +3476,9 @@ impl IrcApp {
                     }
                     if let Some(joined_channel) = self.channel_mut(channel) {
                         joined_channel.joined = true;
+                        if pending_key.is_some() {
+                            joined_channel.key = pending_key;
+                        }
                     }
                     if self.enabled_caps.contains("no-implicit-names") {
                         self.send_command(IrcCommand::Names(Some(channel.clone())));
@@ -4246,8 +4248,13 @@ impl IrcApp {
                     for chan in auto_join.split(',') {
                         let chan = chan.trim();
                         if !chan.is_empty() {
-                            let channel = self.normalize_channel_name(chan);
-                            self.send_command(IrcCommand::Join(channel.clone(), None, None, None));
+                            // An entry may carry a key: "#chan key". Keep it out
+                            // of the channel name and the server window.
+                            let mut words = chan.split_whitespace();
+                            let name = words.next().unwrap_or(chan);
+                            let key = words.next().map(str::to_string);
+                            let channel = self.normalize_channel_name(name);
+                            self.send_join(channel.clone(), key);
                             self.add_server_message(ChatMessage::system(&format!(
                                 "Auto-joining {}",
                                 channel
@@ -5757,6 +5764,20 @@ impl IrcApp {
         } else {
             false
         }
+    }
+
+    /// Send a JOIN and remember its key until the server's own-JOIN echo
+    /// attaches it to the tab, whether that tab is new or retained. Every
+    /// user-initiated JOIN goes through here so /cycle, keyed auto-join
+    /// entries and rejoins on a kicked tab keep the key (#250).
+    pub(crate) fn send_join(&mut self, channel: String, key: Option<String>) -> bool {
+        let sent = self.send_command(IrcCommand::Join(channel.clone(), key.clone(), None, None));
+        // Store the key only for a channel actually being joined.
+        if sent && let Some(key) = key {
+            self.pending_channel_keys
+                .insert(self.network_support.canonicalize(&channel), key);
+        }
+        sent
     }
 
     pub fn process_input(&mut self) {
@@ -7544,6 +7565,108 @@ mod tests {
         assert!(app.current_channel.is_none());
         app.cycle_tab(true);
         assert_eq!(app.current_channel.as_deref(), Some("#b"));
+    }
+
+    fn drain_commands(rx: &mut mpsc::UnboundedReceiver<IrcCommand>) -> Vec<IrcCommand> {
+        std::iter::from_fn(|| rx.try_recv().ok()).collect()
+    }
+
+    #[test]
+    fn cycle_repeatedly_keeps_the_channel_key() {
+        let (mut app, mut rx) = test_app_connected();
+        app.set_session_nick("me".to_string(), true);
+        app.process_command("/join #sec hunter2");
+        app.handle_incoming_message(IrcMessage::parse(":me!u@h JOIN #sec").unwrap());
+        assert_eq!(app.channels["#sec"].key.as_deref(), Some("hunter2"));
+        drain_commands(&mut rx);
+
+        // The own-PART handler drops the tab, so each cycle must carry the
+        // key through the pending map to the new tab (#250).
+        for round in 0..2 {
+            app.current_channel = Some("#sec".to_string());
+            app.process_command("/cycle");
+            assert_eq!(
+                drain_commands(&mut rx),
+                vec![
+                    IrcCommand::Part("#sec".into(), Some("Cycling".into())),
+                    IrcCommand::Join("#sec".into(), Some("hunter2".into()), None, None),
+                ],
+                "round {round}"
+            );
+            app.handle_incoming_message(IrcMessage::parse(":me!u@h PART #sec :Cycling").unwrap());
+            assert!(!app.channels.contains_key("#sec"));
+            app.handle_incoming_message(IrcMessage::parse(":me!u@h JOIN #sec").unwrap());
+            assert_eq!(
+                app.channels["#sec"].key.as_deref(),
+                Some("hunter2"),
+                "round {round}"
+            );
+        }
+        assert!(app.pending_channel_keys.is_empty());
+    }
+
+    #[test]
+    fn join_with_key_on_retained_tab_updates_the_stored_key() {
+        let (mut app, mut rx) = test_app_connected();
+        app.set_session_nick("me".to_string(), true);
+        let mut kicked = Channel::new();
+        kicked.key = Some("old-key".into());
+        app.channels.insert("#sec".to_string(), kicked);
+
+        app.process_command("/join #sec new-key");
+        assert_eq!(
+            drain_commands(&mut rx),
+            vec![IrcCommand::Join(
+                "#sec".into(),
+                Some("new-key".into()),
+                None,
+                None
+            )]
+        );
+        app.handle_incoming_message(IrcMessage::parse(":me!u@h JOIN #sec").unwrap());
+
+        assert!(app.channels["#sec"].joined);
+        assert_eq!(app.channels["#sec"].key.as_deref(), Some("new-key"));
+        assert!(
+            app.pending_channel_keys.is_empty(),
+            "no stale pending key is left behind"
+        );
+        assert_eq!(
+            app.update_session().tabs,
+            vec![("#sec".to_string(), Some("new-key".to_string()), true)]
+        );
+    }
+
+    #[test]
+    fn keyed_auto_join_entries_send_a_key_and_store_it() {
+        let (mut app, mut rx) = test_app_connected();
+        app.auto_join_channels = "#plain, #sec hunter2".into();
+        app.handle_numeric(RPL_WELCOME, &["me".into(), "welcome".into()]);
+
+        let joins: Vec<IrcCommand> = drain_commands(&mut rx)
+            .into_iter()
+            .filter(|cmd| matches!(cmd, IrcCommand::Join(..)))
+            .collect();
+        assert_eq!(
+            joins,
+            vec![
+                IrcCommand::Join("#plain".into(), None, None, None),
+                IrcCommand::Join("#sec".into(), Some("hunter2".into()), None, None),
+            ]
+        );
+        assert!(
+            !app.server_messages
+                .iter()
+                .any(|message| message.content.contains("hunter2")),
+            "the key must not be echoed into the server window"
+        );
+
+        app.handle_incoming_message(IrcMessage::parse(":me!u@h JOIN #sec").unwrap());
+        assert_eq!(app.channels["#sec"].key.as_deref(), Some("hunter2"));
+        assert_eq!(
+            app.update_session().tabs,
+            vec![("#sec".to_string(), Some("hunter2".to_string()), true)]
+        );
     }
 
     #[test]

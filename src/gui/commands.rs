@@ -33,17 +33,9 @@ impl IrcApp {
                     return;
                 }
                 let channel = self.normalize_channel_name(channel_arg);
-                let sent =
-                    self.send_command(IrcCommand::Join(channel.clone(), key.clone(), None, None));
+                // send_join records the key for the tab the server confirms.
+                let sent = self.send_join(channel.clone(), key);
                 self.report_send_failure(sent, &format!("Not connected - join {channel} not sent"));
-                if !sent {
-                    return;
-                }
-                // Store the key only for a channel actually being joined.
-                if let Some(k) = key {
-                    self.pending_channel_keys
-                        .insert(self.network_support.canonicalize(&channel), k);
-                }
             }
 
             "PART" | "LEAVE" => {
@@ -1479,7 +1471,9 @@ impl IrcApp {
                         .and_then(|stored| self.channels.get(&stored))
                         .and_then(|c| c.key.clone());
                     self.send_command(IrcCommand::Part(ch.clone(), Some("Cycling".to_string())));
-                    self.send_command(IrcCommand::Join(ch, key, None, None));
+                    // The own-PART handler drops the tab, so the key must
+                    // travel with this JOIN to reach the replacement tab (#250).
+                    self.send_join(ch, key);
                 }
             }
 
