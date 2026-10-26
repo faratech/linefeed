@@ -655,6 +655,9 @@ impl LinefeedApp {
         let (msg_tx, msg_rx) = mpsc::channel::<IrcMessage>(1000);
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel::<IrcCommand>();
 
+        // The previous worker is gone (connection_thread was None), so nothing
+        // it negotiated or left half-received may leak into this socket.
+        self.app.begin_connection_attempt();
         self.app.msg_rx = Some(msg_rx);
         self.app.cmd_tx = Some(cmd_tx);
 

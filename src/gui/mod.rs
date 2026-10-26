@@ -1310,6 +1310,19 @@ impl IrcApp {
         // CASEMAPPING; a new network that advertises the default never
         // triggers refresh_case_mapping_state, so rebuild them here (#249).
         self.update_cached_lowercase();
+        self.reset_per_connection_state();
+        self.known_users.clear();
+        self.nick_retry_attempts = 0;
+    }
+
+    /// State that only has meaning on the socket that produced it: negotiated
+    /// capabilities, unanswered history requests, half-received batches, the
+    /// server-side MONITOR list and in-flight WHOX tokens. A reconnect to the
+    /// same endpoint keeps the rest of the session (tabs, known nicks), but
+    /// must not carry these over: an unanswered request would be paired with
+    /// the next batch for that target, and leaked batches eventually stop new
+    /// history from being collected (#248).
+    fn reset_per_connection_state(&mut self) {
         self.enabled_caps.clear();
         self.chathistory_enabled = false;
         self.chathistory_limit = None;
@@ -1318,11 +1331,15 @@ impl IrcApp {
         self.multiline_batches.clear();
         self.authtoken_batches.clear();
         self.pending_history_requests.clear();
-        self.known_users.clear();
         self.monitored_users.clear();
         self.pending_whox.clear();
         self.next_whox_token = 1;
-        self.nick_retry_attempts = 0;
+    }
+
+    /// Called when a connection worker is about to start, after the previous
+    /// worker (if any) has fully exited.
+    pub(crate) fn begin_connection_attempt(&mut self) {
+        self.reset_per_connection_state();
     }
 
     fn request_capabilities(&mut self, caps: Vec<String>) {
@@ -2328,6 +2345,90 @@ mod connection_lifecycle_tests {
         assert_eq!(app.highlight_words_lower, ["foo{away}"]);
         assert!(app.is_ignored("Foo{away}", None));
         assert!(app.is_ignored("FOO[AWAY]", None));
+    }
+
+    fn history_request(placement: HistoryPlacement) -> PendingHistoryRequest {
+        PendingHistoryRequest {
+            placement,
+            direction: HistoryDirection::Before,
+            remaining: 10,
+            loaded: 0,
+            shown: 0,
+            page_limit: 10,
+        }
+    }
+
+    #[test]
+    fn new_connection_drops_state_that_belonged_to_the_previous_socket() {
+        let mut app = lifecycle_app();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        app.cmd_tx = Some(tx);
+        app.connected = true;
+        app.handle_cap_message("ACK", &["draft/chathistory batch".to_string()]);
+        assert!(app.chathistory_enabled);
+        // Dropped mid-CHATHISTORY: one request unanswered, one batch (and a
+        // multiline batch nested in the stream) never closed.
+        app.pending_history_requests
+            .entry("#chan".to_string())
+            .or_default()
+            .push_back(history_request(HistoryPlacement::Append));
+        app.pending_history_requests
+            .entry("#other".to_string())
+            .or_default()
+            .push_back(history_request(HistoryPlacement::Prepend));
+        app.handle_incoming_message(
+            IrcMessage::parse(":srv BATCH +h1 chathistory #other").unwrap(),
+        );
+        app.handle_incoming_message(
+            IrcMessage::parse(":a!u@h BATCH +m1 draft/multiline #chan").unwrap(),
+        );
+        app.monitored_users.insert("alice".to_string());
+        app.pending_whox.insert("7".to_string(), "#chan".to_string());
+        app.next_whox_token = 8;
+        app.known_users
+            .insert("alice".to_string(), KnownUser::default());
+        assert!(!app.chathistory_batches.is_empty());
+        assert!(!app.multiline_batches.is_empty());
+        assert!(!app.pending_history_requests.is_empty());
+
+        app.begin_connection_attempt();
+
+        assert!(app.enabled_caps.is_empty());
+        assert!(!app.chathistory_enabled);
+        assert!(app.chathistory_batches.is_empty());
+        assert!(app.batch_parents.is_empty());
+        assert!(app.multiline_batches.is_empty());
+        assert!(app.authtoken_batches.is_empty());
+        assert!(app.pending_history_requests.is_empty());
+        assert!(app.monitored_users.is_empty());
+        assert!(app.pending_whox.is_empty());
+        assert_eq!(app.next_whox_token, 1);
+        // Who we have seen is genuinely cross-connection knowledge.
+        assert!(app.known_users.contains_key("alice"));
+    }
+
+    #[test]
+    fn history_requested_after_a_reconnect_is_not_paired_with_a_dead_requests_placement() {
+        let mut app = lifecycle_app();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        app.cmd_tx = Some(tx);
+        app.connected = true;
+        app.handle_cap_message("ACK", &["draft/chathistory".to_string()]);
+        // The dead connection's unanswered live-catch-up request.
+        app.pending_history_requests
+            .entry("#chan".to_string())
+            .or_default()
+            .push_back(history_request(HistoryPlacement::Append));
+
+        app.begin_connection_attempt();
+        app.handle_cap_message("ACK", &["draft/chathistory".to_string()]);
+        assert!(app.request_latest_history("#chan", Some(5), HistoryPlacement::Prepend));
+        app.handle_incoming_message(IrcMessage::parse(":srv BATCH +h2 chathistory #chan").unwrap());
+
+        assert_eq!(
+            app.chathistory_batches["h2"].request.placement,
+            HistoryPlacement::Prepend
+        );
     }
 }
 
