@@ -120,6 +120,11 @@ def main():
         raise RuntimeError("SHA256SUMS does not cover the exact final assets")
     verify_windows(args.directory, tag)
     values["SHA256SUMS"] = hashlib.sha256(manifest.read_bytes()).hexdigest()
+    # Anything beyond the six binaries and SHA256SUMS would be published
+    # unaudited and unchecksummed; duplicates would hide behind the name map.
+    names = sorted(asset["name"] for asset in release["assets"])
+    if names != sorted(values):
+        raise RuntimeError(f"Draft assets differ from the expected set: {names}")
     remote = {asset["name"]: asset for asset in release["assets"]}
     for name, digest in values.items():
         asset = remote.get(name)

@@ -54,7 +54,7 @@ class PublicationTests(unittest.TestCase):
         sleep.assert_called_once_with(1)
 
     def test_publication_fails_before_edit_for_missing_digest_or_wrong_checksum(self):
-        for failure in ("digest", "checksums", None):
+        for failure in ("digest", "checksums", "extra", "duplicate", None):
             with self.subTest(failure=failure), tempfile.TemporaryDirectory() as directory:
                 root = Path(directory)
                 for name in release_assets.ASSETS:
@@ -70,6 +70,12 @@ class PublicationTests(unittest.TestCase):
                     assets[0]["digest"] = None
                 if failure == "checksums":
                     (root / "SHA256SUMS").write_text("outdated", encoding="utf-8")
+                if failure == "extra":
+                    # A stray upload with a valid digest must not be published unaudited.
+                    assets.append({"name": "stray.txt", "state": "uploaded",
+                                   "digest": f"sha256:{hashlib.sha256(b'stray').hexdigest()}"})
+                if failure == "duplicate":
+                    assets.append(dict(assets[0]))
                 release = {"draft": True, "assets": assets}
                 with patch.dict(os.environ, RELEASE_TAG="v1.2.3", GITHUB_REPOSITORY="faratech/linefeed"), \
                     patch("sys.argv", [str(SCRIPT), "publish", "--directory", str(root)]), \
