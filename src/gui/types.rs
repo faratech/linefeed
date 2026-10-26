@@ -311,6 +311,11 @@ pub struct ChatMessage {
     /// on-disk chat log and from /lastlog searches so search output does not
     /// pollute history or match itself on repeated searches.
     pub no_log: bool,
+    /// A row this session just sent that an `echo-message` echo has yet to
+    /// confirm. Only such rows are paired with an echo: a row loaded from the
+    /// local log looks identical (no msgid, no server-time) and must never be
+    /// stamped by a new message's echo.
+    pub pending_echo: bool,
     /// Parsed formatting + URL segments, computed lazily on first render.
     /// Content never changes after construction, so the cache never invalidates.
     pub render_cache: OnceCell<Vec<RenderSegment>>,
@@ -363,6 +368,7 @@ impl ChatMessage {
             is_system: false,
             is_highlight: false,
             no_log: false,
+            pending_echo: false,
             render_cache: OnceCell::new(),
             row_height: Cell::default(),
         }
@@ -386,6 +392,7 @@ impl ChatMessage {
             is_system: true,
             is_highlight: false,
             no_log: false,
+            pending_echo: false,
             render_cache: OnceCell::new(),
             row_height: Cell::default(),
         }
@@ -405,6 +412,7 @@ impl ChatMessage {
             is_system: false,
             is_highlight: false,
             no_log: false,
+            pending_echo: false,
             render_cache: OnceCell::new(),
             row_height: Cell::default(),
         }
@@ -424,6 +432,7 @@ impl ChatMessage {
             is_system: false,
             is_highlight: true,
             no_log: false,
+            pending_echo: false,
             render_cache: OnceCell::new(),
             row_height: Cell::default(),
         }
@@ -443,6 +452,7 @@ impl ChatMessage {
             is_system: false,
             is_highlight: true,
             no_log: false,
+            pending_echo: false,
             render_cache: OnceCell::new(),
             row_height: Cell::default(),
         }
@@ -466,6 +476,12 @@ impl ChatMessage {
         self.server_time = server_time;
         self.msgid = msgid;
         self.account = account;
+        self
+    }
+
+    /// Mark this as a row we just sent, awaiting its `echo-message` echo.
+    pub fn with_pending_echo(mut self) -> Self {
+        self.pending_echo = true;
         self
     }
 

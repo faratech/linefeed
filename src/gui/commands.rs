@@ -204,7 +204,8 @@ impl IrcApp {
                                 &self.my_nick,
                                 args,
                                 &self.timestamp_format,
-                            );
+                            )
+                            .with_pending_echo();
                             self.add_message_to_channel(channel, msg);
                         } else {
                             self.add_message_to_current(
@@ -245,7 +246,8 @@ impl IrcApp {
                                 &self.my_nick,
                                 &action_text,
                                 &self.timestamp_format,
-                            );
+                            )
+                            .with_pending_echo();
                             self.add_message_to_channel(channel, msg);
                         } else {
                             self.add_message_to_current(
@@ -423,7 +425,8 @@ impl IrcApp {
                         self.add_message_to_channel(
                             &target,
                             ChatMessage::new_fmt(&self.my_nick, content, &self.timestamp_format)
-                                .with_reply_to(Some(msgid.to_string())),
+                                .with_reply_to(Some(msgid.to_string()))
+                                .with_pending_echo(),
                         );
                     }
                 } else {
@@ -1348,7 +1351,8 @@ impl IrcApp {
                         }
                         if self.send_privmsg_text(&channel_name, args) {
                             let msg =
-                                ChatMessage::new_fmt(&self.my_nick, args, &self.timestamp_format);
+                                ChatMessage::new_fmt(&self.my_nick, args, &self.timestamp_format)
+                                    .with_pending_echo();
                             self.add_message_to_channel(&channel_name, msg);
                         } else {
                             // A stale (kicked-from) tab must not swallow the
@@ -1384,7 +1388,8 @@ impl IrcApp {
                                 &self.my_nick,
                                 args,
                                 &self.timestamp_format,
-                            );
+                            )
+                            .with_pending_echo();
                             self.add_message_to_channel(&channel_name, msg);
                         } else {
                             self.add_message_to_channel(
@@ -1406,7 +1411,8 @@ impl IrcApp {
                     if self.connected {
                         if self.send_privmsg_text(channel, args) {
                             let msg =
-                                ChatMessage::new_fmt(&self.my_nick, args, &self.timestamp_format);
+                                ChatMessage::new_fmt(&self.my_nick, args, &self.timestamp_format)
+                                    .with_pending_echo();
                             self.add_message_to_channel(channel, msg);
                         } else {
                             self.add_message_to_current(
@@ -1444,7 +1450,8 @@ impl IrcApp {
                                 &self.my_nick,
                                 action_text,
                                 &self.timestamp_format,
-                            );
+                            )
+                            .with_pending_echo();
                             self.add_message_to_channel(target, msg);
                         } else {
                             self.add_message_to_current(
@@ -2655,7 +2662,7 @@ fn outgoing_local_echo(target: &str, sender: &str, content: &str, format: &str) 
     if service_message_contains_credentials(target, content) {
         ChatMessage::new_fmt(sender, "<credential command sent>", format).without_logging()
     } else {
-        ChatMessage::new_fmt(sender, content, format)
+        ChatMessage::new_fmt(sender, content, format).with_pending_echo()
     }
 }
 

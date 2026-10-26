@@ -1855,14 +1855,18 @@ impl IrcApp {
         };
         // Echoes arrive in send order, so pair with the oldest unconfirmed
         // matching row inside the recent window; searching newest-first would
-        // swap msgid/time between identical consecutive sends.
+        // swap msgid/time between identical consecutive sends. Only rows this
+        // session sent are candidates: rows loaded from the local log also
+        // lack a msgid and server-time, and stamping one of those would
+        // leave the new row unconfirmed.
         let window_start = channel.messages.len().saturating_sub(32);
         let Some(local) = channel
             .messages
             .iter_mut()
             .skip(window_start)
             .find(|candidate| {
-                !candidate.is_system
+                candidate.pending_echo
+                    && !candidate.is_system
                     && candidate.msgid.is_none()
                     && candidate.server_time.is_none()
                     && candidate.sender.eq_ignore_ascii_case(&echoed.sender)
@@ -1872,6 +1876,7 @@ impl IrcApp {
         else {
             return false;
         };
+        local.pending_echo = false;
         local.timestamp.clone_from(&echoed.timestamp);
         local.server_time.clone_from(&echoed.server_time);
         local.msgid.clone_from(&echoed.msgid);
@@ -6417,7 +6422,8 @@ impl IrcApp {
 
             // Send message to current channel
             if self.send_privmsg_text(channel, &input) {
-                let msg = ChatMessage::new_fmt(&self.my_nick, &input, &self.timestamp_format);
+                let msg = ChatMessage::new_fmt(&self.my_nick, &input, &self.timestamp_format)
+                    .with_pending_echo();
                 self.add_message_to_channel(channel, msg);
             } else {
                 self.add_message_to_current(
@@ -9073,6 +9079,55 @@ mod tests {
     }
 
     #[test]
+    fn echo_never_stamps_a_row_loaded_from_the_local_log() {
+        let (mut app, _rx) = test_app_connected();
+        app.set_session_nick("me".into(), true);
+        app.handle_cap_message("ACK", &["echo-message".into()]);
+        let mut channel = Channel::new();
+        channel.joined = true;
+        // Rows loaded from the irssi log carry neither a msgid nor a
+        // server-time, exactly like a freshly sent, unconfirmed local row.
+        channel
+            .messages
+            .push_back(ChatMessage::new_fmt("me", "ok", "short"));
+        app.channels.insert("#chan".to_string(), channel);
+        app.current_channel = Some("#chan".to_string());
+
+        app.process_command("/say ok");
+        assert_eq!(app.channels["#chan"].messages.len(), 2);
+        app.handle_incoming_message(
+            IrcMessage::parse(
+                "@msgid=fresh;time=2026-10-25T12:00:00.000Z :me!u@h PRIVMSG #chan :ok",
+            )
+            .unwrap(),
+        );
+
+        let messages = &app.channels["#chan"].messages;
+        assert_eq!(messages.len(), 2, "the echo must not add a third row");
+        assert_eq!(
+            messages[0].msgid, None,
+            "the old history row must stay unstamped"
+        );
+        assert_eq!(
+            messages[1].msgid.as_deref(),
+            Some("fresh"),
+            "the echo must confirm the row this session just sent"
+        );
+        assert!(messages[1].server_time.is_some());
+
+        // The row is confirmed once: a later echo is not paired with it again.
+        app.handle_incoming_message(
+            IrcMessage::parse(
+                "@msgid=again;time=2026-10-25T12:00:01.000Z :me!u@h PRIVMSG #chan :ok",
+            )
+            .unwrap(),
+        );
+        let messages = &app.channels["#chan"].messages;
+        assert_eq!(messages[0].msgid, None);
+        assert_eq!(messages[1].msgid.as_deref(), Some("fresh"));
+    }
+
+    #[test]
     fn peer_chat_text_does_not_create_a_confirmation() {
         let (mut app, _rx) = test_app_connected();
         app.set_session_nick("me".into(), true);
@@ -10153,7 +10208,10 @@ mod tests {
         let (mut app, _rx) = test_app_connected();
         app.set_session_nick("me".into(), true);
         app.handle_incoming_message(IrcMessage::parse(":srv CAP me ACK :echo-message").unwrap());
-        app.add_message_to_channel("#room", ChatMessage::new_fmt("me", "hello", "short"));
+        app.add_message_to_channel(
+            "#room",
+            ChatMessage::new_fmt("me", "hello", "short").with_pending_echo(),
+        );
 
         app.handle_incoming_message(
             IrcMessage::parse(

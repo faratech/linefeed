@@ -584,6 +584,7 @@ fn parse_log_line(line: &str) -> Option<ChatMessage> {
             is_system: true,
             is_highlight: false,
             no_log: false,
+            pending_echo: false,
             render_cache: Default::default(),
             row_height: Cell::default(),
         })
@@ -604,6 +605,7 @@ fn parse_log_line(line: &str) -> Option<ChatMessage> {
                 is_system: false,
                 is_highlight: false,
                 no_log: false,
+                pending_echo: false,
                 render_cache: Default::default(),
                 row_height: Cell::default(),
             })
@@ -628,6 +630,7 @@ fn parse_log_line(line: &str) -> Option<ChatMessage> {
                 is_system: false,
                 is_highlight: false,
                 no_log: false,
+                pending_echo: false,
                 render_cache: Default::default(),
                 row_height: Cell::default(),
             })
@@ -749,6 +752,7 @@ mod tests {
             is_system: system,
             is_highlight: false,
             no_log: false,
+            pending_echo: false,
             render_cache: Default::default(),
             row_height: Cell::default(),
         }
