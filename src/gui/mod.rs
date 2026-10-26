@@ -1336,6 +1336,7 @@ impl IrcApp {
     fn mark_channel_tabs_unjoined(&mut self) {
         for channel in self.channels.values_mut() {
             channel.joined = false;
+            channel.abandon_user_burst();
         }
         self.channel_list_loading = false;
     }
@@ -1400,6 +1401,10 @@ impl IrcApp {
         self.monitored_users.clear();
         self.pending_whox.clear();
         self.next_whox_token = 1;
+        // A NAMES burst the old socket never finished.
+        for channel in self.channels.values_mut() {
+            channel.abandon_user_burst();
+        }
     }
 
     /// Called when a connection worker is about to start, after the previous
@@ -2845,6 +2850,54 @@ mod connection_lifecycle_tests {
         assert_eq!(app.next_whox_token, 1);
         // Who we have seen is genuinely cross-connection knowledge.
         assert!(app.known_users.contains_key("alice"));
+    }
+
+    #[test]
+    fn names_burst_cut_off_by_a_disconnect_is_not_resumed_by_the_next_connection() {
+        type EndOfConnection = fn(&mut IrcApp);
+        let ways: [(&str, EndOfConnection); 3] = [
+            ("lost", |app| app.mark_connection_lost()),
+            ("manual disconnect", |app| {
+                app.request_manual_disconnect(None)
+            }),
+            // Nothing ended the old connection explicitly; the new attempt
+            // is what discards its leftovers.
+            ("new attempt", |app| app.begin_connection_attempt()),
+        ];
+        for (how, end_connection) in ways {
+            let mut app = lifecycle_app();
+            app.set_session_nick("me".into(), true);
+            let mut channel = Channel::new();
+            channel.joined = true;
+            app.channels.insert("#chan".to_string(), channel);
+
+            // The connection dies after a 353 but before its 366.
+            app.handle_numeric(
+                RPL_NAMREPLY,
+                &[
+                    "me".into(),
+                    "=".into(),
+                    "#chan".into(),
+                    "stale1 stale2".into(),
+                ],
+            );
+            end_connection(&mut app);
+
+            // The next connection's NAMES starts within the burst gap. It
+            // must start from scratch, not append to the dead one's names.
+            app.handle_numeric(
+                RPL_NAMREPLY,
+                &["me".into(), "=".into(), "#chan".into(), "carol".into()],
+            );
+            app.handle_numeric(RPL_ENDOFNAMES, &["me".into(), "#chan".into()]);
+
+            let nicks: Vec<&str> = app.channels["#chan"]
+                .users
+                .iter()
+                .map(|user| user.nick.as_str())
+                .collect();
+            assert_eq!(nicks, ["carol"], "{how}: ghosts from the dead connection");
+        }
     }
 
     #[test]

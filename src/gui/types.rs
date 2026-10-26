@@ -1213,6 +1213,16 @@ impl Channel {
         }
     }
 
+    /// Drop a NAMES burst that will never reach RPL_ENDOFNAMES (its
+    /// connection is gone). Without this the next connection's first 353,
+    /// if it arrives within the burst gap, would be appended to the dead
+    /// burst and its names resurrected as ghost members at 366.
+    pub fn abandon_user_burst(&mut self) {
+        self.names_snapshot = None;
+        self.names_index.clear();
+        self.burst_activity = None;
+    }
+
     /// Insert a user into the pending NAMES snapshot. Used while streaming a
     /// burst, where a per-insert visible-list sort would make a large join
     /// O(N²·logN). The caller must invoke `finish_user_burst` at 366.
