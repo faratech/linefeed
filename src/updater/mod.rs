@@ -570,7 +570,7 @@ fn download(
     context: &egui::Context,
     canceled: &AtomicBool,
 ) -> io::Result<Transaction> {
-    let previous = install::read_json::<Transaction>(&paths.journal()).ok();
+    let previous = existing_journal(paths)?;
     if let Some(tx) = &previous {
         if matches!(tx.phase, Phase::Prepared | Phase::Replaced) {
             return Err(io::Error::other(
@@ -654,6 +654,20 @@ fn download(
     result
 }
 
+/// The journal on disk, or None when there is none. One that exists but cannot
+/// be read is an error, never "none": it may be a Prepared or Replaced journal
+/// holding the only copy of the old executable, and a new stage would
+/// overwrite it.
+fn existing_journal(paths: &Paths) -> io::Result<Option<Transaction>> {
+    match install::read_json(&paths.journal()) {
+        Ok(tx) => Ok(Some(tx)),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(_) => Err(io::Error::other(
+            "Update state is unreadable; restart Linefeed to repair it",
+        )),
+    }
+}
+
 /// Point the journal at a fully verified candidate. This is the only step of a
 /// download that holds the transaction lock, so other launches and exits never
 /// wait on network I/O (#272).
@@ -661,7 +675,7 @@ fn publish_staged(paths: &Paths, tx: &Transaction) -> io::Result<()> {
     let lock = paths.transaction_lock()?;
     install::timed_lock(&lock, false, Duration::from_secs(30))?;
     // Re-read under the lock: an install may have started during the download.
-    let previous = install::read_json::<Transaction>(&paths.journal()).ok();
+    let previous = existing_journal(paths)?;
     if let Some(old) = &previous
         && matches!(old.phase, Phase::Prepared | Phase::Replaced)
     {
@@ -999,6 +1013,22 @@ mod tests {
         let journal: Transaction = install::read_json(&paths.journal()).unwrap();
         assert_eq!(journal.attempt, old.attempt);
         assert!(old.directory.exists());
+        let _ = fs::remove_dir_all(root);
+    }
+    #[test]
+    fn publishing_never_overwrites_a_journal_it_cannot_read() {
+        // An unreadable journal may be a Prepared/Replaced one holding the only
+        // copy of the old executable: not "no journal" (#240).
+        let (root, paths, old) = staged_fixture("0.0.10");
+        fs::write(paths.journal(), b"invalid journal").unwrap();
+        let newer = newer_candidate(&paths);
+        assert!(publish_staged(&paths, &newer).is_err());
+        assert_eq!(fs::read(paths.journal()).unwrap(), b"invalid journal");
+        assert!(old.directory.exists());
+        // A missing journal is the ordinary first download.
+        fs::remove_file(paths.journal()).unwrap();
+        publish_staged(&paths, &newer).unwrap();
+        assert!(paths.journal().exists());
         let _ = fs::remove_dir_all(root);
     }
     #[test]
