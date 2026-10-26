@@ -21,6 +21,12 @@ use super::numerics::*;
 const MAX_LINE_LEN: usize = 16 * 1024;
 const HANDSHAKE_STEP_TIMEOUT: Duration = Duration::from_secs(15);
 const STS_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
+/// Bounds on the phases before registration, whose own deadline only starts
+/// once TLS completes. Without them a blackholed address or a middlebox that
+/// accepts TCP and then goes silent stalls the connection thread forever, so
+/// the GUI's auto-reconnect never gets a connection error to act on (#233).
+const TCP_CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
+const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(20);
 /// Aggregate CAP responses are bounded separately from individual IRC lines.
 /// This permits large, legitimate capability lists without allowing a server
 /// to grow negotiation state until the registration deadline expires.
@@ -190,6 +196,51 @@ fn format_server_addr(host: &str, port: u16) -> String {
     } else {
         format!("{host}:{port}")
     }
+}
+
+/// Try each resolved address in turn, all within one `deadline`. Each address
+/// but the last gets half of the time still left, so a blackholed address
+/// (preferred IPv6 on a broken route, say) cannot starve the fallbacks the way
+/// one overall timeout around a sequential connect would (#233).
+async fn connect_first_reachable<T, F, Fut>(
+    addrs: &[std::net::SocketAddr],
+    deadline: tokio::time::Instant,
+    mut connect: F,
+) -> std::io::Result<T>
+where
+    F: FnMut(std::net::SocketAddr) -> Fut,
+    Fut: std::future::Future<Output = std::io::Result<T>>,
+{
+    let mut last_error = None;
+    for (index, addr) in addrs.iter().enumerate() {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        let share = if index + 1 < addrs.len() {
+            remaining / 2
+        } else {
+            remaining
+        };
+        last_error = Some(match timeout(share, connect(*addr)).await {
+            Ok(Ok(connected)) => return Ok(connected),
+            Ok(Err(error)) => error,
+            Err(_) => std::io::Error::new(std::io::ErrorKind::TimedOut, "connection timed out"),
+        });
+    }
+    Err(last_error.unwrap_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "could not resolve to any address",
+        )
+    }))
+}
+
+/// Resolve `host` and connect TCP, bounded overall by `budget`.
+async fn connect_tcp(host: &str, port: u16, budget: Duration) -> std::io::Result<TcpStream> {
+    let deadline = tokio::time::Instant::now() + budget;
+    let addrs: Vec<_> = tokio::time::timeout_at(deadline, tokio::net::lookup_host((host, port)))
+        .await
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "name lookup timed out"))??
+        .collect();
+    connect_first_reachable(&addrs, deadline, TcpStream::connect).await
 }
 
 /// Watch the command channel while a connection phase is otherwise blocked.
@@ -670,6 +721,10 @@ impl Default for ServerConfig {
 pub struct IrcClient {
     config: ServerConfig,
     tx: Option<mpsc::Sender<String>>,
+    /// Overall budget for resolving and connecting TCP; overridable in tests.
+    connect_timeout: Duration,
+    /// Budget for the TLS handshake after TCP connects; overridable in tests.
+    tls_handshake_timeout: Duration,
 }
 
 /// Capabilities whose semantics Linefeed implements safely. Keep this list
@@ -713,7 +768,12 @@ pub const DESIRED_CAPS: &[&str] = &[
 
 impl IrcClient {
     pub fn new(config: ServerConfig) -> Self {
-        Self { config, tx: None }
+        Self {
+            config,
+            tx: None,
+            connect_timeout: TCP_CONNECT_TIMEOUT,
+            tls_handshake_timeout: TLS_HANDSHAKE_TIMEOUT,
+        }
     }
 
     /// Wire-value validation for the config-sourced registration fields:
@@ -872,7 +932,11 @@ impl IrcClient {
             _ = wait_for_disconnect(&mut outgoing_rx, &mut pending_commands) => {
                 return Err("Connection cancelled during TCP connect".into());
             }
-            result = TcpStream::connect((self.config.host.as_str(), self.config.port)) => result,
+            result = connect_tcp(
+                self.config.host.as_str(),
+                self.config.port,
+                self.connect_timeout,
+            ) => result,
         };
         let stream = match connect_result {
             Ok(s) => s,
@@ -1071,14 +1135,25 @@ impl IrcClient {
             _ = wait_for_disconnect(&mut outgoing_rx, &mut pending_commands) => {
                 return Err("Connection cancelled during TLS handshake".into());
             }
-            result = connector.connect(&self.config.host, stream) => result,
+            result = timeout(
+                self.tls_handshake_timeout,
+                connector.connect(&self.config.host, stream),
+            ) => result,
         };
         let tls_stream = match tls_result {
-            Ok(s) => s,
-            Err(e) => {
+            Ok(Ok(s)) => s,
+            Ok(Err(e)) => {
                 let msg = format!(
                     "TLS handshake failed: {}. Try disabling TLS or enabling 'Accept invalid certs'",
                     e
+                );
+                tracing::error!("{}", msg);
+                return Err(msg.into());
+            }
+            Err(_) => {
+                let msg = format!(
+                    "TLS handshake timed out after {:?}; the server accepted the connection but never completed the handshake",
+                    self.tls_handshake_timeout
                 );
                 tracing::error!("{}", msg);
                 return Err(msg.into());
@@ -4023,6 +4098,132 @@ mod tests {
                 .unwrap_err();
             assert!(error.contains("cancelled during TLS handshake"));
             server.abort();
+        });
+    }
+
+    #[test]
+    fn silent_tls_peer_times_out_with_a_connection_error() {
+        test_runtime().block_on(async {
+            // #233: a middlebox that accepts TCP and then says nothing must
+            // end in an ordinary connection error (so auto-reconnect engages)
+            // rather than leaving the connection thread stuck in the
+            // handshake forever.
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let (accepted_tx, mut accepted_rx) = mpsc::channel(1);
+            let server = tokio::spawn(async move {
+                let (_stream, _) = listener.accept().await.unwrap();
+                accepted_tx.send(()).await.unwrap();
+                tokio::time::sleep(Duration::from_secs(30)).await;
+            });
+
+            let config = ServerConfig {
+                host: "127.0.0.1".to_string(),
+                port: addr.port(),
+                use_tls: true,
+                nick: "tester".to_string(),
+                ..Default::default()
+            };
+            let (msg_tx, _msg_rx) = mpsc::channel(100);
+            let (_cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+            let mut client = IrcClient::new(config);
+            client.tls_handshake_timeout = Duration::from_millis(200);
+            let started = tokio::time::Instant::now();
+            let error = timeout(Duration::from_secs(5), client.connect(msg_tx, cmd_rx))
+                .await
+                .expect("silent TLS peer stalled the connection forever")
+                .unwrap_err();
+            assert!(accepted_rx.recv().await.is_some());
+            assert!(
+                error.to_string().contains("TLS handshake timed out"),
+                "{error}"
+            );
+            assert!(started.elapsed() < Duration::from_secs(3));
+            server.abort();
+        });
+    }
+
+    #[test]
+    fn unresponsive_tcp_address_fails_within_the_connect_budget() {
+        test_runtime().block_on(async {
+            // #233: TEST-NET-3 is unroutable. Depending on the network it is
+            // either blackholed (the budget must end the wait) or rejected at
+            // once; either way connect() must return a connection error
+            // within the budget instead of the OS default (up to minutes).
+            let config = ServerConfig {
+                host: "203.0.113.1".to_string(),
+                port: 9,
+                use_tls: false,
+                nick: "tester".to_string(),
+                ..Default::default()
+            };
+            let (msg_tx, _msg_rx) = mpsc::channel(100);
+            let (_cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+            let mut client = IrcClient::new(config);
+            client.connect_timeout = Duration::from_millis(300);
+            let error = timeout(Duration::from_secs(5), client.connect(msg_tx, cmd_rx))
+                .await
+                .expect("TCP connect was not bounded by its budget")
+                .unwrap_err();
+            assert!(
+                error.to_string().contains("Failed to connect to"),
+                "{error}"
+            );
+        });
+    }
+
+    #[test]
+    fn connect_budget_falls_back_past_a_blackholed_address() {
+        test_runtime().block_on(async {
+            let first: std::net::SocketAddr = "192.0.2.1:6697".parse().unwrap();
+            let second: std::net::SocketAddr = "192.0.2.2:6697".parse().unwrap();
+            let started = tokio::time::Instant::now();
+            // The first address never answers; it may use only half the
+            // budget, leaving the second a chance to connect.
+            let connected = connect_first_reachable(
+                &[first, second],
+                started + Duration::from_millis(600),
+                |addr| async move {
+                    if addr == first {
+                        std::future::pending().await
+                    } else {
+                        Ok(addr)
+                    }
+                },
+            )
+            .await
+            .unwrap();
+            assert_eq!(connected, second);
+            assert!(started.elapsed() < Duration::from_millis(550));
+
+            // Every address silent: the whole attempt ends at the deadline
+            // with a TimedOut error.
+            let started = tokio::time::Instant::now();
+            let error = connect_first_reachable::<(), _, _>(
+                &[first, second],
+                started + Duration::from_millis(300),
+                |_| std::future::pending(),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+            assert!(started.elapsed() < Duration::from_secs(2));
+
+            // A refused address falls through to the next one immediately.
+            let connected = connect_first_reachable(
+                &[first, second],
+                tokio::time::Instant::now() + Duration::from_secs(5),
+                |addr| async move {
+                    if addr == first {
+                        Err(std::io::ErrorKind::ConnectionRefused.into())
+                    } else {
+                        Ok(addr)
+                    }
+                },
+            )
+            .await
+            .unwrap();
+            assert_eq!(connected, second);
         });
     }
 
