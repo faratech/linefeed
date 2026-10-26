@@ -627,6 +627,9 @@ impl LinefeedApp {
             }
         }
 
+        self.app
+            .release_closing_connection(self.connection_thread.is_none());
+
         // Auto-reconnect if enabled and connection was lost.
         if self.app.should_reconnect() {
             self.app.start_reconnect();
@@ -745,5 +748,94 @@ mod tests {
         assert!(linefeed.connection_thread.is_none());
         assert!(linefeed.app.connection_lost);
         assert!(!linefeed.app.connected);
+    }
+
+    /// A plaintext IRC server that completes registration, then records every
+    /// line until the client closes the socket (or goes silent).
+    fn scripted_server() -> (u16, std::sync::mpsc::Receiver<Vec<String>>) {
+        use std::io::{BufRead, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                .unwrap();
+            let mut writer = stream.try_clone().unwrap();
+            let mut reader = std::io::BufReader::new(stream);
+            let mut lines = Vec::new();
+            let mut line = String::new();
+            while reader.read_line(&mut line).unwrap_or(0) > 0 {
+                let text = line.trim_end().to_string();
+                line.clear();
+                match text.as_str() {
+                    "CAP LS 302" => writer.write_all(b":srv CAP * LS :multi-prefix\r\n"),
+                    "CAP REQ :multi-prefix" => {
+                        writer.write_all(b":srv CAP * ACK :multi-prefix\r\n")
+                    }
+                    "CAP END" => writer.write_all(b":srv 001 tester :Welcome\r\n"),
+                    _ => Ok(()),
+                }
+                .unwrap();
+                lines.push(text);
+            }
+            let _ = done_tx.send(lines);
+        });
+        (port, done_rx)
+    }
+
+    fn linefeed_for_port(port: u16) -> LinefeedApp {
+        let mut app = IrcApp::with_settings(gui::Settings {
+            server_host: "127.0.0.1".to_string(),
+            server_port: port.to_string(),
+            use_tls: false,
+            nickname: "tester".to_string(),
+            logging_enabled: false,
+            ..gui::Settings::default()
+        });
+        app.connecting = true;
+        LinefeedApp {
+            startup_ack: None,
+            shutdown: Arc::new(std::sync::Mutex::new(None)),
+            app,
+            connection_thread: None,
+            last_message_time: std::time::Instant::now(),
+            window_size_ok: true,
+            list_loading_since: None,
+        }
+    }
+
+    /// Drive the lifecycle the way the frame loop does until `done` holds.
+    fn tick_until(linefeed: &mut LinefeedApp, what: &str, done: impl Fn(&LinefeedApp) -> bool) {
+        let ctx = egui::Context::default();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !done(linefeed) {
+            assert!(std::time::Instant::now() < deadline, "timed out: {what}");
+            linefeed.background_tick(&ctx);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn manual_disconnect_delivers_quit_before_closing_the_socket() {
+        let (port, lines_rx) = scripted_server();
+        let mut linefeed = linefeed_for_port(port);
+        tick_until(&mut linefeed, "registration", |l| l.app.connected);
+
+        linefeed.app.request_manual_disconnect(Some("bye now".into()));
+        tick_until(&mut linefeed, "worker exit", |l| {
+            l.connection_thread.is_none()
+        });
+
+        let lines = lines_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("server never saw the connection close");
+        assert!(
+            lines.iter().any(|line| line == "QUIT :bye now"),
+            "QUIT was lost on manual disconnect: {lines:?}"
+        );
+        assert!(!linefeed.app.connected && !linefeed.app.connecting);
+        assert!(linefeed.app.msg_rx.is_none());
     }
 }

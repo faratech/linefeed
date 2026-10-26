@@ -329,6 +329,10 @@ pub struct IrcApp {
     // Communication channels
     pub cmd_tx: Option<mpsc::UnboundedSender<IrcCommand>>,
     pub msg_rx: Option<mpsc::Receiver<IrcMessage>>,
+    // Receiver of a connection that was told to QUIT, kept (unread) until its
+    // worker has flushed the QUIT and exited, so the worker is not cancelled
+    // before the QUIT reaches the wire. See request_manual_disconnect.
+    closing_rx: Option<(mpsc::Receiver<IrcMessage>, std::time::Instant)>,
 
     // UI state
     pub show_settings: bool,
@@ -518,7 +522,7 @@ impl Default for IrcApp {
 }
 
 impl IrcApp {
-    fn with_settings(settings: Settings) -> Self {
+    pub(crate) fn with_settings(settings: Settings) -> Self {
         ChatMessage::configure_default_timestamp_format(&settings.timestamp_format);
         let nickname = if settings.nickname.is_empty() {
             format!("Linefeed_{}", rand_suffix())
@@ -562,6 +566,7 @@ impl IrcApp {
 
             cmd_tx: None,
             msg_rx: None,
+            closing_rx: None,
 
             show_settings: false,
             scroll_to_bottom: true,
@@ -2148,20 +2153,42 @@ impl IrcApp {
         // the old worker exits later it must not unexpectedly activate the
         // staged endpoint.
         self.pending_session = None;
-        if self.cmd_tx.is_some() {
-            let _ = self.send_command(IrcCommand::Quit(Self::clamp_quit_reason(reason)));
-        }
+        let quit_queued = self.cmd_tx.is_some()
+            && self.send_command(IrcCommand::Quit(Self::clamp_quit_reason(reason)));
         self.connected = false;
         self.connecting = false;
         self.connection_lost = false;
         self.cmd_tx = None;
         // Dropping the receiver signals the connection thread (the handshake and
         // read loop both watch for a closed channel), so a wedged connect attempt
-        // can be aborted instead of blocking future reconnects.
-        self.msg_rx = None;
+        // can be aborted instead of blocking future reconnects. But the same
+        // signal also aborts the writer, which on the worker's single-threaded
+        // runtime has usually not yet run, so a QUIT queued just above would be
+        // lost (#243). When one is on its way, retire the receiver instead: the
+        // worker exits on its own once QUIT is flushed (or, before the writer
+        // exists, on seeing the queued QUIT), and release_closing_connection
+        // drops the receiver then. Nothing read from it is processed.
+        if let Some(rx) = self.msg_rx.take()
+            && quit_queued
+        {
+            self.closing_rx = Some((rx, std::time::Instant::now()));
+        }
         self.lag_ms = None;
         self.ping_sent_time = None;
         self.mark_channel_tabs_unjoined();
+    }
+
+    /// Drop the retired receiver of a QUIT-ed connection once its worker has
+    /// exited. A worker that cannot flush QUIT (a server that stopped
+    /// reading) is cancelled the old way after a grace period, so it can never
+    /// block the next connection.
+    pub(crate) fn release_closing_connection(&mut self, worker_exited: bool) {
+        const QUIT_FLUSH_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
+        if let Some((_, retired_at)) = &self.closing_rx
+            && (worker_exited || retired_at.elapsed() >= QUIT_FLUSH_GRACE)
+        {
+            self.closing_rx = None;
+        }
     }
 
     pub fn request_reconnect_after_close(&mut self, reason: &str) {
@@ -2345,6 +2372,58 @@ mod connection_lifecycle_tests {
         assert_eq!(app.highlight_words_lower, ["foo{away}"]);
         assert!(app.is_ignored("Foo{away}", None));
         assert!(app.is_ignored("FOO[AWAY]", None));
+    }
+
+    #[test]
+    fn manual_disconnect_retires_the_receiver_until_the_worker_has_flushed_quit() {
+        let mut app = lifecycle_app();
+        let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel();
+        let (msg_tx, msg_rx) = mpsc::channel(4);
+        app.cmd_tx = Some(cmd_tx);
+        app.msg_rx = Some(msg_rx);
+        app.connected = true;
+
+        app.request_manual_disconnect(Some("bye".to_string()));
+
+        assert!(matches!(cmd_rx.try_recv(), Ok(IrcCommand::Quit(Some(reason))) if reason == "bye"));
+        // The worker still sees an open channel, so it flushes QUIT instead of
+        // being cancelled; whatever it reads meanwhile is never processed.
+        assert!(!msg_tx.is_closed());
+        assert!(app.msg_rx.is_none());
+        msg_tx
+            .try_send(IrcMessage::parse(":srv NOTICE * :late").unwrap())
+            .unwrap();
+        app.update_minimal();
+        assert!(app.server_messages.iter().all(|m| !m.content.contains("late")));
+
+        // Still held while the worker runs and within the grace period...
+        app.release_closing_connection(false);
+        assert!(!msg_tx.is_closed());
+        // ...released as soon as the worker has exited...
+        app.release_closing_connection(true);
+        assert!(msg_tx.is_closed());
+
+        // ...or, for a worker that cannot flush QUIT, after the grace period.
+        let (cmd_tx, _cmd_rx) = mpsc::unbounded_channel();
+        let (msg_tx, msg_rx) = mpsc::channel(4);
+        app.cmd_tx = Some(cmd_tx);
+        app.msg_rx = Some(msg_rx);
+        app.request_manual_disconnect(None);
+        app.closing_rx.as_mut().unwrap().1 -= std::time::Duration::from_secs(5);
+        app.release_closing_connection(false);
+        assert!(msg_tx.is_closed());
+    }
+
+    #[test]
+    fn manual_disconnect_without_a_queued_quit_cancels_the_worker_at_once() {
+        let mut app = lifecycle_app();
+        let (msg_tx, msg_rx) = mpsc::channel::<IrcMessage>(4);
+        app.msg_rx = Some(msg_rx);
+
+        app.request_manual_disconnect(None);
+
+        assert!(msg_tx.is_closed());
+        assert!(app.closing_rx.is_none());
     }
 
     fn history_request(placement: HistoryPlacement) -> PendingHistoryRequest {
