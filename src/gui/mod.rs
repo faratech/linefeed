@@ -4947,17 +4947,18 @@ impl IrcApp {
             }
 
             RPL_WHOSPCRPL => {
-                // Our request is `%tcuhnafr,<token>`: WHOX returns the fields
-                // in the order requested, so after the token:
-                // token, channel, user, host, nick, account, flags, realname.
+                // Our request is `%tcuhnafr,<token>`, but WHOX replies in the
+                // fixed order `t c u i h s n f d l a o r` whatever the request
+                // order was, so after the target:
+                // token, channel, user, host, nick, flags, account, realname.
                 if let (
                     Some(token),
                     Some(_channel),
                     Some(user),
                     Some(host),
                     Some(nick),
-                    Some(account),
                     Some(flags),
+                    Some(account),
                 ) = (
                     params.get(1),
                     params.get(2),
@@ -8203,7 +8204,7 @@ mod tests {
     }
 
     #[test]
-    fn whox_fields_follow_the_requested_column_order() {
+    fn whox_fields_follow_the_spec_column_order() {
         let mut app = test_app();
         app.set_session_nick("me".into(), true);
         let mut channel = Channel::new();
@@ -8213,8 +8214,9 @@ mod tests {
         app.pending_whox
             .insert("7".to_string(), "#chan".to_string());
 
-        // Request is %tcuhnafr -> token, channel, user, host, nick,
-        // account, flags, realname (WHOX returns fields in query order).
+        // Request is %tcuhnafr, but WHOX always replies in the fixed order
+        // `t c u i h s n f d l a o r` regardless of request order:
+        // token, channel, user, host, nick, flags, account, realname.
         app.handle_numeric(
             RPL_WHOSPCRPL,
             &[
@@ -8224,8 +8226,8 @@ mod tests {
                 "u".into(),
                 "h".into(),
                 "alice".into(),
-                "acc".into(),
                 "G".into(),
+                "acc".into(),
                 "Alice Real".into(),
             ],
         );
@@ -8244,14 +8246,44 @@ mod tests {
                 "u".into(),
                 "h".into(),
                 "bob".into(),
-                "0".into(),
                 "H@".into(),
+                "0".into(),
                 "Bob".into(),
             ],
         );
         let bob = app.channels["#chan"].get_user("bob").unwrap();
         assert_eq!(bob.account.as_deref(), None);
         assert!(!bob.is_away());
+    }
+
+    #[test]
+    fn whox_account_starting_with_g_is_not_mistaken_for_away() {
+        let mut app = test_app();
+        app.set_session_nick("me".into(), true);
+        let mut channel = Channel::new();
+        channel.add_user("carol", UserMode::Normal);
+        app.channels.insert("#chan".to_string(), channel);
+        app.pending_whox
+            .insert("9".to_string(), "#chan".to_string());
+
+        // Present user (flags "H") whose services account is "Guest42".
+        app.handle_numeric(
+            RPL_WHOSPCRPL,
+            &[
+                "me".into(),
+                "9".into(),
+                "#chan".into(),
+                "u".into(),
+                "h".into(),
+                "carol".into(),
+                "H".into(),
+                "Guest42".into(),
+                "Carol".into(),
+            ],
+        );
+        let carol = app.channels["#chan"].get_user("carol").unwrap();
+        assert_eq!(carol.account.as_deref(), Some("Guest42"));
+        assert!(!carol.is_away(), "an account starting with G is not away");
     }
 
     #[test]
