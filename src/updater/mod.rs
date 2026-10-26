@@ -353,15 +353,26 @@ fn worker(
     }
 }
 
+/// Release metadata and the checksum manifest are small, so a slow body is a
+/// stuck one and keeps the short limit.
 fn agent() -> ureq::Agent {
+    build_agent(Some(Duration::from_secs(30)), true)
+}
+/// The binary download. ureq's body limit is a total for the whole body and is
+/// not restarted per read, so the metadata limit would abort every download on
+/// a link slower than size/30 s; the 300 s global deadline bounds it instead.
+fn download_agent() -> ureq::Agent {
+    build_agent(None, true)
+}
+fn build_agent(recv_body: Option<Duration>, https_only: bool) -> ureq::Agent {
     use ureq::tls::{RootCerts, TlsConfig, TlsProvider};
     ureq::Agent::config_builder()
-        .https_only(true)
+        .https_only(https_only)
         .max_redirects(5)
         .timeout_global(Some(Duration::from_secs(300)))
         .timeout_connect(Some(Duration::from_secs(10)))
         .timeout_recv_response(Some(Duration::from_secs(30)))
-        .timeout_recv_body(Some(Duration::from_secs(30)))
+        .timeout_recv_body(recv_body)
         .tls_config(
             TlsConfig::builder()
                 .provider(TlsProvider::NativeTls)
@@ -523,7 +534,7 @@ fn download(
     let result = (|| {
         let partial = directory.join("download.part");
         let mut file = install::new_file(&partial)?;
-        let mut response = response(&client, &offer.asset.browser_download_url)?;
+        let mut response = response(&download_agent(), &offer.asset.browser_download_url)?;
         let mut reader = response.body_mut().as_reader();
         copy_download(
             &mut reader,
@@ -782,6 +793,58 @@ mod tests {
         )
         .unwrap();
         assert_eq!(output, bytes);
+    }
+    /// Loopback HTTP server: headers at once, then one body byte per `pause`.
+    fn slow_body_server(parts: usize, pause: Duration) -> String {
+        use std::io::BufRead;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/asset", listener.local_addr().unwrap());
+        std::thread::spawn(move || {
+            let Ok((mut stream, _)) = listener.accept() else {
+                return;
+            };
+            let mut reader = io::BufReader::new(stream.try_clone().unwrap());
+            let mut line = String::new();
+            while reader.read_line(&mut line).is_ok_and(|n| n > 0) && line != "\r\n" {
+                line.clear();
+            }
+            let head = format!("HTTP/1.1 200 OK\r\nContent-Length: {parts}\r\nConnection: close\r\n\r\n");
+            if stream.write_all(head.as_bytes()).is_err() {
+                return;
+            }
+            for _ in 0..parts {
+                std::thread::sleep(pause);
+                if stream.write_all(b"x").and_then(|()| stream.flush()).is_err() {
+                    return;
+                }
+            }
+        });
+        url
+    }
+    #[test]
+    fn slow_asset_download_is_not_cut_off_by_the_metadata_body_limit() {
+        // ureq's recv_body limit covers the whole body and is not restarted per
+        // read, so the short metadata limit would abort any slow download (#240).
+        let url = slow_body_server(6, Duration::from_millis(150));
+        let strict = build_agent(Some(Duration::from_millis(400)), false);
+        assert!(limited_body(response(&strict, &url).unwrap(), 1024).is_err());
+        let url = slow_body_server(6, Duration::from_millis(150));
+        let unlimited = build_agent(None, false);
+        assert_eq!(
+            limited_body(response(&unlimited, &url).unwrap(), 1024).unwrap(),
+            b"xxxxxx"
+        );
+    }
+    #[test]
+    fn only_the_asset_download_drops_the_short_body_limit() {
+        let metadata = agent();
+        let download = download_agent();
+        let (metadata, download) = (metadata.config().timeouts(), download.config().timeouts());
+        assert_eq!(metadata.recv_body, Some(Duration::from_secs(30)));
+        assert_eq!(download.recv_body, None);
+        // Both stay bounded by the same overall deadline.
+        assert_eq!(metadata.global, Some(Duration::from_secs(300)));
+        assert_eq!(download.global, metadata.global);
     }
     #[test]
     fn failed_network_read_and_disk_write_abort_download() {
