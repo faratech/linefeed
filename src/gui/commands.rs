@@ -2786,10 +2786,17 @@ mod tests {
         let mut channel = Channel::new();
         channel.joined = true;
         channel.add_user("alice", crate::gui::types::UserMode::Normal);
-        let alice = channel.get_user_mut("alice").unwrap();
-        alice.username = Some("~alice".into());
-        alice.hostname = Some("host.example".into());
         app.channels.insert("#chan".into(), channel);
+        app.update_user_identity(
+            "alice",
+            Some(Some("~alice".into())),
+            Some(Some("host.example".into())),
+            None,
+            None,
+            None,
+            None,
+            Some(true),
+        );
         app.current_channel = Some("#chan".into());
         (app, rx)
     }
