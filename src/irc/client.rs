@@ -1597,6 +1597,22 @@ impl IrcClient {
         let mut rejected_caps = Vec::new();
         let mut pending_caps: std::collections::HashSet<String> =
             caps_to_request.iter().map(|cap| cap.to_string()).collect();
+        // Caps already requested on a line of their own. A NAK rejects every
+        // cap on its REQ line (IRCv3 is all-or-nothing), so a NAK of a
+        // combined line retries each of its caps once, individually, and a
+        // NAK of a lone cap is final. This bounds the retries to one REQ per
+        // requested cap however a hostile server answers (#244).
+        let mut requested_alone: std::collections::HashSet<String> = cap_reqs
+            .iter()
+            .filter_map(|line| {
+                let mut caps = line
+                    .trim_end()
+                    .strip_prefix("CAP REQ :")?
+                    .split_whitespace();
+                let cap = caps.next()?;
+                caps.next().is_none().then(|| cap.to_string())
+            })
+            .collect();
         loop {
             let Some(msg) =
                 read_handshake_msg_timed(writer, reader, buf, incoming_tx, nick_rx).await?
@@ -1660,9 +1676,37 @@ impl IrcClient {
                     // The trailing element is the rejected cap list (after any "*" marker).
                     if let Some(caps) = rest.last() {
                         cap_budget.observe(caps)?;
-                        rejected_caps.push(caps.clone());
+                        let mut retries: Vec<&str> = Vec::new();
                         for cap in caps.split_whitespace() {
-                            pending_caps.remove(&cap_token_name(cap));
+                            let name = cap_token_name(cap);
+                            // Only caps we asked for and still await a reply on.
+                            if !pending_caps.contains(&name) {
+                                continue;
+                            }
+                            if requested_alone.contains(&name) {
+                                pending_caps.remove(&name);
+                                rejected_caps.push(name);
+                            } else if let Some(cap) =
+                                caps_to_request.iter().copied().find(|cap| *cap == name)
+                            {
+                                requested_alone.insert(name);
+                                retries.push(cap);
+                            }
+                        }
+                        if !retries.is_empty() {
+                            // SASL first: it gates authentication, so ask for it
+                            // ahead of the optional caps.
+                            retries.sort_by_key(|cap| *cap != "sasl");
+                            tracing::info!(
+                                "Server NAKed a combined CAP REQ; retrying individually: {}",
+                                retries.join(" ")
+                            );
+                            for cap in retries {
+                                let line = format!("CAP REQ :{cap}\r\n");
+                                tracing::debug!("> {}", line.trim());
+                                writer.write_all(line.as_bytes()).await?;
+                            }
+                            writer.flush().await?;
                         }
                     }
                     if pending_caps.is_empty() {
@@ -1696,6 +1740,8 @@ impl IrcClient {
             } else if want_sasl {
                 let message = if !sasl_available {
                     "Server does not support SASL"
+                } else if rejected_caps.iter().any(|cap| cap == "sasl") {
+                    "Server rejected the SASL capability"
                 } else {
                     "Server does not offer a configured SASL mechanism"
                 };
@@ -3521,6 +3567,282 @@ mod tests {
                 .expect("SCRAM registration timed out");
             assert_eq!(server.await.unwrap(), "AUTHENTICATE *");
             assert!(result.is_err());
+        });
+    }
+
+    #[test]
+    fn cap_nak_of_a_combined_request_retries_each_cap_so_sasl_still_runs() {
+        test_runtime().block_on(async {
+            // #244: this server cannot enable away-notify and NAKs every REQ
+            // containing it. The combined REQ is NAKed as a whole, which must
+            // not take multi-prefix and SASL down with it.
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                let (read_half, mut write_half) = stream.into_split();
+                let mut reader = BufReader::new(read_half);
+                assert_eq!(read_wire_line(&mut reader).await, "CAP LS 302");
+                assert_eq!(read_wire_line(&mut reader).await, "NICK tester");
+                assert!(read_wire_line(&mut reader).await.starts_with("USER "));
+                write_half
+                    .write_all(b":srv CAP * LS :multi-prefix away-notify sasl=PLAIN\r\n")
+                    .await
+                    .unwrap();
+                let mut requests = Vec::new();
+                let next = loop {
+                    let line = read_wire_line(&mut reader).await;
+                    let Some(caps) = line.strip_prefix("CAP REQ :") else {
+                        break line;
+                    };
+                    let verb = if caps.split_whitespace().any(|cap| cap == "away-notify") {
+                        "NAK"
+                    } else {
+                        "ACK"
+                    };
+                    write_half
+                        .write_all(format!(":srv CAP * {verb} :{caps}\r\n").as_bytes())
+                        .await
+                        .unwrap();
+                    requests.push(caps.to_string());
+                };
+                if next == "AUTHENTICATE PLAIN" {
+                    write_half.write_all(b"AUTHENTICATE +\r\n").await.unwrap();
+                    let expected = BASE64_STANDARD.encode(b"\0user\0password");
+                    assert_eq!(
+                        read_wire_line(&mut reader).await,
+                        format!("AUTHENTICATE {expected}")
+                    );
+                    write_half
+                        .write_all(b":srv 903 tester :SASL successful\r\n")
+                        .await
+                        .unwrap();
+                    assert_eq!(read_wire_line(&mut reader).await, "CAP END");
+                    write_half
+                        .write_all(b":srv 001 tester :Welcome\r\n")
+                        .await
+                        .unwrap();
+                }
+                (requests, next)
+            });
+
+            let config = ServerConfig {
+                host: "127.0.0.1".into(),
+                port: addr.port(),
+                use_tls: false,
+                nick: "tester".into(),
+                sasl_username: Some("user".into()),
+                sasl_password: Some("password".into()),
+                sasl_required: true,
+                ..Default::default()
+            };
+            let (msg_tx, mut msg_rx) = mpsc::channel(100);
+            let (_cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+            let mut client = IrcClient::new(config);
+            let result = timeout(Duration::from_secs(5), client.connect(msg_tx, cmd_rx))
+                .await
+                .expect("registration after a CAP NAK timed out");
+            let (requests, next) = server.await.unwrap();
+            assert_eq!(requests[0], "multi-prefix away-notify sasl");
+            // SASL, the critical cap, is retried first.
+            assert_eq!(requests[1..], ["sasl", "multi-prefix", "away-notify"]);
+            assert_eq!(next, "AUTHENTICATE PLAIN");
+            result.unwrap();
+            let notices: Vec<String> = std::iter::from_fn(|| msg_rx.try_recv().ok())
+                .filter_map(|message| match message.command {
+                    IrcCommand::Notice(_, content) => Some(content),
+                    _ => None,
+                })
+                .collect();
+            assert!(
+                notices
+                    .iter()
+                    .any(|content| content == "Server rejected capabilities: away-notify"),
+                "notices: {notices:?}"
+            );
+            assert!(
+                notices
+                    .iter()
+                    .any(|content| content == "IRCv3: multi-prefix"),
+                "notices: {notices:?}"
+            );
+        });
+    }
+
+    #[test]
+    fn hostile_cap_nak_retries_are_bounded_and_limited_to_requested_caps() {
+        test_runtime().block_on(async {
+            // A server that NAKs everything (and pads the first NAK with a cap
+            // we never asked for) can draw each requested cap at most once
+            // more, and no request for anything else.
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                let (read_half, mut write_half) = stream.into_split();
+                let mut reader = BufReader::new(read_half);
+                assert_eq!(read_wire_line(&mut reader).await, "CAP LS 302");
+                assert_eq!(read_wire_line(&mut reader).await, "NICK tester");
+                assert!(read_wire_line(&mut reader).await.starts_with("USER "));
+                write_half
+                    .write_all(format!(":srv CAP * LS :{}\r\n", DESIRED_CAPS.join(" ")).as_bytes())
+                    .await
+                    .unwrap();
+                let mut requests = Vec::new();
+                loop {
+                    let line = read_wire_line(&mut reader).await;
+                    let Some(caps) = line.strip_prefix("CAP REQ :") else {
+                        assert_eq!(line, "CAP END");
+                        break;
+                    };
+                    let echoed = if requests.is_empty() {
+                        format!("{caps} bogus-cap")
+                    } else {
+                        caps.to_string()
+                    };
+                    write_half
+                        .write_all(format!(":srv CAP * NAK :{echoed}\r\n").as_bytes())
+                        .await
+                        .unwrap();
+                    requests.push(caps.to_string());
+                }
+                write_half
+                    .write_all(b":srv 001 tester :Welcome\r\n")
+                    .await
+                    .unwrap();
+                requests
+            });
+
+            let config = ServerConfig {
+                host: "127.0.0.1".into(),
+                port: addr.port(),
+                use_tls: false,
+                nick: "tester".into(),
+                ..Default::default()
+            };
+            let (msg_tx, _msg_rx) = mpsc::channel(100);
+            let (_cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+            let mut client = IrcClient::new(config);
+            timeout(Duration::from_secs(5), client.connect(msg_tx, cmd_rx))
+                .await
+                .expect("registration after blanket CAP NAKs timed out")
+                .unwrap();
+            let requests = server.await.unwrap();
+            let initial = cap_request_lines(DESIRED_CAPS).len();
+            let mut retried: Vec<&str> = requests[initial..].iter().map(String::as_str).collect();
+            assert!(retried.iter().all(|cap| !cap.contains(' ')), "{retried:?}");
+            retried.sort_unstable();
+            let mut expected = DESIRED_CAPS.to_vec();
+            expected.sort_unstable();
+            assert_eq!(retried, expected);
+        });
+    }
+
+    #[test]
+    fn cap_nak_of_a_single_cap_request_is_final() {
+        test_runtime().block_on(async {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                let (read_half, mut write_half) = stream.into_split();
+                let mut reader = BufReader::new(read_half);
+                assert_eq!(read_wire_line(&mut reader).await, "CAP LS 302");
+                assert_eq!(read_wire_line(&mut reader).await, "NICK tester");
+                assert!(read_wire_line(&mut reader).await.starts_with("USER "));
+                write_half
+                    .write_all(b":srv CAP * LS :multi-prefix\r\n")
+                    .await
+                    .unwrap();
+                assert_eq!(read_wire_line(&mut reader).await, "CAP REQ :multi-prefix");
+                write_half
+                    .write_all(b":srv CAP * NAK :multi-prefix\r\n")
+                    .await
+                    .unwrap();
+                // Re-requesting the identical single-cap REQ would be pointless.
+                let next = read_wire_line(&mut reader).await;
+                write_half
+                    .write_all(b":srv 001 tester :Welcome\r\n")
+                    .await
+                    .unwrap();
+                next
+            });
+
+            let config = ServerConfig {
+                host: "127.0.0.1".into(),
+                port: addr.port(),
+                use_tls: false,
+                nick: "tester".into(),
+                ..Default::default()
+            };
+            let (msg_tx, _msg_rx) = mpsc::channel(100);
+            let (_cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+            let mut client = IrcClient::new(config);
+            timeout(Duration::from_secs(5), client.connect(msg_tx, cmd_rx))
+                .await
+                .expect("registration after a single-cap NAK timed out")
+                .unwrap();
+            assert_eq!(server.await.unwrap(), "CAP END");
+        });
+    }
+
+    #[test]
+    fn nak_of_the_sasl_cap_is_reported_as_a_rejection_not_a_missing_mechanism() {
+        test_runtime().block_on(async {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                let (read_half, mut write_half) = stream.into_split();
+                let mut reader = BufReader::new(read_half);
+                assert_eq!(read_wire_line(&mut reader).await, "CAP LS 302");
+                assert_eq!(read_wire_line(&mut reader).await, "NICK tester");
+                assert!(read_wire_line(&mut reader).await.starts_with("USER "));
+                write_half
+                    .write_all(b":srv CAP * LS :sasl=PLAIN\r\n")
+                    .await
+                    .unwrap();
+                assert_eq!(read_wire_line(&mut reader).await, "CAP REQ :sasl");
+                write_half
+                    .write_all(b":srv CAP * NAK :sasl\r\n")
+                    .await
+                    .unwrap();
+                assert_eq!(read_wire_line(&mut reader).await, "CAP END");
+                write_half
+                    .write_all(b":srv 001 tester :Welcome\r\n")
+                    .await
+                    .unwrap();
+            });
+
+            let config = ServerConfig {
+                host: "127.0.0.1".into(),
+                port: addr.port(),
+                use_tls: false,
+                nick: "tester".into(),
+                sasl_username: Some("user".into()),
+                sasl_password: Some("password".into()),
+                ..Default::default()
+            };
+            let (msg_tx, mut msg_rx) = mpsc::channel(100);
+            let (_cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+            let mut client = IrcClient::new(config);
+            timeout(Duration::from_secs(5), client.connect(msg_tx, cmd_rx))
+                .await
+                .expect("registration after a SASL NAK timed out")
+                .unwrap();
+            server.await.unwrap();
+            let notices: Vec<String> = std::iter::from_fn(|| msg_rx.try_recv().ok())
+                .filter_map(|message| match message.command {
+                    IrcCommand::Notice(_, content) => Some(content),
+                    _ => None,
+                })
+                .collect();
+            assert!(
+                notices
+                    .iter()
+                    .any(|content| content == "Server rejected the SASL capability"),
+                "notices: {notices:?}"
+            );
         });
     }
 
