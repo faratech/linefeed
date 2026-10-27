@@ -437,7 +437,8 @@ fn build_agent(recv_body: Option<Duration>, https_only: bool) -> ureq::Agent {
     use ureq::tls::{RootCerts, TlsConfig, TlsProvider};
     ureq::Agent::config_builder()
         .https_only(https_only)
-        .max_redirects(5)
+        // Redirects are followed in `response`, not by ureq; see there.
+        .max_redirects(0)
         .timeout_global(Some(Duration::from_secs(300)))
         .timeout_connect(Some(Duration::from_secs(10)))
         .timeout_recv_response(Some(Duration::from_secs(30)))
@@ -451,19 +452,50 @@ fn build_agent(recv_body: Option<Duration>, https_only: bool) -> ureq::Agent {
         .build()
         .into()
 }
+/// GET `url`, following up to five redirects here rather than in ureq. While
+/// following redirects ureq accepts a 3xx whose headers arrived only in part,
+/// then parses the remaining header lines as the body and fails; every release
+/// download is a redirect to GitHub's asset host, so a header block split
+/// across reads would break every update.
 fn response(agent: &ureq::Agent, url: &str) -> io::Result<ureq::http::Response<ureq::Body>> {
-    agent
-        .get(url)
-        .header(
-            "User-Agent",
-            concat!("linefeed/", env!("CARGO_PKG_VERSION")),
-        )
-        .header("Accept", "application/vnd.github+json")
-        .header("X-GitHub-Api-Version", "2026-03-10")
-        .call()
-        .map_err(|_| {
-            io::Error::other("GitHub request failed; check your connection or try again later")
-        })
+    let failed =
+        || io::Error::other("GitHub request failed; check your connection or try again later");
+    let mut url: ureq::http::Uri = url.parse().map_err(|_| failed())?;
+    for _ in 0..=5 {
+        let response = agent
+            .get(&url)
+            .header(
+                "User-Agent",
+                concat!("linefeed/", env!("CARGO_PKG_VERSION")),
+            )
+            .header("Accept", "application/vnd.github+json")
+            .header("X-GitHub-Api-Version", "2026-03-10")
+            .call()
+            .map_err(|_| failed())?;
+        if !response.status().is_redirection() {
+            return Ok(response);
+        }
+        url = redirect_target(&url, response.headers().get("location")).ok_or_else(failed)?;
+    }
+    Err(failed())
+}
+/// The absolute URI a redirect points to; a path-only Location keeps the
+/// current scheme and host. The agent's https_only setting still applies.
+fn redirect_target(
+    current: &ureq::http::Uri,
+    location: Option<&ureq::http::HeaderValue>,
+) -> Option<ureq::http::Uri> {
+    let location: ureq::http::Uri = location?.to_str().ok()?.parse().ok()?;
+    if location.scheme().is_some() && location.authority().is_some() {
+        return Some(location);
+    }
+    let mut parts = location.into_parts();
+    if !parts.path_and_query.as_ref()?.as_str().starts_with('/') {
+        return None;
+    }
+    parts.scheme = current.scheme().cloned();
+    parts.authority = current.authority().cloned();
+    ureq::http::Uri::from_parts(parts).ok()
 }
 fn limited_body(mut response: ureq::http::Response<ureq::Body>, limit: u64) -> io::Result<Vec<u8>> {
     let mut bytes = Vec::new();
@@ -1118,6 +1150,88 @@ mod tests {
             }
         });
         url
+    }
+    /// Loopback HTTP server answering successive connections with scripted
+    /// responses, each written in the given pieces with a pause in between.
+    fn scripted_server(responses: Vec<Vec<String>>) -> String {
+        use std::io::BufRead;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let host = base.clone();
+        std::thread::spawn(move || {
+            for pieces in responses {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    return;
+                };
+                let mut reader = io::BufReader::new(stream.try_clone().unwrap());
+                let mut line = String::new();
+                while reader.read_line(&mut line).is_ok_and(|n| n > 0) && line != "\r\n" {
+                    line.clear();
+                }
+                for piece in pieces {
+                    let piece = piece.replace("{base}", &host);
+                    if stream.write_all(piece.as_bytes()).and_then(|()| stream.flush()).is_err() {
+                        return;
+                    }
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+            }
+        });
+        base
+    }
+    #[test]
+    fn redirect_with_headers_split_across_reads_still_downloads() {
+        // GitHub answers every asset URL with a chunked 302 to its asset host.
+        // ureq's own redirect handling accepted the first half of such a
+        // header block and failed parsing the rest as the chunked body.
+        let redirect = |location: &str| {
+            vec![
+                format!(
+                    "HTTP/1.1 302 Found\r\nConnection: close\r\nTransfer-Encoding: chunked\r\nLocation: {location}\r\n"
+                ),
+                "Content-Type: text/html\r\nSet-Cookie: a=b\r\n\r\n0\r\n\r\n".to_owned(),
+            ]
+        };
+        let asset = vec!["HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nasset".to_owned()];
+        let base = scripted_server(vec![
+            redirect("{base}/hop"),
+            redirect("/asset"),
+            asset,
+        ]);
+        let agent = build_agent(None, false);
+        let body = limited_body(response(&agent, &format!("{base}/download")).unwrap(), 1024);
+        assert_eq!(body.unwrap(), b"asset");
+    }
+    #[test]
+    fn redirects_are_bounded_and_require_a_location() {
+        let hop = || vec!["HTTP/1.1 302 Found\r\nContent-Length: 0\r\nLocation: /again\r\n\r\n".to_owned()];
+        let base = scripted_server((0..7).map(|_| hop()).collect());
+        let agent = build_agent(None, false);
+        assert!(response(&agent, &format!("{base}/start")).is_err());
+        let base = scripted_server(vec![vec![
+            "HTTP/1.1 302 Found\r\nContent-Length: 0\r\n\r\n".to_owned(),
+        ]]);
+        assert!(response(&agent, &format!("{base}/start")).is_err());
+    }
+    #[test]
+    fn redirect_targets_resolve_against_the_current_url() {
+        let current: ureq::http::Uri = "https://github.com/o/r/releases/download/v1/a".parse().unwrap();
+        let header = |v: &str| ureq::http::HeaderValue::from_str(v).unwrap();
+        assert_eq!(
+            redirect_target(&current, Some(&header("https://release-assets.githubusercontent.com/x?y=1")))
+                .unwrap()
+                .to_string(),
+            "https://release-assets.githubusercontent.com/x?y=1"
+        );
+        assert_eq!(
+            redirect_target(&current, Some(&header("/elsewhere?q"))).unwrap().to_string(),
+            "https://github.com/elsewhere?q"
+        );
+        assert!(redirect_target(&current, Some(&header("relative/path"))).is_none());
+        assert!(redirect_target(&current, None).is_none());
+        // An http:// target parses here; the https_only agent refuses to fetch it.
+        let insecure = redirect_target(&current, Some(&header("http://example.com/a"))).unwrap();
+        assert!(build_agent(None, true).get(&insecure).call().is_err());
     }
     #[test]
     fn slow_asset_download_is_not_cut_off_by_the_metadata_body_limit() {
