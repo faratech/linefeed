@@ -1,0 +1,34 @@
+name: Security audit
+
+# Checks Cargo.lock against the RustSec advisory database. Runs weekly as well
+# as on changes, because new advisories land without any change to this repo.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: '17 6 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: audit-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  cargo-audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
+      # Fails on any vulnerability advisory, and on yanked crates (which
+      # cargo audit only warns about by default).
+      - name: cargo audit
+        run: cargo audit --deny yanked
