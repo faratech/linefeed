@@ -37,6 +37,10 @@ The build script runs `tools/update-deps.py --check` and a non-fatal
 fails the build if UPX compression fails, and only mutates dependency pins
 when `--update-deps` is supplied.
 
+`.github/workflows/audit.yml` runs `cargo audit --deny yanked` on pushes to
+main, pull requests, and weekly; unlike the build script, it fails on any
+advisory or yanked crate.
+
 ## Verification Commands
 
 ```bash
