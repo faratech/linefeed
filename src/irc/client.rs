@@ -421,6 +421,21 @@ where
     Ok(())
 }
 
+/// Serialise an outbound command as one CRLF-terminated wire line. A command
+/// whose fields contain CR, LF or NUL would put extra, attacker-chosen
+/// protocol lines on the wire, so it is refused (logged without its content,
+/// which may be a credential) and an empty string is returned, which the
+/// writers send as a no-op (#285).
+fn outbound_line(cmd: &IrcCommand) -> String {
+    match cmd.to_wire_line() {
+        Some(line) => line + "\r\n",
+        None => {
+            tracing::warn!("Refusing to send a command containing CR, LF or NUL");
+            String::new()
+        }
+    }
+}
+
 /// Consume the complete line in `buf`: parse it, forward a copy to the GUI,
 /// and transparently answer a server PING (which can arrive mid-handshake,
 /// before the writer task that normally handles them exists). PINGs and
@@ -490,7 +505,7 @@ where
         tokio::select! {
             biased;
             Some(nick) = nick_rx.recv() => {
-                let line = format!("{}\r\n", IrcCommand::Nick(nick));
+                let line = outbound_line(&IrcCommand::Nick(nick));
                 tracing::debug!("> {}", line.trim_end());
                 writer.write_all(line.as_bytes()).await?;
                 writer.flush().await?;
@@ -1360,7 +1375,7 @@ impl IrcClient {
             use tokio::time::{Duration, timeout};
             while let Some(cmd) = pending_commands.pop_front() {
                 let should_close = matches!(cmd, IrcCommand::Quit(_));
-                let line = format!("{}\r\n", cmd);
+                let line = outbound_line(&cmd);
                 tracing::debug!("> {}", redact_for_log(&line));
                 if let Err(e) = writer.write_all(line.as_bytes()).await {
                     tracing::error!("Write error: {}", e);
@@ -1379,7 +1394,7 @@ impl IrcClient {
                 tokio::select! {
                     Some(cmd) = outgoing_rx.recv() => {
                         let should_close = matches!(cmd, IrcCommand::Quit(_));
-                        let line = format!("{}\r\n", cmd);
+                        let line = outbound_line(&cmd);
                         tracing::debug!("> {}", redact_for_log(&line));
                         if let Err(e) = writer.write_all(line.as_bytes()).await {
                             tracing::error!("Write error: {}", e);
@@ -1392,7 +1407,7 @@ impl IrcClient {
                         // Drain any queued commands before flushing (batch writes)
                         while let Ok(Some(cmd)) = timeout(Duration::from_micros(100), outgoing_rx.recv()).await {
                             let should_close = matches!(cmd, IrcCommand::Quit(_));
-                            let line = format!("{}\r\n", cmd);
+                            let line = outbound_line(&cmd);
                             tracing::debug!("> {}", redact_for_log(&line));
                             if let Err(e) = writer.write_all(line.as_bytes()).await {
                                 // Exit the whole task, matching the outer loop: a
@@ -4701,6 +4716,67 @@ mod tests {
                 .await
                 .unwrap()
                 .unwrap();
+            client_task.abort();
+        });
+    }
+
+    #[test]
+    fn outbound_commands_with_line_breaks_are_refused_instead_of_split_into_extra_lines() {
+        // #285: the writers append CRLF to the formatted command, so a field
+        // containing CR/LF/NUL would put attacker-chosen lines on the wire,
+        // both on the registration NICK write-through and on the post-001
+        // writer. The unsafe commands are dropped; the safe ones still flow.
+        test_runtime().block_on(async {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                let (read_half, mut write_half) = stream.into_split();
+                let mut reader = BufReader::new(read_half);
+                assert_eq!(read_wire_line(&mut reader).await, "CAP LS 302");
+                assert_eq!(read_wire_line(&mut reader).await, "NICK tester");
+                assert!(read_wire_line(&mut reader).await.starts_with("USER "));
+                let registration_nick = read_wire_line(&mut reader).await;
+                write_half
+                    .write_all(b":srv 001 tester :Welcome\r\n")
+                    .await
+                    .unwrap();
+                let first_after_welcome = read_wire_line(&mut reader).await;
+                let extra = timeout(Duration::from_millis(300), read_wire_line(&mut reader))
+                    .await
+                    .ok();
+                (registration_nick, first_after_welcome, extra)
+            });
+
+            let config = ServerConfig {
+                host: "127.0.0.1".into(),
+                port: addr.port(),
+                use_tls: false,
+                nick: "tester".into(),
+                ..Default::default()
+            };
+            let (msg_tx, _msg_rx) = mpsc::channel(100);
+            let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+            for command in [
+                IrcCommand::Nick("evil\r\nJOIN #evil".to_string()),
+                IrcCommand::Privmsg("#c".to_string(), "hi\r\nPRIVMSG #evil :spam".to_string()),
+                IrcCommand::Nick("safe_".to_string()),
+                IrcCommand::Privmsg("#c".to_string(), "fine".to_string()),
+            ] {
+                cmd_tx.send(command).unwrap();
+            }
+            let mut client = IrcClient::new(config);
+            let client_task = tokio::spawn(async move {
+                let _ = client.connect(msg_tx, cmd_rx).await;
+            });
+            let (registration_nick, first_after_welcome, extra) =
+                timeout(Duration::from_secs(5), server)
+                    .await
+                    .unwrap()
+                    .unwrap();
+            assert_eq!(registration_nick, "NICK safe_");
+            assert_eq!(first_after_welcome, "PRIVMSG #c :fine");
+            assert_eq!(extra, None, "an injected line reached the wire");
             client_task.abort();
         });
     }

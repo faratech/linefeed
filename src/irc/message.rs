@@ -566,6 +566,22 @@ fn unescape_tag_value(value: &str) -> String {
     out
 }
 
+impl IrcCommand {
+    /// The wire form of this command without its CRLF terminator, or `None`
+    /// when any field contains CR, LF or NUL. Display interpolates fields
+    /// verbatim, so those bytes would end the line early and let the rest of
+    /// the field be read by the server as further protocol commands (#285).
+    /// Anything that writes a command to the wire must go through this.
+    pub fn to_wire_line(&self) -> Option<String> {
+        let line = self.to_string();
+        if line.bytes().any(|byte| matches!(byte, b'\r' | b'\n' | 0)) {
+            None
+        } else {
+            Some(line)
+        }
+    }
+}
+
 impl fmt::Display for IrcCommand {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -1101,6 +1117,44 @@ mod tests {
             );
             assert_eq!(message.raw, line);
         }
+    }
+
+    #[test]
+    fn wire_line_refuses_fields_that_would_inject_extra_lines() {
+        // #285: the Display form is verbatim, so the wire form must reject
+        // CR/LF/NUL in any field rather than let one command become several.
+        for command in [
+            IrcCommand::Nick("a\r\nJOIN #x".into()),
+            IrcCommand::Nick("a\nJOIN #x".into()),
+            IrcCommand::Nick("a\rJOIN #x".into()),
+            IrcCommand::Nick("a\0b".into()),
+            IrcCommand::Privmsg("#c".into(), "hi\r\nPRIVMSG #evil :spam".into()),
+            IrcCommand::Privmsg("#c\r\nQUIT".into(), "hi".into()),
+            IrcCommand::Pass("pw\r\nOPER x y".into()),
+            IrcCommand::User {
+                username: "u".into(),
+                realname: "r\nQUIT".into(),
+            },
+            IrcCommand::Mode("#c".into(), Some("+k".into()), vec!["key\nQUIT".into()]),
+            IrcCommand::Cap("*".into(), "REQ".into(), vec!["a\r\nQUIT".into()]),
+            IrcCommand::Raw("PRIVMSG #c :x\r\nQUIT".into()),
+            IrcCommand::Extension("METADATA".into(), vec!["x\nQUIT".into()]),
+        ] {
+            assert_eq!(command.to_wire_line(), None, "{command:?}");
+        }
+
+        assert_eq!(
+            IrcCommand::Privmsg("#c".into(), "hi there".into())
+                .to_wire_line()
+                .as_deref(),
+            Some("PRIVMSG #c :hi there")
+        );
+        assert_eq!(
+            IrcCommand::Raw("@label=1 WHOIS alice".into())
+                .to_wire_line()
+                .as_deref(),
+            Some("@label=1 WHOIS alice")
+        );
     }
 
     #[test]
