@@ -1329,6 +1329,15 @@ impl IrcClient {
             let Some(message) = IrcMessage::parse(&line) else {
                 continue;
             };
+            // 421 for CAP: a legacy server without capability negotiation has
+            // no STS to advertise. It will not say anything more either, as
+            // the probe never registers, so waiting out the deadline would
+            // only delay the real connection (#301).
+            if let IrcCommand::Numeric(ERR_UNKNOWNCOMMAND, params) = &message.command
+                && params.iter().any(|param| param.eq_ignore_ascii_case("CAP"))
+            {
+                return Ok(None);
+            }
             if let IrcCommand::Ping(token) = message.command {
                 if !probe_write(
                     &mut writer,
@@ -3380,6 +3389,87 @@ mod tests {
             .await
             .expect("blocked probe write was not cancelled");
             assert!(result.is_err());
+        });
+    }
+
+    #[test]
+    fn sts_probe_gives_up_at_once_when_the_server_answers_421_to_cap() {
+        test_runtime().block_on(async {
+            // #301: a legacy server answers `421 CAP`, then waits for
+            // NICK/USER that the probe never sends. The probe used to sit
+            // there until its deadline on every plaintext connect.
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                let (read_half, mut write_half) = stream.into_split();
+                let mut reader = BufReader::new(read_half);
+                assert_eq!(read_wire_line(&mut reader).await, "CAP LS 302");
+                write_half
+                    .write_all(b":srv 421 * CAP :Unknown command\r\n")
+                    .await
+                    .unwrap();
+                // Hold the socket open and silent, as a registering ircd does.
+                tokio::time::sleep(Duration::from_secs(5)).await;
+            });
+            let (incoming_tx, _incoming_rx) = mpsc::channel(1);
+            let (_outgoing_tx, mut outgoing_rx) = mpsc::unbounded_channel();
+            let mut pending = VecDeque::new();
+            let started = tokio::time::Instant::now();
+            let port = IrcClient::probe_sts_upgrade_with_timeout(
+                "127.0.0.1",
+                address.port(),
+                &incoming_tx,
+                &mut outgoing_rx,
+                &mut pending,
+                Duration::from_secs(2),
+            )
+            .await
+            .unwrap();
+            assert_eq!(port, None);
+            assert!(
+                started.elapsed() < Duration::from_secs(1),
+                "probe waited {:?} after an immediate 421",
+                started.elapsed()
+            );
+            server.abort();
+        });
+    }
+
+    #[test]
+    fn sts_probe_keeps_waiting_through_unrelated_numerics() {
+        test_runtime().block_on(async {
+            // Guard for the #301 fix: only 421 for CAP ends the probe early.
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                let (read_half, mut write_half) = stream.into_split();
+                let mut reader = BufReader::new(read_half);
+                assert_eq!(read_wire_line(&mut reader).await, "CAP LS 302");
+                write_half
+                    .write_all(b":srv 421 * FOO :Unknown command\r\n:srv NOTICE * :hello\r\n")
+                    .await
+                    .unwrap();
+                write_half
+                    .write_all(b":srv CAP * LS :sts=port=6697\r\n")
+                    .await
+                    .unwrap();
+            });
+            let (incoming_tx, _incoming_rx) = mpsc::channel(1);
+            let (_outgoing_tx, mut outgoing_rx) = mpsc::unbounded_channel();
+            let mut pending = VecDeque::new();
+            let port = IrcClient::probe_sts_upgrade(
+                "127.0.0.1",
+                address.port(),
+                &incoming_tx,
+                &mut outgoing_rx,
+                &mut pending,
+            )
+            .await
+            .unwrap();
+            assert_eq!(port, Some(6697));
+            server.await.unwrap();
         });
     }
 
