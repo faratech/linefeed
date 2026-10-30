@@ -19,8 +19,8 @@ use std::{
 
 const REPOSITORY: &str = "faratech/linefeed";
 const CHECK_INTERVAL: u64 = 24 * 60 * 60;
-/// How long a worker waits before automatically retrying a failed check.
-const CHECK_RETRY: Duration = Duration::from_secs(10 * 60);
+/// Seconds after a failed request before an automatic check tries again.
+const CHECK_RETRY: u64 = 10 * 60;
 
 pub fn asset_name(os: &str, arch: &str) -> Option<&'static str> {
     match (os, arch) {
@@ -344,8 +344,6 @@ fn worker(
     can_install: bool,
 ) {
     let mut offer = None;
-    // When a failed check may be retried automatically.
-    let mut retry_at = None;
     let initial = Instant::now() + Duration::from_secs(5);
     loop {
         let command = match commands.recv_timeout(Duration::from_secs(5)) {
@@ -358,9 +356,7 @@ fn worker(
                 {
                     continue;
                 }
-                let last =
-                    install::read_json::<u64>(&paths.state.join("last-check.json")).unwrap_or(0);
-                if !check_due(last, now(), retry_at, Instant::now()) {
+                if !due_now(&paths, now()) {
                     continue;
                 }
                 Command::Check
@@ -374,12 +370,7 @@ fn worker(
                 Command::Check => {
                     emit(&events, &context, Event::Status(Status::Checking));
                     let (checked, found) =
-                        stamped_check(&paths, check_release).map_err(|error| {
-                            if matches!(error, CheckError::Request(_)) {
-                                retry_at = Some(Instant::now() + CHECK_RETRY);
-                            }
-                            error.into_io()
-                        })?;
+                        stamped_check(&paths, check_release).map_err(CheckError::into_io)?;
                     emit(&events, &context, Event::Checked(checked));
                     offer = found;
                     emit(&events, &context, Event::Offer(offer.clone()));
@@ -429,10 +420,9 @@ fn worker(
 /// Stamp the check cadence for all running instances. The transaction lock is
 /// held only for this write, never across the network requests that follow:
 /// another launch would otherwise wait on it until its own timeout (#272).
-fn record_check(paths: &Paths) -> io::Result<u64> {
+fn record_check(paths: &Paths, checked: u64) -> io::Result<u64> {
     let lock = paths.transaction_lock()?;
     lock.try_lock().map_err(io::Error::other)?;
-    let checked = now();
     install::write_json(&paths.state.join("last-check.json"), &checked)?;
     Ok(checked)
 }
@@ -457,52 +447,64 @@ impl CheckError {
 }
 
 /// Stamp the check cadence, then run `check`. The stamp goes first so that
-/// instances launched meanwhile skip their own check. A request that fails takes
-/// it back, so that it does not suppress automatic checks for a whole interval
-/// (#297); a release GitHub answered with and the updater rejected keeps it,
-/// since that check completed and repeating it would change nothing.
+/// instances launched meanwhile skip their own check. A request that fails marks
+/// its stamp as failed, so that it does not suppress automatic checks for a
+/// whole interval (#297); a release GitHub answered with and the updater
+/// rejected is not marked, since that check completed and repeating it would
+/// change nothing.
 fn stamped_check(
     paths: &Paths,
     check: impl FnOnce() -> Result<Option<Offer>, CheckError>,
 ) -> Result<(u64, Option<Offer>), CheckError> {
-    let previous = install::read_json::<u64>(&paths.state.join("last-check.json")).ok();
-    let checked = record_check(paths).map_err(CheckError::Request)?;
+    stamped_check_at(paths, now(), check)
+}
+fn stamped_check_at(
+    paths: &Paths,
+    at: u64,
+    check: impl FnOnce() -> Result<Option<Offer>, CheckError>,
+) -> Result<(u64, Option<Offer>), CheckError> {
+    let checked = record_check(paths, at).map_err(CheckError::Request)?;
     match check() {
         Ok(offer) => Ok((checked, offer)),
         Err(error) => {
             if matches!(error, CheckError::Request(_)) {
-                unrecord_check(paths, checked, previous);
+                note_failed_check(paths, checked);
             }
             Err(error)
         }
     }
 }
-/// Restore the stamp from before a failed check, unless another instance has
-/// stamped since: that instance's check stands. Best effort; a stamp that stays
-/// only delays the next automatic check.
-fn unrecord_check(paths: &Paths, checked: u64, previous: Option<u64>) {
+/// Record that the check stamped `checked` failed, unless a later check has
+/// stamped since: that one is still in flight (or has its own outcome), and its
+/// stamp stays what the cadence rests on. Nothing is ever written back to the
+/// stamp, so overlapping checks cannot revive a stamp that another unconfirmed
+/// check wrote. Best effort; without the mark the next automatic check is merely
+/// a day away.
+fn note_failed_check(paths: &Paths, checked: u64) {
     let Ok(lock) = paths.transaction_lock() else {
         return;
     };
     if install::timed_lock(&lock, false, Duration::from_secs(5)).is_err() {
         return;
     }
-    let stamp = paths.state.join("last-check.json");
-    if install::read_json::<u64>(&stamp).ok() != Some(checked) {
-        return;
+    if install::read_json::<u64>(&paths.state.join("last-check.json")).ok() == Some(checked) {
+        let _ = install::write_json(&paths.state.join("check-failed.json"), &checked);
     }
-    let _ = match previous {
-        Some(previous) => install::write_json(&stamp, &previous),
-        None => fs::remove_file(&stamp),
-    };
 }
-/// Whether an idle worker starts an automatic check: a full interval has passed
-/// since the last stamp, and a failed check is not still backing off. Without
-/// the backoff a stamp taken back after a failure would be retried on every
-/// idle tick for as long as the network stays down.
-fn check_due(last: u64, current: u64, backoff_until: Option<Instant>, tick: Instant) -> bool {
-    backoff_until.is_none_or(|until| tick >= until)
-        && !(current >= last && current - last < CHECK_INTERVAL)
+/// Whether an idle worker starts an automatic check at `current`.
+fn due_now(paths: &Paths, current: u64) -> bool {
+    let last = install::read_json::<u64>(&paths.state.join("last-check.json")).unwrap_or(0);
+    let failed = install::read_json::<u64>(&paths.state.join("check-failed.json")).ok();
+    check_due(last, failed, current)
+}
+/// A full interval has passed since the last stamp, or the check that wrote it
+/// failed and a retry delay has passed. The delay is measured on the shared
+/// stamp, so instances and idle ticks cannot retry a down network in a loop.
+fn check_due(last: u64, failed: Option<u64>, current: u64) -> bool {
+    let Some(age) = current.checked_sub(last) else {
+        return true;
+    };
+    age >= CHECK_INTERVAL || (failed == Some(last) && age >= CHECK_RETRY)
 }
 
 fn agent() -> ureq::Agent {
@@ -1189,7 +1191,7 @@ mod tests {
         // check_release() runs after record_check returns; a launch or another
         // instance's commit must be able to take the lock meanwhile (#272).
         let (root, paths, _tx) = staged_fixture("0.0.10");
-        let checked = record_check(&paths).unwrap();
+        let checked = record_check(&paths, now()).unwrap();
         assert_eq!(
             install::read_json::<u64>(&paths.state.join("last-check.json")).unwrap(),
             checked
@@ -1199,42 +1201,81 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
     #[test]
-    fn a_failed_update_check_gives_back_its_stamp_so_the_next_attempt_is_not_a_day_away() {
+    fn a_failed_update_request_is_retried_in_minutes_while_a_completed_check_waits_a_day() {
         // Launching offline or hitting a GitHub 5xx must not suppress automatic
         // checks for 24 hours (#297). The stamp is still written before the
         // request, for other instances' sake.
         let (root, paths, _tx) = staged_fixture("0.0.10");
         let stamp = paths.state.join("last-check.json");
+        let first = 1_000_000;
 
-        // The very first check fails: no stamp may be left behind.
-        let failed = stamped_check(&paths, || {
-            assert!(install::read_json::<u64>(&stamp).is_ok());
+        let failed = stamped_check_at(&paths, first, || {
+            assert_eq!(install::read_json::<u64>(&stamp).unwrap(), first);
             Err(CheckError::Request(io::Error::other("offline")))
         });
         assert!(failed.is_err());
-        assert!(!stamp.exists());
+        assert_eq!(install::read_json::<u64>(&stamp).unwrap(), first);
+        assert!(!due_now(&paths, first + CHECK_RETRY - 1));
+        assert!(due_now(&paths, first + CHECK_RETRY));
 
-        // A failure restores an earlier stamp instead of erasing it.
-        install::write_json(&stamp, &1234u64).unwrap();
-        assert!(stamped_check(&paths, || Err(CheckError::Request(io::Error::other("503")))).is_err());
-        assert_eq!(install::read_json::<u64>(&stamp).unwrap(), 1234);
-
-        // A check recorded by another instance in the meantime stands.
-        let newer = now() + 100;
-        assert!(
-            stamped_check(&paths, || {
-                install::write_json(&stamp, &newer).unwrap();
-                Err(CheckError::Request(io::Error::other("503")))
-            })
-            .is_err()
-        );
-        assert_eq!(install::read_json::<u64>(&stamp).unwrap(), newer);
-
-        // A check that succeeds keeps its stamp, whether or not it finds an update.
-        let (checked, offer) = stamped_check(&paths, || Ok(None)).unwrap();
-        assert!(offer.is_none());
-        assert_eq!(install::read_json::<u64>(&stamp).unwrap(), checked);
+        // The retry works, whether or not it finds an update: a day's wait. The
+        // failure recorded for the first stamp says nothing about the new one.
+        let second = first + CHECK_RETRY + 30;
+        let (checked, offer) = stamped_check_at(&paths, second, || Ok(None)).unwrap();
+        assert!(offer.is_none() && checked == second);
+        assert!(!due_now(&paths, second + CHECK_RETRY));
+        assert!(!due_now(&paths, second + CHECK_INTERVAL - 1));
+        assert!(due_now(&paths, second + CHECK_INTERVAL));
         let _ = fs::remove_dir_all(root);
+    }
+    /// Two instances whose checks overlap and both fail: A stamps first, B
+    /// stamps later, and they fail in the given order.
+    fn overlapping_failed_checks(a_fails_first: bool) -> (std::path::PathBuf, Paths) {
+        const A: u64 = 1_000_000;
+        const B: u64 = 1_000_005;
+        let (root, paths, _tx) = staged_fixture("0.0.10");
+        let (a_stamped, b_hears_a) = mpsc::channel::<()>();
+        let (b_stamped, a_hears_b) = mpsc::channel::<()>();
+        let (a_done, b_hears_a_done) = mpsc::channel::<()>();
+        let (b_done, a_hears_b_done) = mpsc::channel::<()>();
+        let unreachable = || Err(CheckError::Request(io::Error::other("offline")));
+        let shared = &paths;
+        std::thread::scope(|scope| {
+            scope.spawn(move || {
+                let _ = stamped_check_at(shared, A, || {
+                    a_stamped.send(()).unwrap();
+                    a_hears_b.recv().unwrap();
+                    if !a_fails_first {
+                        a_hears_b_done.recv().unwrap();
+                    }
+                    unreachable()
+                });
+                let _ = a_done.send(());
+            });
+            b_hears_a.recv().unwrap();
+            let _ = stamped_check_at(shared, B, || {
+                b_stamped.send(()).unwrap();
+                if a_fails_first {
+                    b_hears_a_done.recv().unwrap();
+                }
+                unreachable()
+            });
+            let _ = b_done.send(());
+        });
+        (root, paths)
+    }
+    #[test]
+    fn overlapping_failed_checks_never_leave_a_day_long_suppression_in_either_order() {
+        // A stamps, B stamps, then both fail. Restoring "the previous stamp"
+        // would hand back a stamp an unconfirmed check wrote (#297).
+        for a_fails_first in [true, false] {
+            let (root, paths) = overlapping_failed_checks(a_fails_first);
+            assert!(
+                due_now(&paths, 1_000_005 + CHECK_RETRY),
+                "a_fails_first: {a_fails_first}"
+            );
+            let _ = fs::remove_dir_all(root);
+        }
     }
     /// A loopback "GitHub" answering one request with `status` and `body`.
     fn release_server(status: &str, body: &str) -> String {
@@ -1245,10 +1286,10 @@ mod tests {
         format!("{base}/releases/latest")
     }
     #[test]
-    fn only_a_failed_request_gives_back_the_stamp_not_a_release_github_answered_with() {
+    fn only_a_failed_request_is_retried_soon_not_a_release_github_answered_with() {
         // GitHub answering with data the updater rejects (incomplete assets,
         // invalid metadata) would answer the same ten minutes later: that costs
-        // one request per day, not one per backoff (#297).
+        // one request per day, not one per retry delay (#297).
         let check = |status: &str, body: &str| {
             let url = release_server(status, body);
             move || {
@@ -1258,32 +1299,39 @@ mod tests {
         };
         let incomplete = r#"{"tag_name":"v9.9.9","draft":false,"prerelease":false,"assets":[]}"#;
         let (root, paths, _tx) = staged_fixture("0.0.10");
-        let stamp = paths.state.join("last-check.json");
+        let at = 1_000_000;
+        let reset = || {
+            let _ = fs::remove_file(paths.state.join("last-check.json"));
+            let _ = fs::remove_file(paths.state.join("check-failed.json"));
+        };
 
-        // Rejected data: the check completed, so its stamp stands.
         for (status, body) in [("200 OK", incomplete), ("200 OK", "not json")] {
-            assert!(stamped_check(&paths, check(status, body)).is_err());
-            assert!(install::read_json::<u64>(&stamp).is_ok(), "{body}");
-            fs::remove_file(&stamp).unwrap();
+            reset();
+            assert!(stamped_check_at(&paths, at, check(status, body)).is_err());
+            assert!(!due_now(&paths, at + CHECK_RETRY), "{body}");
+            assert!(due_now(&paths, at + CHECK_INTERVAL), "{body}");
         }
         // The request itself failed (here a 503): nothing was learned.
-        assert!(stamped_check(&paths, check("503 Service Unavailable", "")).is_err());
-        assert!(!stamp.exists());
+        reset();
+        assert!(stamped_check_at(&paths, at, check("503 Service Unavailable", "")).is_err());
+        assert!(due_now(&paths, at + CHECK_RETRY));
         let _ = fs::remove_dir_all(root);
     }
     #[test]
-    fn automatic_checks_wait_a_day_but_retry_a_failed_check_only_after_a_backoff() {
-        let tick = Instant::now();
-        let stamped = 1_000_000;
-        // No stamp (first launch, or a failed check took its stamp back): due.
-        assert!(check_due(0, stamped, None, tick));
-        assert!(!check_due(stamped, stamped + CHECK_INTERVAL - 1, None, tick));
-        assert!(check_due(stamped, stamped + CHECK_INTERVAL, None, tick));
+    fn automatic_checks_wait_a_day_but_retry_a_failed_request_after_a_delay() {
+        let t = 1_000_000;
+        // No stamp yet (first launch): due.
+        assert!(check_due(0, None, t));
+        assert!(!check_due(t, None, t + CHECK_INTERVAL - 1));
+        assert!(check_due(t, None, t + CHECK_INTERVAL));
         // A clock set back is not a reason to stop checking.
-        assert!(check_due(stamped, stamped - 1, None, tick));
-        // A missing stamp must not turn an outage into a check every idle tick.
-        assert!(!check_due(0, stamped, Some(tick + CHECK_RETRY), tick));
-        assert!(check_due(0, stamped, Some(tick), tick));
+        assert!(check_due(t, None, t - 1));
+        // A stamp whose request failed is retried after the delay, not before:
+        // never on every idle tick while the network is down.
+        assert!(!check_due(t, Some(t), t + CHECK_RETRY - 1));
+        assert!(check_due(t, Some(t), t + CHECK_RETRY));
+        // A failure recorded for an earlier stamp says nothing about this one.
+        assert!(!check_due(t, Some(t - 5), t + CHECK_RETRY));
     }
     #[test]
     fn controller_without_updater_state_stays_disabled_and_explains_why() {
