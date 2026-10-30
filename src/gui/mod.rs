@@ -10980,6 +10980,106 @@ mod tests {
     }
 
     #[test]
+    fn quiet_lists_with_a_mode_letter_field_are_replaced_and_completed_per_mode() {
+        // Solanum (Libera) names the list in both the entries and the end
+        // marker: `728 me #chan q mask setter ts` / `729 me #chan q :End ...`.
+        let mut app = test_app();
+        app.handle_incoming_message(
+            IrcMessage::parse(":srv 005 me CHANMODES=eIbqZ,k,fl,imnt :are supported").unwrap(),
+        );
+        app.channels.insert("#chan".into(), Channel::new());
+        let masks = |app: &IrcApp, mode: char| -> Vec<String> {
+            app.channels["#chan"]
+                .mode_lists
+                .get(&mode)
+                .map(|entries| entries.iter().map(|entry| entry.mask.clone()).collect())
+                .unwrap_or_default()
+        };
+        let burst = |app: &mut IrcApp, mode: &str, entries: &[&str]| {
+            for mask in entries {
+                app.handle_incoming_message(
+                    IrcMessage::parse(&format!(":srv 728 me #chan {mode} {mask} op 100")).unwrap(),
+                );
+            }
+            app.handle_incoming_message(
+                IrcMessage::parse(&format!(":srv 729 me #chan {mode} :End of Channel List"))
+                    .unwrap(),
+            );
+        };
+
+        burst(&mut app, "q", &["a!*@*", "b!*@*"]);
+        burst(&mut app, "Z", &["z!*@*"]);
+        assert_eq!(masks(&app, 'q'), ["a!*@*", "b!*@*"]);
+        assert_eq!(masks(&app, 'Z'), ["z!*@*"]);
+        assert!(app.channels["#chan"].mode_lists_complete.contains(&'q'));
+        assert!(app.channels["#chan"].mode_lists_complete.contains(&'Z'));
+
+        // The end marker's mode letter decides which list it closes: a Z
+        // listing in progress is not completed by (or merged into) q's.
+        app.handle_incoming_message(IrcMessage::parse(":srv 728 me #chan Z y!*@* op 100").unwrap());
+        burst(&mut app, "q", &["a!*@*"]);
+        assert_eq!(masks(&app, 'q'), ["a!*@*"]);
+        assert_eq!(masks(&app, 'Z'), ["y!*@*"]);
+        app.handle_incoming_message(
+            IrcMessage::parse(":srv 729 me #chan Z :End of Channel List").unwrap(),
+        );
+        burst(&mut app, "Z", &["w!*@*"]);
+        assert_eq!(masks(&app, 'Z'), ["w!*@*"]);
+        assert_eq!(masks(&app, 'q'), ["a!*@*"]);
+
+        // Either list can be emptied on its own.
+        burst(&mut app, "q", &[]);
+        assert!(masks(&app, 'q').is_empty());
+        assert_eq!(masks(&app, 'Z'), ["w!*@*"]);
+    }
+
+    #[test]
+    fn custom_except_and_invite_letters_are_replaced_on_relisting() {
+        let mut app = test_app();
+        app.handle_incoming_message(
+            IrcMessage::parse(":srv 005 me EXCEPTS=x INVEX=y :are supported").unwrap(),
+        );
+        app.channels.insert("#chan".into(), Channel::new());
+        let masks = |app: &IrcApp, mode: char| -> Vec<String> {
+            app.channels["#chan"]
+                .mode_lists
+                .get(&mode)
+                .map(|entries| entries.iter().map(|entry| entry.mask.clone()).collect())
+                .unwrap_or_default()
+        };
+        for (entry, end, mode) in [
+            (RPL_EXCEPTLIST, RPL_ENDOFEXCEPTLIST, 'x'),
+            (RPL_INVITELIST, RPL_ENDOFINVITELIST, 'y'),
+        ] {
+            let mut burst = |entries: &[&str]| {
+                for mask in entries {
+                    app.handle_numeric(
+                        entry,
+                        &[
+                            "me".into(),
+                            "#chan".into(),
+                            (*mask).into(),
+                            "op".into(),
+                            "100".into(),
+                        ],
+                    );
+                }
+                app.handle_numeric(end, &["me".into(), "#chan".into()]);
+            };
+            burst(&["a!*@*", "b!*@*"]);
+            burst(&["a!*@*"]);
+            assert_eq!(masks(&app, mode), ["a!*@*"], "+{mode}");
+            assert!(
+                app.channels["#chan"].mode_lists_complete.contains(&mode),
+                "+{mode}"
+            );
+        }
+        // Nothing leaked into the default letters.
+        assert!(masks(&app, 'e').is_empty());
+        assert!(masks(&app, 'I').is_empty());
+    }
+
+    #[test]
     fn casemapped_incoming_query_reuses_existing_tab() {
         let mut app = test_app();
         app.set_session_nick("me".to_string(), true);
