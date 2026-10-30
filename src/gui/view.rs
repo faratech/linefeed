@@ -194,8 +194,10 @@ impl Session {
                             (false, false) => "",
                         };
                         let display_text = format!("{}{nick}{state}", user.prefix());
-                        let response =
-                            ui.selectable_label(is_selected, RichText::new(display_text).color(color));
+                        let response = ui.selectable_label(
+                            is_selected,
+                            RichText::new(display_text).color(color),
+                        );
                         if let Some(away_msg) = &user.away {
                             response
                                 .clone()
@@ -247,10 +249,18 @@ impl Session {
             self.send_command(IrcCommand::Whois(commands::whois_query_target(&nick)));
         }
         if let Some((channel, nick)) = op_nick {
-            self.send_command(IrcCommand::Mode(channel, Some("+o".to_string()), vec![nick]));
+            self.send_command(IrcCommand::Mode(
+                channel,
+                Some("+o".to_string()),
+                vec![nick],
+            ));
         }
         if let Some((channel, nick)) = voice_nick {
-            self.send_command(IrcCommand::Mode(channel, Some("+v".to_string()), vec![nick]));
+            self.send_command(IrcCommand::Mode(
+                channel,
+                Some("+v".to_string()),
+                vec![nick],
+            ));
         }
         if let Some((channel, nick)) = kick_nick {
             self.send_command(IrcCommand::Kick(channel, nick, None));
@@ -273,7 +283,11 @@ impl Session {
             // The formatting buttons give way in narrow windows; their
             // keyboard shortcuts still work.
             if ui.available_width() >= 300.0 {
-                if ui.small_button("B").on_hover_text("Bold (Ctrl+B)").clicked() {
+                if ui
+                    .small_button("B")
+                    .on_hover_text("Bold (Ctrl+B)")
+                    .clicked()
+                {
                     insert_bold = true;
                 }
                 if ui
@@ -283,10 +297,18 @@ impl Session {
                 {
                     insert_underline = true;
                 }
-                if ui.small_button("I").on_hover_text("Italic (Ctrl+I)").clicked() {
+                if ui
+                    .small_button("I")
+                    .on_hover_text("Italic (Ctrl+I)")
+                    .clicked()
+                {
                     insert_italic = true;
                 }
-                if ui.small_button("C").on_hover_text("Color (Ctrl+K)").clicked() {
+                if ui
+                    .small_button("C")
+                    .on_hover_text("Color (Ctrl+K)")
+                    .clicked()
+                {
                     insert_color = true;
                 }
             }

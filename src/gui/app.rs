@@ -16,8 +16,7 @@ use std::time::{Duration, Instant};
 use egui::{Color32, RichText};
 
 use super::windows::{
-    ConnId, LayoutFile, LayoutMode, PersistKey, PresentWindow, TargetView, WindowKey,
-    WindowManager,
+    ConnId, LayoutFile, LayoutMode, PersistKey, PresentWindow, TargetView, WindowKey, WindowManager,
 };
 use super::{
     ChatMessage, ServerFavorite, Session, SessionEvent, Settings, UpdateSession, WindowCommand,
@@ -394,9 +393,8 @@ impl App {
     fn observe_root_input(&mut self, ctx: &egui::Context) {
         let root_focused = ctx.input(|i| i.focused);
         self.focused = root_focused || self.focused_detached.is_some();
-        let activity = ctx.input(|i| {
-            !i.keys_down.is_empty() || i.pointer.any_click() || i.pointer.any_pressed()
-        });
+        let activity = ctx
+            .input(|i| !i.keys_down.is_empty() || i.pointer.any_click() || i.pointer.any_pressed());
         if activity {
             self.note_activity();
         }
@@ -1222,7 +1220,11 @@ impl App {
         ui.horizontal(|ui| {
             ui.label(RichText::new(&title).strong());
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui.small_button("✕").on_hover_text("Close (Ctrl+W)").clicked() {
+                if ui
+                    .small_button("✕")
+                    .on_hover_text("Close (Ctrl+W)")
+                    .clicked()
+                {
                     action = Some(WindowAction::Close);
                 }
                 if ui
@@ -1336,7 +1338,10 @@ impl App {
         if let Some(active) = self.windows.active.clone()
             && self.windows.get(&active).is_some_and(|w| !w.detached)
         {
-            ctx.move_to_top(egui::LayerId::new(egui::Order::Middle, child_window_id(&active)));
+            ctx.move_to_top(egui::LayerId::new(
+                egui::Order::Middle,
+                child_window_id(&active),
+            ));
         }
         for key in close {
             self.request_close(key);
@@ -1510,12 +1515,17 @@ impl App {
             return;
         };
         let session = &mut sessions[index];
-        let (changed_to, picker) =
-            with_window_view(session, &mut window.view, command_history, &key.target, |s| {
+        let (changed_to, picker) = with_window_view(
+            session,
+            &mut window.view,
+            command_history,
+            &key.target,
+            |s| {
                 let picker_before = s.show_color_picker;
                 s.draw_target(ui);
                 !picker_before && s.show_color_picker
-            });
+            },
+        );
         if picker {
             self.color_target = Some(key.clone());
         }
@@ -1819,7 +1829,11 @@ mod tests {
         }
     }
 
-    fn two_networks() -> (App, mpsc::UnboundedReceiver<IrcCommand>, mpsc::UnboundedReceiver<IrcCommand>) {
+    fn two_networks() -> (
+        App,
+        mpsc::UnboundedReceiver<IrcCommand>,
+        mpsc::UnboundedReceiver<IrcCommand>,
+    ) {
         let mut app = test_app();
         let second = app.add_session();
         let rx_a = connect(&mut app, 0);
@@ -1841,7 +1855,11 @@ mod tests {
     #[test]
     fn auto_connect_profiles_each_start_their_own_session_at_startup() {
         let mut settings = test_settings();
-        for (name, host, auto) in [("A", "a.example", true), ("B", "b.example", false), ("C", "c.example", true)] {
+        for (name, host, auto) in [
+            ("A", "a.example", true),
+            ("B", "b.example", false),
+            ("C", "c.example", true),
+        ] {
             settings.server_favorites.push(ServerFavorite {
                 name: name.into(),
                 host: host.into(),
@@ -1859,7 +1877,11 @@ mod tests {
             .map(|s| s.active_server_config().unwrap().host)
             .collect();
         assert_eq!(hosts, ["a.example", "c.example"]);
-        assert!(app.sessions.iter().all(|s| s.connecting && !s.show_connect_dialog));
+        assert!(
+            app.sessions
+                .iter()
+                .all(|s| s.connecting && !s.show_connect_dialog)
+        );
         assert!(app.sessions.iter().all(|s| s.profile_id.is_some()));
         assert_ne!(app.sessions[0].profile_id, app.sessions[1].profile_id);
         assert_eq!(app.network_label(&app.sessions[1]), "C");
@@ -1890,7 +1912,10 @@ mod tests {
         let ctx = egui::Context::default();
         frame(&mut app, &ctx);
         assert_eq!(app.windows.get(&rust).unwrap().view.input_text, "draft one");
-        assert_eq!(app.windows.get(&debian).unwrap().view.input_text, "draft two");
+        assert_eq!(
+            app.windows.get(&debian).unwrap().view.input_text,
+            "draft two"
+        );
         assert!(app.sessions[0].input_text.is_empty() && app.sessions[1].input_text.is_empty());
     }
 
@@ -1930,7 +1955,10 @@ mod tests {
         app.request_close(key.clone());
         assert_eq!(drain(&mut rx_a), ["PART #rust"]);
         app.sync_windows();
-        assert!(app.windows.get(&key).is_some(), "window closed before the server confirmed");
+        assert!(
+            app.windows.get(&key).is_some(),
+            "window closed before the server confirmed"
+        );
         feed(&mut app, 0, ":me!u@h PART #rust");
         app.sync_windows();
         assert!(app.windows.get(&key).is_none());
@@ -1992,7 +2020,10 @@ mod tests {
         let conn_b = app.sessions[1].id;
         app.request_close(WindowKey::new(conn_b, None));
         assert_eq!(app.confirm_disconnect, Some(conn_b));
-        assert!(drain(&mut rx_b).is_empty(), "disconnected before confirming");
+        assert!(
+            drain(&mut rx_b).is_empty(),
+            "disconnected before confirming"
+        );
 
         app.disconnect_and_close(conn_b);
         assert!(drain(&mut rx_b).iter().any(|line| line.starts_with("QUIT")));
@@ -2077,7 +2108,10 @@ mod tests {
         let _rx_a = connect(&mut app, 0);
         let _rx_b = connect(&mut app, second);
         app.sync_windows();
-        assert_eq!(app.windows.active, Some(WindowKey::new(app.sessions[0].id, None)));
+        assert_eq!(
+            app.windows.active,
+            Some(WindowKey::new(app.sessions[0].id, None))
+        );
         // Both networks auto-join after registering; the second one last.
         feed(&mut app, 0, ":me!u@h JOIN #rust");
         feed(&mut app, second, ":me!u@h JOIN #debian");
@@ -2147,7 +2181,10 @@ mod tests {
         assert_eq!(hosts, ["b.example", "a.example"]);
         assert!(restored.sessions.iter().all(|s| s.connecting));
         let key = WindowKey::new(restored.sessions[0].id, Some("#debian".into()));
-        assert_eq!(restored.windows.get(&key).unwrap().view.input_text, "unsent");
+        assert_eq!(
+            restored.windows.get(&key).unwrap().view.input_text,
+            "unsent"
+        );
     }
 
     #[test]
@@ -2242,7 +2279,10 @@ mod tests {
         let output = frame(&mut app, &ctx);
         let texts = texts(&output);
         assert!(texts.iter().any(|t| t.contains("apt is fine")), "{texts:?}");
-        assert!(texts.iter().any(|t| t.contains("#rust")), "switchbar missing");
+        assert!(
+            texts.iter().any(|t| t.contains("#rust")),
+            "switchbar missing"
+        );
     }
 
     #[test]
@@ -2256,15 +2296,26 @@ mod tests {
         frame(&mut app, &ctx);
         let output = frame(&mut app, &ctx);
         let texts = texts(&output);
-        assert!(texts.iter().any(|t| t.contains("borrowck says no")), "{texts:?}");
+        assert!(
+            texts.iter().any(|t| t.contains("borrowck says no")),
+            "{texts:?}"
+        );
         assert!(texts.iter().any(|t| t.contains("apt is fine")), "{texts:?}");
     }
 
     #[test]
     fn tiled_windows_keep_their_cells_after_layout_settles() {
         let (mut app, _rx_a, _rx_b) = two_networks();
-        feed(&mut app, 0, ":carol!u@h PRIVMSG me :private hello from Libera");
-        feed(&mut app, 1, ":carol!u@h PRIVMSG me :private hello from OFTC");
+        feed(
+            &mut app,
+            0,
+            ":carol!u@h PRIVMSG me :private hello from Libera",
+        );
+        feed(
+            &mut app,
+            1,
+            ":carol!u@h PRIVMSG me :private hello from OFTC",
+        );
         feed(&mut app, 0, ":me!u@h JOIN #linux");
         app.windows.mode = LayoutMode::Floating;
         let ctx = egui::Context::default();
@@ -2285,14 +2336,16 @@ mod tests {
             let now = window.child_rect.unwrap();
             for other in &app.windows.windows[i + 1..] {
                 assert!(
-                    !now.shrink(1.0).intersects(other.child_rect.unwrap().shrink(1.0)),
+                    !now.shrink(1.0)
+                        .intersects(other.child_rect.unwrap().shrink(1.0)),
                     "{:?} overlaps {:?}",
                     window.key,
                     other.key
                 );
             }
             assert!(
-                (now.width() - cell.width()).abs() < 2.0 && (now.height() - cell.height()).abs() < 2.0,
+                (now.width() - cell.width()).abs() < 2.0
+                    && (now.height() - cell.height()).abs() < 2.0,
                 "{:?} grew from {cell:?} to {now:?}",
                 window.key
             );
@@ -2315,7 +2368,10 @@ mod tests {
         }
         let carol = WindowKey::new(app.sessions[0].id, Some("carol".into()));
         let rect = app.windows.get(&carol).unwrap().child_rect.unwrap();
-        assert!(rect.width() < 1024.0 * 0.7 && rect.height() < 768.0 * 0.7, "{rect:?}");
+        assert!(
+            rect.width() < 1024.0 * 0.7 && rect.height() < 768.0 * 0.7,
+            "{rect:?}"
+        );
         assert_eq!(app.windows.active, Some(rust.clone()));
         // Where the two overlap, the active window is the one on top.
         let active_rect = app.windows.get(&rust).unwrap().child_rect.unwrap();
@@ -2323,7 +2379,10 @@ mod tests {
         if overlap.is_positive() {
             assert_eq!(
                 ctx.layer_id_at(overlap.center()),
-                Some(egui::LayerId::new(egui::Order::Middle, child_window_id(&rust)))
+                Some(egui::LayerId::new(
+                    egui::Order::Middle,
+                    child_window_id(&rust)
+                ))
             );
         }
     }
@@ -2353,7 +2412,10 @@ mod tests {
         assert!(overlap.is_positive(), "{a:?} {b:?}");
         assert_eq!(
             ctx.layer_id_at(overlap.center()),
-            Some(egui::LayerId::new(egui::Order::Middle, child_window_id(&status)))
+            Some(egui::LayerId::new(
+                egui::Order::Middle,
+                child_window_id(&status)
+            ))
         );
     }
 
@@ -2405,14 +2467,16 @@ mod tests {
         // Focus is in the detached window.
         app.focused_detached = Some(debian.clone());
         app.focused = true;
-        tx.try_send(IrcMessage::parse(":bob!u@h PRIVMSG #debian :seen").unwrap()).unwrap();
+        tx.try_send(IrcMessage::parse(":bob!u@h PRIVMSG #debian :seen").unwrap())
+            .unwrap();
         app.tick(&ctx, true);
         assert_eq!(app.sessions[1].channels["#debian"].unread, 0);
 
         // Nothing of ours is focused: the same message is unread.
         app.focused_detached = None;
         app.focused = false;
-        tx.try_send(IrcMessage::parse(":bob!u@h PRIVMSG #debian :unseen").unwrap()).unwrap();
+        tx.try_send(IrcMessage::parse(":bob!u@h PRIVMSG #debian :unseen").unwrap())
+            .unwrap();
         app.tick(&ctx, true);
         assert_eq!(app.sessions[1].channels["#debian"].unread, 1);
     }
@@ -2541,7 +2605,11 @@ mod tests {
         app.settings.notifications_enabled = true;
         app.focused = true;
         let logs = crate::gui::tests::capture_logs(|| {
-            app.notify("bob mentioned you in #room", "the password is swordfish", false);
+            app.notify(
+                "bob mentioned you in #room",
+                "the password is swordfish",
+                false,
+            );
         });
         assert!(!logs.contains("swordfish"), "{logs}");
     }
@@ -2581,8 +2649,18 @@ mod tests {
             std::thread::sleep(Duration::from_millis(5));
         }
         assert!(app.sessions.iter().all(|s| s.worker.is_some()));
-        assert!(app.sessions[0].server_messages.iter().any(|m| m.content.contains("Welcome")));
-        assert!(app.sessions[1].server_messages.iter().any(|m| m.content.contains("Welcome")));
+        assert!(
+            app.sessions[0]
+                .server_messages
+                .iter()
+                .any(|m| m.content.contains("Welcome"))
+        );
+        assert!(
+            app.sessions[1]
+                .server_messages
+                .iter()
+                .any(|m| m.content.contains("Welcome"))
+        );
 
         // Disconnecting one leaves the other connected.
         let conn_b = app.sessions[1].id;
