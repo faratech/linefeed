@@ -1730,6 +1730,12 @@ impl App {
         );
         if picker {
             self.color_target = Some(key.clone());
+            // Dialogs belong to the main window: bring it forward when the
+            // picker is asked for from a detached window.
+            if self.windows.get(key).is_some_and(|w| w.detached) {
+                ui.ctx()
+                    .send_viewport_cmd_to(egui::ViewportId::ROOT, egui::ViewportCommand::Focus);
+            }
         }
         if let Some(target) = changed_to {
             self.user_activate(WindowKey::new(key.conn, target));
