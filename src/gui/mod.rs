@@ -424,6 +424,11 @@ pub struct IrcApp {
 
     // Pending channel keys (for storing key when joining +k channels)
     pub pending_channel_keys: HashMap<String, String>,
+    /// Channels the user asked to join (/join, the join box, the channel
+    /// list). The matching own-JOIN echo moves focus to the new tab; any other
+    /// own-JOIN (auto-join, bouncer replay, reconnect) leaves the tab the user
+    /// is reading alone (#290).
+    join_focus_requests: Vec<String>,
 
     // Pending invites (from_nick, channel)
     pub pending_invites: Vec<(String, String)>,
@@ -660,6 +665,7 @@ impl IrcApp {
             show_save_favorite_dialog: false,
 
             pending_channel_keys: HashMap::new(),
+            join_focus_requests: Vec::new(),
             pending_invites: Vec::new(),
 
             // Away status
@@ -1474,6 +1480,7 @@ impl IrcApp {
         // Keys of JOINs the old socket never confirmed: the new connection's
         // JOINs carry their own.
         self.pending_channel_keys.clear();
+        self.join_focus_requests.clear();
     }
 
     /// Called when a connection worker is about to start, after the previous
@@ -2458,6 +2465,7 @@ impl IrcApp {
         self.selected_user = None;
         self.pending_invites.clear();
         self.pending_channel_keys.clear();
+        self.join_focus_requests.clear();
         self.pending_auto_perform = None;
         self.channel_list.clear();
         self.channel_list_dirty = true;
@@ -4299,12 +4307,27 @@ impl IrcApp {
                         if self.update_join_targets.is_empty() {
                             self.update_selected = None;
                         }
-                    } else {
+                    } else if self.take_join_focus_request(channel)
+                        || self.current_channel.is_none()
+                    {
+                        // The user asked for this channel - or has no tab
+                        // selected at all, so landing on the first joined
+                        // channel takes nothing away. Anything else (an
+                        // auto-join or replayed JOIN) must not steal the tab
+                        // being read (#290).
                         self.current_channel =
                             Some(existing_key.unwrap_or_else(|| channel.clone()));
                     }
+                    // The banner is not news: it must not raise an unread
+                    // badge on a tab joined in the background.
                     let sys_msg = ChatMessage::system(&format!("Now talking in {}", channel));
+                    let unread_before = self.channel_mut(channel).map(|tab| tab.unread);
                     self.add_message_to_channel(channel, sys_msg);
+                    if let Some(unread) = unread_before
+                        && let Some(tab) = self.channel_mut(channel)
+                    {
+                        tab.unread = unread;
+                    }
                     if self.chathistory_enabled && self.logging_load_history {
                         self.request_latest_history(
                             channel,
@@ -5106,7 +5129,7 @@ impl IrcApp {
                             let name = words.next().unwrap_or(chan);
                             let key = words.next().map(str::to_string);
                             let channel = self.normalize_channel_name(name);
-                            self.send_join(channel.clone(), key);
+                            self.send_join_in_background(channel.clone(), key);
                             self.add_server_message(ChatMessage::system(&format!(
                                 "Auto-joining {}",
                                 channel
@@ -6656,6 +6679,21 @@ impl IrcApp {
     /// user-initiated JOIN goes through here so /cycle, keyed auto-join
     /// entries and rejoins on a kicked tab keep the key (#250).
     pub(crate) fn send_join(&mut self, channel: String, key: Option<String>) -> bool {
+        let sent = self.send_join_in_background(channel.clone(), key);
+        // The user asked for this tab: its own-JOIN echo may take focus.
+        if sent {
+            const MAX_JOIN_FOCUS_REQUESTS: usize = 64;
+            if self.join_focus_requests.len() >= MAX_JOIN_FOCUS_REQUESTS {
+                self.join_focus_requests.remove(0);
+            }
+            self.join_focus_requests.push(channel);
+        }
+        sent
+    }
+
+    /// JOIN on the client's own initiative (the auto-join list): same key
+    /// bookkeeping as `send_join`, but the confirmed tab never takes focus.
+    fn send_join_in_background(&mut self, channel: String, key: Option<String>) -> bool {
         let sent = self.send_command(IrcCommand::Join(channel.clone(), key.clone(), None, None));
         // Store the key only for a channel actually being joined.
         if sent && let Some(key) = key {
@@ -6663,6 +6701,19 @@ impl IrcApp {
                 .insert(self.network_support.canonicalize(&channel), key);
         }
         sent
+    }
+
+    /// Consume the user's request to focus `channel`, if there is one.
+    fn take_join_focus_request(&mut self, channel: &str) -> bool {
+        let Some(index) = self
+            .join_focus_requests
+            .iter()
+            .position(|requested| self.identifiers_equal(requested, channel))
+        else {
+            return false;
+        };
+        self.join_focus_requests.remove(index);
+        true
     }
 
     pub fn process_input(&mut self) {
@@ -7495,7 +7546,7 @@ impl eframe::App for IrcApp {
                             && !self.join_channel.is_empty()
                         {
                             let channel = self.normalize_channel_name(&self.join_channel);
-                            self.send_command(IrcCommand::Join(channel, None, None, None));
+                            self.send_join(channel, None);
                             self.join_channel.clear();
                         }
                     });
@@ -12435,4 +12486,73 @@ mod tests {
         assert!(app.dispatched_notifications.is_empty());
     }
 
+
+    #[test]
+    fn unsolicited_self_join_keeps_the_tab_the_user_is_reading() {
+        let (mut app, mut rx) = test_app_connected();
+        app.set_session_nick("me".to_string(), true);
+        app.window_focused = true;
+        app.handle_incoming_message(
+            IrcMessage::parse(":srv CAP me ACK :draft/read-marker").unwrap(),
+        );
+        app.add_message_to_channel("alice", ChatMessage::new_fmt("alice", "hi", "short"));
+        app.current_channel = Some("alice".to_string());
+
+        // A bouncer replay / reconnect echoes our JOIN for channels the user
+        // did not just ask for (#290): the view must not jump to them.
+        for channel in ["#a", "#b", "#c"] {
+            app.handle_incoming_message(
+                IrcMessage::parse(&format!(":me!u@h JOIN {channel}")).unwrap(),
+            );
+            assert_eq!(app.current_channel.as_deref(), Some("alice"), "{channel}");
+            assert!(app.channels[channel].joined);
+        }
+
+        // Messages for the never-selected tab count as unread and are not
+        // reported read to the server.
+        app.handle_incoming_message(
+            IrcMessage::parse(
+                "@time=2026-09-12T12:00:00.000Z;msgid=abc :bob!u@h PRIVMSG #c :anyone here?",
+            )
+            .unwrap(),
+        );
+        assert_eq!(app.channels["#c"].unread, 1);
+        assert!(
+            !std::iter::from_fn(|| rx.try_recv().ok())
+                .any(|cmd| matches!(cmd, IrcCommand::Markread(..))),
+            "#290: MARKREAD sent for a tab the user never selected"
+        );
+    }
+
+    #[test]
+    fn join_the_user_asked_for_still_takes_focus() {
+        let (mut app, _rx) = test_app_connected();
+        app.set_session_nick("me".to_string(), true);
+        app.add_message_to_channel("alice", ChatMessage::new_fmt("alice", "hi", "short"));
+        app.current_channel = Some("alice".to_string());
+
+        app.process_command("/join #wanted");
+        // The server confirms a different channel first (bouncer replay): no
+        // focus change for it, and the request stays pending for #wanted.
+        app.handle_incoming_message(IrcMessage::parse(":me!u@h JOIN #replayed").unwrap());
+        assert_eq!(app.current_channel.as_deref(), Some("alice"));
+        app.handle_incoming_message(IrcMessage::parse(":me!u@h JOIN #WANTED").unwrap());
+        assert_eq!(app.current_channel.as_deref(), Some("#WANTED"));
+
+        // The request is consumed: a later rejoin of it does not refocus.
+        app.current_channel = Some("alice".to_string());
+        app.handle_incoming_message(IrcMessage::parse(":me!u@h JOIN #WANTED").unwrap());
+        assert_eq!(app.current_channel.as_deref(), Some("alice"));
+    }
+
+    #[test]
+    fn auto_join_from_the_server_buffer_lands_on_the_first_channel_only() {
+        let mut app = test_app();
+        app.set_session_nick("me".to_string(), true);
+        assert!(app.current_channel.is_none());
+
+        app.handle_incoming_message(IrcMessage::parse(":me!u@h JOIN #first").unwrap());
+        app.handle_incoming_message(IrcMessage::parse(":me!u@h JOIN #second").unwrap());
+        assert_eq!(app.current_channel.as_deref(), Some("#first"));
+    }
 }

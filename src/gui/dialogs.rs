@@ -109,7 +109,7 @@ impl IrcApp {
     /// on failure keep the window and selection and report it (#204).
     /// Returns whether the join was sent (and the window closed).
     fn join_from_channel_list(&mut self, channel: String) -> bool {
-        let sent = self.send_command(IrcCommand::Join(channel.clone(), None, None, None));
+        let sent = self.send_join(channel.clone(), None);
         if sent {
             self.show_channel_list = false;
             self.channel_list_selected = None;
