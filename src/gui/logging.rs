@@ -1,6 +1,6 @@
 //! Chat logging manager for persistent message history
 
-use super::helpers::days_to_ymd;
+use super::helpers::{days_to_ymd, local_utc_offset_secs};
 use super::types::ChatMessage;
 use std::cell::Cell;
 use std::fs::{self, File, OpenOptions};
@@ -693,6 +693,14 @@ fn current_datetime_string() -> String {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
+    datetime_string_at(secs, local_utc_offset_secs(secs))
+}
+
+/// Render the instant `epoch_secs` as a session-marker date in the zone that
+/// is `utc_offset_secs` ahead of UTC, so the marker agrees with the local
+/// `[HH:MM]` stamps on the surrounding log lines (#295).
+fn datetime_string_at(epoch_secs: u64, utc_offset_secs: i64) -> String {
+    let secs = epoch_secs.saturating_add_signed(utc_offset_secs);
 
     let days = secs / 86400;
     let time_secs = secs % 86400;
@@ -1101,5 +1109,35 @@ mod tests {
         let line = format_log_line(&bad);
         assert!(!line.contains('\n'));
         assert!(!line.contains('\r'));
+    }
+
+    #[test]
+    fn session_marker_uses_the_local_calendar_day_and_time() {
+        // 2026-09-15 22:30:00 UTC is a Tuesday evening; on a UTC+10 host it is
+        // already Wednesday 08:30 local time (#295).
+        let utc_evening = 1_789_511_400;
+        assert_eq!(
+            datetime_string_at(utc_evening, 0),
+            "Tue Sep 15 22:30:00 2026"
+        );
+        assert_eq!(
+            datetime_string_at(utc_evening, 10 * 3600),
+            "Wed Sep 16 08:30:00 2026"
+        );
+        // West of Greenwich the marker can fall on the previous day.
+        assert_eq!(
+            datetime_string_at(utc_evening - 20 * 3600, -5 * 3600),
+            "Mon Sep 14 21:30:00 2026"
+        );
+    }
+
+    #[test]
+    fn session_marker_clock_matches_message_timestamps_in_this_zone() {
+        let secs = 1_789_511_400;
+        let marker = datetime_string_at(secs, local_utc_offset_secs(secs));
+        let line_stamp = crate::gui::helpers::epoch_time_formatted(secs, "long");
+        // "[HH:MM:SS]" in the log line must be the marker's clock.
+        let clock = line_stamp.trim_matches(|c| c == '[' || c == ']');
+        assert!(marker.contains(&format!(" {clock} ")), "{marker} vs {line_stamp}");
     }
 }

@@ -95,6 +95,33 @@ fn epoch_to_local_parts(secs: u64) -> (u64, u64, u64, u64, u64) {
     }
 }
 
+/// Seconds the local time zone is ahead of UTC at epoch time `secs` (negative
+/// west of Greenwich), for formatting a full calendar date in local time.
+pub fn local_utc_offset_secs(secs: u64) -> i64 {
+    #[cfg(unix)]
+    {
+        let t = secs as libc::time_t;
+        let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+        if unsafe { libc::localtime_r(&t, &mut tm) }.is_null() {
+            0
+        } else {
+            tm.tm_gmtoff as i64
+        }
+    }
+
+    #[cfg(windows)]
+    {
+        let _ = secs;
+        windows_local_offset_secs()
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = secs;
+        0
+    }
+}
+
 /// Current UTC offset in seconds on Windows (local now minus UTC now).
 #[cfg(windows)]
 fn windows_local_offset_secs() -> i64 {
