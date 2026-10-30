@@ -227,6 +227,9 @@ pub(crate) struct SnapUi {
     drag: Option<Drag>,
     /// The maximize button the pointer rests on, and since when.
     hover: Option<(WindowKey, f64)>,
+    /// The maximize button whose flyout was dismissed (Escape, a click on
+    /// the button): it stays closed until the pointer leaves the button.
+    dismissed: Option<WindowKey>,
     /// The open layout flyout: its window and the button it hangs from.
     pub(crate) flyout: Option<(WindowKey, Rect)>,
     /// The layout bar a window was dragged to; `Rect::NOTHING` until drawn.
@@ -371,7 +374,7 @@ impl App {
         ui.painter()
             .line_segment([cross.right_top(), cross.left_bottom()], stroke);
 
-        if caption.drag_started()
+        if caption.drag_started_by(egui::PointerButton::Primary)
             && let Some(origin) = ui.input(|i| i.pointer.press_origin())
             && let Some(window) = self.windows.get(key).and_then(|w| w.child_rect)
         {
@@ -401,7 +404,21 @@ impl App {
         } else if maximize.clicked() || caption.double_clicked() {
             action = Some(CaptionAction::Maximize);
         }
+        if action.is_some() {
+            self.dismiss_flyout();
+        }
         action
+    }
+
+    /// Close the layout flyout; it does not reopen until the pointer has
+    /// left the button it hangs from.
+    pub(super) fn dismiss_flyout(&mut self) {
+        if let Some((key, _)) = self.snap.flyout.take() {
+            self.snap.dismissed = Some(key);
+        } else if let Some((key, _)) = &self.snap.hover {
+            self.snap.dismissed = Some(key.clone());
+        }
+        self.snap.hover = None;
     }
 
     /// Open the layout flyout once the pointer has rested on `button`, a
@@ -419,6 +436,12 @@ impl App {
             if self.snap.hover.as_ref().is_some_and(|(k, _)| k == key) {
                 self.snap.hover = None;
             }
+            if self.snap.dismissed.as_ref() == Some(key) {
+                self.snap.dismissed = None;
+            }
+            return;
+        }
+        if self.snap.dismissed.as_ref() == Some(key) {
             return;
         }
         let now = ctx.input(|i| i.time);
@@ -460,8 +483,13 @@ impl App {
     /// window is dragged to the top, the flyout of a maximize button, the
     /// preview of where a window would go, and Snap Assist.
     pub(super) fn draw_snap(&mut self, ctx: &egui::Context, area: Rect) {
+        // Snaps are computed in this area. While windows are maximized
+        // nothing else keeps their placements in step with it, and a snap
+        // made against a stale area would be rescaled on the next floating
+        // frame.
+        self.windows.fit_to_area(area);
         if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
-            self.snap.flyout = None;
+            self.dismiss_flyout();
             self.snap.bar = None;
             self.snap.assist = None;
         }

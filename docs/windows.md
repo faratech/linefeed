@@ -69,10 +69,10 @@ channel on a second monitor. When Linefeed goes to the system tray
 it again brings them back where they were. Connections keep running
 throughout.
 
-Channel info, the channel list and the colour picker open inside the
-detached window they were asked for from. Settings and Connect belong to
-the whole application: asking for them from a detached window brings the
-main window forward with the dialog.
+Dialogs open inside the detached window they were asked for from:
+channel info, the channel list, the colour picker, and also Settings,
+Connect and the question before disconnecting a server. So they are seen
+even while the main window is minimized.
 
 In floating mode, child windows keep their place relative to the chat area:
 when the main window is resized, or the switchbar wraps onto another line,

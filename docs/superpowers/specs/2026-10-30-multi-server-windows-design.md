@@ -287,8 +287,11 @@ Recorded after building it, so the design and the code agree.
   Snap Assist offers the other windows for the zones left.
 - **Dialogs follow the window that asked.** Channel info, the channel list
   and the colour picker open in the detached OS window they were requested
-  from (`App::dialog_owner`, `App::color_target`). The global Settings and
-  Connect dialogs stay in the main window, which is brought forward.
+  from (`App::dialog_owner`, `App::color_target`), and so do Settings,
+  Connect and the disconnect confirmation (`App::global_dialog_owner`, set
+  when they open). The main window may be minimized, so nothing depends on
+  bringing it forward; a detached status window being closed stays
+  detached while it asks.
 - **Floating windows follow the chat area.** `WindowManager::fit_to_area`
   scales attached placements when the central area changes (window resize,
   switchbar wrapping), and the area is saved in `layout.json` so a restart

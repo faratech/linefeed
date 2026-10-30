@@ -140,6 +140,13 @@ pub struct App {
     /// from. When that window is detached, the dialogs show in its OS window
     /// instead of the main one.
     dialog_owner: HashMap<ConnId, WindowKey>,
+    /// The detached window the application's own dialogs (Connect,
+    /// Settings, the disconnect confirmation) were asked for from; they
+    /// show in it, so they are seen even while the main window is
+    /// minimized. `None`: the main window.
+    global_dialog_owner: Option<WindowKey>,
+    /// Whether any of those dialogs was open last frame.
+    global_dialogs_were_open: bool,
 }
 
 impl App {
@@ -230,6 +237,8 @@ impl App {
             restore_after_update: None,
             pending_focus: None,
             dialog_owner: HashMap::new(),
+            global_dialog_owner: None,
+            global_dialogs_were_open: false,
             detached_hidden: false,
             snap: Default::default(),
         }
@@ -551,6 +560,7 @@ impl App {
         self.process_events();
         self.flush_deferred_notification();
         self.sync_windows();
+        self.update_global_dialog_owner();
     }
 
     fn run_lifecycles(&mut self, ctx: &egui::Context) {
@@ -1127,6 +1137,26 @@ impl App {
     // ----- dialogs --------------------------------------------------------
 
     fn show_dialogs(&mut self, ctx: &egui::Context) {
+        if self.global_dialog_window().is_none() {
+            self.show_global_dialogs(ctx);
+        }
+        for index in 0..self.sessions.len() {
+            let conn = self.sessions[index].id;
+            if self.detached_dialog_owner(conn).is_some() {
+                continue;
+            }
+            self.show_session_dialogs(ctx, index);
+        }
+        if let Some(target) = self.color_target.clone()
+            && !self.windows.get(&target).is_some_and(|w| w.detached)
+        {
+            self.show_color_picker_for(ctx, &target);
+        }
+    }
+
+    /// The application's own dialogs: Connect (for the active session),
+    /// Settings, and the confirmation before disconnecting a server.
+    fn show_global_dialogs(&mut self, ctx: &egui::Context) {
         let active = self.active_index();
         {
             let App {
@@ -1151,21 +1181,41 @@ impl App {
             // Live edits apply to every session while the dialog is open.
             self.push_config();
         }
-        for index in 0..self.sessions.len() {
-            let conn = self.sessions[index].id;
-            if self.detached_dialog_owner(conn).is_some() {
-                continue;
-            }
-            self.show_session_dialogs(ctx, index);
-        }
-        if let Some(target) = self.color_target.clone()
-            && !self.windows.get(&target).is_some_and(|w| w.detached)
-        {
-            self.show_color_picker_for(ctx, &target);
-        }
         if let Some(conn) = self.confirm_disconnect {
             self.show_confirm_disconnect(ctx, conn);
         }
+    }
+
+    /// The detached window the application's dialogs show in, if they were
+    /// asked for from one that is still detached.
+    fn global_dialog_window(&self) -> Option<WindowKey> {
+        self.global_dialog_owner
+            .clone()
+            .filter(|key| self.windows.get(key).is_some_and(|w| w.detached))
+    }
+
+    /// When the application's dialogs open, note the detached window they
+    /// belong to: the status window being closed, or the window the user
+    /// is working in.
+    fn update_global_dialog_owner(&mut self) {
+        let open = self.show_settings
+            || self.confirm_disconnect.is_some()
+            || self
+                .sessions
+                .get(self.active_index())
+                .is_some_and(|s| s.show_connect_dialog && !s.connected && !s.connecting);
+        if !open {
+            self.global_dialog_owner = None;
+        } else if !self.global_dialogs_were_open {
+            let detached = |key: &WindowKey| self.windows.get(key).is_some_and(|w| w.detached);
+            let closing = self
+                .confirm_disconnect
+                .map(|conn| WindowKey::new(conn, None))
+                .filter(|key| detached(key));
+            self.global_dialog_owner =
+                closing.or_else(|| self.windows.active.clone().filter(|key| detached(key)));
+        }
+        self.global_dialogs_were_open = open;
     }
 
     /// The detached window a session's dialogs belong to, if any.
@@ -1191,6 +1241,9 @@ impl App {
 
     /// The dialogs a detached window opened, drawn inside its OS window.
     fn show_detached_window_dialogs(&mut self, ctx: &egui::Context, key: &WindowKey) {
+        if self.global_dialog_window().as_ref() == Some(key) {
+            self.show_global_dialogs(ctx);
+        }
         if self.detached_dialog_owner(key.conn).as_ref() == Some(key)
             && let Some(index) = self.session_index(key.conn)
         {
@@ -1540,7 +1593,10 @@ impl App {
         match action {
             Some(WindowAction::Close) => self.request_close(key),
             Some(WindowAction::Detach) => self.toggle_detached(&key),
-            Some(WindowAction::Restore) => self.toggle_maximized(),
+            Some(WindowAction::Restore) => {
+                self.dismiss_flyout();
+                self.toggle_maximized();
+            }
             None => {}
         }
     }
@@ -1590,12 +1646,13 @@ impl App {
             }
             let default = known.or(pending).unwrap_or(cascade[0]);
             let active = self.windows.active.as_ref() == Some(key);
-            // Our own caption (`draw_caption`) moves the window, so egui's
-            // title bar and dragging by the background are off.
+            // Our own caption (`draw_caption`) replaces egui's title bar.
+            // The window stays movable: egui 0.37 drops the left and top
+            // resize handles of a window that is not, and dragging the
+            // background moves it as before (without snapping).
             let mut window = egui::Window::new(title)
                 .id(id)
                 .title_bar(false)
-                .movable(false)
                 .collapsible(false)
                 .default_rect(default);
             window = match (pending, self.dragged_window_pos(ctx, key)) {
@@ -1805,18 +1862,13 @@ impl App {
             self.toggle_detached(&key);
         }
         for key in close {
-            self.spawn_geometry.remove(&key);
-            match key.target {
-                // Closing a status window still asks first; until then the
-                // window goes back inside the main window.
-                None => {
-                    if let Some(window) = self.windows.get_mut(&key) {
-                        window.detached = false;
-                    }
-                    self.request_close(key);
-                }
-                Some(_) => self.request_close(key),
+            // A status window asks before disconnecting, in its own OS
+            // window (the main one may be minimized), and stays if the
+            // user cancels.
+            if key.target.is_some() {
+                self.spawn_geometry.remove(&key);
             }
+            self.request_close(key);
         }
         // Forget geometry of viewports that are no longer detached.
         let detached: HashSet<WindowKey> = self
@@ -3688,6 +3740,218 @@ mod tests {
             time += 0.05;
         }
         assert!(app.snap.assist.is_none());
+    }
+
+    fn button(pos: egui::Pos2, button: egui::PointerButton, pressed: bool) -> egui::Event {
+        egui::Event::PointerButton {
+            pos,
+            button,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        }
+    }
+
+    fn escape() -> egui::Event {
+        egui::Event::Key {
+            key: egui::Key::Escape,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        }
+    }
+
+    /// Rest the pointer on `key`'s maximize button until the layouts open;
+    /// returns the next frame time.
+    fn open_flyout(app: &mut App, ctx: &egui::Context, mut time: f64, key: &WindowKey) -> f64 {
+        let at = ctx
+            .read_response(snap::maximize_button_id(key))
+            .unwrap()
+            .rect
+            .center();
+        pointer_frame(app, ctx, time, vec![egui::Event::PointerMoved(at)]);
+        for _ in 0..2 {
+            time += 0.4;
+            pointer_frame(app, ctx, time, vec![]);
+        }
+        assert!(app.snap.flyout.is_some(), "no layouts after resting");
+        time + 0.05
+    }
+
+    #[test]
+    fn a_floating_window_still_resizes_from_its_left_edge() {
+        let (mut app, _rx_a, _rx_b) = two_networks();
+        let ctx = egui::Context::default();
+        let mut time = floating_windows(&mut app, &ctx);
+        let key = app.windows.active.clone().unwrap();
+        let placed = egui::Rect::from_min_max(egui::pos2(300.0, 200.0), egui::pos2(700.0, 600.0));
+        app.windows.place(&key, placed);
+        for _ in 0..3 {
+            pointer_frame(&mut app, &ctx, time, vec![]);
+            time += 0.05;
+        }
+        let edge = egui::pos2(placed.left() + 1.0, placed.center().y);
+        let to = edge - egui::vec2(60.0, 0.0);
+        drag(
+            &mut app,
+            &ctx,
+            time,
+            edge,
+            &[edge - egui::vec2(20.0, 0.0), to],
+        );
+        let rect = app.windows.get(&key).unwrap().child_rect.unwrap();
+        assert!(
+            (rect.left() - (placed.left() - 60.0)).abs() < 3.0,
+            "{rect:?}"
+        );
+        assert!((rect.right() - placed.right()).abs() < 3.0, "{rect:?}");
+    }
+
+    #[test]
+    fn escape_closes_the_layouts_while_the_pointer_still_rests_on_the_button() {
+        let (mut app, _rx_a, _rx_b) = two_networks();
+        let ctx = egui::Context::default();
+        let time = floating_windows(&mut app, &ctx);
+        let key = app.windows.active.clone().unwrap();
+        let mut time = open_flyout(&mut app, &ctx, time, &key);
+        pointer_frame(&mut app, &ctx, time, vec![escape()]);
+        for _ in 0..4 {
+            time += 0.4;
+            pointer_frame(&mut app, &ctx, time, vec![]);
+            assert!(app.snap.flyout.is_none(), "reopened while still resting");
+        }
+    }
+
+    #[test]
+    fn clicking_maximize_with_the_layouts_open_closes_them() {
+        let (mut app, _rx_a, _rx_b) = two_networks();
+        let ctx = egui::Context::default();
+        let time = floating_windows(&mut app, &ctx);
+        let key = app.windows.active.clone().unwrap();
+        let mut time = open_flyout(&mut app, &ctx, time, &key);
+        let at = ctx
+            .read_response(snap::maximize_button_id(&key))
+            .unwrap()
+            .rect
+            .center();
+        for events in [vec![primary(at, true)], vec![primary(at, false)], vec![]] {
+            pointer_frame(&mut app, &ctx, time, events);
+            time += 0.05;
+        }
+        assert_eq!(app.windows.mode, LayoutMode::Maximized);
+        assert!(app.snap.flyout.is_none());
+    }
+
+    #[test]
+    fn a_snap_made_while_maximized_lands_in_the_current_chat_area() {
+        let (mut app, _rx_a, _rx_b) = two_networks();
+        let ctx = egui::Context::default();
+        frame(&mut app, &ctx);
+        // The area floating windows were last laid out in, before the main
+        // window was resized.
+        app.windows.area = Some(egui::Rect::from_min_size(
+            egui::pos2(0.0, 60.0),
+            egui::vec2(600.0, 400.0),
+        ));
+        frame(&mut app, &ctx);
+        let area = app.windows.area.unwrap();
+        assert!(area.width() > 900.0, "area not followed while maximized");
+        let key = app.windows.active.clone().unwrap();
+        let target = snap::SnapTarget::layout(area, 0, 0);
+        app.snap_window(&key, target.clone());
+        for _ in 0..3 {
+            frame(&mut app, &ctx);
+        }
+        assert_placed(&app, &key, target.rect());
+    }
+
+    #[test]
+    fn a_right_button_drag_does_not_snap() {
+        let (mut app, _rx_a, _rx_b) = two_networks();
+        let ctx = egui::Context::default();
+        let mut time = floating_windows(&mut app, &ctx);
+        let key = app.windows.active.clone().unwrap();
+        let before = app.windows.get(&key).unwrap().child_rect.unwrap();
+        let caption = ctx.read_response(snap::caption_id(&key)).unwrap().rect;
+        let area = app.windows.area.unwrap();
+        let from = caption.left_center() + egui::vec2(40.0, 0.0);
+        let edge = egui::pos2(area.left() + 2.0, area.center().y);
+        let secondary = egui::PointerButton::Secondary;
+        // The drag starts with the pointer already at the edge.
+        for events in [
+            vec![egui::Event::PointerMoved(from)],
+            vec![button(from, secondary, true)],
+            vec![egui::Event::PointerMoved(edge)],
+            vec![button(edge, secondary, false)],
+            vec![escape()],
+            vec![],
+        ] {
+            pointer_frame(&mut app, &ctx, time, events);
+            time += 0.05;
+        }
+        assert_eq!(app.windows.get(&key).unwrap().child_rect.unwrap(), before);
+        assert!(app.snap.assist.is_none());
+    }
+
+    #[test]
+    fn settings_asked_for_in_a_detached_window_open_in_it_while_minimized() {
+        let (mut app, _rx_a, _rx_b) = two_networks();
+        let debian = WindowKey::new(app.sessions[1].id, Some("#debian".into()));
+        app.toggle_detached(&debian);
+        app.activate(debian.clone());
+        {
+            let window = app.windows.get_mut(&debian).unwrap();
+            window.view.input_text = "/settings".into();
+            window.view.input_focus_request = true;
+        }
+        let ctx = egui::Context::default();
+        frame(&mut app, &ctx);
+        frame(&mut app, &ctx);
+        // The main window is minimized: `logic` ticks, then a ui pass draws
+        // only the detached window.
+        let minimized = |app: &mut App, events: Vec<egui::Event>| {
+            app.background_tick(&ctx);
+            let mut output = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(1024.0, 768.0),
+                    )),
+                    events,
+                    ..Default::default()
+                },
+                |ui| app.ui_detached_only(ui.ctx(), true),
+            );
+            output.textures_delta.clear();
+            texts(&output)
+        };
+        let enter = egui::Event::Key {
+            key: egui::Key::Enter,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        };
+        minimized(&mut app, vec![enter]);
+        minimized(&mut app, vec![]);
+        let shown = minimized(&mut app, vec![]);
+        assert!(app.show_settings, "/settings was not run");
+        assert_eq!(app.global_dialog_window(), Some(debian));
+        assert!(shown.iter().any(|t| t == "Automation"), "{shown:?}");
+    }
+
+    #[test]
+    fn closing_a_detached_status_window_asks_in_it() {
+        let (mut app, _rx_a, _rx_b) = two_networks();
+        let status = WindowKey::new(app.sessions[1].id, None);
+        app.toggle_detached(&status);
+        let ctx = egui::Context::default();
+        frame(&mut app, &ctx);
+        app.request_close(status.clone());
+        frame(&mut app, &ctx);
+        assert_eq!(app.confirm_disconnect, Some(status.conn));
+        assert!(app.windows.get(&status).unwrap().detached);
+        assert_eq!(app.global_dialog_window(), Some(status));
     }
 
     #[test]
