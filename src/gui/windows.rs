@@ -74,6 +74,10 @@ pub(crate) struct TargetView {
     pub history_temp: String,
     pub tab_completion: Option<TabCompletion>,
     pub selected_user: Option<String>,
+    /// Focus this window's input line on its next draw.
+    pub input_focus_request: bool,
+    /// Whether this window's input line had focus when last drawn.
+    pub input_had_focus: bool,
 }
 
 pub(crate) struct TargetWindow {
@@ -132,8 +136,11 @@ pub(crate) struct WindowManager {
     /// Placement of windows that are not open right now (parted channels,
     /// networks not connected yet), restored when they reappear.
     saved: HashMap<PersistKey, SavedWindow>,
-    /// The persisted active window, applied once when it first appears.
+    /// The persisted active window. When it appears, `sync` reports it in
+    /// `restore_match`; the App decides whether to still honour it.
     restore_active: Option<PersistKey>,
+    /// The persisted active window appeared during the last `sync`.
+    pub restore_match: Option<WindowKey>,
     /// Set when placement changed and layout.json should be rewritten.
     pub dirty: bool,
 }
@@ -150,6 +157,7 @@ impl WindowManager {
             mode: layout.mode,
             saved,
             restore_active: layout.active,
+            restore_match: None,
             dirty: false,
         }
     }
@@ -180,7 +188,11 @@ impl WindowManager {
                 false
             }
         });
-        for saved in removed {
+        for mut saved in removed {
+            // A window that closes goes back inside the main window: a query
+            // closed in its own OS window must not reopen as one on the
+            // next message.
+            saved.detached = false;
             self.saved.insert(saved.key.clone(), saved);
         }
         if self
@@ -213,7 +225,7 @@ impl WindowManager {
             let saved = self.saved.remove(&persist);
             if self.restore_active.as_ref() == Some(&persist) {
                 self.restore_active = None;
-                self.active = Some(key.clone());
+                self.restore_match = Some(key.clone());
             }
             self.windows
                 .push(TargetWindow::new(key.clone(), persist, saved.as_ref()));
@@ -261,6 +273,13 @@ impl WindowManager {
     }
 
     /// The layout to persist: open windows plus remembered closed ones.
+    /// Stop waiting for the persisted active window: the user has chosen
+    /// one, or startup is over.
+    pub(crate) fn forget_restore_active(&mut self) {
+        self.restore_active = None;
+        self.restore_match = None;
+    }
+
     pub(crate) fn layout(&self) -> LayoutFile {
         let lasting = |key: &PersistKey| !key.network.starts_with(UNCONNECTED_PREFIX);
         let mut windows: Vec<SavedWindow> = self
@@ -524,7 +543,8 @@ mod tests {
         assert_eq!(appeared.len(), 2);
         let window = manager.get(&key(2, Some("#A"))).unwrap();
         assert_eq!(window.child_rect, Some(rect));
-        assert!(window.detached);
+        // Closed windows come back inside the main window.
+        assert!(!window.detached);
     }
 
     #[test]
@@ -555,7 +575,9 @@ mod tests {
         let mut restored = WindowManager::from_layout(LayoutFile::load_from(&path));
         assert_eq!(restored.mode, LayoutMode::Floating);
         restored.sync(vec![present(7, "tls://irc.example:6697", Some("#Rust"))]);
-        assert_eq!(restored.active, Some(key(7, Some("#Rust"))));
+        // Reported for the App to apply, never applied behind its back.
+        assert_eq!(restored.active, None);
+        assert_eq!(restored.restore_match, Some(key(7, Some("#Rust"))));
         let window = restored.get(&key(7, Some("#Rust"))).unwrap();
         assert!(window.detached);
         assert_eq!(window.os_size, Some(Vec2::new(640.0, 480.0)));

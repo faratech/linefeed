@@ -93,6 +93,22 @@ impl Session {
             ));
             return;
         };
+        if let Some(endpoint) = self.active_endpoint_key()
+            && self.blocked_endpoints.contains(&endpoint)
+        {
+            // Refused where the worker would start, so neither a manual
+            // connect, an auto-reconnect nor a /server switch can open a
+            // second live session on one endpoint. A pending reconnect
+            // stops: the other window owns this server now.
+            self.connecting = false;
+            self.connection_lost = false;
+            let label = self.active_endpoint_label();
+            self.add_server_message(ChatMessage::system(&format!(
+                "Already connected to {label} in another window"
+            )));
+            self.events.push(super::SessionEvent::DuplicateEndpoint);
+            return;
+        }
         tracing::info!("Connecting to {}:{}", config.host, config.port);
 
         let (msg_tx, msg_rx) = mpsc::channel::<IrcMessage>(1000);

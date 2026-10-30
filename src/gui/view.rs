@@ -333,9 +333,14 @@ impl Session {
                         .desired_width(ui.available_width()),
                 );
 
+                if std::mem::take(&mut self.input_focus_request) {
+                    response.request_focus();
+                }
+                self.input_had_focus = response.has_focus();
                 if response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
                     send = true;
                     response.request_focus();
+                    self.input_had_focus = true;
                 }
 
                 if response.has_focus() {

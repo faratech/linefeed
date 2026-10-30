@@ -82,6 +82,9 @@ pub(crate) enum SessionEvent {
         command: WindowCommand,
         target: Option<String>,
     },
+    /// A worker was not started because another session is live on the
+    /// same endpoint.
+    DuplicateEndpoint,
     /// `/server -m`: connect to an endpoint in a new status window.
     NewServer {
         host: String,
@@ -144,6 +147,9 @@ pub struct UpdateSession {
     /// `others` of its own). Older binaries ignore this and restore only
     /// the top-level (active) session.
     others: Vec<UpdateSession>,
+    /// Where the top-level session stood among `others`, so a restart keeps
+    /// the networks in their order (switchbar, Alt+N).
+    active_position: usize,
 }
 
 impl UpdateSession {
@@ -161,6 +167,14 @@ impl UpdateSession {
 
     pub(crate) fn take_others(&mut self) -> Vec<UpdateSession> {
         std::mem::take(&mut self.others)
+    }
+
+    pub(crate) fn active_position(&self) -> usize {
+        self.active_position
+    }
+
+    pub(crate) fn set_active_position(&mut self, position: usize) {
+        self.active_position = position;
     }
 }
 
@@ -463,6 +477,11 @@ pub struct Session {
     pub(crate) form_profile: Option<String>,
     /// Requests for the App, drained every frame (see `SessionEvent`).
     pub(crate) events: Vec<SessionEvent>,
+    /// Endpoints other sessions are live on (connected, connecting, or
+    /// waiting to reconnect), set by the App before each lifecycle pass. A
+    /// worker is never started for one of them: two sessions on one
+    /// endpoint would share log files and nick state.
+    pub(crate) blocked_endpoints: Vec<EndpointKey>,
 
     // UI state
     pub scroll_to_bottom: bool,
@@ -497,6 +516,11 @@ pub struct Session {
 
     // Tab completion
     pub tab_completion: Option<TabCompletion>,
+    /// Give the input line keyboard focus on its next draw (swapped in per
+    /// window, like the input text: see `app::with_window_view`).
+    pub(crate) input_focus_request: bool,
+    /// Whether the input line had keyboard focus when last drawn.
+    pub(crate) input_had_focus: bool,
 
     // User list selection
     pub selected_user: Option<String>,
@@ -696,6 +720,9 @@ impl Session {
             id: 0,
             profile_id: None,
             form_profile: None,
+            blocked_endpoints: Vec::new(),
+            input_focus_request: false,
+            input_had_focus: false,
             events: Vec::new(),
 
             scroll_to_bottom: true,
@@ -1227,6 +1254,7 @@ impl Session {
             input: self.input_text.clone(),
             away: self.away_status.clone(),
             others: Vec::new(),
+            active_position: 0,
         }
     }
 

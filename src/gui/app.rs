@@ -22,6 +22,9 @@ use super::{
     ChatMessage, ServerFavorite, Session, SessionEvent, Settings, UpdateSession, WindowCommand,
 };
 
+/// How long after startup the window that was active at the last exit may
+/// still take focus when it reappears (auto-joins take a moment).
+const RESTORE_ACTIVE_WINDOW: Duration = Duration::from_secs(30);
 /// How long placement changes settle before layout.json is rewritten.
 const LAYOUT_SAVE_DELAY: Duration = Duration::from_secs(2);
 /// Desktop notifications that are not forced are spaced at least this far
@@ -107,6 +110,25 @@ pub struct App {
     /// Restored unsent input, placed into the session's selected window once
     /// that window exists.
     pending_inputs: Vec<(ConnId, String)>,
+    /// When the App started: the persisted active window is only restored
+    /// while startup auto-joins are still arriving.
+    started: Instant,
+    /// The user has picked a window (click, switchbar, shortcut, typing a
+    /// /query): the persisted active window no longer applies.
+    user_activated: bool,
+    /// The window to return to if a "New connection" status window is
+    /// dismissed without connecting.
+    focus_before_new: Option<WindowKey>,
+    /// The session the open Settings window edits, fixed when it opened so
+    /// switching windows meanwhile cannot move its edits to another network.
+    pub(crate) settings_session: Option<ConnId>,
+    /// The window icon, built once for every detached window.
+    icon: Option<std::sync::Arc<egui::IconData>>,
+    /// The window that was active before an update restart.
+    restore_after_update: Option<WindowKey>,
+    /// A window that should take input focus once it exists (activated
+    /// before its first sync, e.g. a query opened by /query).
+    pending_focus: Option<WindowKey>,
 }
 
 impl App {
@@ -182,6 +204,13 @@ impl App {
             tray_hidden: false,
             tile_request: None,
             pending_inputs: Vec::new(),
+            started: Instant::now(),
+            user_activated: false,
+            focus_before_new: None,
+            settings_session: None,
+            icon: None,
+            restore_after_update: None,
+            pending_focus: None,
         }
     }
 
@@ -272,10 +301,13 @@ impl App {
         {
             return favorite.name.clone();
         }
-        if let Some(name) = &session.network_support.network_name
-            && !name.is_empty()
-        {
-            return name.clone();
+        // The server chooses its NETWORK name: never trust it to be short or
+        // free of control and direction-changing characters.
+        if let Some(name) = &session.network_support.network_name {
+            let name = sanitize_label(name);
+            if !name.is_empty() {
+                return name;
+            }
         }
         session.active_endpoint_label()
     }
@@ -402,10 +434,33 @@ impl App {
     fn observe_root_input(&mut self, ctx: &egui::Context) {
         let root_focused = ctx.input(|i| i.focused);
         self.focused = root_focused || self.focused_detached.is_some();
-        let activity = ctx
-            .input(|i| !i.keys_down.is_empty() || i.pointer.any_click() || i.pointer.any_pressed());
+        let (activity, acted_here) = ctx.input(|i| {
+            let pressed = i.pointer.any_pressed()
+                || i.events
+                    .iter()
+                    .any(|e| matches!(e, egui::Event::Key { pressed: true, .. }));
+            (
+                !i.keys_down.is_empty() || i.pointer.any_click() || pressed,
+                pressed,
+            )
+        });
         if activity {
             self.note_activity();
+        }
+        // The user is working in the main window while a detached window is
+        // the active one: the window the main window shows becomes active
+        // (a click on a particular window or switchbar entry overrides this
+        // later in the frame).
+        if acted_here
+            && self
+                .windows
+                .active
+                .as_ref()
+                .and_then(|k| self.windows.get(k))
+                .is_some_and(|w| w.detached)
+            && let Some(shown) = self.maximized_window()
+        {
+            self.user_activate(shown);
         }
     }
 
@@ -449,26 +504,18 @@ impl App {
     fn run_lifecycles(&mut self, ctx: &egui::Context) {
         for index in 0..self.sessions.len() {
             // One live session per endpoint: two would share log files and
-            // nick state on the same network.
-            if self.sessions[index].connecting
-                && self.sessions[index].worker.is_none()
-                && let Some(endpoint) = self.sessions[index].active_endpoint_key()
-                && let Some(other) = self.sessions.iter().position(|s| {
-                    s.id != self.sessions[index].id
-                        && (s.connected || s.connecting || s.worker.is_some())
-                        && s.active_endpoint_key().as_ref() == Some(&endpoint)
+            // nick state on the same network. Sessions earlier in this pass
+            // have already started their workers, so the first one wins.
+            let id = self.sessions[index].id;
+            let blocked: Vec<_> = self
+                .sessions
+                .iter()
+                .filter(|s| {
+                    s.id != id && (s.connected || s.worker.is_some() || s.awaiting_reconnect())
                 })
-            {
-                let label = self.sessions[other].active_endpoint_label();
-                let session = &mut self.sessions[index];
-                session.connecting = false;
-                session.add_server_message(ChatMessage::system(&format!(
-                    "Already connected to {label} in another window"
-                )));
-                let key = WindowKey::new(self.sessions[other].id, None);
-                self.activate(key);
-                continue;
-            }
+                .filter_map(|s| s.active_endpoint_key())
+                .collect();
+            self.sessions[index].blocked_endpoints = blocked;
             self.sessions[index].process_connection_lifecycle(ctx);
         }
 
@@ -505,16 +552,17 @@ impl App {
                     SessionEvent::Notify { title, body, force } => {
                         self.notify(&title, &body, force);
                     }
-                    SessionEvent::OpenSettings => self.show_settings = true,
+                    SessionEvent::OpenSettings => {
+                        let conn = self.sessions[index].id;
+                        self.open_settings(conn);
+                    }
                     SessionEvent::SaveSettings => self.save_settings_from(index),
                     SessionEvent::SaveConfig => {
                         self.sessions[index].export_config(&mut self.settings);
                         self.save_settings();
                     }
-                    SessionEvent::SaveAutoPerform => {
-                        self.settings.auto_perform = self.sessions[index].auto_perform.clone();
-                        self.save_settings();
-                    }
+                    SessionEvent::SaveAutoPerform => self.save_auto_perform_from(index),
+                    SessionEvent::DuplicateEndpoint => self.focus_duplicate_of(index),
                     SessionEvent::NewServer {
                         host,
                         port,
@@ -526,6 +574,58 @@ impl App {
                     }
                 }
             }
+        }
+    }
+
+    /// Persist `/perform` edits where they belong. Auto-perform is part of a
+    /// server profile (it typically identifies to that network's services):
+    /// it goes to the favorite the form was loaded from, or to the Quick
+    /// Connect defaults only when those are for this same server. Never to
+    /// another network's profile or defaults.
+    fn save_auto_perform_from(&mut self, index: usize) {
+        let session = &self.sessions[index];
+        let list = session.auto_perform.clone();
+        if let Some(id) = session.form_profile.clone()
+            && let Some(favorite) = self
+                .settings
+                .server_favorites
+                .iter_mut()
+                .find(|favorite| favorite.id == id)
+        {
+            favorite.auto_perform = list;
+            self.save_settings();
+        } else if same_endpoint(
+            (&session.server_host, &session.server_port, session.use_tls),
+            (
+                &self.settings.server_host,
+                &self.settings.server_port,
+                self.settings.use_tls,
+            ),
+        ) {
+            self.settings.auto_perform = list;
+            self.save_settings();
+        } else {
+            self.sessions[index].add_server_message(ChatMessage::system(
+                "Auto-perform changed for this connection only: save it as a favorite to keep it",
+            ));
+        }
+    }
+
+    /// A session refused to start a second connection to an endpoint
+    /// another session is live on: bring that session's status window
+    /// forward.
+    fn focus_duplicate_of(&mut self, index: usize) {
+        let Some(endpoint) = self.sessions[index].active_endpoint_key() else {
+            return;
+        };
+        let id = self.sessions[index].id;
+        if let Some(other) = self
+            .sessions
+            .iter()
+            .find(|s| s.id != id && s.active_endpoint_key().as_ref() == Some(&endpoint))
+        {
+            let key = WindowKey::new(other.id, None);
+            self.activate(key);
         }
     }
 
@@ -553,14 +653,19 @@ impl App {
                 }
             }
             WindowCommand::Close => self.request_close(key),
-            WindowCommand::New => {
-                let index = self.add_session();
-                self.sessions[index].show_connect_dialog = true;
-                let key = WindowKey::new(self.sessions[index].id, None);
-                self.activate(key);
-            }
+            WindowCommand::New => self.new_connection(),
         }
         self.windows.dirty = true;
+    }
+
+    /// A new status window with its Connect dialog. If the dialog is
+    /// dismissed without connecting, the window goes and focus returns.
+    fn new_connection(&mut self) {
+        self.focus_before_new = self.windows.active.clone();
+        let index = self.add_session();
+        self.sessions[index].show_connect_dialog = true;
+        let key = WindowKey::new(self.sessions[index].id, None);
+        self.user_activate(key);
     }
 
     /// `/server -m`: connect to an endpoint in a new status window.
@@ -686,9 +791,16 @@ impl App {
                 });
             }
         }
+        let previous_active = self.windows.active.clone();
         let appeared = self.windows.sync(present);
         if !appeared.is_empty() {
             self.windows.dirty = true;
+        }
+        if let Some(key) = &self.pending_focus
+            && let Some(window) = self.windows.get_mut(key)
+        {
+            window.view.input_focus_request = true;
+            self.pending_focus = None;
         }
         let sessions = &self.sessions;
         let windows = &mut self.windows;
@@ -711,7 +823,8 @@ impl App {
             self.main_window = None;
         }
 
-        let active_conn = self.windows.active.as_ref().map(|k| k.conn);
+        // Taken before `sync`, which clears an active window that vanished.
+        let active_conn = previous_active.as_ref().map(|k| k.conn);
         let mut follow = None;
         for session in &self.sessions {
             let current = session.current_channel.clone();
@@ -728,20 +841,58 @@ impl App {
         if let Some(key) = follow {
             self.activate(key);
         }
+        // The active window closed (a part confirmed, a query closed, a nick
+        // change re-keyed it): stay on its network.
         if self.windows.active.is_none()
-            && let Some(first) = self.sessions.first()
+            && let Some(previous) = &previous_active
+            && let Some(index) = self.session_index(previous.conn)
         {
-            let key = WindowKey::new(first.id, first.current_channel.clone());
+            let key = WindowKey::new(previous.conn, self.sessions[index].current_channel.clone());
             self.activate(key);
+        }
+        // The window that was active when Linefeed last closed, once it
+        // reappears: only during startup, and only if the user has not
+        // picked a window yet.
+        if let Some(key) = self.windows.restore_match.take() {
+            if !self.user_activated && self.started.elapsed() < RESTORE_ACTIVE_WINDOW {
+                self.activate(key);
+            }
+        } else if self.user_activated || self.started.elapsed() >= RESTORE_ACTIVE_WINDOW {
+            self.windows.forget_restore_active();
+        }
+        if self.windows.active.is_none() {
+            let start = self.restore_after_update.take().or_else(|| {
+                self.sessions
+                    .first()
+                    .map(|first| WindowKey::new(first.id, first.current_channel.clone()))
+            });
+            if let Some(key) = start {
+                self.activate(key);
+            }
         }
     }
 
     /// Make a window the active one: select it in its session (clearing its
     /// unread count) and bring it forward.
+    /// `activate` for a window the user picked.
+    pub(crate) fn user_activate(&mut self, key: WindowKey) {
+        self.user_activated = true;
+        self.activate(key);
+    }
+
     pub(crate) fn activate(&mut self, key: WindowKey) {
         let Some(index) = self.session_index(key.conn) else {
             return;
         };
+        // Typing continues in the new window: if the input line of the
+        // window being left had focus, the new window's input takes it.
+        let carry_focus = self
+            .windows
+            .active
+            .as_ref()
+            .filter(|active| **active != key)
+            .and_then(|active| self.windows.get(active))
+            .is_some_and(|window| window.view.input_had_focus);
         if self.windows.get(&key).is_none()
             && key
                 .target
@@ -755,6 +906,12 @@ impl App {
             .insert(key.conn, self.sessions[index].current_channel.clone());
         if self.windows.get(&key).is_some_and(|w| !w.detached) {
             self.main_window = Some(key.clone());
+        }
+        if carry_focus {
+            match self.windows.get_mut(&key) {
+                Some(window) => window.view.input_focus_request = true,
+                None => self.pending_focus = Some(key.clone()),
+            }
         }
         self.windows.active = Some(key);
         self.windows.dirty = true;
@@ -790,12 +947,12 @@ impl App {
     }
 
     fn dialog_blocks_shortcuts(&self) -> bool {
+        // Only the active session's Connect dialog is ever shown.
+        let active = self.sessions.get(self.active_index());
         self.show_settings
             || self.confirm_disconnect.is_some()
-            || self
-                .sessions
-                .iter()
-                .any(|s| s.show_channel_list || (s.show_connect_dialog && !s.connected))
+            || self.sessions.iter().any(|s| s.show_channel_list)
+            || active.is_some_and(|s| s.show_connect_dialog && !s.connected && !s.connecting)
     }
 
     fn handle_shortcuts(&mut self, ctx: &egui::Context) {
@@ -839,7 +996,7 @@ impl App {
         if let Some(index) = alt_index
             && let Some(key) = self.ordered_windows().get(index).cloned()
         {
-            self.activate(key);
+            self.user_activate(key);
         }
     }
 
@@ -859,7 +1016,7 @@ impl App {
         } else {
             (current + 1) % order.len()
         };
-        self.activate(order[next].clone());
+        self.user_activate(order[next].clone());
     }
 
     fn toggle_maximized(&mut self) {
@@ -884,6 +1041,9 @@ impl App {
                 if session.connected || session.connecting || session.worker.is_some() {
                     self.confirm_disconnect = Some(key.conn);
                 } else if self.sessions.len() > 1 {
+                    // Idle, but possibly waiting out a reconnect backoff:
+                    // stop it, or the closed window would reconnect.
+                    self.sessions[index].request_manual_disconnect(None);
                     self.closing_sessions.insert(key.conn);
                 }
             }
@@ -965,6 +1125,22 @@ impl App {
         }
     }
 
+    /// Open Settings for the network `conn`: its Connection and Automation
+    /// tabs edit that session's form until the window closes.
+    pub(crate) fn open_settings(&mut self, conn: ConnId) {
+        if !self.show_settings {
+            self.settings_session = Some(conn);
+        }
+        self.show_settings = true;
+    }
+
+    /// The session the Settings window edits.
+    pub(crate) fn settings_index(&self) -> usize {
+        self.settings_session
+            .and_then(|conn| self.session_index(conn))
+            .unwrap_or_else(|| self.active_index())
+    }
+
     /// Cancel the Connect dialog of session `index`: discard its scratch
     /// form edits (#208) and the favorites selection, which the restored
     /// list may no longer index (#268). The canonical settings are what was
@@ -998,6 +1174,11 @@ impl App {
             if self.sessions.len() > 1 {
                 self.sessions.retain(|s| s.id != conn);
                 self.last_current.remove(&conn);
+                if let Some(key) = self.focus_before_new.take()
+                    && self.session_index(key.conn).is_some()
+                {
+                    self.activate(key);
+                }
             }
         }
     }
@@ -1050,7 +1231,8 @@ impl App {
 
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui.button("Settings").clicked() {
-                    self.show_settings = true;
+                    let conn = self.sessions[self.active_index()].id;
+                    self.open_settings(conn);
                 }
                 ui.menu_button("Window", |ui| {
                     if ui.button("Tile").clicked() {
@@ -1073,10 +1255,7 @@ impl App {
                     }
                     ui.separator();
                     if ui.button("New connection...").clicked() {
-                        let index = self.add_session();
-                        self.sessions[index].show_connect_dialog = true;
-                        let key = WindowKey::new(self.sessions[index].id, None);
-                        self.activate(key);
+                        self.new_connection();
                         ui.close();
                     }
                 });
@@ -1150,7 +1329,7 @@ impl App {
             }
         });
         if let Some(key) = clicked {
-            self.activate(key.clone());
+            self.user_activate(key.clone());
             self.focus_detached(ui.ctx(), &key);
         }
         if let Some(key) = toggle_detach {
@@ -1175,9 +1354,19 @@ impl App {
             self.windows.dirty = true;
         }
         if self.windows.get(key).is_some_and(|w| !w.detached) {
-            self.activate(key.clone());
-        } else if self.main_window.as_ref() == Some(key) {
-            self.main_window = None;
+            self.user_activate(key.clone());
+        } else {
+            if self.main_window.as_ref() == Some(key) {
+                self.main_window = None;
+            }
+            // The main window now shows another window; it becomes the
+            // active one until the detached window takes focus, so the
+            // toolbar, Ctrl+W and the unread state follow what is on screen.
+            if self.windows.active.as_ref() == Some(key)
+                && let Some(shown) = self.maximized_window()
+            {
+                self.activate(shown);
+            }
         }
     }
 
@@ -1338,7 +1527,7 @@ impl App {
         if let Some(key) = activate
             && self.windows.active.as_ref() != Some(&key)
         {
-            self.activate(key);
+            self.user_activate(key);
         }
         // The active window is always the front one. egui raises a window on
         // its first visible frame and on a click; a click also makes that
@@ -1390,7 +1579,11 @@ impl App {
                 .with_title(title)
                 .with_inner_size(size.unwrap_or(egui::vec2(720.0, 520.0)))
                 .with_min_inner_size([320.0, 240.0])
-                .with_icon(std::sync::Arc::new(crate::load_icon()));
+                .with_icon(
+                    self.icon
+                        .get_or_insert_with(|| std::sync::Arc::new(crate::load_icon()))
+                        .clone(),
+                );
             if let Some(pos) = pos {
                 builder = builder.with_position(pos);
             }
@@ -1474,7 +1667,7 @@ impl App {
             && self.focused_detached.as_ref() != Some(key)
             && self.windows.active.as_ref() != Some(key)
         {
-            self.activate(key.clone());
+            self.user_activate(key.clone());
         }
         self.focused_detached = focused;
         if activity {
@@ -1539,7 +1732,7 @@ impl App {
             self.color_target = Some(key.clone());
         }
         if let Some(target) = changed_to {
-            self.activate(WindowKey::new(key.conn, target));
+            self.user_activate(WindowKey::new(key.conn, target));
         }
     }
 
@@ -1566,7 +1759,7 @@ impl App {
             |s| s.process_input(),
         );
         if let Some(target) = changed_to {
-            self.activate(WindowKey::new(key.conn, target));
+            self.user_activate(WindowKey::new(key.conn, target));
         }
     }
 
@@ -1577,11 +1770,8 @@ impl App {
     /// others follow in `others`.
     pub fn update_session(&mut self) -> UpdateSession {
         let active = self.active_index();
-        let mut order: Vec<usize> = (0..self.sessions.len()).collect();
-        order.retain(|&i| i != active);
-        order.insert(0, active);
         let mut snapshots = Vec::new();
-        for index in order {
+        for index in 0..self.sessions.len() {
             let conn = self.sessions[index].id;
             let target = self.sessions[index].current_channel.clone();
             let input = self
@@ -1593,21 +1783,31 @@ impl App {
             snapshot.set_input(input);
             snapshots.push(snapshot);
         }
-        let mut snapshots = snapshots.into_iter();
-        let mut first = snapshots.next().unwrap_or_default();
-        first.set_others(snapshots.collect());
+        if snapshots.is_empty() {
+            return UpdateSession::default();
+        }
+        let mut first = snapshots.remove(active);
+        first.set_others(snapshots);
+        first.set_active_position(active);
         first
     }
 
     fn restore_update_session(&mut self, mut snapshot: UpdateSession) {
-        let others = snapshot.take_others();
-        for snapshot in std::iter::once(snapshot).chain(others) {
+        let mut ordered = snapshot.take_others();
+        let position = snapshot.active_position().min(ordered.len());
+        ordered.insert(position, snapshot);
+        for snapshot in ordered {
             let input = snapshot.input().to_string();
             let index = self.add_session();
             self.sessions[index].restore_update_session(snapshot);
             self.sessions[index].input_text.clear();
             let conn = self.sessions[index].id;
             self.pending_inputs.push((conn, input));
+        }
+        // The active session's window is the one to come back to.
+        if let Some(session) = self.sessions.get(position) {
+            self.restore_after_update =
+                Some(WindowKey::new(session.id, session.current_channel.clone()));
         }
     }
 
@@ -1644,6 +1844,26 @@ impl App {
             session.msg_rx = None;
         }
     }
+}
+
+/// Make a server-chosen name safe to show as a label: no control or
+/// bidirectional-override characters, at most 32 characters.
+fn sanitize_label(name: &str) -> String {
+    const BIDI: &[char] = &[
+        '\u{061C}', '\u{200E}', '\u{200F}', '\u{202A}', '\u{202B}', '\u{202C}', '\u{202D}',
+        '\u{202E}', '\u{2066}', '\u{2067}', '\u{2068}', '\u{2069}',
+    ];
+    name.chars()
+        .filter(|c| !c.is_control() && !BIDI.contains(c))
+        .take(32)
+        .collect::<String>()
+        .trim()
+        .to_string()
+}
+
+/// Whether two connect forms point at the same server.
+fn same_endpoint(a: (&str, &str, bool), b: (&str, &str, bool)) -> bool {
+    a.0.trim().eq_ignore_ascii_case(b.0.trim()) && a.1.trim() == b.1.trim() && a.2 == b.2
 }
 
 /// A forced (private message) notification held back by the rate limiter.
@@ -1738,11 +1958,25 @@ pub(crate) fn with_window_view<R>(
     let result = f(session);
     swap_view(session, view, history);
     let after = session.current_channel.clone();
+    let exists = |session: &Session, target: &Option<String>| {
+        target
+            .as_ref()
+            .is_none_or(|name| session.channel_key(name).is_some())
+    };
     if &after == target {
         session.current_channel = saved_current;
         (None, result)
-    } else {
+    } else if exists(session, target) {
+        // The command moved focus (/query, /join of a joined channel).
         (Some(after), result)
+    } else {
+        // The window's own tab went away (/close, /part of a query): keep
+        // the session's selection where it was, if that still exists; the
+        // App moves activity off a vanished active window (`sync_windows`).
+        if exists(session, &saved_current) {
+            session.current_channel = saved_current;
+        }
+        (None, result)
     }
 }
 
@@ -1752,6 +1986,11 @@ fn swap_view(session: &mut Session, view: &mut TargetView, history: &mut Vec<Str
     std::mem::swap(&mut session.history_temp, &mut view.history_temp);
     std::mem::swap(&mut session.tab_completion, &mut view.tab_completion);
     std::mem::swap(&mut session.selected_user, &mut view.selected_user);
+    std::mem::swap(
+        &mut session.input_focus_request,
+        &mut view.input_focus_request,
+    );
+    std::mem::swap(&mut session.input_had_focus, &mut view.input_had_focus);
     std::mem::swap(&mut session.command_history, history);
 }
 
@@ -2011,6 +2250,305 @@ mod tests {
     }
 
     #[test]
+    fn perform_goes_to_the_profile_it_belongs_to_never_another_networks_defaults() {
+        let mut settings = test_settings();
+        settings.server_host = "irc.libera.chat".into();
+        settings.server_port = "6697".into();
+        settings.use_tls = true;
+        settings.auto_perform = "/msg NickServ IDENTIFY liberapass".into();
+        settings.server_favorites.push(ServerFavorite {
+            name: "OFTC".into(),
+            host: "irc.oftc.net".into(),
+            port: "6697".into(),
+            use_tls: true,
+            auto_perform: "/msg NickServ IDENTIFY oftcpass".into(),
+            ..ServerFavorite::default()
+        });
+        let mut app = App::with_settings(settings, LayoutFile::default());
+        app.start(None);
+        let favorite = app.settings.server_favorites[0].clone();
+        app.sessions[0].load_favorite(&favorite);
+        assert!(app.sessions[0].start_session_from_form());
+
+        app.sessions[0].process_command("/perform /join #x");
+        app.process_events();
+        let saved = app.settings_file.clone().unwrap();
+        // The OFTC profile got its own list...
+        assert_eq!(
+            saved.server_favorites[0].auto_perform,
+            "/msg NickServ IDENTIFY oftcpass\n/join #x"
+        );
+        // ...and Libera's defaults never got OFTC's IDENTIFY.
+        assert_eq!(saved.server_host, "irc.libera.chat");
+        assert_eq!(saved.auto_perform, "/msg NickServ IDENTIFY liberapass");
+
+        // An unprofiled session on another server persists nowhere.
+        let second = app.add_session();
+        app.sessions[second].apply_unprofiled_endpoint("irc.other.example", "6697", true);
+        app.sessions[second].process_command("/perform /join #y");
+        app.process_events();
+        assert_eq!(
+            app.settings_file.clone().unwrap().auto_perform,
+            "/msg NickServ IDENTIFY liberapass"
+        );
+        assert!(
+            app.sessions[second]
+                .server_messages
+                .iter()
+                .any(|m| m.content.contains("this connection only"))
+        );
+    }
+
+    #[test]
+    fn detaching_the_active_window_activates_the_one_the_main_window_shows() {
+        let (mut app, mut rx_a, mut rx_b) = two_networks();
+        let rust = WindowKey::new(app.sessions[0].id, Some("#rust".into()));
+        let debian = WindowKey::new(app.sessions[1].id, Some("#debian".into()));
+        app.activate(rust.clone());
+        app.activate(debian.clone());
+        app.toggle_detached(&debian);
+        let shown = app.maximized_window().unwrap();
+        assert_ne!(shown, debian);
+        assert_eq!(app.windows.active, Some(shown.clone()));
+        // Ctrl+W in the main window closes what it shows, not the detached one.
+        app.request_close(app.windows.active.clone().unwrap());
+        assert!(
+            drain(&mut rx_b).is_empty(),
+            "the detached channel was parted"
+        );
+        let _ = drain(&mut rx_a);
+
+        // Working in the main window again after the detached one took over.
+        app.activate(debian.clone());
+        let ctx = egui::Context::default();
+        ctx.run_ui(
+            egui::RawInput {
+                events: vec![egui::Event::Key {
+                    key: egui::Key::A,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::NONE,
+                }],
+                ..Default::default()
+            },
+            |ui| app.observe_root_input(ui.ctx()),
+        )
+        .textures_delta
+        .clear();
+        assert_ne!(app.windows.active, Some(debian));
+    }
+
+    #[test]
+    fn closing_the_active_window_keeps_focus_on_its_network() {
+        let (mut app, _rx_a, _rx_b) = two_networks();
+        feed(&mut app, 1, ":me!u@h JOIN #ubuntu");
+        app.sync_windows();
+        let debian = WindowKey::new(app.sessions[1].id, Some("#debian".into()));
+        app.activate(debian.clone());
+        app.request_close(debian.clone());
+        feed(&mut app, 1, ":me!u@h PART #debian");
+        app.sync_windows();
+        assert_eq!(
+            app.windows.active.as_ref().map(|k| k.conn),
+            Some(app.sessions[1].id)
+        );
+    }
+
+    #[test]
+    fn the_remembered_active_window_does_not_steal_focus_once_the_user_picked_one() {
+        let (mut app, _rx_a, _rx_b) = two_networks();
+        let network = App::network_identity(&app.sessions[0]);
+        let layout = LayoutFile {
+            active: Some(PersistKey {
+                network,
+                target: Some("bob".into()),
+            }),
+            ..LayoutFile::default()
+        };
+        app.windows = WindowManager::from_layout(layout);
+        app.sync_windows();
+        let rust = WindowKey::new(app.sessions[0].id, Some("#rust".into()));
+        app.user_activate(rust.clone());
+        // Bob writes much later.
+        feed(&mut app, 0, ":bob!u@h PRIVMSG me :hi");
+        app.sync_windows();
+        assert_eq!(app.windows.active, Some(rust));
+        assert_eq!(app.sessions[0].current_channel.as_deref(), Some("#rust"));
+    }
+
+    #[test]
+    fn the_remembered_active_window_is_restored_through_activate_at_startup() {
+        let (mut app, _rx_a, _rx_b) = two_networks();
+        let network = App::network_identity(&app.sessions[1]);
+        app.windows = WindowManager::from_layout(LayoutFile {
+            active: Some(PersistKey {
+                network,
+                target: Some("#debian".into()),
+            }),
+            ..LayoutFile::default()
+        });
+        app.sync_windows();
+        let debian = WindowKey::new(app.sessions[1].id, Some("#debian".into()));
+        assert_eq!(app.windows.active, Some(debian));
+        assert_eq!(app.sessions[1].current_channel.as_deref(), Some("#debian"));
+    }
+
+    #[test]
+    fn a_hidden_connect_dialog_does_not_block_shortcuts() {
+        let (mut app, _rx_a, _rx_b) = two_networks();
+        app.new_connection();
+        assert!(app.dialog_blocks_shortcuts());
+        // The user goes back to another window without dismissing it.
+        app.user_activate(WindowKey::new(app.sessions[0].id, Some("#rust".into())));
+        assert!(!app.dialog_blocks_shortcuts());
+    }
+
+    #[test]
+    fn input_focus_follows_a_window_switch() {
+        let (mut app, _rx_a, _rx_b) = two_networks();
+        let rust = WindowKey::new(app.sessions[0].id, Some("#rust".into()));
+        let debian = WindowKey::new(app.sessions[1].id, Some("#debian".into()));
+        app.activate(rust.clone());
+        app.windows.get_mut(&rust).unwrap().view.input_had_focus = true;
+        app.cycle_window(false);
+        let next = app.windows.active.clone().unwrap();
+        assert!(app.windows.get(&next).unwrap().view.input_focus_request);
+
+        // Drawing the window hands the request to its input line.
+        let ctx = egui::Context::default();
+        app.activate(debian.clone());
+        app.windows
+            .get_mut(&debian)
+            .unwrap()
+            .view
+            .input_focus_request = true;
+        frame(&mut app, &ctx);
+        frame(&mut app, &ctx);
+        let view = &app.windows.get(&debian).unwrap().view;
+        assert!(!view.input_focus_request);
+        assert!(view.input_had_focus);
+    }
+
+    #[test]
+    fn input_focus_follows_into_a_query_opened_from_the_keyboard() {
+        let (mut app, _rx_a, _rx_b) = two_networks();
+        let rust = WindowKey::new(app.sessions[0].id, Some("#rust".into()));
+        app.activate(rust.clone());
+        app.windows.get_mut(&rust).unwrap().view.input_had_focus = true;
+        app.windows.get_mut(&rust).unwrap().view.input_text = "/query carol".into();
+        app.submit_window_input(&rust);
+        app.sync_windows();
+        let carol = WindowKey::new(app.sessions[0].id, Some("carol".into()));
+        assert_eq!(app.windows.active, Some(carol.clone()));
+        assert!(app.windows.get(&carol).unwrap().view.input_focus_request);
+    }
+
+    #[test]
+    fn closing_an_idle_status_window_cancels_its_pending_reconnect() {
+        let (mut app, _rx_a, _rx_b) = two_networks();
+        let conn = app.sessions[1].id;
+        app.sessions[1].apply_unprofiled_endpoint("irc.example", "6697", true);
+        assert!(app.sessions[1].start_session_from_form());
+        app.sessions[1].connecting = false;
+        app.sessions[1].mark_connection_lost();
+        app.sessions[1].last_disconnect_time = None; // retry due now
+        assert!(app.sessions[1].awaiting_reconnect());
+
+        app.request_close(WindowKey::new(conn, None));
+        assert!(
+            app.confirm_disconnect.is_none(),
+            "idle windows close at once"
+        );
+        app.run_lifecycles(&egui::Context::default());
+        assert!(
+            app.session_index(conn).is_none(),
+            "the closed session reconnected"
+        );
+    }
+
+    #[test]
+    fn a_session_waiting_to_reconnect_keeps_its_endpoint() {
+        let (mut app, _rx_a, _rx_b) = two_networks();
+        // Session A on irc.example dropped and waits out its backoff.
+        app.sessions[0].apply_unprofiled_endpoint("irc.example", "6697", true);
+        assert!(app.sessions[0].start_session_from_form());
+        app.sessions[0].connecting = false;
+        app.sessions[0].mark_connection_lost();
+        app.sessions[0].last_disconnect_time = Some(Instant::now());
+        assert!(app.sessions[0].awaiting_reconnect());
+        // Session B tries the same server meanwhile.
+        app.sessions[1].request_manual_disconnect(None);
+        app.sessions[1].apply_unprofiled_endpoint("irc.example", "6697", true);
+        assert!(app.sessions[1].start_session_from_form());
+
+        app.run_lifecycles(&egui::Context::default());
+        assert!(!app.sessions[1].connecting);
+        assert!(app.sessions[1].worker.is_none());
+        assert!(
+            app.sessions[1]
+                .server_messages
+                .iter()
+                .any(|m| m.content.contains("Already connected"))
+        );
+        assert!(app.sessions[0].awaiting_reconnect(), "A lost its claim");
+    }
+
+    #[test]
+    fn server_chosen_network_names_are_sanitized_for_labels() {
+        let (mut app, _rx_a, _rx_b) = two_networks();
+        let evil = format!("Libera{}{}", '\u{202E}', "x".repeat(80));
+        feed(
+            &mut app,
+            0,
+            &format!(":srv 005 me NETWORK={evil} :are supported"),
+        );
+        let label = app.network_label(&app.sessions[0]);
+        assert!(label.chars().count() <= 32, "{label}");
+        assert!(!label.contains('\u{202E}'));
+        assert!(label.starts_with("Libera"));
+    }
+
+    #[test]
+    fn close_typed_in_a_window_that_is_not_active_keeps_the_selection() {
+        let (mut app, _rx_a, _rx_b) = two_networks();
+        feed(&mut app, 0, ":carol!u@h PRIVMSG me :hi");
+        app.sync_windows();
+        let rust = WindowKey::new(app.sessions[0].id, Some("#rust".into()));
+        let carol = WindowKey::new(app.sessions[0].id, Some("carol".into()));
+        app.activate(rust.clone());
+        app.windows.get_mut(&carol).unwrap().view.input_text = "/close".into();
+        app.submit_window_input(&carol);
+        app.sync_windows();
+        assert!(app.windows.get(&carol).is_none());
+        assert_eq!(app.windows.active, Some(rust));
+        assert_eq!(app.sessions[0].current_channel.as_deref(), Some("#rust"));
+    }
+
+    #[test]
+    fn settings_stay_with_the_network_they_were_opened_for() {
+        let (mut app, _rx_a, _rx_b) = two_networks();
+        let first = app.sessions[0].id;
+        app.user_activate(WindowKey::new(first, None));
+        app.open_settings(first);
+        app.user_activate(WindowKey::new(app.sessions[1].id, None));
+        assert_eq!(app.settings_index(), 0);
+    }
+
+    #[test]
+    fn cancelling_a_new_connection_returns_to_the_previous_window() {
+        let (mut app, _rx_a, _rx_b) = two_networks();
+        let debian = WindowKey::new(app.sessions[1].id, Some("#debian".into()));
+        app.user_activate(debian.clone());
+        app.new_connection();
+        let new = app.sessions.len() - 1;
+        app.cancel_connect(new);
+        app.drop_cancelled_new_sessions();
+        assert_eq!(app.sessions.len(), 2);
+        assert_eq!(app.windows.active, Some(debian));
+    }
+
+    #[test]
     fn closing_a_query_window_closes_it_without_sending_anything() {
         let (mut app, mut rx_a, _rx_b) = two_networks();
         feed(&mut app, 0, ":friend!u@h PRIVMSG me :hi");
@@ -2186,14 +2724,18 @@ mod tests {
             .iter()
             .map(|s| s.active_server_config().unwrap().host)
             .collect();
-        // The active session comes first: it is all an older binary reads.
-        assert_eq!(hosts, ["b.example", "a.example"]);
+        // Networks keep their order; the active one is also the top-level
+        // snapshot, which is all an older binary reads.
+        assert_eq!(hosts, ["a.example", "b.example"]);
+        let top: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(top["session"]["server"]["host"], "b.example");
         assert!(restored.sessions.iter().all(|s| s.connecting));
-        let key = WindowKey::new(restored.sessions[0].id, Some("#debian".into()));
+        let key = WindowKey::new(restored.sessions[1].id, Some("#debian".into()));
         assert_eq!(
             restored.windows.get(&key).unwrap().view.input_text,
             "unsent"
         );
+        assert_eq!(restored.windows.active, Some(key));
     }
 
     #[test]
@@ -2445,7 +2987,10 @@ mod tests {
 
         app.tray_hidden = true;
         app.background_tick(&ctx);
-        assert!(app.spawn_geometry.is_empty(), "stale creation geometry kept");
+        assert!(
+            app.spawn_geometry.is_empty(),
+            "stale creation geometry kept"
+        );
         let output = ctx.run_ui(egui::RawInput::default(), |_ui| app.draw_detached(&ctx));
         assert!(!texts(&output).iter().any(|t| t.contains("apt is fine")));
         assert!(app.spawn_geometry.is_empty());

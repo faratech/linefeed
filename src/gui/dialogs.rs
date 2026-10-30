@@ -1515,7 +1515,9 @@ impl App {
     /// behaviour settings), which the App adopts and mirrors into every
     /// session; About and the App-only switches edit the App directly.
     pub(crate) fn show_settings_window(&mut self, ctx: &egui::Context) {
-        let active = self.active_index();
+        // The network the window was opened for, even if another window
+        // became active meanwhile.
+        let active = self.settings_index();
         let mut close = false;
         egui::Window::new("Settings")
             // Dialogs stay above the chat windows they belong to.
@@ -1575,10 +1577,11 @@ impl App {
     /// keep the window open on the Connection tab so the error is visible
     /// and editable (#207). Returns whether the window was closed.
     pub(crate) fn close_settings_window(&mut self) -> bool {
-        let active = self.active_index();
+        let active = self.settings_index();
         if self.sessions[active].validate_connection_form() {
             self.save_settings_from(active);
             self.show_settings = false;
+            self.settings_session = None;
             true
         } else {
             self.settings_tab = 0;
@@ -2046,6 +2049,9 @@ mod tests {
     #[test]
     fn perform_commands_persist_only_the_auto_perform_list() {
         let mut app = app_with_dirty_connection_form();
+        // The form is still for the defaults' server; its other fields hold
+        // unsaved scratch.
+        app.sessions[0].server_port = "6697".into();
         app.sessions[0].auto_perform.clear();
         app.sessions[0].process_command("/perform /mode +i");
         app.process_events();
