@@ -679,6 +679,7 @@ impl IrcApp {
                                     loaded: 0,
                                     shown: 0,
                                     page_limit: page,
+                                    announce_arrivals: false,
                                 }),
                             ))
                         }
@@ -700,6 +701,8 @@ impl IrcApp {
                                     loaded: 0,
                                     shown: 0,
                                     page_limit: page,
+                                    // A dump the user asked for, not news.
+                                    announce_arrivals: false,
                                 }),
                             ))
                         }

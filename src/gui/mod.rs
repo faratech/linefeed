@@ -89,6 +89,11 @@ struct PendingHistoryRequest {
     loaded: usize,
     shown: usize,
     page_limit: usize,
+    /// An automatic reconnect catch-up anchored at a message this client
+    /// already has (CHATHISTORY AFTER): its rows are genuinely new, so they
+    /// raise unread and notifications. Latest-page fallbacks and user-requested
+    /// history are never announced (#306).
+    announce_arrivals: bool,
 }
 
 struct ChatHistoryBatch {
@@ -1851,6 +1856,7 @@ impl IrcApp {
                 loaded: 0,
                 shown: 0,
                 page_limit: limit,
+                announce_arrivals: direction == HistoryDirection::After,
             },
         )
     }
@@ -2490,16 +2496,18 @@ impl IrcApp {
         // count as unread and notify like the identical live message (#306).
         // Only others' chat rows qualify; backlog pages (Prepend) are old by
         // design and stay silent.
-        let arrivals: Vec<(String, String, bool)> =
-            if batch.request.placement == HistoryPlacement::Append {
-                messages
-                    .iter()
-                    .filter(|row| !row.is_system && !self.sender_is_self(&row.sender))
-                    .map(|row| (row.sender.clone(), row.content.clone(), row.is_highlight))
-                    .collect()
-            } else {
-                Vec::new()
-            };
+        let arrivals: Vec<(String, String, bool)> = if batch.request.placement
+            == HistoryPlacement::Append
+            && batch.request.announce_arrivals
+        {
+            messages
+                .iter()
+                .filter(|row| !row.is_system && !self.sender_is_self(&row.sender))
+                .map(|row| (row.sender.clone(), row.content.clone(), row.is_highlight))
+                .collect()
+        } else {
+            Vec::new()
+        };
         history.extend(messages.drain(..));
 
         if let Some(channel) = self.channels.get_mut(&key) {
@@ -3150,6 +3158,7 @@ mod connection_lifecycle_tests {
             loaded: 0,
             shown: 0,
             page_limit: 10,
+            announce_arrivals: false,
         }
     }
 
@@ -4967,6 +4976,7 @@ impl IrcApp {
                                 loaded: 0,
                                 shown: 0,
                                 page_limit: self.max_scrollback.max(1),
+                                announce_arrivals: false,
                             });
                         if self
                             .pending_history_requests
@@ -13251,6 +13261,7 @@ mod tests {
                 loaded: 0,
                 shown: 0,
                 page_limit: 100,
+                announce_arrivals: false,
             });
 
         // The server holds two identical "ok" lines in that minute; only one
@@ -13405,6 +13416,114 @@ mod tests {
             app.dispatched_notifications.len(),
             2,
             "a notification held back must not appear after they were turned off"
+        );
+    }
+
+    /// A background app with chathistory negotiated and a notification-ready
+    /// window, plus a retained "#room" tab holding one local-log row (no
+    /// msgid, no server-time) and another tab being read.
+    fn restored_app_with_unanchored_room() -> (IrcApp, mpsc::UnboundedReceiver<IrcCommand>) {
+        let (mut app, rx) = test_app_connected();
+        app.set_session_nick("mynick".into(), true);
+        app.logging_load_history = true;
+        app.notifications_enabled = true;
+        app.window_focused = false;
+        app.handle_incoming_message(
+            IrcMessage::parse(":srv CAP me ACK :draft/chathistory").unwrap(),
+        );
+        let mut room = Channel::new();
+        room.messages.push_back(ChatMessage::new_fmt(
+            "carol",
+            "restored from the log",
+            &app.timestamp_format,
+        ));
+        app.channels.insert("#room".into(), room);
+        app.channels.insert("#other".into(), Channel::new());
+        app.current_channel = Some("#other".into());
+        (app, rx)
+    }
+
+    fn deliver_history_page(app: &mut IrcApp, target: &str, rows: &[(&str, &str)]) {
+        app.handle_incoming_message(
+            IrcMessage::parse(&format!(":srv BATCH +h chathistory {target}")).unwrap(),
+        );
+        for (n, (id, content)) in rows.iter().enumerate() {
+            app.handle_incoming_message(
+                IrcMessage::parse(&format!(
+                    "@batch=h;time=2026-09-12T10:0{n}:00.000Z;msgid={id} :alice!u@h PRIVMSG {target} :{content}"
+                ))
+                .unwrap(),
+            );
+        }
+        app.handle_incoming_message(IrcMessage::parse(":srv BATCH -h").unwrap());
+    }
+
+    #[test]
+    fn latest_fallback_catch_up_does_not_count_old_history_as_new_arrivals() {
+        let (mut app, mut rx) = restored_app_with_unanchored_room();
+
+        // Update-restart rejoin: no row to anchor on, so the request is
+        // CHATHISTORY LATEST * even though its placement is Append.
+        app.handle_incoming_message(IrcMessage::parse(":mynick!u@h JOIN #room").unwrap());
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            IrcCommand::ChathistoryLatest("#room".into(), "*".into(), 100)
+        );
+        deliver_history_page(
+            &mut app,
+            "#room",
+            &[
+                ("o1", "ancient chatter"),
+                ("o2", "mynick said hello long ago"),
+                ("o3", "more chatter"),
+            ],
+        );
+
+        assert_eq!(
+            app.channels["#room"].unread, 0,
+            "#306: the LATEST * dump was counted as new arrivals"
+        );
+        assert!(app.dispatched_notifications.is_empty());
+        assert!(
+            app.channels["#room"]
+                .messages
+                .iter()
+                .any(|row| row.content == "more chatter"),
+            "the history itself is still shown"
+        );
+    }
+
+    #[test]
+    fn user_requested_history_after_never_raises_unread_or_notifications() {
+        let (mut app, mut rx) = restored_app_with_unanchored_room();
+        app.channels.get_mut("#room").unwrap().messages.push_back(
+            ChatMessage::new_fmt("carol", "anchor", &app.timestamp_format).with_irc_metadata(
+                Some("2026-09-12T09:00:00.000Z".into()),
+                Some("anchor".into()),
+                None,
+            ),
+        );
+
+        app.process_command("/chathistory AFTER #room msgid=anchor 50");
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(IrcCommand::ChathistoryAfter(target, _, _)) if target == "#room"
+        ));
+        // The command may have selected the tab; the user then looks elsewhere.
+        app.current_channel = Some("#other".into());
+        deliver_history_page(
+            &mut app,
+            "#room",
+            &[("n1", "mynick are you there"), ("n2", "chatter")],
+        );
+
+        assert_eq!(app.channels["#room"].unread, 0, "#306: manual dump counted");
+        assert!(app.dispatched_notifications.is_empty());
+        assert!(
+            app.channels["#room"]
+                .messages
+                .iter()
+                .any(|row| row.content == "chatter")
         );
     }
 }
