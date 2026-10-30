@@ -211,6 +211,10 @@ impl IrcMessage {
             "JOIN" | "PART" | "NICK" | "TOPIC" | "TAGMSG" | "MODE" | "AUTHENTICATE" | "ACCOUNT"
             | "SETNAME" | "MARKREAD" | "BATCH" => (1, 1),
             "KICK" | "INVITE" | "CAP" | "CHGHOST" | "REDACT" | "RENAME" | "RELOCATE" => (2, 2),
+            // FAIL/WARN/NOTE <command> <code> [<context>...] <description>:
+            // without the description, "last param" would reuse the code (or
+            // the command) as the description.
+            "FAIL" | "WARN" | "NOTE" => (3, 2),
             // CHATHISTORY TARGETS <target> <timestamp>
             "CHATHISTORY"
                 if params
@@ -1098,6 +1102,54 @@ mod tests {
         assert_eq!(
             join.command,
             IrcCommand::Join("#c".into(), None, None, None)
+        );
+    }
+
+    #[test]
+    fn standard_replies_without_a_description_are_not_given_a_fabricated_one() {
+        // #302: FAIL/WARN/NOTE need <command> <code> <description>. With only
+        // two parameters the code was reused as the description, and with one
+        // the command was.
+        for line in [
+            ":srv FAIL CHATHISTORY INVALID_TARGET",
+            ":srv WARN CHATHISTORY",
+            ":srv NOTE",
+            ":srv FAIL",
+            ":srv FAIL * :",
+            ":srv FAIL CHATHISTORY : desc",
+        ] {
+            let message = IrcMessage::parse(line).unwrap();
+            assert!(
+                matches!(message.command, IrcCommand::Raw(_)),
+                "{line:?} was typed as {:?}",
+                message.command
+            );
+            assert_eq!(message.raw, line);
+        }
+
+        // The smallest well-formed reply keeps the description, and an empty
+        // description is still the description rather than a missing one.
+        let note = IrcMessage::parse(":srv NOTE * REHASHED :config reloaded").unwrap();
+        assert_eq!(
+            note.command,
+            IrcCommand::StandardReply {
+                kind: "NOTE".into(),
+                command: "*".into(),
+                code: "REHASHED".into(),
+                context: Vec::new(),
+                description: "config reloaded".into(),
+            }
+        );
+        let one_context = IrcMessage::parse(":srv WARN CMD CODE ctx :why").unwrap();
+        assert_eq!(
+            one_context.command,
+            IrcCommand::StandardReply {
+                kind: "WARN".into(),
+                command: "CMD".into(),
+                code: "CODE".into(),
+                context: vec!["ctx".into()],
+                description: "why".into(),
+            }
         );
     }
 
