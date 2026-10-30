@@ -1339,6 +1339,7 @@ impl IrcApp {
         for channel in self.channels.values_mut() {
             channel.joined = false;
             channel.abandon_user_burst();
+            channel.abandon_mode_list_bursts();
         }
         self.channel_list_loading = false;
     }
@@ -1403,9 +1404,10 @@ impl IrcApp {
         self.monitored_users.clear();
         self.pending_whox.clear();
         self.next_whox_token = 1;
-        // A NAMES burst the old socket never finished.
+        // A NAMES burst or mode-list reply the old socket never finished.
         for channel in self.channels.values_mut() {
             channel.abandon_user_burst();
+            channel.abandon_mode_list_bursts();
         }
         // Keys of JOINs the old socket never confirmed: the new connection's
         // JOINs carry their own.
@@ -5226,28 +5228,7 @@ impl IrcApp {
                 {
                     let ts: u64 = ts_str.parse().unwrap_or(0);
                     if let Some(ch) = self.channel_mut(channel) {
-                        ch.upsert_mode_list_entry('b', mask.clone(), setter.clone(), ts);
-                        // Overlapping MODE +b requests can list the same mask
-                        // twice; a re-listed ban replaces its earlier entry
-                        // instead of accumulating duplicates.
-                        match ch
-                            .bans
-                            .iter()
-                            .position(|b| b.mask.eq_ignore_ascii_case(mask))
-                        {
-                            Some(slot) => {
-                                let existing = &mut ch.bans[slot];
-                                existing.set_by = setter.clone();
-                                existing.set_time = ts;
-                            }
-                            None => {
-                                ch.bans.push(BanEntry {
-                                    mask: mask.clone(),
-                                    set_by: setter.clone(),
-                                    set_time: ts,
-                                });
-                            }
-                        }
+                        ch.record_mode_list_reply('b', mask.clone(), setter.clone(), ts);
                     }
                 }
             }
@@ -5276,7 +5257,7 @@ impl IrcApp {
                         .and_then(|value| value.parse().ok())
                         .unwrap_or(0);
                     if let Some(ch) = self.channel_mut(channel) {
-                        ch.upsert_mode_list_entry(mode, mask.clone(), setter, set_time);
+                        ch.record_mode_list_reply(mode, mask.clone(), setter, set_time);
                     }
                 }
             }
@@ -5717,7 +5698,10 @@ impl IrcApp {
                     params.get(5),
                     params.get(6),
                     params.get(7),
-                ) && self.pending_whox.iter().any(|(pending, _)| pending == token)
+                ) && self
+                    .pending_whox
+                    .iter()
+                    .any(|(pending, _)| pending == token)
                 {
                     let account = if account == "0" || account == "*" {
                         None
@@ -5844,17 +5828,27 @@ impl IrcApp {
                             .and_then(|value| value.parse().ok())
                             .unwrap_or(0);
                         if let Some(ch) = self.channel_mut(channel) {
-                            ch.upsert_mode_list_entry(mode, mask.clone(), setter, set_time);
+                            ch.record_mode_list_reply(mode, mask.clone(), setter, set_time);
                         }
                     }
                 }
             }
 
             RPL_ENDOFQUIETLIST => {
+                // The end marker names its list like the entries do: either
+                // <me> <channel> :text or <me> <channel> <mode> :text.
+                let mode = params
+                    .get(2)
+                    .filter(|value| {
+                        value.chars().count() == 1
+                            && self.network_support.chanmodes_a.contains(*value)
+                    })
+                    .and_then(|value| value.chars().next())
+                    .unwrap_or('q');
                 if let Some(channel) = params.get(1)
                     && let Some(ch) = self.channel_mut(channel)
                 {
-                    ch.complete_mode_list('q');
+                    ch.complete_mode_list(mode);
                 }
             }
 
@@ -10414,6 +10408,78 @@ mod tests {
             &["account:*".into(), "*!*@bad.example".into()],
         );
         assert_eq!(app.channels["#room"].mode_lists[&'I'][0].mask, "account:*");
+    }
+
+    #[test]
+    fn relisting_a_mode_list_drops_entries_the_server_no_longer_has() {
+        // (list reply, end-of-list reply, list mode)
+        let lists = [
+            (RPL_BANLIST, RPL_ENDOFBANLIST, 'b'),
+            (RPL_INVITELIST, RPL_ENDOFINVITELIST, 'I'),
+            (RPL_EXCEPTLIST, RPL_ENDOFEXCEPTLIST, 'e'),
+            (RPL_QUIETLIST, RPL_ENDOFQUIETLIST, 'q'),
+        ];
+        for (entry, end, mode) in lists {
+            let mut app = test_app();
+            app.channels.insert("#room".into(), Channel::new());
+            let list = |app: &IrcApp| -> Vec<String> {
+                let channel = &app.channels["#room"];
+                let masks: Vec<String> = channel
+                    .mode_lists
+                    .get(&mode)
+                    .map(|entries| entries.iter().map(|e| e.mask.clone()).collect())
+                    .unwrap_or_default();
+                if mode == 'b' {
+                    let bans: Vec<String> = channel.bans.iter().map(|b| b.mask.clone()).collect();
+                    assert_eq!(bans, masks, "+{mode} mirror");
+                }
+                masks
+            };
+            let burst = |app: &mut IrcApp, masks: &[&str]| {
+                for mask in masks {
+                    app.handle_numeric(
+                        entry,
+                        &[
+                            "me".into(),
+                            "#room".into(),
+                            (*mask).into(),
+                            "op".into(),
+                            "100".into(),
+                        ],
+                    );
+                }
+                app.handle_numeric(end, &["me".into(), "#room".into()]);
+            };
+
+            burst(&mut app, &["a!*@*", "b!*@*"]);
+            assert_eq!(list(&app), ["a!*@*", "b!*@*"], "+{mode}");
+
+            // Another op removed b while we were away; the fresh listing is
+            // the whole truth, not an addition to what we remembered.
+            burst(&mut app, &["a!*@*"]);
+            assert_eq!(list(&app), ["a!*@*"], "+{mode}");
+
+            // An emptied list sends only the end marker.
+            burst(&mut app, &[]);
+            assert!(list(&app).is_empty(), "+{mode}");
+            assert!(app.channels["#room"].mode_lists_complete.contains(&mode));
+
+            // A listing cut off by a disconnect is not continued by the next.
+            burst(&mut app, &["a!*@*"]);
+            app.handle_numeric(
+                entry,
+                &[
+                    "me".into(),
+                    "#room".into(),
+                    "stale!*@*".into(),
+                    "op".into(),
+                    "100".into(),
+                ],
+            );
+            app.mark_connection_lost();
+            burst(&mut app, &["c!*@*"]);
+            assert_eq!(list(&app), ["c!*@*"], "+{mode}");
+        }
     }
 
     #[test]

@@ -866,6 +866,9 @@ pub struct Channel {
     /// dedicated ban fields remain for settings compatibility and common UI.
     pub mode_lists: HashMap<char, Vec<BanEntry>>,
     pub mode_lists_complete: HashSet<char>,
+    /// Lists whose server listing has begun but not yet reached its end
+    /// marker; the next entry of a list not in here starts a fresh listing.
+    mode_lists_receiving: HashSet<char>,
     pub read_marker: Option<String>,
     /// Whether chat history (from server or local log) has been loaded for this target.
     pub history_loaded: bool,
@@ -906,6 +909,7 @@ impl Channel {
             ban_list_complete: false,
             mode_lists: HashMap::new(),
             mode_lists_complete: HashSet::new(),
+            mode_lists_receiving: HashSet::new(),
             read_marker: None,
             history_loaded: false,
             joined: false,
@@ -989,8 +993,62 @@ impl Channel {
         }
     }
 
+    /// Record one entry of a server list reply (367, 346, 348, 728). The first
+    /// entry of a listing replaces whatever an earlier listing left behind, so
+    /// an entry another op removed while we were away does not linger; the
+    /// rest of the listing accumulates. `complete_mode_list` ends the listing.
+    pub fn record_mode_list_reply(
+        &mut self,
+        mode: char,
+        mask: String,
+        set_by: String,
+        set_time: u64,
+    ) {
+        if self.mode_lists_receiving.insert(mode) {
+            self.clear_mode_list(mode);
+        }
+        if mode == 'b' {
+            // Overlapping requests can list the same mask twice; a re-listed
+            // ban replaces its earlier entry instead of duplicating it.
+            match self
+                .bans
+                .iter()
+                .position(|entry| entry.mask.eq_ignore_ascii_case(&mask))
+            {
+                Some(slot) => {
+                    self.bans[slot].set_by = set_by.clone();
+                    self.bans[slot].set_time = set_time;
+                }
+                None => self.bans.push(BanEntry {
+                    mask: mask.clone(),
+                    set_by: set_by.clone(),
+                    set_time,
+                }),
+            }
+        }
+        self.upsert_mode_list_entry(mode, mask, set_by, set_time);
+    }
+
+    /// Mark a list fully received. An end marker with no entries before it is
+    /// the server saying the list is empty, which also supersedes our copy.
     pub fn complete_mode_list(&mut self, mode: char) {
+        if !self.mode_lists_receiving.remove(&mode) {
+            self.clear_mode_list(mode);
+        }
         self.mode_lists_complete.insert(mode);
+    }
+
+    /// Forget listings that will never reach their end marker (the connection
+    /// is gone), so the next listing starts fresh instead of continuing them.
+    pub fn abandon_mode_list_bursts(&mut self) {
+        self.mode_lists_receiving.clear();
+    }
+
+    fn clear_mode_list(&mut self, mode: char) {
+        self.mode_lists.remove(&mode);
+        if mode == 'b' {
+            self.bans.clear();
+        }
     }
 
     pub fn apply_mode_list_change(&mut self, sign: char, mode: char, mask: &str, setter: &str) {
