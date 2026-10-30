@@ -143,6 +143,10 @@ pub(crate) struct WindowManager {
     pub restore_match: Option<WindowKey>,
     /// Set when placement changed and layout.json should be rewritten.
     pub dirty: bool,
+    /// The chat area floating windows were last laid out in. When it
+    /// changes (the main window is resized, the switchbar wraps onto a
+    /// second line) the windows are scaled into the new area.
+    pub area: Option<Rect>,
 }
 
 impl WindowManager {
@@ -159,6 +163,7 @@ impl WindowManager {
             restore_active: layout.active,
             restore_match: None,
             dirty: false,
+            area: layout.area.map(rect_from_array),
         }
     }
 
@@ -248,6 +253,32 @@ impl WindowManager {
         self.apply_placements(rects);
     }
 
+    /// Lay floating windows out for the chat area `area`: when it differs
+    /// from the one they were placed in, scale every attached window's
+    /// rect proportionally, so a tiled layout stays tiled and nothing is
+    /// left off screen or overlapping after the area moves or resizes.
+    pub(crate) fn fit_to_area(&mut self, area: Rect) {
+        let Some(old) = self.area.replace(area) else {
+            return;
+        };
+        let moved =
+            (old.min - area.min).length() > 0.5 || (old.size() - area.size()).length() > 0.5;
+        if !moved || old.width() <= 0.0 || old.height() <= 0.0 {
+            return;
+        }
+        let scale = Vec2::new(area.width() / old.width(), area.height() / old.height());
+        for window in self.windows.iter_mut().filter(|w| !w.detached) {
+            let Some(rect) = window.child_rect else {
+                continue;
+            };
+            let min = area.min + (rect.min - old.min) * scale;
+            let fitted = Rect::from_min_size(min, rect.size() * scale);
+            window.child_rect = Some(fitted);
+            window.pending_place = Some(fitted);
+        }
+        self.dirty = true;
+    }
+
     fn attached_count(&self) -> usize {
         self.windows.iter().filter(|w| !w.detached).count()
     }
@@ -315,6 +346,7 @@ impl WindowManager {
             mode: self.mode,
             active,
             windows,
+            area: self.area.map(rect_to_array),
         }
     }
 }
@@ -408,6 +440,8 @@ pub(crate) struct LayoutFile {
     pub mode: LayoutMode,
     pub active: Option<PersistKey>,
     pub windows: Vec<SavedWindow>,
+    /// The chat area the floating windows were laid out in.
+    pub area: Option<[f32; 4]>,
 }
 
 impl LayoutFile {
@@ -621,6 +655,54 @@ mod tests {
         assert_eq!(layout.windows.len(), 1);
         assert_eq!(layout.windows[0].key.network, "tls://irc.example:6697");
         assert_eq!(layout.active, None);
+    }
+
+    #[test]
+    fn tiled_windows_are_rescaled_when_the_chat_area_changes() {
+        let mut manager = WindowManager::default();
+        manager.sync(vec![
+            present(1, "net", None),
+            present(1, "net", Some("#a")),
+            present(1, "net", Some("#b")),
+            present(1, "net", Some("#c")),
+        ]);
+        manager.fit_to_area(area());
+        manager.tile(area());
+        // The switchbar wraps (the area loses 22 points at the top) and the
+        // main window is made narrower.
+        let smaller = Rect::from_min_max(
+            area().min + Vec2::new(0.0, 22.0),
+            area().max - Vec2::new(200.0, 0.0),
+        );
+        manager.fit_to_area(smaller);
+        let rects: Vec<Rect> = manager
+            .windows
+            .iter()
+            .map(|w| w.pending_place.unwrap())
+            .collect();
+        for (i, a) in rects.iter().enumerate() {
+            assert!(
+                smaller.expand(0.01).contains_rect(*a),
+                "{a:?} outside {smaller:?}"
+            );
+            for b in &rects[i + 1..] {
+                assert!(!a.intersects(*b), "{a:?} overlaps {b:?}");
+            }
+        }
+        // Same area again: nothing to do.
+        for window in &mut manager.windows {
+            window.pending_place = None;
+        }
+        manager.fit_to_area(smaller);
+        assert!(manager.windows.iter().all(|w| w.pending_place.is_none()));
+    }
+
+    #[test]
+    fn the_layout_area_is_remembered_with_the_layout() {
+        let mut manager = WindowManager::default();
+        manager.fit_to_area(area());
+        let restored = WindowManager::from_layout(manager.layout());
+        assert_eq!(restored.area, Some(area()));
     }
 
     #[test]

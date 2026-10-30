@@ -129,6 +129,10 @@ pub struct App {
     /// A window that should take input focus once it exists (activated
     /// before its first sync, e.g. a query opened by /query).
     pending_focus: Option<WindowKey>,
+    /// The window a session's Channel List / Channel Info dialog was opened
+    /// from. When that window is detached, the dialogs show in its OS window
+    /// instead of the main one.
+    dialog_owner: HashMap<ConnId, WindowKey>,
 }
 
 impl App {
@@ -211,6 +215,7 @@ impl App {
             icon: None,
             restore_after_update: None,
             pending_focus: None,
+            dialog_owner: HashMap::new(),
         }
     }
 
@@ -1099,29 +1104,67 @@ impl App {
             // Live edits apply to every session while the dialog is open.
             self.push_config();
         }
-        for session in &mut self.sessions {
-            if session.show_channel_list {
-                session.show_channel_list_window(ctx);
+        for index in 0..self.sessions.len() {
+            let conn = self.sessions[index].id;
+            if self.detached_dialog_owner(conn).is_some() {
+                continue;
             }
-            if session.show_channel_info {
-                session.show_channel_info_window(ctx);
-            }
+            self.show_session_dialogs(ctx, index);
         }
         if let Some(target) = self.color_target.clone()
-            && let Some(index) = self.session_index(target.conn)
+            && !self.windows.get(&target).is_some_and(|w| w.detached)
         {
+            self.show_color_picker_for(ctx, &target);
+        }
+        if let Some(conn) = self.confirm_disconnect {
+            self.show_confirm_disconnect(ctx, conn);
+        }
+    }
+
+    /// The detached window a session's dialogs belong to, if any.
+    fn detached_dialog_owner(&self, conn: ConnId) -> Option<WindowKey> {
+        self.dialog_owner
+            .get(&conn)
+            .filter(|key| self.windows.get(key).is_some_and(|w| w.detached))
+            .cloned()
+    }
+
+    fn show_session_dialogs(&mut self, ctx: &egui::Context, index: usize) {
+        let session = &mut self.sessions[index];
+        if session.show_channel_list {
+            session.show_channel_list_window(ctx);
+        }
+        if session.show_channel_info {
+            session.show_channel_info_window(ctx);
+        }
+        if !session.show_channel_list && !session.show_channel_info {
+            self.dialog_owner.remove(&session.id);
+        }
+    }
+
+    /// The dialogs a detached window opened, drawn inside its OS window.
+    fn show_detached_window_dialogs(&mut self, ctx: &egui::Context, key: &WindowKey) {
+        if self.detached_dialog_owner(key.conn).as_ref() == Some(key)
+            && let Some(index) = self.session_index(key.conn)
+        {
+            self.show_session_dialogs(ctx, index);
+        }
+        if self.color_target.as_ref() == Some(key) {
+            self.show_color_picker_for(ctx, key);
+        }
+    }
+
+    fn show_color_picker_for(&mut self, ctx: &egui::Context, target: &WindowKey) {
+        if let Some(index) = self.session_index(target.conn) {
             if self.sessions[index].show_color_picker {
                 if let Some(code) = self.sessions[index].show_color_picker_window(ctx)
-                    && let Some(window) = self.windows.get_mut(&target)
+                    && let Some(window) = self.windows.get_mut(target)
                 {
                     window.view.input_text.push_str(&code);
                 }
             } else {
                 self.color_target = None;
             }
-        }
-        if let Some(conn) = self.confirm_disconnect {
-            self.show_confirm_disconnect(ctx, conn);
         }
     }
 
@@ -1452,6 +1495,9 @@ impl App {
     }
 
     fn draw_floating(&mut self, ctx: &egui::Context, area: egui::Rect) {
+        // Before any tile/cascade, so a placement made for this area is not
+        // rescaled again.
+        self.windows.fit_to_area(area);
         match self.tile_request.take() {
             Some(TileRequest::Tile) => self.windows.tile(area),
             Some(TileRequest::Cascade) => self.windows.cascade(area),
@@ -1624,6 +1670,7 @@ impl App {
                 egui::CentralPanel::default().show(ui, |ui| {
                     self.draw_window_contents(ui, &key);
                 });
+                self.show_detached_window_dialogs(ui.ctx(), &key);
                 (
                     close_requested,
                     is_focused,
@@ -1717,24 +1764,35 @@ impl App {
             return;
         };
         let session = &mut sessions[index];
-        let (changed_to, picker) = with_window_view(
+        let detached = window.detached;
+        let (changed_to, (picker, dialog)) = with_window_view(
             session,
             &mut window.view,
             command_history,
             &key.target,
             |s| {
-                let picker_before = s.show_color_picker;
+                let before = (
+                    s.show_color_picker,
+                    s.show_channel_list,
+                    s.show_channel_info,
+                );
                 s.draw_target(ui);
-                !picker_before && s.show_color_picker
+                (
+                    !before.0 && s.show_color_picker,
+                    (!before.1 && s.show_channel_list) || (!before.2 && s.show_channel_info),
+                )
             },
         );
         if picker {
             self.color_target = Some(key.clone());
-            // Dialogs belong to the main window: bring it forward when the
-            // picker is asked for from a detached window.
-            if self.windows.get(key).is_some_and(|w| w.detached) {
-                ui.ctx()
-                    .send_viewport_cmd_to(egui::ViewportId::ROOT, egui::ViewportCommand::Focus);
+        }
+        // A dialog asked for from this window (/list, the colour button)
+        // shows where the user is: in this window's OS window if detached.
+        if dialog {
+            if detached {
+                self.dialog_owner.insert(key.conn, key.clone());
+            } else {
+                self.dialog_owner.remove(&key.conn);
             }
         }
         if let Some(target) = changed_to {
@@ -3004,6 +3062,48 @@ mod tests {
         app.tray_hidden = false;
         let output = frame(&mut app, &ctx);
         assert!(texts(&output).iter().any(|t| t.contains("apt is fine")));
+    }
+
+    #[test]
+    fn a_dialog_asked_for_in_a_detached_window_belongs_to_that_window() {
+        let (mut app, _rx_a, _rx_b) = two_networks();
+        let debian = WindowKey::new(app.sessions[1].id, Some("#debian".into()));
+        app.toggle_detached(&debian);
+        {
+            let window = app.windows.get_mut(&debian).unwrap();
+            window.view.input_text = "/list".into();
+            window.view.input_focus_request = true;
+        }
+        let ctx = egui::Context::default();
+        frame(&mut app, &ctx);
+        frame(&mut app, &ctx);
+        assert!(app.windows.get(&debian).unwrap().view.input_had_focus);
+        // Enter in the detached window's input line.
+        ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1024.0, 768.0),
+                )),
+                events: vec![egui::Event::Key {
+                    key: egui::Key::Enter,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::NONE,
+                }],
+                ..Default::default()
+            },
+            |ui| app.ui(ui),
+        )
+        .textures_delta
+        .clear();
+        let index = app.session_index(debian.conn).unwrap();
+        assert!(app.sessions[index].show_channel_list, "/list was not run");
+        assert_eq!(app.detached_dialog_owner(debian.conn), Some(debian.clone()));
+        // Reattached: the dialogs go back to the main window.
+        app.toggle_detached(&debian);
+        assert_eq!(app.detached_dialog_owner(debian.conn), None);
     }
 
     #[test]
