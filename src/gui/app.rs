@@ -366,7 +366,11 @@ impl App {
     /// While the main window is minimized but detached windows are visible,
     /// eframe still runs frames; keep those windows alive and working.
     pub fn ui_detached_only(&mut self, ctx: &egui::Context) {
-        self.tick(ctx, false);
+        // The main window is minimized: only a detached window can have
+        // focus, and the main window's last reading must not linger.
+        self.focused = self.focused_detached.is_some();
+        // Detached windows are on screen, so this is a visible frame.
+        self.tick(ctx, true);
         self.draw_detached(ctx);
         self.finish_frame();
     }
