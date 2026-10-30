@@ -129,6 +129,9 @@ pub struct App {
     /// A window that should take input focus once it exists (activated
     /// before its first sync, e.g. a query opened by /query).
     pending_focus: Option<WindowKey>,
+    /// The detached windows were hidden because the main window was
+    /// minimized; they are shown again with it.
+    detached_hidden: bool,
     /// The window a session's Channel List / Channel Info dialog was opened
     /// from. When that window is detached, the dialogs show in its OS window
     /// instead of the main one.
@@ -216,6 +219,7 @@ impl App {
             restore_after_update: None,
             pending_focus: None,
             dialog_owner: HashMap::new(),
+            detached_hidden: false,
         }
     }
 
@@ -400,16 +404,46 @@ impl App {
         self.finish_frame();
     }
 
-    /// While the main window is minimized but detached windows are visible,
-    /// eframe still runs frames; keep those windows alive and working.
-    pub fn ui_detached_only(&mut self, ctx: &egui::Context) {
-        // The main window is minimized: only a detached window can have
-        // focus, and the main window's last reading must not linger.
-        self.focused = self.focused_detached.is_some();
-        // Detached windows are on screen, so this is a visible frame.
-        self.tick(ctx, true);
-        self.draw_detached(ctx);
-        self.finish_frame();
+    /// The main window is minimized: its detached windows go with it (as
+    /// owned windows do on Windows), and come back when it is restored.
+    /// eframe runs no ui pass for a minimized main window, and forcing one
+    /// would paint (present) a minimized window, which can block on Windows;
+    /// so the windows are hidden with a viewport command, which eframe also
+    /// applies on logic-only frames.
+    pub fn hide_detached_windows(&mut self, ctx: &egui::Context) {
+        if !self.detached_hidden {
+            for key in self.detached_keys() {
+                ctx.send_viewport_cmd_to(
+                    detached_viewport_id(&key),
+                    egui::ViewportCommand::Visible(false),
+                );
+            }
+            self.detached_hidden = true;
+        }
+        self.focused_detached = None;
+    }
+
+    /// A ui pass while the main window is minimized: the detached windows
+    /// are not drawn, so egui closes them; they reopen where they last were
+    /// when the main window is restored.
+    pub fn forget_detached_windows(&mut self) {
+        self.spawn_geometry.clear();
+        self.focused_detached = None;
+        self.detached_hidden = false;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn detached_windows_hidden(&self) -> bool {
+        self.detached_hidden
+    }
+
+    fn detached_keys(&self) -> Vec<WindowKey> {
+        self.windows
+            .windows
+            .iter()
+            .filter(|w| w.detached)
+            .map(|w| w.key.clone())
+            .collect()
     }
 
     /// Hidden or minimized with nothing to draw: drain every session so the
@@ -424,16 +458,6 @@ impl App {
         }
         self.tick(ctx, false);
         self.finish_frame();
-    }
-
-    fn has_detached(&self) -> bool {
-        self.windows.windows.iter().any(|w| w.detached)
-    }
-
-    /// Whether detached windows need frames while the main window is not
-    /// drawn (minimized, not hidden to the tray).
-    pub fn needs_detached_frames(&self) -> bool {
-        !self.tray_hidden && self.has_detached()
     }
 
     fn observe_root_input(&mut self, ctx: &egui::Context) {
@@ -1609,6 +1633,15 @@ impl App {
             .filter(|w| w.detached)
             .map(|w| w.key.clone())
             .collect();
+        if std::mem::take(&mut self.detached_hidden) {
+            // Back from a minimized main window.
+            for key in &keys {
+                ctx.send_viewport_cmd_to(
+                    detached_viewport_id(key),
+                    egui::ViewportCommand::Visible(true),
+                );
+            }
+        }
         let mut focused = None;
         let mut close = Vec::new();
         let mut reattach = Vec::new();
@@ -1798,6 +1831,14 @@ impl App {
         if let Some(target) = changed_to {
             self.user_activate(WindowKey::new(key.conn, target));
         }
+    }
+
+    /// Detach the first session's status window (tests outside this module).
+    #[cfg(test)]
+    pub(crate) fn detach_status_window_for_tests(&mut self) {
+        self.sync_windows();
+        let key = WindowKey::new(self.sessions[0].id, None);
+        self.toggle_detached(&key);
     }
 
     /// Submit a window's input line as if Enter was pressed in it.

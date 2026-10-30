@@ -363,7 +363,7 @@ src/
 Linefeed is designed for low resource usage:
 
 - **Adaptive refresh rate**: Reduces from 100ms to 500ms when idle
-- **Minimized optimization**: 1 second refresh when minimized
+- **Minimized optimization**: Nothing is drawn while minimized; connections are still serviced 4 times a second
 - **System tray mode**: Near-zero CPU when hidden to tray (Windows)
 - **Batch message processing**: Handles high-traffic events smoothly
 - **Efficiency Mode**: Uses Windows EcoQoS for power efficiency

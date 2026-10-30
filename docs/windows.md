@@ -43,9 +43,20 @@ window, or `/window detach`) to move it into its own OS window, for example
 onto another monitor. The detached window has its own topic, user list and
 input line; **Reattach** (or `/window attach`) puts it back.
 
-While Linefeed is minimized, detached windows stay open and usable. When
-Linefeed is hidden to the system tray (Windows), detached windows hide
-with it and come back where they were when it is restored.
+Detached windows minimize with the main window, and hide with it when it
+goes to the system tray (Windows). Restoring Linefeed, from the taskbar, the
+tray or by starting it again, brings them back where they were. Connections
+keep running throughout, so nothing is missed while they are away.
+
+Channel info, the channel list and the colour picker open inside the
+detached window they were asked for from. Settings and Connect belong to
+the whole application: asking for them from a detached window brings the
+main window forward with the dialog.
+
+In floating mode, child windows keep their place relative to the chat area:
+when the main window is resized, or the switchbar wraps onto another line,
+they move and resize with it instead of ending up under the switchbar or
+off-screen.
 
 ## Closing windows
 

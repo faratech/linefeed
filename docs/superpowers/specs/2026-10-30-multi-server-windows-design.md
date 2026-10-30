@@ -271,3 +271,21 @@ Recorded after building it, so the design and the code agree.
 - **Startup focus** starts on the first network; later selection changes are
   followed only for the active network (#290 keeps unsolicited JOINs from
   moving focus at all).
+- **Minimized, detached windows hide.** The plan kept detached windows
+  usable while the main window was minimized. eframe 0.37 runs only
+  `App::logic` for a minimized root, and forcing a ui pass
+  (`RequestPaintWhileHidden`) presents to the minimized window, which can
+  block on Windows. So `logic` ticks every connection and sends the detached
+  viewports `Visible(false)`; the next ui pass after a restore recreates them
+  from their saved geometry. Minimize-to-tray is also driven from `logic`,
+  with a posted `ShowWindowAsync`: a synchronous `ShowWindow` or
+  `GetWindowTextW` on our own window from inside eframe's event-loop
+  callback deadlocks.
+- **Dialogs follow the window that asked.** Channel info, the channel list
+  and the colour picker open in the detached OS window they were requested
+  from (`App::dialog_owner`, `App::color_target`). The global Settings and
+  Connect dialogs stay in the main window, which is brought forward.
+- **Floating windows follow the chat area.** `WindowManager::fit_to_area`
+  scales attached placements when the central area changes (window resize,
+  switchbar wrapping), and the area is saved in `layout.json` so a restart
+  at another size rescales too.
