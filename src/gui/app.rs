@@ -19,7 +19,9 @@ use super::windows::{
     ConnId, LayoutFile, LayoutMode, PersistKey, PresentWindow, TargetView, WindowKey,
     WindowManager,
 };
-use super::{ChatMessage, ServerFavorite, Session, SessionEvent, Settings, UpdateSession};
+use super::{
+    ChatMessage, ServerFavorite, Session, SessionEvent, Settings, UpdateSession, WindowCommand,
+};
 
 /// How long placement changes settle before layout.json is rewritten.
 const LAYOUT_SAVE_DELAY: Duration = Duration::from_secs(2);
@@ -511,9 +513,47 @@ impl App {
                         port,
                         use_tls,
                     } => self.open_server(&host, &port, use_tls),
+                    SessionEvent::Window { command, target } => {
+                        let key = WindowKey::new(self.sessions[index].id, target);
+                        self.window_command(command, key);
+                    }
                 }
             }
         }
+    }
+
+    /// `/window ...` typed in the window `key`.
+    pub(crate) fn window_command(&mut self, command: WindowCommand, key: WindowKey) {
+        match command {
+            WindowCommand::Tile => {
+                self.windows.mode = LayoutMode::Floating;
+                self.tile_request = Some(TileRequest::Tile);
+            }
+            WindowCommand::Cascade => {
+                self.windows.mode = LayoutMode::Floating;
+                self.tile_request = Some(TileRequest::Cascade);
+            }
+            WindowCommand::Maximize => self.windows.mode = LayoutMode::Maximized,
+            WindowCommand::Restore => self.windows.mode = LayoutMode::Floating,
+            WindowCommand::Detach => {
+                if self.windows.get(&key).is_some_and(|w| !w.detached) {
+                    self.toggle_detached(&key);
+                }
+            }
+            WindowCommand::Attach => {
+                if self.windows.get(&key).is_some_and(|w| w.detached) {
+                    self.toggle_detached(&key);
+                }
+            }
+            WindowCommand::Close => self.request_close(key),
+            WindowCommand::New => {
+                let index = self.add_session();
+                self.sessions[index].show_connect_dialog = true;
+                let key = WindowKey::new(self.sessions[index].id, None);
+                self.activate(key);
+            }
+        }
+        self.windows.dirty = true;
     }
 
     /// `/server -m`: connect to an endpoint in a new status window.
@@ -1894,6 +1934,43 @@ mod tests {
         feed(&mut app, 0, ":me!u@h PART #rust");
         app.sync_windows();
         assert!(app.windows.get(&key).is_none());
+    }
+
+    #[test]
+    fn window_commands_arrange_detach_and_close_the_window_they_are_typed_in() {
+        let (mut app, mut rx_a, _rx_b) = two_networks();
+        let rust = WindowKey::new(app.sessions[0].id, Some("#rust".into()));
+        app.activate(rust.clone());
+        app.windows.get_mut(&rust).unwrap().view.input_text = "/window detach".into();
+        app.submit_window_input(&rust);
+        app.process_events();
+        assert!(app.windows.get(&rust).unwrap().detached);
+
+        app.windows.get_mut(&rust).unwrap().view.input_text = "/window attach".into();
+        app.submit_window_input(&rust);
+        app.process_events();
+        assert!(!app.windows.get(&rust).unwrap().detached);
+
+        app.sessions[0].process_command("/window tile");
+        app.process_events();
+        assert_eq!(app.windows.mode, LayoutMode::Floating);
+        app.sessions[0].process_command("/window max");
+        app.process_events();
+        assert_eq!(app.windows.mode, LayoutMode::Maximized);
+
+        app.windows.get_mut(&rust).unwrap().view.input_text = "/window close".into();
+        app.submit_window_input(&rust);
+        app.process_events();
+        assert_eq!(drain(&mut rx_a), ["PART #rust"]);
+
+        let before = app.sessions.len();
+        app.sessions[0].process_command("/window new");
+        app.process_events();
+        assert_eq!(app.sessions.len(), before + 1);
+        assert!(app.sessions.last().unwrap().show_connect_dialog);
+
+        app.sessions[0].process_command("/window sideways");
+        assert!(app.sessions[0].events.is_empty());
     }
 
     #[test]

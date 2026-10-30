@@ -27,6 +27,35 @@ use types::{CtcpReplyDecision, CtcpReplyLimiter};
 pub use app::App;
 pub(crate) use app::MAIN_WINDOW_TITLE;
 
+/// `/window` subcommands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WindowCommand {
+    Tile,
+    Cascade,
+    Maximize,
+    Restore,
+    Detach,
+    Attach,
+    Close,
+    New,
+}
+
+impl WindowCommand {
+    pub(crate) fn parse(word: &str) -> Option<Self> {
+        Some(match word {
+            "tile" => Self::Tile,
+            "cascade" => Self::Cascade,
+            "max" | "maximize" => Self::Maximize,
+            "restore" | "float" => Self::Restore,
+            "detach" => Self::Detach,
+            "attach" | "reattach" => Self::Attach,
+            "close" => Self::Close,
+            "new" => Self::New,
+            _ => return None,
+        })
+    }
+}
+
 /// Requests a session makes of the App, drained every frame. A session never
 /// reaches the App directly: notifications, settings and new connections are
 /// global, so they go through here.
@@ -48,6 +77,11 @@ pub(crate) enum SessionEvent {
     /// Persist this session's auto-perform list (`/perform`), not the rest
     /// of its connect form (#316).
     SaveAutoPerform,
+    /// `/window ...`, typed in the window showing `target`.
+    Window {
+        command: WindowCommand,
+        target: Option<String>,
+    },
     /// `/server -m`: connect to an endpoint in a new status window.
     NewServer {
         host: String,
@@ -343,6 +377,7 @@ const COMMAND_COMPLETIONS: &[&str] = &[
     "/version",
     "/verify",
     "/webpush",
+    "/window",
     "/voice",
     "/wallchops",
     "/wallops",

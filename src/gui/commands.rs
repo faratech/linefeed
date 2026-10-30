@@ -1,7 +1,7 @@
 //! IRC command processing and help system
 
 use super::helpers::{is_extended_ban, mask_matches, nick_to_mask};
-use super::{ChatMessage, Session, SessionEvent};
+use super::{ChatMessage, Session, SessionEvent, WindowCommand};
 use crate::irc::IrcCommand;
 
 impl Session {
@@ -2071,6 +2071,19 @@ impl Session {
                 }
             }
 
+            "WINDOW" => {
+                let action = args.trim().to_ascii_lowercase();
+                match WindowCommand::parse(&action) {
+                    Some(command) => self.events.push(SessionEvent::Window {
+                        command,
+                        target: self.current_channel.clone(),
+                    }),
+                    None => self.add_message_to_current(ChatMessage::system(
+                        "Usage: /window tile|cascade|max|restore|detach|attach|close|new",
+                    )),
+                }
+            }
+
             "SETTINGS" => {
                 self.events.push(SessionEvent::OpenSettings);
             }
@@ -2538,6 +2551,7 @@ impl Session {
                     "/server <host> [[+]port] - Connect to a server (saved settings unchanged)",
                     "  Port 6697 or +port (e.g. +7000) uses TLS, ports 6660-6669 plain text;",
                     "  any other port (or no port) keeps the current TLS setting",
+                    "/server -m <host> [[+]port] - Connect to another server in a new status window",
                     "/disconnect         - Disconnect",
                     "/reconnect          - Reconnect",
                     "/away [message]     - Set away message",
@@ -2609,10 +2623,22 @@ impl Session {
                 ],
             ),
             (
+                "=== Windows ===",
+                vec![
+                    "/window tile|cascade - Arrange the windows side by side or stacked",
+                    "/window max|restore  - One window at a time, or all side by side",
+                    "/window detach|attach - Move this window into its own OS window and back",
+                    "/window close       - Close this window (parts a channel)",
+                    "/window new         - Open a status window for another server",
+                ],
+            ),
+            (
                 "=== Shortcuts ===",
                 vec![
-                    "Alt+1-9             - Switch tabs",
-                    "Ctrl+W              - Close tab",
+                    "Alt+1-9             - Switch windows",
+                    "Ctrl+Tab            - Next window (Ctrl+Shift+Tab: previous)",
+                    "Ctrl+M              - Maximize / restore the windows",
+                    "Ctrl+W              - Close window",
                     "Up/Down             - Command history",
                     "Tab                 - Nick completion",
                 ],
