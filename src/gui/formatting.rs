@@ -459,7 +459,24 @@ struct SpanBreak {
     reset: bool,
 }
 
+/// Lower-case ASCII only: URL schemes and `www.` host labels are
+/// case-insensitive (RFC 3986), so they are matched with the helpers below.
 const URL_PREFIXES: [&str; 3] = ["http://", "https://", "www."];
+
+fn starts_with_ignore_ascii_case(text: &str, prefix: &str) -> bool {
+    text.as_bytes()
+        .get(..prefix.len())
+        .is_some_and(|head| head.eq_ignore_ascii_case(prefix.as_bytes()))
+}
+
+/// Byte offset of the first case-insensitive occurrence of the ASCII
+/// `prefix`. An ASCII match never starts or ends inside a multi-byte
+/// character, so the offset is always a valid `str` index.
+fn find_ignore_ascii_case(text: &str, prefix: &str) -> Option<usize> {
+    text.as_bytes()
+        .windows(prefix.len())
+        .position(|window| window.eq_ignore_ascii_case(prefix.as_bytes()))
+}
 
 /// A character that may continue a URL across a formatting control. Stricter
 /// than what a plain run of text may hold (`url_length`): a control is no
@@ -499,7 +516,9 @@ fn url_plain_char(c: char) -> bool {
 fn break_ends_url(rest: &str, brk: &SpanBreak) -> bool {
     brk.reset
         || !rest.chars().next().is_some_and(url_plain_char)
-        || URL_PREFIXES.iter().any(|prefix| rest.starts_with(prefix))
+        || URL_PREFIXES
+            .iter()
+            .any(|prefix| starts_with_ignore_ascii_case(rest, prefix))
 }
 
 /// Byte length of the URL at the start of `text` (which begins at offset
@@ -556,7 +575,7 @@ fn find_urls(text: &str, breaks: &[SpanBreak]) -> Vec<(usize, usize)> {
 
         for prefix in &URL_PREFIXES {
             let mut search_from = from;
-            while let Some(rel) = text[search_from..].find(prefix) {
+            while let Some(rel) = find_ignore_ascii_case(&text[search_from..], prefix) {
                 let pos = search_from + rel;
                 let at_word_start = pos == 0
                     || breaks.binary_search_by_key(&pos, |brk| brk.at).is_ok()
@@ -690,6 +709,15 @@ pub fn layout_irc_text(text: &str) -> Vec<RenderSegment> {
     segments
 }
 
+/// The address a link segment opens: a bare `www.` host gets an https scheme.
+fn link_target(text: &str) -> String {
+    if starts_with_ignore_ascii_case(text, "www.") {
+        format!("https://{text}")
+    } else {
+        text.to_string()
+    }
+}
+
 /// Render pre-parsed segments (see `layout_irc_text`).
 pub fn render_segments(ui: &mut egui::Ui, segments: &[RenderSegment], default_color: Color32) {
     ui.horizontal_wrapped(|ui| {
@@ -705,11 +733,7 @@ pub fn render_segments(ui: &mut egui::Ui, segments: &[RenderSegment], default_co
 
             if span.is_url {
                 // Render as clickable hyperlink
-                let url = if span.text.starts_with("www.") {
-                    format!("https://{}", span.text)
-                } else {
-                    span.text.clone()
-                };
+                let url = link_target(&span.text);
                 ui.hyperlink_to(
                     RichText::new(&span.text)
                         .color(Color32::from_rgb(100, 150, 255))
@@ -1029,6 +1053,42 @@ mod tests {
             urls_in("https://a.testhttps://b.test"),
             ["https://a.testhttps://b.test"]
         );
+    }
+
+    #[test]
+    fn url_schemes_and_www_prefixes_match_in_any_letter_case() {
+        // RFC 3986 schemes and host names are case-insensitive (#294).
+        for (text, expected) in [
+            ("HTTPS://EXAMPLE.COM/path", "HTTPS://EXAMPLE.COM/path"),
+            ("Https://example.com", "Https://example.com"),
+            ("see HTTP://Example.com/x now", "HTTP://Example.com/x"),
+            ("WWW.EXAMPLE.COM", "WWW.EXAMPLE.COM"),
+            ("go to Www.Example.com.", "Www.Example.com"),
+            ("(HTTPS://EXAMPLE.COM)", "HTTPS://EXAMPLE.COM"),
+        ] {
+            assert_eq!(urls_in(text), [expected], "{text}");
+        }
+        // The word-boundary rule still applies to every case.
+        assert!(urls_in("aWWW.so cute").is_empty());
+        assert!(urls_in("SeeHTTPS://a.test").is_empty());
+        // A bare prefix is still not a link.
+        assert!(urls_in("HTTPS:// or WWW.").is_empty());
+        // A control before a new upper-case prefix still starts a new link.
+        assert_eq!(
+            urls_in("\x02https://a.test\x02\x1FHTTPS://b.test"),
+            ["https://a.test", "HTTPS://b.test"]
+        );
+        // Non-ASCII text next to a match does not disturb the byte offsets.
+        assert_eq!(urls_in("é HTTPS://É.test ü"), ["HTTPS://É.test"]);
+    }
+
+    #[test]
+    fn bare_www_links_open_with_an_https_scheme_in_any_letter_case() {
+        assert_eq!(link_target("www.example.com"), "https://www.example.com");
+        assert_eq!(link_target("WWW.EXAMPLE.COM"), "https://WWW.EXAMPLE.COM");
+        assert_eq!(link_target("Www.example.com"), "https://Www.example.com");
+        assert_eq!(link_target("HTTPS://EXAMPLE.COM"), "HTTPS://EXAMPLE.COM");
+        assert_eq!(link_target("http://a.test"), "http://a.test");
     }
 
     #[test]
