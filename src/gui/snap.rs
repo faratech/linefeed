@@ -174,7 +174,7 @@ pub(crate) fn maximize_button_id(key: &WindowKey) -> Id {
     Id::unique(("linefeed_snap_maximize", key.conn, key.target.clone()))
 }
 
-fn close_button_id(key: &WindowKey) -> Id {
+pub(crate) fn close_button_id(key: &WindowKey) -> Id {
     Id::unique(("linefeed_snap_close", key.conn, key.target.clone()))
 }
 
