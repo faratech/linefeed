@@ -199,7 +199,48 @@ impl IrcMessage {
         params
     }
 
+    /// Whether `params` carries what the typed form of `cmd` needs. Required
+    /// identity parameters (target, channel, nick, ...) must be present and
+    /// non-empty; message text may legitimately be empty. Commands that are
+    /// not listed have no required parameters. PING/PONG stay lenient: a bare
+    /// PING is still answered with an empty token rather than ignored.
+    fn has_required_params(cmd: &str, params: &[String]) -> bool {
+        // (parameters that must be present, leading ones that must be non-empty)
+        let (present, named) = match cmd {
+            "PRIVMSG" | "NOTICE" | "WALLCHOPS" | "WALLHOPS" | "WALLVOICES" => (2, 1),
+            "JOIN" | "PART" | "NICK" | "TOPIC" | "TAGMSG" | "MODE" | "AUTHENTICATE" | "ACCOUNT"
+            | "SETNAME" | "MARKREAD" | "BATCH" => (1, 1),
+            "KICK" | "INVITE" | "CAP" | "CHGHOST" | "REDACT" | "RENAME" | "RELOCATE" => (2, 2),
+            // CHATHISTORY TARGETS <target> <timestamp>
+            "CHATHISTORY"
+                if params
+                    .first()
+                    .is_some_and(|p| p.eq_ignore_ascii_case("TARGETS")) =>
+            {
+                (3, 3)
+            }
+            _ => (0, 0),
+        };
+        params.len() >= present && params[..named].iter().all(|param| !param.is_empty())
+    }
+
+    /// The untyped form of a command line, for unknown commands and for known
+    /// commands that arrive without the parameters they require.
+    fn raw_command(cmd: &str, params: &[String]) -> IrcCommand {
+        if params.is_empty() {
+            IrcCommand::Raw(cmd.to_string())
+        } else {
+            IrcCommand::Raw(format!("{} {}", cmd, params.join(" ")))
+        }
+    }
+
     fn parse_command(cmd: &str, params: Vec<String>) -> IrcCommand {
+        // A line missing required parameters must not become a typed command
+        // with fabricated empty targets (phantom tabs, a rename to "", a
+        // false logout); it stays raw and is shown as-is.
+        if !Self::has_required_params(cmd, &params) {
+            return Self::raw_command(cmd, &params);
+        }
         match cmd {
             "PING" => IrcCommand::Ping(params.first().cloned().unwrap_or_default()),
             "PONG" => IrcCommand::Pong(params.first().cloned().unwrap_or_default()),
@@ -267,9 +308,7 @@ impl IrcMessage {
             ),
             "AUTHENTICATE" => IrcCommand::Authenticate(params.first().cloned().unwrap_or_default()),
             // IRCv3 account-notify
-            "ACCOUNT" => {
-                IrcCommand::Account(params.first().cloned().unwrap_or_else(|| "*".to_string()))
-            }
+            "ACCOUNT" => IrcCommand::Account(params.first().cloned().unwrap_or_default()),
             // IRCv3 chghost
             "CHGHOST" => IrcCommand::Chghost(
                 params.first().cloned().unwrap_or_default(),
@@ -335,7 +374,7 @@ impl IrcMessage {
                 if let Ok(num) = cmd.parse::<u16>() {
                     IrcCommand::Numeric(num, params)
                 } else {
-                    IrcCommand::Raw(format!("{} {}", cmd, params.join(" ")))
+                    Self::raw_command(cmd, &params)
                 }
             }
         }
@@ -971,6 +1010,71 @@ mod tests {
         assert_eq!(message.get_account().as_deref(), Some("alice"));
         assert_eq!(message.get_oper().as_deref(), Some("netadmin"));
         assert_eq!(message.get_reply().as_deref(), Some("prior"));
+    }
+
+    #[test]
+    fn commands_missing_required_parameters_are_not_given_fabricated_values() {
+        // #283: a hostile server or bouncer must not be able to mint empty
+        // targets, channels, nicks or a bare "logged out" ACCOUNT by omitting
+        // the parameters the typed command needs.
+        for line in [
+            ":evil PRIVMSG",
+            ":evil PRIVMSG #c",
+            ":evil PRIVMSG :",
+            ":evil PRIVMSG : text",
+            ":evil NOTICE",
+            ":evil NOTICE me",
+            ":evil WALLCHOPS #c",
+            ":evil TAGMSG",
+            ":evil JOIN",
+            ":evil JOIN :",
+            ":evil PART",
+            ":n!u@h NICK",
+            ":n!u@h NICK :",
+            ":evil TOPIC",
+            ":evil KICK",
+            ":evil KICK #c",
+            ":evil KICK #c :",
+            ":evil INVITE me",
+            ":evil MODE",
+            ":evil CAP",
+            ":evil CAP *",
+            ":evil CAP * :",
+            ":n!u@h ACCOUNT",
+            ":n!u@h ACCOUNT :",
+            ":n!u@h CHGHOST newuser",
+            ":n!u@h SETNAME",
+            ":evil BATCH",
+            ":evil MARKREAD",
+            ":evil REDACT #c",
+            ":evil RENAME #old",
+            ":evil RELOCATE #old",
+            ":evil CHATHISTORY TARGETS #c",
+        ] {
+            let message = IrcMessage::parse(line).unwrap();
+            assert!(
+                matches!(message.command, IrcCommand::Raw(_)),
+                "{line:?} was typed as {:?}",
+                message.command
+            );
+            // The original line stays available for the server buffer.
+            assert_eq!(message.raw, line);
+        }
+
+        // Complete lines, including the legitimately empty optional/text
+        // parameters, keep their typed form.
+        let account = IrcMessage::parse(":n!u@h ACCOUNT *").unwrap();
+        assert_eq!(account.command, IrcCommand::Account("*".into()));
+        let clear_topic = IrcMessage::parse(":n!u@h TOPIC #c :").unwrap();
+        assert_eq!(
+            clear_topic.command,
+            IrcCommand::Topic("#c".into(), Some(String::new()))
+        );
+        let join = IrcMessage::parse(":n!u@h JOIN :#c").unwrap();
+        assert_eq!(
+            join.command,
+            IrcCommand::Join("#c".into(), None, None, None)
+        );
     }
 
     #[test]
