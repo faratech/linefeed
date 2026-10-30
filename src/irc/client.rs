@@ -436,6 +436,18 @@ fn outbound_line(cmd: &IrcCommand) -> String {
     }
 }
 
+/// Build the PONG answering a server PING. The token is server-controlled and
+/// echoed verbatim, so CR, LF and NUL are dropped: a bare CR is a line
+/// terminator to some peers (bouncers, lax parsers), which would turn the tail
+/// of the token into a second command sent as this client (#281).
+fn pong_line(token: &str) -> String {
+    let token: String = token
+        .chars()
+        .filter(|c| !matches!(c, '\r' | '\n' | '\0'))
+        .collect();
+    format!("PONG :{token}\r\n")
+}
+
 /// Consume the complete line in `buf`: parse it, forward a copy to the GUI,
 /// and transparently answer a server PING (which can arrive mid-handshake,
 /// before the writer task that normally handles them exists). PINGs and
@@ -459,8 +471,7 @@ where
     match IrcMessage::parse(&trimmed) {
         Some(msg) => {
             if let IrcCommand::Ping(token) = &msg.command {
-                let pong = format!("PONG :{}\r\n", token);
-                writer.write_all(pong.as_bytes()).await?;
+                writer.write_all(pong_line(token).as_bytes()).await?;
                 writer.flush().await?;
             }
             incoming_tx
@@ -1232,9 +1243,7 @@ impl IrcClient {
                 continue;
             };
             if let IrcCommand::Ping(token) = message.command {
-                writer
-                    .write_all(format!("PONG :{token}\r\n").as_bytes())
-                    .await?;
+                writer.write_all(pong_line(&token).as_bytes()).await?;
                 writer.flush().await?;
                 continue;
             }
@@ -2497,13 +2506,11 @@ impl IrcClient {
                                 // (instead of try_send) means a saturated writer
                                 // queue delays the PONG rather than silently
                                 // dropping it and risking a server ping-timeout.
-                                if let IrcCommand::Ping(server) = &msg.command {
-                                    let pong = format!("PONG :{}\r\n", server);
-                                    if let Some(ref tx) = self.tx
-                                        && tx.send(pong).await.is_err()
-                                    {
-                                        tracing::warn!("Writer task gone; cannot send PONG");
-                                    }
+                                if let IrcCommand::Ping(server) = &msg.command
+                                    && let Some(ref tx) = self.tx
+                                    && tx.send(pong_line(server)).await.is_err()
+                                {
+                                    tracing::warn!("Writer task gone; cannot send PONG");
                                 }
                                 // Awaiting send applies backpressure (and naturally throttles
                                 // our socket reads) instead of silently dropping messages when
@@ -3017,6 +3024,76 @@ mod tests {
             assert_eq!(port, Some(6697));
             assert!(pending.is_empty());
             server.await.unwrap();
+        });
+    }
+
+    /// A PING whose token smuggles a second command after a bare CR (#281).
+    const CR_INJECTION_PING: &str = ":srv PING :token\rOPER attacker password\r\n";
+    /// The only PONG that is safe to send for it: one line, no interior CR.
+    const SANITIZED_PONG: &[u8] = b"PONG :tokenOPER attacker password\r\n";
+
+    #[test]
+    fn handshake_pong_does_not_reflect_a_carriage_return_from_the_ping_token() {
+        test_runtime().block_on(async {
+            let (incoming_tx, _incoming_rx) = mpsc::channel(10);
+            let mut buf = CR_INJECTION_PING.as_bytes().to_vec();
+            let mut written = Vec::new();
+            handle_handshake_line(&mut written, &mut buf, &incoming_tx)
+                .await
+                .unwrap();
+            assert_eq!(written, SANITIZED_PONG);
+        });
+    }
+
+    #[test]
+    fn read_loop_pong_does_not_reflect_a_carriage_return_from_the_ping_token() {
+        test_runtime().block_on(async {
+            let mut client = IrcClient::new(ServerConfig::default());
+            let (send_tx, mut send_rx) = mpsc::channel(10);
+            client.tx = Some(send_tx);
+            let (msg_tx, _msg_rx) = mpsc::channel(10);
+            client.read_loop(CR_INJECTION_PING.as_bytes(), msg_tx).await;
+            let pong = send_rx.try_recv().expect("PING went unanswered");
+            assert_eq!(pong.as_bytes(), SANITIZED_PONG);
+        });
+    }
+
+    #[test]
+    fn sts_probe_pong_does_not_reflect_a_carriage_return_from_the_ping_token() {
+        test_runtime().block_on(async {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                let (read_half, mut write_half) = stream.into_split();
+                let mut reader = BufReader::new(read_half);
+                assert_eq!(read_wire_line(&mut reader).await, "CAP LS 302");
+                write_half
+                    .write_all(CR_INJECTION_PING.as_bytes())
+                    .await
+                    .unwrap();
+                let mut pong = Vec::new();
+                reader.read_until(b'\n', &mut pong).await.unwrap();
+                write_half
+                    .write_all(b":srv CAP * LS :sts=port=6697\r\n")
+                    .await
+                    .unwrap();
+                pong
+            });
+            let (incoming_tx, _incoming_rx) = mpsc::channel(1);
+            let (_outgoing_tx, mut outgoing_rx) = mpsc::unbounded_channel();
+            let mut pending = VecDeque::new();
+            let port = IrcClient::probe_sts_upgrade(
+                "127.0.0.1",
+                address.port(),
+                &incoming_tx,
+                &mut outgoing_rx,
+                &mut pending,
+            )
+            .await
+            .unwrap();
+            assert_eq!(port, Some(6697));
+            assert_eq!(server.await.unwrap(), SANITIZED_PONG);
         });
     }
 
