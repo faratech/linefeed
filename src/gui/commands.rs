@@ -87,6 +87,16 @@ impl IrcApp {
                         (self.current_channel.clone(), Some(args.to_string()))
                     }
                 };
+                let channel = match channel {
+                    // A query tab: current_channel holds the partner's nick,
+                    // and PART <nick> is a server error. Close it locally,
+                    // as closing the tab does (#293).
+                    Some(target) if !self.is_channel_name(&target) => {
+                        self.close_tab(&target);
+                        None
+                    }
+                    other => other,
+                };
                 if let Some(ch) = channel {
                     // Inline reason wins, else the configured part message (if any).
                     let reason = inline_reason.or_else(|| {
@@ -2913,7 +2923,12 @@ mod tests {
     use tokio::sync::mpsc;
 
     fn connected_command_app() -> (IrcApp, mpsc::UnboundedReceiver<IrcCommand>) {
-        let mut app = IrcApp::with_settings(crate::gui::Settings::default());
+        // Logging off: query tabs opened by a test must not write chat logs
+        // under the real config directory.
+        let mut app = IrcApp::with_settings(crate::gui::Settings {
+            logging_enabled: false,
+            ..crate::gui::Settings::default()
+        });
         let (tx, rx) = mpsc::unbounded_channel();
         app.cmd_tx = Some(tx);
         app.connected = true;
@@ -3483,6 +3498,46 @@ mod tests {
             rx.try_recv().unwrap(),
             IrcCommand::Part("#room".into(), Some("gone   fishing".into()))
         );
+    }
+
+    #[test]
+    fn part_in_a_query_tab_closes_the_tab_locally_without_sending_part() {
+        // current_channel holds the partner's nick in a query tab; PART <nick>
+        // is a server error and left the tab open (#293).
+        let (mut app, mut rx) = connected_command_app();
+        app.channels.insert("#room".into(), Channel::new());
+        for input in ["/part", "/part bye", "/leave"] {
+            assert!(app.open_query("bob"), "{input}");
+            assert_eq!(app.current_channel.as_deref(), Some("bob"));
+            app.process_command(input);
+            assert!(rx.try_recv().is_err(), "{input} must not send PART bob");
+            assert!(
+                !app.channels.contains_key("bob"),
+                "{input} closes the query tab"
+            );
+            assert_ne!(app.current_channel.as_deref(), Some("bob"), "{input}");
+        }
+
+        // Disconnected the outcome is the same, and other tabs survive.
+        app.cmd_tx = None;
+        app.connected = false;
+        assert!(app.open_query("carol"));
+        app.process_command("/part");
+        assert!(!app.channels.contains_key("carol"));
+        assert!(app.channels.contains_key("#room"));
+
+        // An explicit channel still parts for real from inside a query.
+        let (mut app, mut rx) = connected_command_app();
+        let mut room = Channel::new();
+        room.joined = true;
+        app.channels.insert("#room".into(), room);
+        assert!(app.open_query("bob"));
+        app.process_command("/part #room later");
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            IrcCommand::Part("#room".into(), Some("later".into()))
+        );
+        assert!(app.channels.contains_key("bob"), "the query tab stays");
     }
 
     #[test]
