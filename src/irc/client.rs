@@ -488,6 +488,24 @@ where
     }
 }
 
+/// The reason carried by a server `ERROR` message (possibly empty), or `None`
+/// for any other message. `ERROR` announces that the server is closing the
+/// link; the message layer has no variant for it, so it is recognised from the
+/// raw line (after any tags and prefix).
+fn server_error_reason(msg: &IrcMessage) -> Option<&str> {
+    let mut rest = msg.raw.trim_start();
+    for marker in ['@', ':'] {
+        if rest.starts_with(marker) {
+            rest = rest.split_once(' ')?.1.trim_start();
+        }
+    }
+    let (command, params) = rest.split_once(' ').unwrap_or((rest, ""));
+    let params = params.trim();
+    command
+        .eq_ignore_ascii_case("ERROR")
+        .then(|| params.strip_prefix(':').unwrap_or(params))
+}
+
 /// Read the next protocol message of interest during the registration
 /// handshake (see `handle_handshake_line`). Returns `None` when the per-step
 /// budget expires with nothing received.
@@ -533,6 +551,19 @@ where
         }
         // PING answered (or junk line skipped): re-arm a fresh budget.
         if let Some(msg) = handle_handshake_line(writer, buf, incoming_tx).await? {
+            // ERROR is terminal. Every registration state machine reads
+            // through here, so failing here ends all of them at once instead
+            // of letting them wait out their timeouts, or send CAP END /
+            // AUTHENTICATE * / the next SASL mechanism, on a dead link (#299).
+            // The line was already forwarded to the GUI above.
+            if let Some(reason) = server_error_reason(&msg) {
+                let reason = if reason.is_empty() {
+                    "no reason given"
+                } else {
+                    reason
+                };
+                return Err(format!("Server sent ERROR during registration: {reason}").into());
+            }
             return Ok(Some(msg));
         }
     }
@@ -4150,6 +4181,124 @@ mod tests {
             .await;
             assert_eq!(result, Ok(()));
         });
+    }
+
+    const THROTTLE_ERROR: &[u8] =
+        b"ERROR :Closing Link: 127.0.0.1 (Throttled: Reconnecting too fast)\r\n";
+
+    /// Send a terminal ERROR and keep the socket open, as throttling ircds
+    /// do. The client must give up on its own, writing nothing further (no
+    /// CAP END, no AUTHENTICATE *, no next SASL mechanism): the next read
+    /// only ends when the client closes its end.
+    async fn send_error_and_expect_silence(
+        reader: &mut BufReader<tokio::net::tcp::OwnedReadHalf>,
+        writer: &mut tokio::net::tcp::OwnedWriteHalf,
+    ) {
+        writer.write_all(THROTTLE_ERROR).await.unwrap();
+        assert_eq!(
+            read_wire_line(reader).await,
+            "",
+            "client kept talking to a server that sent ERROR"
+        );
+    }
+
+    fn assert_fails_with_throttle_reason(result: Result<(), String>) {
+        let error = result.expect_err("registration must fail on a terminal ERROR");
+        assert!(
+            error.contains("Throttled: Reconnecting too fast"),
+            "the server's reason was lost: {error}"
+        );
+    }
+
+    #[test]
+    fn error_while_awaiting_cap_ls_fails_registration_with_the_servers_reason() {
+        test_runtime().block_on(async {
+            // #299: this used to wait out the step timeout / 60 s deadline.
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let config = cap_ack_test_config(listener.local_addr().unwrap().port());
+            let result = connect_with_script(config, listener, async |mut reader, mut writer| {
+                send_error_and_expect_silence(&mut reader, &mut writer).await;
+            })
+            .await;
+            assert_fails_with_throttle_reason(result);
+        });
+    }
+
+    #[test]
+    fn error_while_awaiting_cap_ack_fails_registration_with_the_servers_reason() {
+        test_runtime().block_on(async {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let config = cap_ack_test_config(listener.local_addr().unwrap().port());
+            let result = connect_with_script(config, listener, async |mut reader, mut writer| {
+                writer
+                    .write_all(b":srv CAP * LS :multi-prefix\r\n")
+                    .await
+                    .unwrap();
+                assert_eq!(read_wire_line(&mut reader).await, "CAP REQ :multi-prefix");
+                send_error_and_expect_silence(&mut reader, &mut writer).await;
+            })
+            .await;
+            assert_fails_with_throttle_reason(result);
+        });
+    }
+
+    #[test]
+    fn error_during_sasl_fails_registration_without_trying_the_next_mechanism() {
+        test_runtime().block_on(async {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            // Auto with a password tries SCRAM-SHA-256 and then PLAIN.
+            let config = ServerConfig {
+                sasl_username: Some("user".to_string()),
+                sasl_password: Some("password".to_string()),
+                ..cap_ack_test_config(listener.local_addr().unwrap().port())
+            };
+            let result = connect_with_script(config, listener, async |mut reader, mut writer| {
+                writer
+                    .write_all(b":srv CAP * LS :sasl=SCRAM-SHA-256,PLAIN\r\n")
+                    .await
+                    .unwrap();
+                assert_eq!(read_wire_line(&mut reader).await, "CAP REQ :sasl");
+                writer.write_all(b":srv CAP * ACK :sasl\r\n").await.unwrap();
+                assert_eq!(
+                    read_wire_line(&mut reader).await,
+                    "AUTHENTICATE SCRAM-SHA-256"
+                );
+                send_error_and_expect_silence(&mut reader, &mut writer).await;
+            })
+            .await;
+            assert_fails_with_throttle_reason(result);
+        });
+    }
+
+    #[test]
+    fn error_while_awaiting_welcome_fails_registration_with_the_servers_reason() {
+        test_runtime().block_on(async {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let config = cap_ack_test_config(listener.local_addr().unwrap().port());
+            let result = connect_with_script(config, listener, async |mut reader, mut writer| {
+                writer.write_all(b":srv CAP * LS :\r\n").await.unwrap();
+                assert_eq!(read_wire_line(&mut reader).await, "CAP END");
+                send_error_and_expect_silence(&mut reader, &mut writer).await;
+            })
+            .await;
+            assert_fails_with_throttle_reason(result);
+        });
+    }
+
+    #[test]
+    fn server_error_reason_reads_the_raw_error_line() {
+        let reason = |line: &str| {
+            let msg = IrcMessage::parse(line).unwrap();
+            server_error_reason(&msg).map(str::to_string)
+        };
+        assert_eq!(
+            reason("ERROR :Closing Link: x (banned)").as_deref(),
+            Some("Closing Link: x (banned)")
+        );
+        assert_eq!(reason("@time=1 :srv error :Bye").as_deref(), Some("Bye"));
+        assert_eq!(reason("ERROR").as_deref(), Some(""));
+        assert_eq!(reason(":srv NOTICE * :ERROR in your ways"), None);
+        assert_eq!(reason("ERRORS :nope"), None);
     }
 
     fn authenticate_payload(line: &str) -> String {
