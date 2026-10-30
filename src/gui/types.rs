@@ -976,10 +976,11 @@ impl Channel {
         set_by: String,
         set_time: u64,
     ) {
+        let mapping = self.case_mapping;
         let entries = self.mode_lists.entry(mode).or_default();
         match entries
             .iter()
-            .position(|entry| entry.mask.eq_ignore_ascii_case(&mask))
+            .position(|entry| mapping.eq(&entry.mask, &mask))
         {
             Some(slot) => {
                 entries[slot].set_by = set_by;
@@ -1010,10 +1011,11 @@ impl Channel {
         if mode == 'b' {
             // Overlapping requests can list the same mask twice; a re-listed
             // ban replaces its earlier entry instead of duplicating it.
+            let mapping = self.case_mapping;
             match self
                 .bans
                 .iter()
-                .position(|entry| entry.mask.eq_ignore_ascii_case(&mask))
+                .position(|entry| mapping.eq(&entry.mask, &mask))
             {
                 Some(slot) => {
                     self.bans[slot].set_by = set_by.clone();
@@ -1052,14 +1054,11 @@ impl Channel {
     }
 
     pub fn apply_mode_list_change(&mut self, sign: char, mode: char, mask: &str, setter: &str) {
+        // Masks match under the network's CASEMAPPING, like nicks and channels.
+        let mapping = self.case_mapping;
         if sign == '+' {
             self.upsert_mode_list_entry(mode, mask.to_string(), setter.to_string(), 0);
-            if mode == 'b'
-                && !self
-                    .bans
-                    .iter()
-                    .any(|entry| entry.mask.eq_ignore_ascii_case(mask))
-            {
+            if mode == 'b' && !self.bans.iter().any(|entry| mapping.eq(&entry.mask, mask)) {
                 self.bans.push(BanEntry {
                     mask: mask.to_string(),
                     set_by: setter.to_string(),
@@ -1068,11 +1067,10 @@ impl Channel {
             }
         } else {
             if let Some(entries) = self.mode_lists.get_mut(&mode) {
-                entries.retain(|entry| !entry.mask.eq_ignore_ascii_case(mask));
+                entries.retain(|entry| !mapping.eq(&entry.mask, mask));
             }
             if mode == 'b' {
-                self.bans
-                    .retain(|entry| !entry.mask.eq_ignore_ascii_case(mask));
+                self.bans.retain(|entry| !mapping.eq(&entry.mask, mask));
             }
         }
     }
@@ -1788,6 +1786,47 @@ mod tests {
             ch.mode_parameters.get(&'k').map(String::as_str),
             Some("newkey")
         );
+    }
+
+    #[test]
+    fn mode_list_masks_are_compared_under_the_networks_casemapping() {
+        let masks =
+            |ch: &Channel| -> Vec<String> { ch.bans.iter().map(|ban| ban.mask.clone()).collect() };
+        let list_masks = |ch: &Channel| -> Vec<String> {
+            ch.mode_lists[&'b']
+                .iter()
+                .map(|ban| ban.mask.clone())
+                .collect()
+        };
+
+        // RFC1459 folds [ ] \ ^ onto { } | ~, so these are the same mask.
+        let mut ch = Channel::new();
+        ch.record_mode_list_reply('b', "[troll]!*@*".into(), "op".into(), 1);
+        ch.complete_mode_list('b');
+        ch.apply_mode_list_change('+', 'b', "{troll}!*@*", "other");
+        assert_eq!(masks(&ch), ["[troll]!*@*"]);
+        assert_eq!(list_masks(&ch), ["[troll]!*@*"]);
+        ch.record_mode_list_reply('b', "{TROLL}!*@*".into(), "op".into(), 2);
+        ch.record_mode_list_reply('b', "[Troll]!*@*".into(), "op".into(), 3);
+        assert_eq!(masks(&ch), ["{TROLL}!*@*"]);
+        assert_eq!(list_masks(&ch), ["{TROLL}!*@*"]);
+        assert_eq!(ch.bans[0].set_time, 3);
+
+        // The removal names the other spelling and still finds the entry.
+        let mut ch = Channel::new();
+        ch.apply_mode_list_change('+', 'b', "[troll]!*@*", "op");
+        ch.apply_mode_list_change('-', 'b', "{troll}!*@*", "op");
+        assert!(masks(&ch).is_empty());
+        assert!(list_masks(&ch).is_empty());
+
+        // CASEMAPPING=ascii keeps them distinct.
+        let mut ch = Channel::new();
+        ch.set_case_mapping(CaseMapping::Ascii);
+        ch.apply_mode_list_change('+', 'b', "[troll]!*@*", "op");
+        ch.apply_mode_list_change('+', 'b', "{troll}!*@*", "op");
+        assert_eq!(masks(&ch), ["[troll]!*@*", "{troll}!*@*"]);
+        ch.apply_mode_list_change('-', 'b', "{TROLL}!*@*", "op");
+        assert_eq!(masks(&ch), ["[troll]!*@*"]);
     }
 
     #[test]
