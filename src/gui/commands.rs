@@ -992,12 +992,20 @@ impl IrcApp {
             }
 
             "BAN" => {
-                if !args.is_empty() {
+                // One target per ban: a second word would otherwise ride along
+                // inside the mask and reach the wire as an extra MODE
+                // parameter (#292).
+                let (target, extra) = split_word(args);
+                if !extra.is_empty() {
+                    self.add_message_to_current(ChatMessage::system(
+                        "Usage: /ban <nick|mask> (one target at a time)",
+                    ));
+                } else if !target.is_empty() {
                     if let Some(channel) = &self.current_channel.clone()
                         && self.is_channel_name(channel)
                     {
                         // Convert nick to ban mask if it's just a nick
-                        let mask = self.ban_mask_for(args);
+                        let mask = self.ban_mask_for(target);
                         self.send_command(IrcCommand::Mode(
                             channel.clone(),
                             Some("+b".to_string()),
@@ -1017,11 +1025,16 @@ impl IrcApp {
             }
 
             "UNBAN" => {
-                if !args.is_empty() {
+                let (target, extra) = split_word(args);
+                if !extra.is_empty() {
+                    self.add_message_to_current(ChatMessage::system(
+                        "Usage: /unban <nick|mask> (one target at a time)",
+                    ));
+                } else if !target.is_empty() {
                     if let Some(channel) = &self.current_channel.clone()
                         && self.is_channel_name(channel)
                     {
-                        let plan = self.unban_masks_for(args);
+                        let plan = self.unban_masks_for(target);
                         if let Some(note) = plan.note {
                             self.add_message_to_current(ChatMessage::system(&note));
                         }
@@ -3176,6 +3189,33 @@ mod tests {
             .back()
             .map(|row| row.content.clone())
             .unwrap_or_default()
+    }
+
+    #[test]
+    fn ban_and_unban_with_extra_words_send_no_mode_and_show_usage() {
+        // "alice bob" used to go out as the single mask "alice bob!*@*": the
+        // wire line then carried two parameters for one +b (#292).
+        let (mut app, mut rx) = ban_command_app();
+        for input in [
+            "/ban alice bob",
+            "/ban alice\tbob",
+            "/ban *!*@a.test *!*@b.test",
+            "/unban alice bob",
+        ] {
+            app.process_command(input);
+            assert!(rx.try_recv().is_err(), "{input} must not reach the wire");
+            assert!(
+                last_note(&app).starts_with("Usage: /"),
+                "{input}: {}",
+                last_note(&app)
+            );
+        }
+
+        // Single targets, with stray trailing whitespace, still work.
+        app.process_command("/ban alice  ");
+        expect_mode(&mut rx, "+b", "*!~alice@host.example");
+        app.process_command("/unban alice\t");
+        expect_mode(&mut rx, "-b", "*!~alice@host.example");
     }
 
     #[test]
