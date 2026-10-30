@@ -15,10 +15,11 @@ use crate::irc::{IrcCommand, IrcMessage};
 use formatting::{nick_color, render_irc_text, render_segments};
 use helpers::{epoch_time_formatted, format_timestamp, mask_matches, truncate_chars};
 pub use types::{
-    BanEntry, CaseMapping, Channel, ChannelListEntry, ChannelListSort, ChatMessage, KnownUser,
+    CaseMapping, Channel, ChannelListEntry, ChannelListSort, ChatMessage, KnownUser,
     NetworkSupport, RowHeightEntry, ServerFavorite, Settings, SortDirection, TabCompletion,
     UserMode,
 };
+use types::{CtcpReplyDecision, CtcpReplyLimiter};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConnectionIntent {
@@ -471,6 +472,8 @@ pub struct IrcApp {
     /// no token, so it completes the oldest query still open for its channel.
     pending_whox: VecDeque<(String, String)>,
     next_whox_token: u16,
+    /// Budget for automatic CTCP replies (see `CTCP_REPLY_BURST`).
+    ctcp_reply_limiter: CtcpReplyLimiter,
 
     // Cached lowercase versions for efficient comparison (updated when source changes)
     my_nick_lower: String,
@@ -694,6 +697,7 @@ impl IrcApp {
             monitored_users: std::collections::HashSet::new(),
             pending_whox: VecDeque::new(),
             next_whox_token: 1,
+            ctcp_reply_limiter: CtcpReplyLimiter::default(),
 
             // Reconnect settings
             reconnect_delay_secs: settings.reconnect_delay_secs.max(1),
@@ -1404,6 +1408,7 @@ impl IrcApp {
         self.monitored_users.clear();
         self.pending_whox.clear();
         self.next_whox_token = 1;
+        self.ctcp_reply_limiter = CtcpReplyLimiter::default();
         // A NAMES burst or mode-list reply the old socket never finished.
         for channel in self.channels.values_mut() {
             channel.abandon_user_burst();
@@ -7101,11 +7106,22 @@ impl IrcApp {
         // Send the reply if we have one and CTCP replies are enabled
         if let Some(reply_msg) = reply {
             if self.ctcp_replies_enabled {
-                self.send_command(IrcCommand::Notice(sender.to_string(), reply_msg));
-                self.add_message_to_current(ChatMessage::system(&format!(
-                    "[CTCP] {} from {} - replied",
-                    ctcp_cmd, sender
-                )));
+                match self.ctcp_reply_limiter.check(std::time::Instant::now()) {
+                    CtcpReplyDecision::Reply => {
+                        self.send_command(IrcCommand::Notice(sender.to_string(), reply_msg));
+                        self.add_message_to_current(ChatMessage::system(&format!(
+                            "[CTCP] {} from {} - replied",
+                            ctcp_cmd, sender
+                        )));
+                    }
+                    CtcpReplyDecision::Suppress { first: true } => {
+                        self.add_message_to_current(ChatMessage::system(&format!(
+                            "[CTCP] {} from {} - not replied (rate limited); further requests are ignored silently",
+                            ctcp_cmd, sender
+                        )));
+                    }
+                    CtcpReplyDecision::Suppress { first: false } => {}
+                }
             } else {
                 self.add_message_to_current(ChatMessage::system(&format!(
                     "[CTCP] {} from {} - ignored (replies disabled)",
@@ -10190,6 +10206,69 @@ mod tests {
             rx.try_recv(),
             Ok(IrcCommand::Notice(target, _)) if target == "peer"
         ));
+    }
+
+    #[test]
+    fn ctcp_request_floods_are_answered_within_a_bounded_budget() {
+        let (mut app, mut rx) = test_app_connected();
+        app.set_session_nick("me".into(), true);
+        let mut channel = Channel::new();
+        channel.joined = true;
+        app.channels.insert("#chan".to_string(), channel);
+        app.current_channel = Some("#chan".to_string());
+
+        // Fifty channel-wide requests, from one flooder and from fifty nicks.
+        for i in 0..50 {
+            app.handle_incoming_message(
+                IrcMessage::parse(":flood!u@h PRIVMSG #chan :\x01PING 12345\x01").unwrap(),
+            );
+            app.handle_incoming_message(
+                IrcMessage::parse(&format!(":n{i}!u@h PRIVMSG #chan :\x01VERSION\x01")).unwrap(),
+            );
+        }
+
+        let replies = drain_commands(&mut rx)
+            .into_iter()
+            .filter(|command| matches!(command, IrcCommand::Notice(..)))
+            .count();
+        assert!(
+            (1..=types::CTCP_REPLY_BURST).contains(&replies),
+            "{replies} CTCP replies were sent"
+        );
+        // The focused tab is told once that replies are being held back, not
+        // once per request.
+        let rows = app.channels["#chan"]
+            .messages
+            .iter()
+            .filter(|message| message.content.starts_with("[CTCP]"))
+            .count();
+        assert_eq!(rows, replies + 1);
+        assert!(
+            app.channels["#chan"]
+                .messages
+                .iter()
+                .any(|message| message.content.contains("rate limit"))
+        );
+    }
+
+    #[test]
+    fn a_new_connection_gets_a_fresh_ctcp_reply_budget() {
+        let (mut app, mut rx) = test_app_connected();
+        app.set_session_nick("me".into(), true);
+        for _ in 0..=types::CTCP_REPLY_BURST {
+            app.handle_incoming_message(
+                IrcMessage::parse(":peer!u@h PRIVMSG me :\x01VERSION\x01").unwrap(),
+            );
+        }
+        assert_eq!(drain_commands(&mut rx).len(), types::CTCP_REPLY_BURST);
+
+        app.begin_connection_attempt();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        app.cmd_tx = Some(tx);
+        app.handle_incoming_message(
+            IrcMessage::parse(":peer!u@h PRIVMSG me :\x01VERSION\x01").unwrap(),
+        );
+        assert_eq!(drain_commands(&mut rx).len(), 1);
     }
 
     fn topic_test_channel(app: &mut IrcApp) {

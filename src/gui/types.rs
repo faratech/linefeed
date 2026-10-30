@@ -733,6 +733,51 @@ impl NetworkSupport {
     }
 }
 
+/// CTCP replies answered per `CTCP_REPLY_WINDOW`. Anyone in a channel can
+/// trigger a reply by a single message, so unbounded answering lets one
+/// flooder (or many nicks at once) get the client disconnected for excess
+/// flood and fingerprint it with VERSION.
+pub const CTCP_REPLY_BURST: usize = 5;
+pub const CTCP_REPLY_WINDOW: std::time::Duration = std::time::Duration::from_secs(10);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CtcpReplyDecision {
+    Reply,
+    /// Over budget. `first` is set for the first refusal of an over-budget
+    /// spell, so the user hears about a flood once rather than per request.
+    Suppress {
+        first: bool,
+    },
+}
+
+/// Sliding-window budget for automatic CTCP replies.
+#[derive(Debug, Default)]
+pub struct CtcpReplyLimiter {
+    answered: VecDeque<std::time::Instant>,
+    flood_announced: bool,
+}
+
+impl CtcpReplyLimiter {
+    pub fn check(&mut self, now: std::time::Instant) -> CtcpReplyDecision {
+        while self
+            .answered
+            .front()
+            .is_some_and(|at| now.saturating_duration_since(*at) >= CTCP_REPLY_WINDOW)
+        {
+            self.answered.pop_front();
+        }
+        if self.answered.len() < CTCP_REPLY_BURST {
+            self.answered.push_back(now);
+            self.flood_announced = false;
+            CtcpReplyDecision::Reply
+        } else {
+            let first = !self.flood_announced;
+            self.flood_announced = true;
+            CtcpReplyDecision::Suppress { first }
+        }
+    }
+}
+
 /// Ban list entry
 #[derive(Debug, Clone)]
 pub struct BanEntry {
@@ -1827,6 +1872,40 @@ mod tests {
         assert_eq!(masks(&ch), ["[troll]!*@*", "{troll}!*@*"]);
         ch.apply_mode_list_change('-', 'b', "{TROLL}!*@*", "op");
         assert_eq!(masks(&ch), ["[troll]!*@*"]);
+    }
+
+    #[test]
+    fn ctcp_reply_budget_refills_as_the_window_slides() {
+        use std::time::{Duration, Instant};
+        let start = Instant::now();
+        let mut limiter = CtcpReplyLimiter::default();
+        for _ in 0..CTCP_REPLY_BURST {
+            assert_eq!(limiter.check(start), CtcpReplyDecision::Reply);
+        }
+        // Over budget: announced once, then silent.
+        let later = start + Duration::from_secs(1);
+        assert_eq!(
+            limiter.check(later),
+            CtcpReplyDecision::Suppress { first: true }
+        );
+        assert_eq!(
+            limiter.check(later),
+            CtcpReplyDecision::Suppress { first: false }
+        );
+        // Requests that arrive while over budget do not extend the penalty.
+        assert_eq!(
+            limiter.check(start + CTCP_REPLY_WINDOW - Duration::from_millis(1)),
+            CtcpReplyDecision::Suppress { first: false }
+        );
+        let reopened = start + CTCP_REPLY_WINDOW;
+        for _ in 0..CTCP_REPLY_BURST {
+            assert_eq!(limiter.check(reopened), CtcpReplyDecision::Reply);
+        }
+        // A later flood is announced afresh.
+        assert_eq!(
+            limiter.check(reopened),
+            CtcpReplyDecision::Suppress { first: true }
+        );
     }
 
     #[test]
