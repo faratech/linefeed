@@ -383,10 +383,15 @@ impl IrcMessage {
         }
     }
 
+    /// The sender's nickname (or server name): the prefix up to the first '!'
+    /// or '@', since the grammar is `nickname [ [ "!" user ] "@" host ]`.
+    /// A prefix with no name before the separator has no sender.
     pub fn get_sender_nick(&self) -> Option<String> {
         self.prefix
-            .as_ref()
-            .map(|p| p.split('!').next().unwrap_or(p).to_string())
+            .as_deref()
+            .and_then(|p| p.split(['!', '@']).next())
+            .filter(|nick| !nick.is_empty())
+            .map(str::to_string)
     }
 
     /// Get a specific IRCv3 tag value
@@ -1094,6 +1099,29 @@ mod tests {
             join.command,
             IrcCommand::Join("#c".into(), None, None, None)
         );
+    }
+
+    #[test]
+    fn sender_nick_is_the_prefix_up_to_the_first_bang_or_at() {
+        // #286: prefix = servername / nickname [ [ "!" user ] "@" host ]
+        let nick_of = |line: &str| IrcMessage::parse(line).unwrap().get_sender_nick();
+        assert_eq!(
+            nick_of(":alice!u@h PRIVMSG #c :hi").as_deref(),
+            Some("alice")
+        );
+        assert_eq!(
+            nick_of(":alice@host PRIVMSG #c :hi").as_deref(),
+            Some("alice")
+        );
+        assert_eq!(nick_of(":alice PRIVMSG #c :hi").as_deref(), Some("alice"));
+        assert_eq!(
+            nick_of(":irc.example.org NOTICE me :hi").as_deref(),
+            Some("irc.example.org")
+        );
+        // No nick at all is no sender, not an empty identity.
+        assert_eq!(nick_of(":!u@h PRIVMSG #c :hi"), None);
+        assert_eq!(nick_of(":@h PRIVMSG #c :hi"), None);
+        assert_eq!(nick_of("PRIVMSG #c :hi"), None);
     }
 
     #[test]
