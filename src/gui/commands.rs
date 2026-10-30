@@ -813,7 +813,10 @@ impl IrcApp {
                 // /ctcp <nick> <command> [args]
                 let (target, rest) = split_word(args);
                 let (ctcp_command, ctcp_args) = split_word(rest);
-                if !target.is_empty() && !ctcp_command.is_empty() {
+                if !target.is_empty()
+                    && !ctcp_command.is_empty()
+                    && !self.target_reaches_channel(target)
+                {
                     let ctcp_cmd = ctcp_command.to_uppercase();
                     let ctcp_msg = if ctcp_args.is_empty() {
                         format!("\x01{}\x01", ctcp_cmd)
@@ -845,7 +848,7 @@ impl IrcApp {
                 // Only the first word is the target; trailing words would
                 // otherwise become the message text of the PRIVMSG (#261).
                 let (target, _) = split_word(args);
-                if !target.is_empty() {
+                if !target.is_empty() && !self.target_reaches_channel(target) {
                     let ctcp_msg = "\x01VERSION\x01".to_string();
                     if self.send_command(IrcCommand::Privmsg(target.to_string(), ctcp_msg)) {
                         self.add_message_to_current(ChatMessage::system(&format!(
@@ -865,7 +868,7 @@ impl IrcApp {
                 }
             }
 
-            "PING" if !args.is_empty() && !args.starts_with('#') => {
+            "PING" if !args.is_empty() && !self.target_reaches_channel(split_word(args).0) => {
                 // /ping <nick> - Send CTCP PING to measure latency (first word
                 // only is the target, as for /version).
                 use std::time::{SystemTime, UNIX_EPOCH};
@@ -2119,6 +2122,16 @@ impl IrcApp {
                     .without_logging(),
             );
         }
+    }
+
+    /// Whether a message target reaches a channel: any CHANTYPES name, with
+    /// or without a STATUSMSG prefix (`@#chan`), in a comma-separated list. A
+    /// CTCP request sent there would go to every member and draw a reply from
+    /// each auto-replying client (#312).
+    fn target_reaches_channel(&self, target: &str) -> bool {
+        target
+            .split(',')
+            .any(|part| self.is_channel_name(self.strip_status_prefix(part)))
     }
 
     /// True once the server's ISUPPORT has arrived and advertises none of
@@ -3654,6 +3667,53 @@ mod tests {
                 .iter()
                 .all(|row| !row.contains("hello") && !row.contains("ignored")),
             "{confirmations:?}"
+        );
+    }
+
+    #[test]
+    fn ctcp_requests_are_never_broadcast_to_channel_targets() {
+        // A CTCP request to a channel reaches every member, and each client
+        // that auto-replies adds a NOTICE to the flood (#312).
+        let (mut app, mut rx) = connected_command_app();
+        for target in [
+            "#chan",
+            "&chan",
+            "+chan",
+            "!chan",
+            // STATUSMSG and comma lists still reach channel members.
+            "@#chan",
+            "alice,#chan",
+        ] {
+            for input in [
+                format!("/version {target}"),
+                format!("/ctcp {target} VERSION"),
+                format!("/ctcp {target} PING 123"),
+                format!("/ping {target}"),
+            ] {
+                let before = app.server_messages.len();
+                app.process_command(&input);
+                assert!(rx.try_recv().is_err(), "{input} must not reach the wire");
+                assert_eq!(app.server_messages.len(), before + 1, "{input}");
+                assert!(
+                    app.server_messages
+                        .back()
+                        .is_some_and(|row| row.content.starts_with("Usage: /")),
+                    "{input}: {:?}",
+                    app.server_messages.back()
+                );
+            }
+        }
+
+        // Nick targets still work.
+        app.process_command("/version alice");
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            IrcCommand::Privmsg("alice".into(), "\x01VERSION\x01".into())
+        );
+        app.process_command("/ctcp alice VERSION");
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            IrcCommand::Privmsg("alice".into(), "\x01VERSION\x01".into())
         );
     }
 
