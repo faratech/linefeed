@@ -925,6 +925,11 @@ impl IrcClient {
         {
             return Err("Nickname must be free of spaces, @, CR, LF and NUL".into());
         }
+        // "NICK :alice" would be read as a trailing parameter: the server
+        // registers "alice" while the client believes ":alice" (#303).
+        if nick.starts_with(':') {
+            return Err("Nickname must not start with ':'".into());
+        }
         if username.is_empty() {
             return Err("Username must be non-empty".into());
         }
@@ -3181,7 +3186,19 @@ mod tests {
     #[test]
     fn invalid_nick_is_rejected_before_connecting() {
         test_runtime().block_on(async {
-            for nick in ["", "a b", "a\rb", "a@b", "a\nb", "a\0b", &"x".repeat(501)] {
+            // ":alice" is sent as "NICK :alice", which the server reads as a
+            // trailing parameter and registers "alice" (#303).
+            for nick in [
+                "",
+                "a b",
+                "a\rb",
+                "a@b",
+                "a\nb",
+                "a\0b",
+                ":alice",
+                ":",
+                &"x".repeat(501),
+            ] {
                 let config = ServerConfig {
                     host: "127.0.0.1".into(),
                     port: 6697,
