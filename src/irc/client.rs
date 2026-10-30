@@ -2339,12 +2339,18 @@ impl IrcClient {
             };
             match &msg.command {
                 IrcCommand::Authenticate(data) => {
-                    if let Some(complete) = challenge.feed(data) {
-                        return Ok(SaslServerEvent::Challenge(complete));
-                    }
-                    if challenge.pending_len() > MAX_SASL_CHALLENGE_LEN {
+                    // The bound covers the terminating chunk too: forty full
+                    // chunks plus a short tail used to slip past it (#282).
+                    let complete = challenge.feed(data);
+                    let size = complete
+                        .as_ref()
+                        .map_or_else(|| challenge.pending_len(), String::len);
+                    if size > MAX_SASL_CHALLENGE_LEN {
                         self.abort_sasl_exchange(writer).await?;
                         return Ok(SaslServerEvent::Failed);
+                    }
+                    if let Some(complete) = complete {
+                        return Ok(SaslServerEvent::Challenge(complete));
                     }
                     continue;
                 }
@@ -2816,6 +2822,76 @@ mod tests {
             drop(msg_tx);
             drain.await.unwrap();
             server.await.unwrap();
+        });
+    }
+
+    /// Run `read_sasl_event` against a server that sends `wire`, and return
+    /// the event plus whatever the client wrote back before it returned.
+    async fn sasl_event_for_wire(wire: String) -> (SaslServerEvent, String) {
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let (client_read, mut client_write) = tokio::io::split(client_io);
+        let mut client_read = BufReader::new(client_read);
+        let (server_read, mut server_write) = tokio::io::split(server_io);
+        let server = tokio::spawn(async move {
+            server_write.write_all(wire.as_bytes()).await.unwrap();
+            server_write.flush().await.unwrap();
+            // The client side is dropped once it has its event, ending this
+            // read with whatever it wrote (nothing, at EOF).
+            let mut reader = BufReader::new(server_read);
+            read_wire_line(&mut reader).await
+        });
+        let client = IrcClient::new(ServerConfig::default());
+        let (msg_tx, _msg_rx) = mpsc::channel(100);
+        let (_nick_tx, mut nick_rx) = mpsc::unbounded_channel::<String>();
+        let mut buf = Vec::new();
+        let event = client
+            .read_sasl_event(
+                &mut client_write,
+                &mut client_read,
+                &msg_tx,
+                &mut nick_rx,
+                &mut buf,
+            )
+            .await
+            .unwrap();
+        drop((client_read, client_write));
+        (event, server.await.unwrap())
+    }
+
+    /// `chunks` full 400-byte AUTHENTICATE lines, then a terminating line of
+    /// `tail` bytes.
+    fn authenticate_wire(chunks: usize, tail: usize) -> String {
+        let mut wire = format!("AUTHENTICATE {}\r\n", "A".repeat(400)).repeat(chunks);
+        wire.push_str(&format!("AUTHENTICATE {}\r\n", "B".repeat(tail)));
+        wire
+    }
+
+    #[test]
+    fn sasl_challenge_over_the_limit_is_aborted_even_when_the_last_chunk_terminates_it() {
+        test_runtime().block_on(async {
+            // #282: forty full chunks (16000 bytes) pass the pending-size
+            // check; the short terminating chunk then pushed the challenge to
+            // 16399 bytes, which used to be returned as valid.
+            let (event, written) = sasl_event_for_wire(authenticate_wire(40, 399)).await;
+            assert!(
+                matches!(event, SaslServerEvent::Failed),
+                "oversized challenge was accepted"
+            );
+            assert_eq!(written, "AUTHENTICATE *");
+        });
+    }
+
+    #[test]
+    fn sasl_challenge_at_the_limit_is_still_accepted() {
+        test_runtime().block_on(async {
+            let (event, written) = sasl_event_for_wire(authenticate_wire(40, 384)).await;
+            match event {
+                SaslServerEvent::Challenge(challenge) => {
+                    assert_eq!(challenge.len(), MAX_SASL_CHALLENGE_LEN)
+                }
+                _ => panic!("a challenge of exactly the limit must be accepted"),
+            }
+            assert_eq!(written, "");
         });
     }
 
