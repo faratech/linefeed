@@ -1939,6 +1939,25 @@ impl IrcApp {
                 topic.as_deref().unwrap_or_default()
             ),
             IrcCommand::Nick(new_nick) => format!("{sender} is now known as {new_nick}"),
+            // A replayed channel move is history, not a command: the live tab
+            // must stay put so the batch still finds the target it was
+            // requested for.
+            IrcCommand::Rename(old, new, reason) => format!(
+                "Channel renamed from {old} to {new}{}",
+                reason
+                    .as_deref()
+                    .filter(|reason| !reason.is_empty())
+                    .map(|reason| format!(": {reason}"))
+                    .unwrap_or_default()
+            ),
+            IrcCommand::Relocate(old, new, reason) => format!(
+                "Channel {old} moved to {new}{}",
+                reason
+                    .as_deref()
+                    .filter(|reason| !reason.is_empty())
+                    .map(|reason| format!(": {reason}"))
+                    .unwrap_or_default()
+            ),
             IrcCommand::Setname(realname) => {
                 format!("{sender} changed their realname to {realname}")
             }
@@ -11869,6 +11888,52 @@ mod tests {
                 .iter()
                 .any(|message| message.content == "gone joined #room")
         );
+    }
+
+    #[test]
+    fn historical_channel_rename_and_relocate_do_not_mutate_the_live_tab() {
+        for (event, shown) in [
+            (
+                ":op!u@h RENAME #old #new :new name",
+                "Channel renamed from #old to #new: new name",
+            ),
+            (
+                ":op!u@h RELOCATE #old #new :moved",
+                "Channel #old moved to #new: moved",
+            ),
+        ] {
+            let mut app = test_app();
+            app.prepare_history_target("#old");
+            app.current_channel = Some("#old".to_string());
+            app.handle_incoming_message(
+                IrcMessage::parse("@draft/chathistory-end :srv BATCH +hist chathistory #old")
+                    .unwrap(),
+            );
+            app.handle_incoming_message(
+                IrcMessage::parse(&format!(
+                    "@batch=hist;time=2026-09-12T12:00:00.000Z;msgid=r1 {event}"
+                ))
+                .unwrap(),
+            );
+            // The replay is still open: nothing may have moved yet.
+            assert!(app.channels.contains_key("#old"), "{event}");
+            assert!(!app.channels.contains_key("#new"), "{event}");
+            assert_eq!(app.current_channel.as_deref(), Some("#old"), "{event}");
+            app.handle_incoming_message(IrcMessage::parse(":srv BATCH -hist").unwrap());
+
+            let mut tabs: Vec<&String> = app.channels.keys().collect();
+            tabs.sort();
+            assert_eq!(tabs, ["#old"], "{event}");
+            assert_eq!(app.current_channel.as_deref(), Some("#old"), "{event}");
+            assert!(
+                app.channels["#old"]
+                    .messages
+                    .iter()
+                    .any(|message| message.content == shown
+                        && message.msgid.as_deref() == Some("r1")),
+                "{event}"
+            );
+        }
     }
 
     #[test]
