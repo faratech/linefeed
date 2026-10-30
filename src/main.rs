@@ -17,12 +17,12 @@ use std::sync::Arc;
 #[cfg(windows)]
 use std::sync::OnceLock;
 
-use gui::Session;
+use gui::App;
 
 #[cfg(windows)]
 static SINGLE_INSTANCE_MUTEX: OnceLock<isize> = OnceLock::new();
 
-fn load_icon() -> egui::IconData {
+pub(crate) fn load_icon() -> egui::IconData {
     egui::IconData {
         rgba: icon_data::ICON_RGBA.to_vec(),
         width: icon_data::ICON_WIDTH,
@@ -309,7 +309,7 @@ fn main() -> eframe::Result<()> {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1024.0, 768.0])
             .with_min_inner_size([640.0, 480.0])
-            .with_title("Linefeed")
+            .with_title(gui::MAIN_WINDOW_TITLE)
             .with_icon(Arc::new(load_icon())),
         ..Default::default()
     };
@@ -326,17 +326,16 @@ fn main() -> eframe::Result<()> {
                 opts.reduce_texture_memory = true;
             });
 
-            let mut app = Session::new(cc);
-            if let Some(snapshot) = snapshot {
-                app.restore_update_session(snapshot);
-            }
+            let mut app = App::load();
+            app.start(snapshot);
             app.updater.install_reason = update_error;
+            let automatic_updates = app.automatic_updates();
             app.updater
-                .start(paths, cc.egui_ctx.clone(), app.automatic_updates);
+                .start(paths, cc.egui_ctx.clone(), automatic_updates);
             let mut style = (*cc.egui_ctx.global_style()).clone();
             style.spacing.item_spacing = egui::vec2(8.0, 4.0);
             cc.egui_ctx.set_global_style(style);
-            gui::apply_font_size(&cc.egui_ctx, app.font_size);
+            gui::apply_font_size(&cc.egui_ctx, app.font_size());
 
             Ok(Box::new(LinefeedApp {
                 app,
@@ -360,7 +359,7 @@ fn main() -> eframe::Result<()> {
 struct LinefeedApp {
     startup_ack: Option<updater::install::Transaction>,
     shutdown: Arc<std::sync::Mutex<Option<updater::install::Armed>>>,
-    app: Session,
+    app: App,
     /// Track when we last received messages (for adaptive repaint intervals)
     last_message_time: std::time::Instant,
     /// Set once the window has been confirmed at a sane size; guards the
@@ -372,7 +371,7 @@ struct LinefeedApp {
 }
 
 impl eframe::App for LinefeedApp {
-    fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         let ctx = &ctx;
         self.app.updater.poll();
@@ -418,9 +417,13 @@ impl eframe::App for LinefeedApp {
             // the tray (handled above); resync if something else re-showed
             // the window, e.g. a second instance's activate racing this frame.
             if systray::is_window_hidden() {
+                // Detached windows hide with the main window and are
+                // recreated from their saved geometry on restore.
+                self.app.tray_hidden = true;
                 self.app.background_tick(ctx);
                 if systray::is_window_visible() {
                     systray::clear_hidden();
+                    self.app.tray_hidden = false;
                     if ctx.input(|i| i.viewport().minimized.unwrap_or(false)) {
                         ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
                     }
@@ -437,7 +440,7 @@ impl eframe::App for LinefeedApp {
             // applies viewport commands after the frame, and a minimized
             // window is a *visible* window on Windows, so it would undo the
             // hide and leave a taskbar button behind.
-            if self.app.minimize_to_tray && systray::is_active() && !restoring {
+            if self.app.minimize_to_tray() && systray::is_active() && !restoring {
                 let close_requested = ctx.input(|i| i.viewport().close_requested());
                 let minimized = ctx.input(|i| i.viewport().minimized.unwrap_or(false));
                 if close_requested || minimized {
@@ -445,6 +448,7 @@ impl eframe::App for LinefeedApp {
                         ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
                     }
                     systray::hide_window();
+                    self.app.tray_hidden = true;
                     self.app.background_tick(ctx);
                     ctx.request_repaint_after(std::time::Duration::from_millis(250));
                     return;
@@ -455,8 +459,15 @@ impl eframe::App for LinefeedApp {
         // Check if window is minimized (cross-platform, including Linux)
         let is_minimized = ctx.input(|i| i.viewport().minimized.unwrap_or(false));
         if is_minimized {
-            // Process messages to prevent buffer overflow, but skip rendering.
-            self.app.background_tick(ctx);
+            // Process messages to prevent buffer overflow, but skip rendering
+            // the main window. Detached windows stay usable: eframe keeps
+            // running frames while one of them is visible, and a viewport
+            // that is not shown for a pass is destroyed.
+            if self.app.needs_detached_frames() {
+                self.app.ui_detached_only(ctx);
+            } else {
+                self.app.background_tick(ctx);
+            }
             // Drain reasonably often while minimized: update_minimal() empties the
             // channel each call, so polling ~4x/second keeps the message-loss window
             // small without the cost of full-rate rendering.
@@ -480,10 +491,9 @@ impl eframe::App for LinefeedApp {
             }
         }
 
-        self.app.process_connection_lifecycle(ctx);
-
         // Main UI update
-        self.app.ui(ui, frame);
+        self.app.tray_hidden = false;
+        self.app.ui(ui);
 
         // Hyperlink clicks queue OpenUrl commands that eframe's native
         // backends ignore (only its web backend acts on them), so open them
@@ -510,14 +520,12 @@ impl eframe::App for LinefeedApp {
         }
 
         // Adaptive repaint interval based on activity level
-        if self.app.connected
-            || self.app.connecting
-            // While waiting out the reconnect backoff nothing else wakes the
-            // event loop: without a scheduled repaint the frame would never
-            // re-run to observe the retry deadline passing.
-            || self.app.awaiting_reconnect()
-        {
-            let interval = if self.app.channel_list_loading {
+        // While any session is connected, connecting or waiting out a
+        // reconnect backoff, nothing else wakes the event loop: without a
+        // scheduled repaint the frame would never observe new messages or
+        // the retry deadline passing.
+        if self.app.wants_polling() {
+            let interval = if self.app.channel_list_loading() {
                 // High-traffic mode during /list - fast polling for UI
                 // responsiveness. A broken or hostile server that never sends
                 // RPL_LISTEND (323) must not pin this rate forever.
@@ -552,17 +560,12 @@ impl eframe::App for LinefeedApp {
     // eframe passes a glow context only on Linux; other targets use wgpu.
     fn on_exit(&mut self, #[cfg(target_os = "linux")] _gl: Option<&eframe::glow::Context>) {
         self.app.prepare_update_shutdown();
+        // One deadline for all sessions: every worker flushes its QUIT
+        // concurrently.
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-        if let Some(thread) = self.app.worker.take() {
-            while !thread.is_finished() && std::time::Instant::now() < deadline {
-                std::thread::sleep(std::time::Duration::from_millis(10));
-            }
-            if thread.is_finished() {
-                let _ = thread.join();
-            }
-        }
-        self.app.msg_rx = None;
-        if let Some(armed) = self.app.updater.arm_on_exit(self.app.automatic_updates)
+        self.app.join_workers(deadline);
+        let automatic_updates = self.app.automatic_updates();
+        if let Some(armed) = self.app.updater.arm_on_exit(automatic_updates)
             && let Ok(mut shutdown) = self.shutdown.lock()
         {
             *shutdown = Some(armed);

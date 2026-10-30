@@ -1,7 +1,8 @@
 //! Dialog windows for connect, settings, and channel list
 
 use super::helpers::format_timestamp;
-use super::{ChatMessage, Session, ServerFavorite, Settings};
+use super::app::FavoritesUi;
+use super::{App, ChatMessage, Session, ServerFavorite, Settings};
 use crate::irc::IrcCommand;
 use crate::irc::client::SaslMechanism;
 use egui::{Color32, RichText, ScrollArea, TextEdit, Vec2};
@@ -56,7 +57,6 @@ impl Session {
         self.auto_join_channels = persisted.auto_join_channels.clone();
         self.set_invisible = persisted.set_invisible;
         self.auto_reconnect = persisted.auto_reconnect;
-        self.server_favorites = persisted.server_favorites.clone();
         self.auto_perform = persisted.auto_perform.clone();
         self.pre_away_message = persisted.pre_away_message.clone();
         self.persistence_profile = persisted.persistence_profile.clone();
@@ -66,50 +66,21 @@ impl Session {
         self.sasl_required = persisted.sasl_required;
         self.tls_client_cert_path = persisted.tls_client_cert_path.clone();
         self.tls_client_key_path = persisted.tls_client_key_path.clone();
-        self.new_favorite_name.clear();
-        self.show_save_favorite_dialog = false;
         self.connection_error = None;
-        // The reloaded list can be shorter than the one the selection indexed.
-        self.selected_favorite = None;
+        // The persisted form is the Quick Connect defaults, not a profile.
+        self.form_profile = None;
     }
 
-    /// Persist one setting changed outside the Connection form (the About-tab
-    /// updates toggle, a deleted favorite, the channel-list minimum). The
-    /// change is applied to the settings already on disk, never to the form's
-    /// unsaved or unvalidated fields: only Connect and a validated Close may
-    /// persist those (#316).
-    ///
-    /// If the settings file exists but cannot be read, nothing is written:
-    /// starting from defaults would replace the real file (favorites,
-    /// passwords) with defaults plus this one field.
-    pub(super) fn save_setting(&mut self, apply: impl FnOnce(&mut Settings)) {
-        let mut persisted = match self.try_load_persisted_settings() {
-            Ok(Some(settings)) => settings,
-            // First save: nothing to preserve.
-            Ok(None) => Settings::default(),
-            Err(error) => {
-                tracing::warn!("Not saving settings: the existing file could not be read: {error}");
-                return;
-            }
-        };
-        apply(&mut persisted);
-        self.store_persisted_settings(persisted);
-    }
-
-    fn set_automatic_updates(&mut self, enabled: bool) {
-        self.automatic_updates = enabled;
-        self.updater.set_automatic(enabled);
-        self.save_setting(|settings| settings.automatic_updates = enabled);
-    }
-
-    /// Store the validated Connection form as a named favorite and persist the
-    /// favorites list. Returns whether a favorite was saved.
-    fn save_form_as_favorite(&mut self) -> bool {
-        if self.new_favorite_name.is_empty() || !self.validate_connection_form() {
-            return false;
+    /// The validated Connection form as a new favorite named `name`, with
+    /// the form now describing it; `None` when the name is empty or the form
+    /// does not validate. The caller adds it to the list and persists only
+    /// the list: the form's other fields are not saved settings yet (#316).
+    pub(crate) fn form_as_favorite(&mut self, name: &str) -> Option<ServerFavorite> {
+        if name.is_empty() || !self.validate_connection_form() {
+            return None;
         }
-        let new_fav = ServerFavorite {
-            name: self.new_favorite_name.clone(),
+        let favorite = ServerFavorite {
+            name: name.to_string(),
             host: self.server_host.clone(),
             port: self.server_port.clone(),
             use_tls: self.use_tls,
@@ -128,15 +99,11 @@ impl Session {
             accept_invalid_certs: self.accept_invalid_certs,
             pre_away_message: self.pre_away_message.clone(),
             persistence_profile: self.persistence_profile.clone(),
+            id: super::new_profile_id(),
+            auto_connect: false,
         };
-        self.server_favorites.push(new_fav);
-        self.selected_favorite = Some(self.server_favorites.len() - 1);
-        // Only the list: the form's other fields are not saved settings yet.
-        let favorites = self.server_favorites.clone();
-        self.save_setting(|settings| settings.server_favorites = favorites);
-        self.new_favorite_name.clear();
-        self.show_save_favorite_dialog = false;
-        true
+        self.form_profile = Some(favorite.id.clone());
+        Some(favorite)
     }
 
     /// Request a fresh channel list from the Channel List window.
@@ -165,51 +132,17 @@ impl Session {
         }
     }
 
+    /// Persist the channel-list minimum on its own: never the connect
+    /// form's unsaved or unvalidated fields (#316).
     fn save_list_min_users(&mut self) {
-        let min_users = self.list_min_users;
-        self.save_setting(|settings| settings.list_min_users = min_users);
+        self.save_config();
     }
 
-    /// Delete a favorite and persist the shortened list.
-    fn delete_favorite(&mut self, idx: usize) -> bool {
-        let removed = self.remove_favorite(idx);
-        if removed {
-            let favorites = self.server_favorites.clone();
-            self.save_setting(|settings| settings.server_favorites = favorites);
-        }
-        removed
-    }
-
-    /// Remove a favorite by index; false when the index is out of range.
-    fn remove_favorite(&mut self, idx: usize) -> bool {
-        if idx < self.server_favorites.len() {
-            self.server_favorites.remove(idx);
-            true
-        } else {
-            false
-        }
-    }
-
-    /// Cancel the Connect dialog: discard scratch edits so a later unrelated
-    /// `save_settings()` cannot persist them, then hide the dialog (#208).
-    fn cancel_connect_dialog(&mut self) {
-        let persisted = self.load_persisted_settings();
-        self.restore_connect_form_from(&persisted);
+    /// Cancel the Connect dialog: restore the form from the persisted
+    /// settings, so a later save cannot persist the scratch edits (#208).
+    pub(crate) fn cancel_connect_dialog(&mut self, persisted: &Settings) {
+        self.restore_connect_form_from(persisted);
         self.show_connect_dialog = false;
-    }
-
-    /// Close Settings only when the connection form validates; on failure
-    /// keep the window open on the Connection tab so the error is visible
-    /// and editable (#207). Returns whether the window was closed.
-    fn close_settings_window(&mut self) -> bool {
-        if self.validate_connection_form() {
-            self.save_settings();
-            self.show_settings = false;
-            true
-        } else {
-            self.settings_tab = 0;
-            false
-        }
     }
 
     /// Join from the Channel List only when the JOIN was actually sent;
@@ -231,8 +164,19 @@ impl Session {
         }
     }
 
-    pub fn show_connect_window(&mut self, ctx: &egui::Context) {
+    /// The Connect dialog. Returns true when Cancel was pressed: the App
+    /// then restores the form from its persisted settings.
+    pub fn show_connect_window(
+        &mut self,
+        ctx: &egui::Context,
+        favorites: &mut Vec<ServerFavorite>,
+        favorites_ui: &mut FavoritesUi,
+    ) -> bool {
+        let mut cancelled = false;
         egui::Window::new("Connect to Server")
+            // Dialogs stay above the chat windows they belong to.
+            .order(egui::Order::Foreground)
+            .id(egui::Id::unique(("connect_dialog", self.id)))
             .collapsible(false)
             .resizable(true)
             .default_width(450.0)
@@ -240,7 +184,7 @@ impl Session {
             .show(ctx, |ui| {
                 // ===== Network Presets Section =====
                 egui::CollapsingHeader::new("Quick Connect (Network Presets)")
-                    .default_open(self.server_favorites.is_empty())
+                    .default_open(favorites.is_empty())
                     .show(ui, |ui| {
                         ui.horizontal_wrapped(|ui| {
                             for (name, host, port, tls) in NETWORK_PRESETS {
@@ -257,9 +201,9 @@ impl Session {
 
                 // ===== Server Favorites Section =====
                 egui::CollapsingHeader::new("Server Favorites")
-                    .default_open(!self.server_favorites.is_empty())
+                    .default_open(!favorites.is_empty())
                     .show(ui, |ui| {
-                        if self.server_favorites.is_empty() {
+                        if favorites.is_empty() {
                             ui.label("No saved favorites. Fill in connection details and click 'Save as Favorite'.");
                         } else {
                             // Favorites list with selection
@@ -268,10 +212,19 @@ impl Session {
                                 .show(ui, |ui| {
                                     let mut clicked_idx = None;
                                     let mut connect_idx = None;
-                                    for (idx, fav) in self.server_favorites.iter().enumerate() {
-                                        let is_selected = self.selected_favorite == Some(idx);
+                                    let mut toggled_auto = false;
+                                    for (idx, fav) in favorites.iter_mut().enumerate() {
+                                        let is_selected = favorites_ui.selected == Some(idx);
                                         let text = format!("{} ({}:{})", fav.name, fav.host, fav.port);
-                                        let response = ui.selectable_label(is_selected, &text);
+                                        let response = ui
+                                            .horizontal(|ui| {
+                                                toggled_auto |= ui
+                                                    .checkbox(&mut fav.auto_connect, "")
+                                                    .on_hover_text("Connect to this network when Linefeed starts")
+                                                    .changed();
+                                                ui.selectable_label(is_selected, &text)
+                                            })
+                                            .inner;
                                         if response.clicked() {
                                             clicked_idx = Some(idx);
                                         }
@@ -282,10 +235,13 @@ impl Session {
                                         }
                                     }
                                     if let Some(idx) = clicked_idx {
-                                        self.selected_favorite = Some(idx);
+                                        favorites_ui.selected = Some(idx);
+                                    }
+                                    if toggled_auto {
+                                        self.save_config();
                                     }
                                     if let Some(idx) = connect_idx
-                                        && let Some(fav) = self.server_favorites.get(idx).cloned() {
+                                        && let Some(fav) = favorites.get(idx).cloned() {
                                             self.load_favorite(&fav);
                                             if self.start_session_from_form() {
                                                 self.save_settings();
@@ -296,24 +252,27 @@ impl Session {
 
                             ui.horizontal(|ui| {
                                 // Load button
-                                let has_selection = self.selected_favorite.is_some();
+                                let has_selection = favorites_ui.selected.is_some();
                                 if ui.add_enabled(has_selection, egui::Button::new("Load")).clicked()
-                                    && let Some(idx) = self.selected_favorite
-                                        && let Some(fav) = self.server_favorites.get(idx).cloned() {
+                                    && let Some(idx) = favorites_ui.selected
+                                        && let Some(fav) = favorites.get(idx).cloned() {
                                             self.load_favorite(&fav);
                                         }
 
                                 // Delete button
                                 if ui.add_enabled(has_selection, egui::Button::new("Delete")).clicked()
-                                    && let Some(idx) = self.selected_favorite {
-                                        self.delete_favorite(idx);
-                                        self.selected_favorite = None;
+                                    && let Some(idx) = favorites_ui.selected {
+                                        favorites_ui.selected = None;
+                                        if remove_favorite(favorites, idx) {
+                                            // Only the list changed (#316).
+                                            self.save_config();
+                                        }
                                     }
 
                                 // Connect button
                                 if ui.add_enabled(has_selection, egui::Button::new("Connect")).clicked()
-                                    && let Some(idx) = self.selected_favorite
-                                                && let Some(fav) = self.server_favorites.get(idx).cloned() {
+                                    && let Some(idx) = favorites_ui.selected
+                                                && let Some(fav) = favorites.get(idx).cloned() {
                                                     self.load_favorite(&fav);
                                                     if self.start_session_from_form() {
                                                         self.save_settings();
@@ -461,25 +420,32 @@ impl Session {
                 ui.separator();
 
                 // ===== Save as Favorite =====
-                if self.show_save_favorite_dialog {
+                if favorites_ui.show_save_dialog {
                     ui.horizontal(|ui| {
                         ui.label("Name:");
-                        ui.add(TextEdit::singleline(&mut self.new_favorite_name).desired_width(150.0));
-                        if ui.button("Save").clicked() {
-                            self.save_form_as_favorite();
+                        ui.add(TextEdit::singleline(&mut favorites_ui.new_name).desired_width(150.0));
+                        if ui.button("Save").clicked()
+                            && let Some(favorite) = self.form_as_favorite(&favorites_ui.new_name)
+                        {
+                            favorites.push(favorite);
+                            favorites_ui.selected = Some(favorites.len() - 1);
+                            // Only the list changed (#316).
+                            self.save_config();
+                            favorites_ui.new_name.clear();
+                            favorites_ui.show_save_dialog = false;
                         }
                         if ui.button("Cancel").clicked() {
-                            self.new_favorite_name.clear();
-                            self.show_save_favorite_dialog = false;
+                            favorites_ui.new_name.clear();
+                            favorites_ui.show_save_dialog = false;
                         }
                     });
                 } else {
                     if ui.button("Save as Favorite").clicked() {
                         // Pre-fill with server name if empty
-                        if self.new_favorite_name.is_empty() {
-                            self.new_favorite_name = self.server_host.clone();
+                        if favorites_ui.new_name.is_empty() {
+                            favorites_ui.new_name = self.server_host.clone();
                         }
-                        self.show_save_favorite_dialog = true;
+                        favorites_ui.show_save_dialog = true;
                     }
                 }
 
@@ -492,69 +458,11 @@ impl Session {
                         self.show_connect_dialog = false;
                     }
                     if ui.button("Cancel").clicked() {
-                        self.cancel_connect_dialog();
+                        cancelled = true;
                     }
                 });
             });
-    }
-
-    pub fn show_settings_window(&mut self, ctx: &egui::Context) {
-        egui::Window::new("Settings")
-            .collapsible(false)
-            .resizable(true)
-            .default_size([380.0, 320.0])
-            .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
-            .show(ctx, |ui| {
-                // Tab bar
-                ui.horizontal(|ui| {
-                    if ui
-                        .selectable_label(self.settings_tab == 0, "Connection")
-                        .clicked()
-                    {
-                        self.settings_tab = 0;
-                    }
-                    if ui
-                        .selectable_label(self.settings_tab == 1, "Display")
-                        .clicked()
-                    {
-                        self.settings_tab = 1;
-                    }
-                    if ui
-                        .selectable_label(self.settings_tab == 2, "Automation")
-                        .clicked()
-                    {
-                        self.settings_tab = 2;
-                    }
-                    if ui
-                        .selectable_label(self.settings_tab == 3, "Behavior")
-                        .clicked()
-                    {
-                        self.settings_tab = 3;
-                    }
-                    if ui
-                        .selectable_label(self.settings_tab == 4, "About")
-                        .clicked()
-                    {
-                        self.settings_tab = 4;
-                    }
-                });
-                ui.separator();
-
-                // Tab content
-                match self.settings_tab {
-                    0 => self.settings_tab_connection(ui),
-                    1 => self.settings_tab_display(ui),
-                    2 => self.settings_tab_automation(ui),
-                    3 => self.settings_tab_behavior(ui),
-                    4 => self.settings_tab_about(ui),
-                    _ => {}
-                }
-
-                ui.separator();
-                if ui.button("Close").clicked() {
-                    self.close_settings_window();
-                }
-            });
+        cancelled
     }
 
     fn settings_tab_connection(&mut self, ui: &mut egui::Ui) {
@@ -615,7 +523,7 @@ impl Session {
             });
     }
 
-    fn settings_tab_display(&mut self, ui: &mut egui::Ui) {
+    fn settings_tab_display(&mut self, ui: &mut egui::Ui, font_size: &mut f32) {
         ui.heading("Timestamps");
         ui.add_space(4.0);
 
@@ -666,13 +574,13 @@ impl Session {
             ui.label("Size:");
             let changed = ui
                 .add(
-                    egui::DragValue::new(&mut self.font_size)
+                    egui::DragValue::new(font_size)
                         .speed(0.5)
                         .range(10.0..=24.0),
                 )
                 .changed();
             if changed {
-                super::apply_font_size(ui.ctx(), self.font_size);
+                super::apply_font_size(ui.ctx(), *font_size);
             }
             ui.label("px");
         });
@@ -753,7 +661,12 @@ impl Session {
         }
     }
 
-    fn settings_tab_behavior(&mut self, ui: &mut egui::Ui) {
+    fn settings_tab_behavior(
+        &mut self,
+        ui: &mut egui::Ui,
+        notifications_enabled: &mut bool,
+        minimize_to_tray: &mut bool,
+    ) {
         ui.heading("Connection");
         ui.add_space(4.0);
 
@@ -777,12 +690,12 @@ impl Session {
         }
 
         ui.checkbox(
-            &mut self.notifications_enabled,
+            notifications_enabled,
             "Desktop notifications for highlights/PMs",
         );
 
-        let tray_response = ui.checkbox(&mut self.minimize_to_tray, "Minimize to system tray");
-        if self.minimize_to_tray {
+        let tray_response = ui.checkbox(minimize_to_tray, "Minimize to system tray");
+        if *minimize_to_tray {
             tray_response.on_hover_text("System tray support requires platform-specific setup");
         }
 
@@ -881,142 +794,6 @@ impl Session {
         );
     }
 
-    fn settings_tab_about(&mut self, ui: &mut egui::Ui) {
-        ui.add_space(20.0);
-        ui.vertical_centered(|ui| {
-            ui.heading("Linefeed");
-            ui.label(concat!("Version ", env!("CARGO_PKG_VERSION")));
-            ui.add_space(10.0);
-            ui.label("A cross-platform IRC client");
-            ui.label(
-                RichText::new("Built with Rust + egui")
-                    .small()
-                    .color(Color32::GRAY),
-            );
-            ui.add_space(20.0);
-            ui.label(
-                RichText::new(format!(
-                    "{} / {}",
-                    std::env::consts::OS,
-                    std::env::consts::ARCH
-                ))
-                .small(),
-            );
-            ui.add_space(12.0);
-            ui.separator();
-            if ui
-                .checkbox(&mut self.automatic_updates, "Automatic updates")
-                .changed()
-            {
-                self.set_automatic_updates(self.automatic_updates);
-            }
-            ui.label(
-                RichText::new("Downloads updates in the background and installs when you exit.")
-                    .small(),
-            );
-            if let Some(time) = self.updater.last_check {
-                ui.label(
-                    RichText::new(format!(
-                        "Last checked: {}",
-                        super::helpers::epoch_time_formatted(time, "full")
-                    ))
-                    .small(),
-                );
-            }
-            let busy = self.updater.busy();
-            if ui
-                .add_enabled(
-                    !busy && self.updater.available(),
-                    egui::Button::new("Check for updates"),
-                )
-                .clicked()
-            {
-                self.updater.check();
-            }
-            use crate::updater::Status;
-            match &self.updater.status {
-                Status::Idle => {}
-                Status::Checking => {
-                    ui.spinner();
-                    ui.label("Checking for updates…");
-                }
-                Status::UpToDate => {
-                    ui.label("You're up to date.");
-                }
-                Status::Available => {
-                    ui.label("An update is available.");
-                }
-                Status::Downloading { received, total } => {
-                    let fraction = if *total > 0 {
-                        *received as f32 / *total as f32
-                    } else {
-                        0.0
-                    };
-                    ui.add(
-                        egui::ProgressBar::new(fraction)
-                            .show_percentage()
-                            .text("Downloading update…"),
-                    );
-                }
-                Status::Ready => {
-                    ui.label("Update downloaded and verified.");
-                }
-                Status::Applying => {
-                    ui.spinner();
-                    ui.label("Preparing to restart…");
-                }
-                Status::Error(message) => {
-                    ui.colored_label(Color32::LIGHT_RED, message);
-                }
-            }
-            if let Some(offer) = &self.updater.offer {
-                ui.label(format!("Version {} is available", offer.version));
-                ui.hyperlink_to("Release notes", offer.release_url());
-                if self.updater.download_available()
-                    && self.updater.install_reason.is_none()
-                    && ui
-                        .add_enabled(!busy, egui::Button::new("Download update"))
-                        .clicked()
-                {
-                    self.updater.download();
-                }
-            }
-            if let Some(tx) = &self.updater.staged {
-                ui.label(format!("Version {} is ready to install", tx.version));
-                if self.updater.install_reason.is_none()
-                    && ui
-                        .add_enabled(!busy, egui::Button::new("Restart to update"))
-                        .clicked()
-                {
-                    self.updater.restart_requested = true;
-                }
-            }
-            if let Some(reason) = &self.updater.install_reason {
-                ui.label(RichText::new(reason).small());
-            }
-            if self.updater.reset_available() {
-                if ui
-                    .button("Reset update state")
-                    .on_hover_text(
-                        "Deletes Linefeed's saved update recovery files, including any \
-                         downloaded update and the backup of the previous version. Use it \
-                         after installing a release yourself.",
-                    )
-                    .clicked()
-                {
-                    self.updater.reset_recovery();
-                }
-                ui.label(
-                    RichText::new("Restart Linefeed afterwards to re-enable updates.").small(),
-                );
-            }
-            ui.hyperlink_to(
-                "Download releases",
-                "https://github.com/faratech/linefeed/releases",
-            );
-        });
-    }
-
     /// Recompute the channel-list view (filtered + sorted row indices) only when
     /// the underlying list, the filter text, or the sort order actually changed.
     /// While the list is still streaming in from the server, refresh at most a
@@ -1077,6 +854,9 @@ impl Session {
         self.ensure_channel_list_cache();
 
         egui::Window::new("Channel List")
+            // Dialogs stay above the chat windows they belong to.
+            .order(egui::Order::Foreground)
+            .id(egui::Id::unique(("channel_list", self.id)))
             .resizable(false)
             .fixed_size([600.0, 400.0])
             .show(ctx, |ui| {
@@ -1357,6 +1137,9 @@ impl Session {
         let mut refresh = false;
 
         egui::Window::new(format!("Channel Info: {}", channel_name))
+            // Dialogs stay above the chat windows they belong to.
+            .order(egui::Order::Foreground)
+            .id(egui::Id::unique(("channel_info", self.id)))
             .collapsible(false)
             .resizable(true)
             .default_size([500.0, 400.0])
@@ -1632,6 +1415,9 @@ impl Session {
         ];
 
         egui::Window::new("IRC Colors")
+            // Dialogs stay above the chat windows they belong to.
+            .order(egui::Order::Foreground)
+            .id(egui::Id::unique(("color_picker", self.id)))
             .collapsible(false)
             .resizable(false)
             .default_width(220.0)
@@ -1713,6 +1499,229 @@ impl Session {
     }
 }
 
+/// Remove a favorite by index; false when the index is out of range.
+pub(crate) fn remove_favorite(favorites: &mut Vec<ServerFavorite>, idx: usize) -> bool {
+    if idx < favorites.len() {
+        favorites.remove(idx);
+        true
+    } else {
+        false
+    }
+}
+
+impl App {
+    /// The Settings window. Connection, Display, Automation and Behavior
+    /// edit the active session (its connect form and its copy of the
+    /// behaviour settings), which the App adopts and mirrors into every
+    /// session; About and the App-only switches edit the App directly.
+    pub(crate) fn show_settings_window(&mut self, ctx: &egui::Context) {
+        let active = self.active_index();
+        let mut close = false;
+        egui::Window::new("Settings")
+            // Dialogs stay above the chat windows they belong to.
+            .order(egui::Order::Foreground)
+            .collapsible(false)
+            .resizable(true)
+            .default_size([380.0, 320.0])
+            .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    for (index, label) in ["Connection", "Display", "Automation", "Behavior", "About"]
+                        .into_iter()
+                        .enumerate()
+                    {
+                        if ui.selectable_label(self.settings_tab == index, label).clicked() {
+                            self.settings_tab = index;
+                        }
+                    }
+                });
+                ui.separator();
+
+                let tab = self.settings_tab;
+                if tab == 4 {
+                    self.settings_tab_about(ui);
+                } else {
+                    let App {
+                        sessions, settings, ..
+                    } = &mut *self;
+                    let session = &mut sessions[active];
+                    match tab {
+                        0 => session.settings_tab_connection(ui),
+                        1 => session.settings_tab_display(ui, &mut settings.font_size),
+                        2 => session.settings_tab_automation(ui),
+                        3 => session.settings_tab_behavior(
+                            ui,
+                            &mut settings.notifications_enabled,
+                            &mut settings.minimize_to_tray,
+                        ),
+                        _ => {}
+                    }
+                }
+
+                ui.separator();
+                if ui.button("Close").clicked() {
+                    close = true;
+                }
+            });
+        // Behaviour edits made on the active session apply everywhere while
+        // the window is open.
+        self.sessions[active].export_config(&mut self.settings);
+        if close {
+            self.close_settings_window();
+        }
+    }
+
+    /// Close Settings only when the connection form validates; on failure
+    /// keep the window open on the Connection tab so the error is visible
+    /// and editable (#207). Returns whether the window was closed.
+    pub(crate) fn close_settings_window(&mut self) -> bool {
+        let active = self.active_index();
+        if self.sessions[active].validate_connection_form() {
+            self.save_settings_from(active);
+            self.show_settings = false;
+            true
+        } else {
+            self.settings_tab = 0;
+            false
+        }
+    }
+
+    fn settings_tab_about(&mut self, ui: &mut egui::Ui) {
+        ui.add_space(20.0);
+        ui.vertical_centered(|ui| {
+            ui.heading("Linefeed");
+            ui.label(concat!("Version ", env!("CARGO_PKG_VERSION")));
+            ui.add_space(10.0);
+            ui.label("A cross-platform IRC client");
+            ui.label(
+                RichText::new("Built with Rust + egui")
+                    .small()
+                    .color(Color32::GRAY),
+            );
+            ui.add_space(20.0);
+            ui.label(
+                RichText::new(format!(
+                    "{} / {}",
+                    std::env::consts::OS,
+                    std::env::consts::ARCH
+                ))
+                .small(),
+            );
+            ui.add_space(12.0);
+            ui.separator();
+            let mut automatic = self.settings.automatic_updates;
+            if ui.checkbox(&mut automatic, "Automatic updates").changed() {
+                self.set_automatic_updates(automatic);
+            }
+            ui.label(
+                RichText::new("Downloads updates in the background and installs when you exit.")
+                    .small(),
+            );
+            if let Some(time) = self.updater.last_check {
+                ui.label(
+                    RichText::new(format!(
+                        "Last checked: {}",
+                        super::helpers::epoch_time_formatted(time, "full")
+                    ))
+                    .small(),
+                );
+            }
+            let busy = self.updater.busy();
+            if ui
+                .add_enabled(
+                    !busy && self.updater.available(),
+                    egui::Button::new("Check for updates"),
+                )
+                .clicked()
+            {
+                self.updater.check();
+            }
+            use crate::updater::Status;
+            match &self.updater.status {
+                Status::Idle => {}
+                Status::Checking => {
+                    ui.spinner();
+                    ui.label("Checking for updates…");
+                }
+                Status::UpToDate => {
+                    ui.label("You're up to date.");
+                }
+                Status::Available => {
+                    ui.label("An update is available.");
+                }
+                Status::Downloading { received, total } => {
+                    let fraction = if *total > 0 {
+                        *received as f32 / *total as f32
+                    } else {
+                        0.0
+                    };
+                    ui.add(
+                        egui::ProgressBar::new(fraction)
+                            .show_percentage()
+                            .text("Downloading update…"),
+                    );
+                }
+                Status::Ready => {
+                    ui.label("Update downloaded and verified.");
+                }
+                Status::Applying => {
+                    ui.spinner();
+                    ui.label("Preparing to restart…");
+                }
+                Status::Error(message) => {
+                    ui.colored_label(Color32::LIGHT_RED, message);
+                }
+            }
+            if let Some(offer) = &self.updater.offer {
+                ui.label(format!("Version {} is available", offer.version));
+                ui.hyperlink_to("Release notes", offer.release_url());
+                if self.updater.download_available()
+                    && self.updater.install_reason.is_none()
+                    && ui
+                        .add_enabled(!busy, egui::Button::new("Download update"))
+                        .clicked()
+                {
+                    self.updater.download();
+                }
+            }
+            if let Some(tx) = &self.updater.staged {
+                ui.label(format!("Version {} is ready to install", tx.version));
+                if self.updater.install_reason.is_none()
+                    && ui
+                        .add_enabled(!busy, egui::Button::new("Restart to update"))
+                        .clicked()
+                {
+                    self.updater.restart_requested = true;
+                }
+            }
+            if let Some(reason) = &self.updater.install_reason {
+                ui.label(RichText::new(reason).small());
+            }
+            if self.updater.reset_available() {
+                if ui
+                    .button("Reset update state")
+                    .on_hover_text(
+                        "Deletes Linefeed's saved update recovery files, including any \
+                         downloaded update and the backup of the previous version. Use it \
+                         after installing a release yourself.",
+                    )
+                    .clicked()
+                {
+                    self.updater.reset_recovery();
+                }
+                ui.label(
+                    RichText::new("Restart Linefeed afterwards to re-enable updates.").small(),
+                );
+            }
+            ui.hyperlink_to(
+                "Download releases",
+                "https://github.com/faratech/linefeed/releases",
+            );
+        });
+    }
+
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1764,17 +1773,24 @@ mod tests {
         }));
     }
 
+    fn test_app(persisted: Settings) -> App {
+        let mut app = App::with_settings(persisted, crate::gui::windows::LayoutFile::default());
+        app.start(None);
+        app
+    }
+
     #[test]
     fn settings_close_keeps_window_open_on_invalid_connection_form() {
-        let mut app = Session::with_settings(Settings::default());
+        let mut app = test_app(Settings::default());
         app.show_settings = true;
         app.settings_tab = 1;
-        app.server_port = "abc".into();
+        app.sessions[0].server_port = "abc".into();
 
         assert!(!app.close_settings_window());
         assert!(app.show_settings);
         assert_eq!(app.settings_tab, 0);
-        assert!(app.connection_error().is_some());
+        assert!(app.sessions[0].connection_error().is_some());
+        assert!(app.settings_file.is_none(), "an invalid form was saved");
     }
 
     #[test]
@@ -1787,25 +1803,28 @@ mod tests {
             sasl_password: "persisted-sasl".into(),
             ..Settings::default()
         };
-        let mut app = Session::with_settings(persisted.clone());
-        app.server_host = "scratch.example".into();
-        app.server_port = "1234".into();
-        app.nickname = "scratchnick".into();
-        app.password = "scratch-pass".into();
-        app.sasl_password = "scratch-sasl".into();
-        app.auto_perform = "/ns identify scratch-pass".into();
-        app.new_favorite_name = "scratch".into();
-        app.show_save_favorite_dialog = true;
+        let mut app = test_app(persisted);
+        let session = &mut app.sessions[0];
+        session.server_host = "scratch.example".into();
+        session.server_port = "1234".into();
+        session.nickname = "scratchnick".into();
+        session.password = "scratch-pass".into();
+        session.sasl_password = "scratch-sasl".into();
+        session.auto_perform = "/ns identify scratch-pass".into();
+        app.favorites_ui.new_name = "scratch".into();
+        app.favorites_ui.show_save_dialog = true;
 
-        app.restore_connect_form_from(&persisted);
+        app.cancel_connect(0);
 
-        assert_eq!(app.server_host, "persisted.example");
-        assert_eq!(app.nickname, "persistednick");
-        assert!(app.new_favorite_name.is_empty());
-        assert!(!app.show_save_favorite_dialog);
+        let session = &app.sessions[0];
+        assert_eq!(session.server_host, "persisted.example");
+        assert_eq!(session.nickname, "persistednick");
+        assert!(!session.show_connect_dialog);
+        assert!(app.favorites_ui.new_name.is_empty());
+        assert!(!app.favorites_ui.show_save_dialog);
         // What a later unrelated save would persist no longer carries the
         // cancelled credentials.
-        let snapshot = app.get_settings();
+        let snapshot = session.get_settings();
         assert_eq!(snapshot.password, "persisted-pass");
         assert_eq!(snapshot.sasl_password, "persisted-sasl");
         assert!(snapshot.auto_perform.is_empty());
@@ -1813,37 +1832,29 @@ mod tests {
 
     #[test]
     fn cancelled_connect_dialog_drops_a_stale_favorite_selection() {
-        let persisted = Settings {
+        let mut app = test_app(Settings {
             server_favorites: vec![ServerFavorite::default()],
             ..Settings::default()
-        };
-        let mut app = Session::with_settings(persisted.clone());
-        // The in-memory list outgrew the file (a failed save or an external
-        // edit) and the last entry is selected (#268).
-        app.server_favorites.push(ServerFavorite::default());
-        app.selected_favorite = Some(1);
-
-        app.restore_connect_form_from(&persisted);
-
-        assert_eq!(app.server_favorites.len(), 1);
-        assert_eq!(app.selected_favorite, None);
+        });
+        // A selection the list no longer covers (#268).
+        app.favorites_ui.selected = Some(1);
+        app.cancel_connect(0);
+        assert_eq!(app.favorites_ui.selected, None);
     }
 
     #[test]
     fn deleting_a_favorite_ignores_an_out_of_range_index() {
-        let mut app = Session::with_settings(Settings {
-            server_favorites: vec![ServerFavorite::default()],
-            ..Settings::default()
-        });
-        assert!(!app.remove_favorite(1));
-        assert_eq!(app.server_favorites.len(), 1);
-        assert!(app.remove_favorite(0));
-        assert!(app.server_favorites.is_empty());
+        let mut favorites = vec![ServerFavorite::default()];
+        assert!(!remove_favorite(&mut favorites, 1));
+        assert_eq!(favorites.len(), 1);
+        assert!(remove_favorite(&mut favorites, 0));
+        assert!(favorites.is_empty());
     }
 
-    /// An app whose Connection form holds invalid and unsaved scratch edits
-    /// over a clean persisted configuration (the "disk" is in memory).
-    fn app_with_dirty_connection_form() -> Session {
+    /// An app whose active session's Connection form holds invalid and
+    /// unsaved scratch edits over a clean persisted configuration. Saves
+    /// land in `app.settings_file`, never on disk.
+    fn app_with_dirty_connection_form() -> App {
         let persisted = Settings {
             server_host: "persisted.example".into(),
             server_port: "6697".into(),
@@ -1851,84 +1862,98 @@ mod tests {
             automatic_updates: true,
             server_favorites: vec![ServerFavorite::default(), ServerFavorite::default()],
             list_min_users: 0,
+            logging_enabled: false,
             ..Settings::default()
         };
-        let mut app = Session::with_settings(persisted);
-        app.server_port = "abc".into();
-        app.password = "scratch-pass".into();
-        app.sasl_username = "scratch-user".into();
-        app.sasl_password = "scratch-sasl".into();
-        app.auto_perform = "/ns identify scratch-pass".into();
+        let mut app = test_app(persisted);
+        let session = &mut app.sessions[0];
+        session.server_port = "abc".into();
+        session.password = "scratch-pass".into();
+        session.sasl_username = "scratch-user".into();
+        session.sasl_password = "scratch-sasl".into();
+        session.auto_perform = "/ns identify scratch-pass".into();
         app
     }
 
-    /// Nothing from the dirty Connection form may have reached the file.
-    fn assert_form_not_persisted(app: &Session) {
-        let saved = app.load_persisted_settings();
+    /// What was saved, which must not carry the dirty Connection form.
+    fn saved_without_the_form(app: &App) -> Settings {
+        let saved = app.settings_file.clone().expect("nothing was saved");
         assert_eq!(saved.server_port, "6697");
         assert_eq!(saved.nickname, "persistednick");
         assert!(saved.password.is_empty(), "scratch password persisted");
         assert!(saved.sasl_username.is_empty());
         assert!(saved.sasl_password.is_empty());
         assert!(saved.auto_perform.is_empty());
+        saved
     }
 
     #[test]
     fn automatic_updates_toggle_persists_without_the_unvalidated_connection_form() {
         let mut app = app_with_dirty_connection_form();
-
         app.set_automatic_updates(false);
-
-        assert!(!app.load_persisted_settings().automatic_updates);
-        assert_form_not_persisted(&app);
+        assert!(!saved_without_the_form(&app).automatic_updates);
     }
 
     #[test]
     fn deleting_a_favorite_persists_without_the_unvalidated_connection_form() {
         let mut app = app_with_dirty_connection_form();
-
-        assert!(app.delete_favorite(0));
-
-        assert_eq!(app.load_persisted_settings().server_favorites.len(), 1);
-        assert_form_not_persisted(&app);
+        // What the Delete button does.
+        assert!(remove_favorite(&mut app.settings.server_favorites, 0));
+        app.sessions[0].save_config();
+        app.process_events();
+        assert_eq!(saved_without_the_form(&app).server_favorites.len(), 1);
     }
 
     #[test]
     fn channel_list_minimum_persists_without_the_unvalidated_connection_form() {
         let mut app = app_with_dirty_connection_form();
-        app.list_min_users = 12;
-
-        app.save_list_min_users();
-
-        assert_eq!(app.load_persisted_settings().list_min_users, 12);
-        assert_form_not_persisted(&app);
+        app.sessions[0].list_min_users = 12;
+        app.sessions[0].save_list_min_users();
+        app.process_events();
+        assert_eq!(saved_without_the_form(&app).list_min_users, 12);
+        // Every session picks the new minimum up.
+        assert_eq!(app.sessions[0].list_min_users, 12);
     }
 
     #[test]
     fn closing_the_channel_list_after_a_join_does_not_persist_the_connection_form() {
         let mut app = app_with_dirty_connection_form();
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
-        app.cmd_tx = Some(tx);
-        app.connected = true;
-        app.show_channel_list = true;
-        app.list_min_users = 3;
+        let session = &mut app.sessions[0];
+        session.cmd_tx = Some(tx);
+        session.connected = true;
+        session.show_channel_list = true;
+        session.list_min_users = 3;
 
-        assert!(app.join_from_channel_list("#room".into()));
+        assert!(session.join_from_channel_list("#room".into()));
+        assert!(!session.show_channel_list);
+        app.process_events();
+        assert_eq!(saved_without_the_form(&app).list_min_users, 3);
+    }
 
-        assert!(!app.show_channel_list);
-        assert_eq!(app.load_persisted_settings().list_min_users, 3);
-        assert_form_not_persisted(&app);
+    #[test]
+    fn a_valid_scratch_form_is_not_persisted_by_an_unrelated_save() {
+        let mut app = app_with_dirty_connection_form();
+        // Valid, but still unsaved scratch: only Connect or a validated
+        // Settings close may persist it (#316).
+        app.sessions[0].server_port = "6667".into();
+        app.set_automatic_updates(false);
+        saved_without_the_form(&app);
     }
 
     #[test]
     fn validated_settings_close_still_persists_the_whole_form() {
         let mut app = app_with_dirty_connection_form();
-        app.server_port = "6667".into();
+        app.sessions[0].server_port = "6667".into();
         app.show_settings = true;
 
-        assert!(app.close_settings_window(), "{:?}", app.connection_error());
-
-        assert_eq!(app.load_persisted_settings().server_port, "6667");
+        assert!(
+            app.close_settings_window(),
+            "{:?}",
+            app.sessions[0].connection_error()
+        );
+        assert!(!app.show_settings);
+        assert_eq!(app.settings_file.as_ref().unwrap().server_port, "6667");
     }
 
     fn list_row(app: &mut Session, channel: &str, users: &str) {
@@ -1989,93 +2014,75 @@ mod tests {
         assert_eq!(names, ["#kept"]);
     }
 
-    fn settings_json(settings: &Settings) -> String {
-        serde_json::to_string(settings).unwrap()
-    }
-
     #[test]
     fn saving_a_favorite_persists_only_the_favorites_list() {
         let mut app = app_with_dirty_connection_form();
-        app.server_port = "6667".into();
-        app.new_favorite_name = "mine".into();
+        app.sessions[0].server_port = "6667".into();
+        // What the Save button does.
+        let favorite = app.sessions[0].form_as_favorite("mine").unwrap();
+        app.settings.server_favorites.push(favorite);
+        app.sessions[0].save_config();
+        app.process_events();
 
-        assert!(app.save_form_as_favorite());
-
-        let saved = app.load_persisted_settings();
+        let saved = saved_without_the_form(&app);
         assert_eq!(saved.server_favorites.len(), 3);
         let favorite = saved.server_favorites.last().unwrap();
         assert_eq!(favorite.name, "mine");
-        assert_eq!(
-            favorite.password, "scratch-pass",
-            "favorites keep credentials"
-        );
-        // ...but the co-open Connect dialog's scratch values are not top-level
-        // settings until Connect or a validated Close saves them.
-        assert_eq!(saved.server_port, "6697");
-        assert!(saved.password.is_empty(), "scratch password persisted");
-        assert!(saved.sasl_password.is_empty());
-        assert!(saved.auto_perform.is_empty());
+        assert_eq!(favorite.password, "scratch-pass", "favorites keep credentials");
     }
 
     #[test]
     fn ignore_commands_persist_only_the_ignore_list() {
         let mut app = app_with_dirty_connection_form();
+        app.sessions[0].process_command("/ignore troll");
+        app.process_events();
+        assert_eq!(saved_without_the_form(&app).ignore_list, ["troll"]);
 
-        app.process_command("/ignore troll");
-        let saved = app.load_persisted_settings();
-        assert_eq!(saved.ignore_list, app.ignore_list);
-        assert_eq!(saved.ignore_list.len(), 1);
-        assert_form_not_persisted(&app);
-
-        app.process_command("/unignore troll");
-        assert!(app.load_persisted_settings().ignore_list.is_empty());
-        assert_form_not_persisted(&app);
+        app.sessions[0].process_command("/unignore troll");
+        app.process_events();
+        assert!(saved_without_the_form(&app).ignore_list.is_empty());
     }
 
     #[test]
     fn perform_commands_persist_only_the_auto_perform_list() {
         let mut app = app_with_dirty_connection_form();
-        app.auto_perform.clear();
-
-        app.process_command("/perform /mode +i");
-        let saved = app.load_persisted_settings();
+        app.sessions[0].auto_perform.clear();
+        app.sessions[0].process_command("/perform /mode +i");
+        app.process_events();
+        let saved = app.settings_file.clone().unwrap();
         assert_eq!(saved.auto_perform, "/mode +i");
         assert_eq!(saved.server_port, "6697");
         assert!(saved.password.is_empty());
         assert!(saved.sasl_username.is_empty());
 
-        app.process_command("/perform clear");
-        let saved = app.load_persisted_settings();
+        app.sessions[0].process_command("/perform clear");
+        app.process_events();
+        let saved = app.settings_file.clone().unwrap();
         assert!(saved.auto_perform.is_empty());
-        assert_eq!(saved.server_port, "6697");
         assert!(saved.password.is_empty());
     }
 
     #[test]
-    fn an_unreadable_settings_file_is_never_overwritten_by_a_field_save() {
+    fn an_unreadable_settings_file_is_never_overwritten() {
         let mut app = app_with_dirty_connection_form();
-        let before = settings_json(app.settings_file.as_ref().unwrap());
-        app.settings_file_unreadable = true;
-
+        // The file existed at startup but could not be read.
+        app.settings_writable = false;
         app.set_automatic_updates(false);
-        assert!(app.delete_favorite(0));
-        app.process_command("/ignore troll");
-        app.save_list_min_users();
-
-        assert_eq!(
-            settings_json(app.settings_file.as_ref().unwrap()),
-            before,
-            "a read failure must skip the save, not write defaults over the file"
+        assert!(remove_favorite(&mut app.settings.server_favorites, 0));
+        app.sessions[0].save_config();
+        app.sessions[0].process_command("/ignore troll");
+        app.process_events();
+        assert!(
+            app.settings_file.is_none(),
+            "a read failure must disable saving, not write defaults over the file"
         );
     }
 
     #[test]
-    fn a_missing_settings_file_is_created_by_a_field_save() {
+    fn a_missing_settings_file_is_created_by_the_first_save() {
         let mut app = app_with_dirty_connection_form();
-        app.settings_file = None;
-
+        assert!(app.settings_file.is_none());
         app.set_automatic_updates(false);
-
         let saved = app.settings_file.as_ref().expect("file created");
         assert!(!saved.automatic_updates);
         assert!(saved.password.is_empty());

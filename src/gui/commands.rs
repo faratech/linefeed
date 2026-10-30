@@ -1,7 +1,7 @@
 //! IRC command processing and help system
 
 use super::helpers::{is_extended_ban, mask_matches, nick_to_mask};
-use super::{ChatMessage, Session};
+use super::{ChatMessage, Session, SessionEvent};
 use crate::irc::IrcCommand;
 
 impl Session {
@@ -1784,6 +1784,48 @@ impl Session {
             }
 
             // === Connection Commands ===
+            "SERVER" if new_window_server_args(args).is_some() => {
+                // `/server -m host [port]`: a new status window, keeping this
+                // connection. Like /server it is unprofiled: the new session
+                // starts from the endpoint alone, never from this form's
+                // secrets.
+                let rest = new_window_server_args(args).unwrap_or_default();
+                if rest.is_empty() {
+                    self.add_message_to_current(ChatMessage::system(
+                        "Usage: /server -m <host> [port]",
+                    ));
+                    return;
+                }
+                let ServerArg { host, port, tls } = match parse_server_arg(rest) {
+                    Ok(endpoint) => endpoint,
+                    Err(error) => {
+                        self.add_server_message(ChatMessage::system_fmt(
+                            &error,
+                            &self.timestamp_format,
+                        ));
+                        return;
+                    }
+                };
+                if host.trim().is_empty() {
+                    self.add_server_message(ChatMessage::system_fmt(
+                        "Server host cannot be empty",
+                        &self.timestamp_format,
+                    ));
+                    return;
+                }
+                let port = port.unwrap_or_else(|| self.server_port.clone());
+                if let Err(error) = parse_server_port(&port) {
+                    self.add_server_message(ChatMessage::system_fmt(&error, &self.timestamp_format));
+                    return;
+                }
+                let use_tls = tls.unwrap_or(self.use_tls);
+                self.events.push(SessionEvent::NewServer {
+                    host,
+                    port,
+                    use_tls,
+                });
+            }
+
             "SERVER" => {
                 if !args.is_empty() {
                     // Handles "host", "host [+]port", "host:[+]port",
@@ -1902,8 +1944,7 @@ impl Session {
                     }
                 } else {
                     if self.add_ignore_masks(args) {
-                        let ignored = self.ignore_list.clone();
-                        self.save_setting(|settings| settings.ignore_list = ignored);
+                        self.save_config();
                     }
                 }
             }
@@ -1914,8 +1955,7 @@ impl Session {
                         "Usage: /unignore <nick|mask>",
                     ));
                 } else if self.remove_ignore_masks(args) {
-                    let ignored = self.ignore_list.clone();
-                    self.save_setting(|settings| settings.ignore_list = ignored);
+                    self.save_config();
                 }
             }
 
@@ -2014,8 +2054,7 @@ impl Session {
                     }
                 } else if args.eq_ignore_ascii_case("clear") {
                     self.auto_perform.clear();
-                    let perform = self.auto_perform.clone();
-                    self.save_setting(|settings| settings.auto_perform = perform);
+                    self.save_auto_perform();
                     self.add_message_to_current(ChatMessage::system(
                         "Auto-perform commands cleared.",
                     ));
@@ -2025,8 +2064,7 @@ impl Session {
                         self.auto_perform.push('\n');
                     }
                     self.auto_perform.push_str(args);
-                    let perform = self.auto_perform.clone();
-                    self.save_setting(|settings| settings.auto_perform = perform);
+                    self.save_auto_perform();
                     self.add_message_to_current(
                         ChatMessage::system("Added command to auto-perform.").without_logging(),
                     );
@@ -2034,7 +2072,7 @@ impl Session {
             }
 
             "SETTINGS" => {
-                self.show_settings = true;
+                self.events.push(SessionEvent::OpenSettings);
             }
 
             "CPRIVMSG" | "CNOTICE" => {
@@ -2378,6 +2416,8 @@ impl Session {
         self.persistence_profile.clear();
         self.pending_auto_perform = None;
         self.accept_invalid_certs = false;
+        // Without its credentials the form no longer describes the profile.
+        self.form_profile = None;
     }
 
     /// Snapshot the connection-form fields that make up the saved network
@@ -2399,6 +2439,7 @@ impl Session {
             auto_perform: self.auto_perform.clone(),
             pre_away_message: self.pre_away_message.clone(),
             persistence_profile: self.persistence_profile.clone(),
+            form_profile: self.form_profile.clone(),
         }
     }
 
@@ -2418,6 +2459,7 @@ impl Session {
         self.auto_perform = form.auto_perform;
         self.pre_away_message = form.pre_away_message;
         self.persistence_profile = form.persistence_profile;
+        self.form_profile = form.form_profile;
     }
 
     pub fn show_help(&mut self) {
@@ -2902,6 +2944,7 @@ struct EndpointForm {
     auto_perform: String,
     pre_away_message: String,
     persistence_profile: String,
+    form_profile: Option<String>,
 }
 
 /// The standard TLS port: a `/server` that names it connects with TLS.
@@ -2966,6 +3009,7 @@ fn parse_server_arg_port(value: &str) -> Result<(u16, Option<bool>), String> {
 /// host that is not a single (optionally `+`) port. Such a line must not be
 /// echoed or kept in history (#226).
 pub(super) fn server_args_carry_secret(args: &str) -> bool {
+    let args = new_window_server_args(args).unwrap_or(args);
     let mut parts = args.split_whitespace();
     parts.next();
     match (parts.next(), parts.next()) {
@@ -2973,6 +3017,13 @@ pub(super) fn server_args_carry_secret(args: &str) -> bool {
         (Some(port), None) => parse_server_arg_port(port).is_err(),
         (Some(_), Some(_)) => true,
     }
+}
+
+/// The arguments after a leading `-m` flag (`/server -m host [port]`, which
+/// opens a new status window), or `None` without the flag.
+fn new_window_server_args(args: &str) -> Option<&str> {
+    let rest = args.trim_start().strip_prefix("-m")?;
+    (rest.is_empty() || rest.starts_with(char::is_whitespace)).then(|| rest.trim())
 }
 
 /// Parse the /server argument: "host", "host [+]port", "host:[+]port",

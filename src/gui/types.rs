@@ -71,6 +71,13 @@ pub struct ServerFavorite {
     /// Nefarious draft/persistence profile attached during registration.
     #[serde(default)]
     pub persistence_profile: String,
+    /// Stable identity of this network profile (random hex, assigned on
+    /// load when missing). Window layout and running sessions refer to it.
+    #[serde(default)]
+    pub id: String,
+    /// Connect to this network when Linefeed starts.
+    #[serde(default)]
+    pub auto_connect: bool,
 }
 
 /// Persistent settings
@@ -285,7 +292,7 @@ impl Settings {
 /// contains server and SASL passwords, and fsynced so the atomic rename that
 /// follows lands on durable bytes.
 #[cfg(unix)]
-fn write_settings_file(tmp: &std::path::Path, data: &str) -> std::io::Result<()> {
+pub(super) fn write_settings_file(tmp: &std::path::Path, data: &str) -> std::io::Result<()> {
     use std::io::Write;
     use std::os::unix::fs::OpenOptionsExt;
     let mut file = std::fs::OpenOptions::new()
@@ -299,7 +306,7 @@ fn write_settings_file(tmp: &std::path::Path, data: &str) -> std::io::Result<()>
 }
 
 #[cfg(not(unix))]
-fn write_settings_file(tmp: &std::path::Path, data: &str) -> std::io::Result<()> {
+pub(super) fn write_settings_file(tmp: &std::path::Path, data: &str) -> std::io::Result<()> {
     std::fs::write(tmp, data)
 }
 

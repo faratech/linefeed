@@ -1,3 +1,4 @@
+mod app;
 mod commands;
 mod connection;
 mod dialogs;
@@ -5,15 +6,17 @@ mod formatting;
 mod helpers;
 mod logging;
 mod types;
+mod view;
+mod windows;
 
-use egui::{Color32, RichText, ScrollArea, TextEdit};
+use egui::{Color32, RichText, ScrollArea};
 use std::collections::{HashMap, VecDeque};
 use tokio::sync::mpsc;
 
 use crate::irc::client::{DESIRED_CAPS, SaslMechanism, ServerConfig};
 use crate::irc::numerics::*;
 use crate::irc::{IrcCommand, IrcMessage};
-use formatting::{nick_color, render_irc_text, render_segments};
+use formatting::{nick_color, render_segments};
 use helpers::{epoch_time_formatted, format_timestamp, mask_matches, truncate_chars};
 pub use types::{
     CaseMapping, Channel, ChannelListEntry, ChannelListSort, ChatMessage, KnownUser,
@@ -21,6 +24,37 @@ pub use types::{
     UserMode,
 };
 use types::{CtcpReplyDecision, CtcpReplyLimiter};
+pub use app::App;
+pub(crate) use app::MAIN_WINDOW_TITLE;
+
+/// Requests a session makes of the App, drained every frame. A session never
+/// reaches the App directly: notifications, settings and new connections are
+/// global, so they go through here.
+pub(crate) enum SessionEvent {
+    /// A desktop notification; the App applies focus, the setting and rate
+    /// limits (`App::notify`).
+    Notify {
+        title: String,
+        body: String,
+        force: bool,
+    },
+    /// `/settings`
+    OpenSettings,
+    /// Persist this session's connect form and behaviour settings.
+    SaveSettings,
+    /// Persist this session's behaviour settings and the favorites, not
+    /// its connect form (#316).
+    SaveConfig,
+    /// Persist this session's auto-perform list (`/perform`), not the rest
+    /// of its connect form (#316).
+    SaveAutoPerform,
+    /// `/server -m`: connect to an endpoint in a new status window.
+    NewServer {
+        host: String,
+        port: String,
+        use_tls: bool,
+    },
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConnectionIntent {
@@ -30,7 +64,7 @@ pub enum ConnectionIntent {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct EndpointKey {
+pub(crate) struct EndpointKey {
     host: String,
     port: u16,
     use_tls: bool,
@@ -51,6 +85,10 @@ struct SessionConfig {
     auto_perform: String,
     #[serde(default)]
     set_invisible: bool,
+    /// The network profile (server favorite) this connection was started
+    /// from, if any: it names the session's windows and keys its layout.
+    #[serde(default)]
+    profile_id: Option<String>,
 }
 
 /// Private, short-lived state used only across an explicit update restart.
@@ -68,6 +106,28 @@ pub struct UpdateSession {
     selected: Option<String>,
     input: String,
     away: Option<String>,
+    /// Every other session, each a snapshot of the same shape (with no
+    /// `others` of its own). Older binaries ignore this and restore only
+    /// the top-level (active) session.
+    others: Vec<UpdateSession>,
+}
+
+impl UpdateSession {
+    pub(crate) fn input(&self) -> &str {
+        &self.input
+    }
+
+    pub(crate) fn set_input(&mut self, input: String) {
+        self.input = input;
+    }
+
+    pub(crate) fn set_others(&mut self, others: Vec<UpdateSession>) {
+        self.others = others;
+    }
+
+    pub(crate) fn take_others(&mut self) -> Vec<UpdateSession> {
+        std::mem::take(&mut self.others)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -126,20 +186,6 @@ struct MultilineBatch {
 /// batch that streams chunks without end must not grow memory for as long as
 /// the connection lives (the multiline batches are capped alike, #191).
 const MAX_AUTHTOKEN_BYTES: usize = 8192;
-
-/// Rate limit for desktop notifications: each one spawns an OS thread (and on
-/// Linux/macOS a subprocess), so a netsplit replay or highlight flood must not
-/// spawn one per message.
-const MIN_NOTIFICATION_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
-
-/// A forced (private message) notification held back by the rate limiter.
-/// Further ones arriving meanwhile are folded into it, so nothing is dropped
-/// and the OS still sees at most one helper per interval (#323).
-struct DeferredNotification {
-    title: String,
-    body: String,
-    count: usize,
-}
 
 struct AuthtokenBatch {
     service: String,
@@ -328,8 +374,6 @@ pub(crate) fn apply_font_size(ctx: &egui::Context, font_size: f32) {
 }
 
 pub struct Session {
-    pub updater: crate::updater::Controller,
-    pub automatic_updates: bool,
     update_rejoins: Option<Vec<(String, Option<String>)>>,
     update_selected: Option<String>,
     update_join_targets: Vec<String>,
@@ -375,9 +419,17 @@ pub struct Session {
     /// This session's connection worker thread, if one is running or has
     /// exited without being observed yet (see `connection.rs`).
     pub(crate) worker: Option<std::thread::JoinHandle<()>>,
+    /// Identifies this session to the window manager; never reused.
+    pub(crate) id: windows::ConnId,
+    /// The network profile (server favorite) this session was started from.
+    pub(crate) profile_id: Option<String>,
+    /// The favorite the connect form was last loaded from, cleared once the
+    /// form stops describing it (its credentials are cleared).
+    pub(crate) form_profile: Option<String>,
+    /// Requests for the App, drained every frame (see `SessionEvent`).
+    pub(crate) events: Vec<SessionEvent>,
 
     // UI state
-    pub show_settings: bool,
     pub scroll_to_bottom: bool,
     pub show_connect_dialog: bool,
 
@@ -417,9 +469,7 @@ pub struct Session {
     // Connection options
     pub auto_join_channels: String,
     pub set_invisible: bool,
-    pub minimize_to_tray: bool,
     pub auto_reconnect: bool,
-    pub notifications_enabled: bool,
 
     // Window focus tracking (for notifications)
     pub window_focused: bool,
@@ -432,8 +482,6 @@ pub struct Session {
     // Ignore list
     pub ignore_list: Vec<String>,
 
-    // Server favorites
-    pub server_favorites: Vec<ServerFavorite>,
 
     // Auto-perform commands (newline-separated)
     pub auto_perform: String,
@@ -443,20 +491,9 @@ pub struct Session {
     // Pending auto-perform (to execute after connect)
     pub pending_auto_perform: Option<Vec<String>>,
 
-    // Server favorites UI state
-    pub selected_favorite: Option<usize>,
-    pub new_favorite_name: String,
-    pub show_save_favorite_dialog: bool,
 
     // Pending channel keys (for storing key when joining +k channels)
     pub pending_channel_keys: HashMap<String, String>,
-    /// In-memory stand-in for settings.json, so unit tests can observe what
-    /// would be persisted without reading or overwriting the real file.
-    #[cfg(test)]
-    settings_file: Option<Settings>,
-    /// Test switch: the settings file exists but cannot be read.
-    #[cfg(test)]
-    settings_file_unreadable: bool,
     /// Channels the user asked to join (/join, the join box, the channel
     /// list). The matching own-JOIN echo moves focus to the new tab; any other
     /// own-JOIN (auto-join, bouncer replay, reconnect) leaves the tab the user
@@ -493,7 +530,6 @@ pub struct Session {
     // Display settings
     pub timestamp_format: String,
     pub hide_join_part: bool,
-    pub font_size: f32,
     pub max_scrollback: usize,
 
     // Privacy
@@ -541,8 +577,6 @@ pub struct Session {
     pub show_channel_info: bool,
     pub channel_info_target: Option<String>,
 
-    // Settings dialog tab
-    pub settings_tab: usize,
 
     // Lag meter
     pub lag_ms: Option<u32>,
@@ -556,16 +590,6 @@ pub struct Session {
     // CPU optimization state
     pub had_messages_this_frame: bool,
 
-    // Rate limiting for desktop notifications (each one spawns a thread and,
-    // on Linux/macOS, a subprocess - a flood must not spawn one per message).
-    last_notification_time: Option<std::time::Instant>,
-    /// Rate-limit clock for forced (private message) notifications, kept apart
-    /// from `last_notification_time` so a highlight never mutes a PM (#323).
-    last_forced_notification_time: Option<std::time::Instant>,
-    deferred_notification: Option<DeferredNotification>,
-    /// Notifications that would have reached the OS (tests only).
-    #[cfg(test)]
-    dispatched_notifications: Vec<(String, String)>,
 
     nick_retry_attempts: u8,
     /// Nicks this client has held this session (newest first, capped). Own
@@ -602,12 +626,6 @@ impl Session {
         let self_nick_keys = vec![my_nick_lower.clone()];
 
         Self {
-            #[cfg(test)]
-            settings_file: Some(settings.clone()),
-            #[cfg(test)]
-            settings_file_unreadable: false,
-            updater: crate::updater::Controller::default(),
-            automatic_updates: settings.automatic_updates,
             update_rejoins: None,
             update_selected: None,
             update_join_targets: Vec::new(),
@@ -640,8 +658,11 @@ impl Session {
             msg_rx: None,
             closing_rx: None,
             worker: None,
+            id: 0,
+            profile_id: None,
+            form_profile: None,
+            events: Vec::new(),
 
-            show_settings: false,
             scroll_to_bottom: true,
             show_connect_dialog: true,
 
@@ -670,9 +691,7 @@ impl Session {
 
             auto_join_channels: settings.auto_join_channels,
             set_invisible: settings.set_invisible,
-            minimize_to_tray: settings.minimize_to_tray,
             auto_reconnect: settings.auto_reconnect,
-            notifications_enabled: settings.notifications_enabled,
 
             window_focused: true,
 
@@ -695,16 +714,11 @@ impl Session {
                 .collect(),
 
             ignore_list: settings.ignore_list,
-            server_favorites: settings.server_favorites,
             auto_perform: settings.auto_perform,
             pre_away_message: settings.pre_away_message,
             persistence_profile: settings.persistence_profile,
             pending_auto_perform: None,
 
-            // Server favorites UI state
-            selected_favorite: None,
-            new_favorite_name: String::new(),
-            show_save_favorite_dialog: false,
 
             pending_channel_keys: HashMap::new(),
             join_focus_requests: Vec::new(),
@@ -735,7 +749,6 @@ impl Session {
             // Display settings
             timestamp_format: settings.timestamp_format,
             hide_join_part: settings.hide_join_part,
-            font_size: settings.font_size,
             max_scrollback: settings.max_scrollback.max(100),
 
             // Privacy
@@ -772,8 +785,6 @@ impl Session {
             show_channel_info: false,
             channel_info_target: None,
 
-            // Settings dialog tab
-            settings_tab: 0,
 
             // Lag meter
             lag_ms: None,
@@ -786,11 +797,6 @@ impl Session {
 
             // CPU optimization
             had_messages_this_frame: false,
-            last_notification_time: None,
-            last_forced_notification_time: None,
-            deferred_notification: None,
-            #[cfg(test)]
-            dispatched_notifications: Vec::new(),
             nick_retry_attempts: 0,
             past_nicks: Vec::new(),
             nick_confirmed: false,
@@ -798,57 +804,84 @@ impl Session {
         }
     }
 
+    #[cfg(test)]
+    /// This session's view of the settings: its connect form and its copy of
+    /// the behaviour settings. App-only settings (favorites, tray, updates,
+    /// font) keep their defaults; the App owns those.
     fn get_settings(&self) -> Settings {
-        Settings {
-            server_host: self.server_host.clone(),
-            server_port: self.server_port.clone(),
-            use_tls: self.use_tls,
-            accept_invalid_certs: self.accept_invalid_certs,
-            nickname: self.nickname.clone(),
-            username: self.username.clone(),
-            realname: self.realname.clone(),
-            password: self.password.clone(),
-            auto_join_channels: self.auto_join_channels.clone(),
-            set_invisible: self.set_invisible,
-            minimize_to_tray: self.minimize_to_tray,
-            automatic_updates: self.automatic_updates,
-            auto_reconnect: self.auto_reconnect,
-            notifications_enabled: self.notifications_enabled,
-            ignore_list: self.ignore_list.clone(),
-            server_favorites: self.server_favorites.clone(),
-            auto_perform: self.auto_perform.clone(),
-            pre_away_message: self.pre_away_message.clone(),
-            persistence_profile: self.persistence_profile.clone(),
-            auto_away_enabled: self.auto_away_enabled,
-            auto_away_minutes: self.auto_away_minutes,
-            auto_away_message: self.auto_away_message.clone(),
-            sasl_username: self.sasl_username.clone(),
-            sasl_password: self.sasl_password.clone(),
-            sasl_mechanism: self.sasl_mechanism,
-            sasl_required: self.sasl_required,
-            tls_client_cert_path: self.tls_client_cert_path.clone(),
-            tls_client_key_path: self.tls_client_key_path.clone(),
-            logging_enabled: self.logging_enabled,
-            logging_load_history: self.logging_load_history,
-            logging_history_lines: self.logging_history_lines,
-            // Display
-            timestamp_format: self.timestamp_format.clone(),
-            hide_join_part: self.hide_join_part,
-            font_size: self.font_size,
-            max_scrollback: self.max_scrollback,
-            // Privacy
-            ctcp_replies_enabled: self.ctcp_replies_enabled,
-            // Highlights
-            highlight_words: self.highlight_words.clone(),
-            // Connection
-            reconnect_delay_secs: self.reconnect_delay_secs,
-            max_reconnect_attempts: self.max_reconnect_attempts,
-            // Custom messages
-            quit_message: self.quit_message.clone(),
-            part_message: self.part_message.clone(),
-            // Channel list
-            list_min_users: self.list_min_users,
-        }
+        let mut settings = Settings::default();
+        self.export_form(&mut settings);
+        self.export_config(&mut settings);
+        settings
+    }
+
+    /// Write this session's connect form into `settings`.
+    pub(crate) fn export_form(&self, settings: &mut Settings) {
+        settings.server_host = self.server_host.clone();
+        settings.server_port = self.server_port.clone();
+        settings.use_tls = self.use_tls;
+        settings.accept_invalid_certs = self.accept_invalid_certs;
+        settings.nickname = self.nickname.clone();
+        settings.username = self.username.clone();
+        settings.realname = self.realname.clone();
+        settings.password = self.password.clone();
+        settings.auto_join_channels = self.auto_join_channels.clone();
+        settings.set_invisible = self.set_invisible;
+        settings.auto_perform = self.auto_perform.clone();
+        settings.pre_away_message = self.pre_away_message.clone();
+        settings.persistence_profile = self.persistence_profile.clone();
+        settings.sasl_username = self.sasl_username.clone();
+        settings.sasl_password = self.sasl_password.clone();
+        settings.sasl_mechanism = self.sasl_mechanism;
+        settings.sasl_required = self.sasl_required;
+        settings.tls_client_cert_path = self.tls_client_cert_path.clone();
+        settings.tls_client_key_path = self.tls_client_key_path.clone();
+    }
+
+    /// Write this session's copy of the behaviour settings into `settings`.
+    pub(crate) fn export_config(&self, settings: &mut Settings) {
+        settings.auto_reconnect = self.auto_reconnect;
+        settings.ignore_list = self.ignore_list.clone();
+        settings.auto_away_enabled = self.auto_away_enabled;
+        settings.auto_away_minutes = self.auto_away_minutes;
+        settings.auto_away_message = self.auto_away_message.clone();
+        settings.logging_enabled = self.logging_enabled;
+        settings.logging_load_history = self.logging_load_history;
+        settings.logging_history_lines = self.logging_history_lines;
+        settings.timestamp_format = self.timestamp_format.clone();
+        settings.hide_join_part = self.hide_join_part;
+        settings.max_scrollback = self.max_scrollback;
+        settings.ctcp_replies_enabled = self.ctcp_replies_enabled;
+        settings.highlight_words = self.highlight_words.clone();
+        settings.reconnect_delay_secs = self.reconnect_delay_secs;
+        settings.max_reconnect_attempts = self.max_reconnect_attempts;
+        settings.quit_message = self.quit_message.clone();
+        settings.part_message = self.part_message.clone();
+        settings.list_min_users = self.list_min_users;
+    }
+
+    /// Mirror the App's behaviour settings into this session, with the same
+    /// floors as loading them (#144).
+    pub(crate) fn apply_config(&mut self, settings: &Settings) {
+        self.auto_reconnect = settings.auto_reconnect;
+        self.ignore_list = settings.ignore_list.clone();
+        self.auto_away_enabled = settings.auto_away_enabled;
+        self.auto_away_minutes = settings.auto_away_minutes.max(1);
+        self.auto_away_message = settings.auto_away_message.clone();
+        self.logging_enabled = settings.logging_enabled;
+        self.logging_load_history = settings.logging_load_history;
+        self.logging_history_lines = settings.logging_history_lines.max(10);
+        self.timestamp_format = settings.timestamp_format.clone();
+        self.hide_join_part = settings.hide_join_part;
+        self.max_scrollback = settings.max_scrollback.max(100);
+        self.ctcp_replies_enabled = settings.ctcp_replies_enabled;
+        self.highlight_words = settings.highlight_words.clone();
+        self.reconnect_delay_secs = settings.reconnect_delay_secs.max(1);
+        self.max_reconnect_attempts = settings.max_reconnect_attempts.max(1);
+        self.quit_message = settings.quit_message.clone();
+        self.part_message = settings.part_message.clone();
+        self.list_min_users = settings.list_min_users;
+        self.update_cached_lowercase();
     }
 
     /// Check if a sender is ignored (by nick or mask)
@@ -959,6 +992,7 @@ impl Session {
         )));
     }
 
+    #[cfg(test)]
     /// Minimal update when window is minimized - drains messages without rendering UI
     /// This prevents the message buffer from filling up while keeping CPU usage near zero
     pub fn update_minimal(&mut self) {
@@ -966,26 +1000,53 @@ impl Session {
         // the focus flag meanwhile: a stale `true` would suppress highlight,
         // kick and invite notifications and mark unseen messages read (#237).
         self.set_window_focused(false);
+        self.pump(None);
+        self.run_timed_tasks();
+    }
 
-        // Drain all pending messages to prevent buffer overflow
-        let messages: Vec<_> = if let Some(rx) = &mut self.msg_rx {
-            std::iter::from_fn(|| rx.try_recv().ok()).collect()
-        } else {
-            Vec::new()
+    /// Drain this session's incoming messages: at most `limit` (plus one)
+    /// per call so a flood cannot stall a frame, or all of them. Returns
+    /// whether more were left queued. Logged lines are flushed once per call
+    /// instead of once per message.
+    pub(crate) fn pump(&mut self, limit: Option<usize>) -> bool {
+        let messages: Vec<_> = match &mut self.msg_rx {
+            Some(rx) => {
+                let incoming = std::iter::from_fn(|| rx.try_recv().ok());
+                match limit {
+                    // One extra detects that more are pending.
+                    Some(limit) => incoming.take(limit + 1).collect(),
+                    None => incoming.collect(),
+                }
+            }
+            None => Vec::new(),
         };
-
-        // Process messages so notifications, state updates, etc. still work
+        let has_more = limit.is_some_and(|limit| messages.len() > limit);
+        self.had_messages_this_frame = !messages.is_empty();
         for msg in messages {
             self.handle_incoming_message(msg);
         }
         self.log_manager.flush_all();
-        self.run_timed_tasks();
+        has_more
+    }
+
+    /// The user did something in one of our windows: restart the idle
+    /// clock and undo an automatic away.
+    pub(crate) fn note_user_activity(&mut self, now: std::time::Instant) {
+        self.last_activity = now;
+        if self.auto_away_triggered && self.away_status.is_some() {
+            self.send_command(IrcCommand::Away(None));
+            self.away_status = None;
+            self.auto_away_triggered = false;
+            self.add_server_message(ChatMessage::system(
+                "You are no longer away (auto-detected activity)",
+            ));
+        }
     }
 
     /// Record whether the window has focus. Regaining it is the moment the
     /// selected tab is actually seen, so whatever it accrued while the window
     /// was minimised, hidden or in the background is acknowledged then (#305).
-    fn set_window_focused(&mut self, focused: bool) {
+    pub(crate) fn set_window_focused(&mut self, focused: bool) {
         let regained = focused && !self.window_focused;
         self.window_focused = focused;
         if regained {
@@ -1011,9 +1072,7 @@ impl Session {
     /// drawn: queued auto-perform commands, the auto-away idle check and the
     /// lag ping. Called from `ui()` and from `update_minimal()`, which is all
     /// that runs while minimized or hidden to the tray (#237).
-    fn run_timed_tasks(&mut self) {
-        self.flush_deferred_notification();
-
+    pub(crate) fn run_timed_tasks(&mut self) {
         // Execute pending auto-perform commands (one per frame to avoid flooding)
         if let Some(ref mut commands) = self.pending_auto_perform.take()
             && let Some(cmd) = commands.first().cloned()
@@ -1084,192 +1143,36 @@ impl Session {
         }
     }
 
-    /// Deliver the forced notification the rate limiter held back, once its
-    /// interval has passed. Several held messages go out as one summary.
-    fn flush_deferred_notification(&mut self) {
-        if self.deferred_notification.is_none() {
-            return;
-        }
-        if !self.notifications_enabled {
-            self.deferred_notification = None;
-            return;
-        }
-        if self
-            .last_forced_notification_time
-            .is_some_and(|last| last.elapsed() < MIN_NOTIFICATION_INTERVAL)
-        {
-            return;
-        }
-        let Some(held) = self.deferred_notification.take() else {
-            return;
-        };
-        let (title, body) = if held.count > 1 {
-            (
-                format!("{} new private messages", held.count),
-                format!("{}: {}", held.title, held.body),
-            )
-        } else {
-            (held.title, held.body)
-        };
-        self.last_forced_notification_time = Some(std::time::Instant::now());
-        self.dispatch_notification(&title, &body);
-    }
-
-    /// Send a desktop notification
+    /// Ask the App for a desktop notification; it decides from focus, the
+    /// setting and its rate limit (`App::notify`).
     pub fn send_notification(&mut self, title: &str, body: &str, force: bool) {
-        // Title only, at debug: the body is message text, which must not reach
-        // the default-level log whether or not notifications are enabled (#228).
-        tracing::debug!("Notification requested: {}", title);
-
-        if !self.notifications_enabled {
-            tracing::debug!("Notifications disabled, skipping");
-            return;
-        }
-
-        // Skip if window is focused (unless force=true for PMs)
-        if self.window_focused && !force {
-            tracing::debug!("Window focused, skipping notification");
-            return;
-        }
-
-        if force {
-            // Private messages are never dropped, only paced: inside the
-            // interval they are held and folded together, then delivered by
-            // the next timed tick. Their clock is separate from the highlight
-            // one, so a highlight cannot mute a PM (#323).
-            self.flush_deferred_notification();
-            if self
-                .last_forced_notification_time
-                .is_some_and(|last| last.elapsed() < MIN_NOTIFICATION_INTERVAL)
-            {
-                tracing::debug!("Private-message notification held back by the rate limit");
-                let held = self
-                    .deferred_notification
-                    .get_or_insert_with(|| DeferredNotification {
-                        title: String::new(),
-                        body: String::new(),
-                        count: 0,
-                    });
-                held.title = title.to_string();
-                held.body = body.to_string();
-                held.count += 1;
-                return;
-            }
-            self.last_forced_notification_time = Some(std::time::Instant::now());
-        } else {
-            // Highlights, kicks and invites are best-effort: a flood inside
-            // the interval is dropped.
-            if let Some(last) = self.last_notification_time
-                && last.elapsed() < MIN_NOTIFICATION_INTERVAL
-            {
-                tracing::debug!("Notification rate-limited");
-                return;
-            }
-            self.last_notification_time = Some(std::time::Instant::now());
-        }
-        self.dispatch_notification(title, body);
+        self.events.push(SessionEvent::Notify {
+            title: title.to_string(),
+            body: body.to_string(),
+            force,
+        });
     }
 
-    /// Hand a notification that passed the policy gates to the OS. Unit tests
-    /// record it instead of spawning helpers.
-    fn dispatch_notification(&mut self, title: &str, body: &str) {
-        #[cfg(test)]
-        self.dispatched_notifications
-            .push((title.to_string(), body.to_string()));
-        #[cfg(not(test))]
-        Self::spawn_os_notification(title, body);
-    }
-
-    #[cfg_attr(test, allow(dead_code))]
-    fn spawn_os_notification(title: &str, body: &str) {
-        // Use notify-send on Linux/BSD (usually pre-installed on Linux desktops)
-        #[cfg(all(unix, not(target_os = "macos")))]
-        {
-            let title = title.to_string();
-            let body = body.to_string();
-            std::thread::spawn(move || {
-                let mut command = std::process::Command::new("notify-send");
-                command.args(notify_send_args(&title, &body));
-                match wait_for_notification_helper(&mut command) {
-                    Ok(status) if !status.success() => {
-                        tracing::warn!("notify-send exited with status {}", status)
-                    }
-                    Err(error) => tracing::warn!("Failed to run notify-send: {}", error),
-                    Ok(_) => {}
-                }
-            });
-        }
-
-        #[cfg(target_os = "macos")]
-        {
-            let script = applescript_notification(title, body);
-            std::thread::spawn(move || {
-                let mut command = std::process::Command::new("osascript");
-                command.args(["-e", &script]);
-                match wait_for_notification_helper(&mut command) {
-                    Ok(status) if !status.success() => {
-                        tracing::warn!("osascript exited with status {}", status)
-                    }
-                    Err(error) => tracing::warn!("Failed to run osascript: {}", error),
-                    Ok(_) => {}
-                }
-            });
-        }
-
-        // On Windows, flash the taskbar - or, when hidden to the tray (no
-        // taskbar button to flash), show a tray balloon instead.
-        #[cfg(windows)]
-        {
-            crate::systray::notify(title, body);
-        }
-    }
-
+    /// Ask the App to persist this session's connect form and behaviour
+    /// settings (it validates the form first, #316).
     fn save_settings(&mut self) {
         self.update_cached_lowercase();
         ChatMessage::configure_default_timestamp_format(&self.timestamp_format);
-        let settings = self.get_settings();
-        self.store_persisted_settings(settings);
+        self.events.push(SessionEvent::SaveSettings);
     }
 
-    /// The settings as last persisted. Unit tests read an in-memory copy.
-    fn load_persisted_settings(&self) -> Settings {
-        #[cfg(test)]
-        {
-            self.settings_file.clone().unwrap_or_default()
-        }
-        #[cfg(not(test))]
-        {
-            Settings::load()
-        }
+    /// Ask the App to persist the auto-perform list on its own, not the
+    /// rest of the connect form (#316).
+    fn save_auto_perform(&mut self) {
+        self.events.push(SessionEvent::SaveAutoPerform);
     }
 
-    /// The persisted settings, telling "no file yet" (`Ok(None)`) apart from
-    /// "a file exists but cannot be read" (`Err`), unlike `load`, which turns
-    /// both into defaults.
-    fn try_load_persisted_settings(&self) -> std::io::Result<Option<Settings>> {
-        #[cfg(test)]
-        {
-            if self.settings_file_unreadable {
-                Err(std::io::Error::other("settings file unreadable (test)"))
-            } else {
-                Ok(self.settings_file.clone())
-            }
-        }
-        #[cfg(not(test))]
-        {
-            Settings::try_load()
-        }
-    }
-
-    fn store_persisted_settings(&mut self, settings: Settings) {
-        #[cfg(test)]
-        {
-            self.settings_file = Some(settings);
-        }
-        #[cfg(not(test))]
-        {
-            settings.save();
-        }
+    /// Ask the App to persist this session's behaviour settings (ignore
+    /// list, channel-list minimum) and the favorites, but never the connect
+    /// form: its fields may be unsaved scratch or invalid (#316).
+    pub(crate) fn save_config(&mut self) {
+        self.update_cached_lowercase();
+        self.events.push(SessionEvent::SaveConfig);
     }
 
     pub fn update_session(&self) -> UpdateSession {
@@ -1288,6 +1191,7 @@ impl Session {
             selected: self.current_channel.clone(),
             input: self.input_text.clone(),
             away: self.away_status.clone(),
+            others: Vec::new(),
         }
     }
 
@@ -1333,7 +1237,7 @@ impl Session {
     }
 
     pub fn prepare_update_shutdown(&mut self) {
-        self.save_settings();
+        // The App saves settings; this only winds the connection down.
         self.log_manager.flush_all();
         self.connection_intent = ConnectionIntent::ManualDisconnect;
         self.pending_session = None;
@@ -2736,7 +2640,8 @@ impl Session {
     }
 
     /// Load a server favorite into the connection form
-    fn load_favorite(&mut self, fav: &ServerFavorite) {
+    pub(crate) fn load_favorite(&mut self, fav: &ServerFavorite) {
+        self.form_profile = (!fav.id.is_empty()).then(|| fav.id.clone());
         self.server_host = fav.host.clone();
         self.server_port = fav.port.clone();
         self.use_tls = fav.use_tls;
@@ -3313,6 +3218,66 @@ mod connection_lifecycle_tests {
     }
 }
 
+/// Show a desktop notification now: notify-send on Linux/BSD, osascript on
+/// macOS, a taskbar flash or tray balloon on Windows. Policy (focus, the
+/// setting, rate limiting) is the caller's (`App::notify`).
+#[cfg_attr(test, allow(dead_code))]
+pub(crate) fn show_desktop_notification(title: &str, body: &str) {
+        // Use notify-send on Linux/BSD (usually pre-installed on Linux desktops)
+        #[cfg(all(unix, not(target_os = "macos")))]
+        {
+            let title = title.to_string();
+            let body = body.to_string();
+            std::thread::spawn(move || {
+                let mut command = std::process::Command::new("notify-send");
+                command.args(notify_send_args(&title, &body));
+                match wait_for_notification_helper(&mut command) {
+                    Ok(status) if !status.success() => {
+                        tracing::warn!("notify-send exited with status {}", status)
+                    }
+                    Err(error) => tracing::warn!("Failed to run notify-send: {}", error),
+                    Ok(_) => {}
+                }
+            });
+        }
+
+        #[cfg(target_os = "macos")]
+        {
+            let script = applescript_notification(title, body);
+            std::thread::spawn(move || {
+                let mut command = std::process::Command::new("osascript");
+                command.args(["-e", &script]);
+                match wait_for_notification_helper(&mut command) {
+                    Ok(status) if !status.success() => {
+                        tracing::warn!("osascript exited with status {}", status)
+                    }
+                    Err(error) => tracing::warn!("Failed to run osascript: {}", error),
+                    Ok(_) => {}
+                }
+            });
+        }
+
+        // On Windows, flash the taskbar - or, when hidden to the tray (no
+        // taskbar button to flash), show a tray balloon instead.
+        #[cfg(windows)]
+        {
+            crate::systray::notify(title, body);
+        }
+}
+
+/// A random 16-hex-digit id for a network profile.
+pub(crate) fn new_profile_id() -> String {
+    use std::hash::{BuildHasher, Hasher};
+    let mut hasher = std::collections::hash_map::RandomState::new().build_hasher();
+    hasher.write_u128(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or_default(),
+    );
+    format!("{:016x}", hasher.finish())
+}
+
 fn rand_suffix() -> u32 {
     use std::time::{SystemTime, UNIX_EPOCH};
     (SystemTime::now()
@@ -3560,8 +3525,15 @@ fn wait_for_notification_helper(
 }
 
 impl Session {
-    pub fn new(_cc: &eframe::CreationContext<'_>) -> Self {
-        Self::default()
+    /// Never configured or connected: a status window opened with "New
+    /// connection" whose Connect dialog was dismissed.
+    pub(crate) fn is_pristine(&self) -> bool {
+        self.active_session.is_none()
+            && self.pending_session.is_none()
+            && !self.connecting
+            && !self.connected
+            && self.worker.is_none()
+            && self.channels.is_empty()
     }
 
     fn session_from_form(&self) -> Result<SessionConfig, String> {
@@ -3671,10 +3643,12 @@ impl Session {
             auto_join_channels: self.auto_join_channels.clone(),
             auto_perform: self.auto_perform.clone(),
             set_invisible: self.set_invisible,
+            profile_id: self.form_profile.clone(),
         })
     }
 
     fn activate_session(&mut self, session: SessionConfig) {
+        self.profile_id = session.profile_id.clone();
         let endpoint_changed = self
             .active_session
             .as_ref()
@@ -3859,8 +3833,7 @@ impl Session {
             })
     }
 
-    #[cfg(test)]
-    fn active_endpoint_key(&self) -> Option<EndpointKey> {
+    pub(crate) fn active_endpoint_key(&self) -> Option<EndpointKey> {
         self.active_session
             .as_ref()
             .map(SessionConfig::endpoint_key)
@@ -7283,7 +7256,7 @@ impl Session {
 
         let mut painted_offset = 0.0;
         let output = ScrollArea::vertical()
-            .id_salt(("chat_scrollback", &self.current_channel))
+            .id_salt(("chat_scrollback", self.id, &self.current_channel))
             .auto_shrink([false; 2])
             .max_height(available_height)
             .stick_to_bottom(stick)
@@ -7416,6 +7389,7 @@ impl Session {
         }
     }
 
+    #[cfg(test)]
     fn cycle_tab(&mut self, reverse: bool) {
         let tabs = self.ordered_tabs();
         if tabs.is_empty() {
@@ -7609,709 +7583,10 @@ impl Session {
             .iter()
             .any(|highlight| ident_contains(&content_key, highlight))
     }
-
-    /// Handle keyboard shortcuts
-    fn handle_keyboard_shortcuts(&mut self, ctx: &egui::Context) {
-        // Don't process shortcuts if a dialog is open
-        if self.show_connect_dialog || self.show_settings || self.show_channel_list {
-            return;
-        }
-
-        let (cycle_tabs, reverse_tabs, close_tab) = ctx.input(|input| {
-            (
-                input.modifiers.ctrl && input.key_pressed(egui::Key::Tab),
-                input.modifiers.shift,
-                input.modifiers.ctrl && input.key_pressed(egui::Key::W),
-            )
-        });
-        if cycle_tabs {
-            self.cycle_tab(reverse_tabs);
-        }
-        if close_tab {
-            self.close_current_tab();
-        }
-
-        ctx.input(|i| {
-            // Check Alt+1 through Alt+9
-            let alt = i.modifiers.alt;
-            if alt {
-                // Alt+1-9 to switch channels. Build the ordered tab list (Server
-                // is index 0, then channels sorted alphabetically) only while Alt
-                // is actually held - building and sorting it every frame is
-                // wasted work on nearly all frames.
-                let tabs = self.ordered_tabs(); // Server buffer is index 0 (Alt+1)
-
-                for (idx, key) in [
-                    egui::Key::Num1,
-                    egui::Key::Num2,
-                    egui::Key::Num3,
-                    egui::Key::Num4,
-                    egui::Key::Num5,
-                    egui::Key::Num6,
-                    egui::Key::Num7,
-                    egui::Key::Num8,
-                    egui::Key::Num9,
-                ]
-                .iter()
-                .enumerate()
-                {
-                    if i.key_pressed(*key) && idx < tabs.len() {
-                        self.select_tab(tabs[idx].clone());
-                    }
-                }
-            }
-        });
-    }
-}
-
-impl eframe::App for Session {
-    fn ui(&mut self, root_ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        let ctx = root_ui.ctx().clone();
-        let ctx = &ctx;
-        // Reset frame state
-        self.had_messages_this_frame = false;
-
-        // Process incoming messages with batch limiting for UI responsiveness
-        const MAX_MESSAGES_PER_FRAME: usize = 100;
-
-        let messages: Vec<_> = if let Some(rx) = &mut self.msg_rx {
-            std::iter::from_fn(|| rx.try_recv().ok())
-                .take(MAX_MESSAGES_PER_FRAME + 1) // Take one extra to detect if more pending
-                .collect()
-        } else {
-            Vec::new()
-        };
-
-        // Check if we hit the batch limit (got more than MAX_MESSAGES_PER_FRAME)
-        let has_more = messages.len() > MAX_MESSAGES_PER_FRAME;
-
-        self.had_messages_this_frame = !messages.is_empty();
-        for msg in messages {
-            self.handle_incoming_message(msg);
-        }
-
-        // If we hit the batch limit, request immediate repaint to process remaining
-        if has_more {
-            ctx.request_repaint();
-        }
-
-        // Push this frame's logged lines to disk in one flush per file instead of
-        // one flush syscall per message.
-        self.log_manager.flush_all();
-
-        // Handle keyboard shortcuts
-        self.handle_keyboard_shortcuts(ctx);
-
-        // Track window focus for notifications
-        self.set_window_focused(ctx.input(|i| i.focused));
-
-        // Track user activity for auto-away
-        let has_activity = ctx
-            .input(|i| !i.keys_down.is_empty() || i.pointer.any_click() || i.pointer.any_pressed());
-        if has_activity {
-            self.last_activity = std::time::Instant::now();
-
-            // Clear auto-away on user activity
-            if self.auto_away_triggered && self.away_status.is_some() {
-                self.send_command(IrcCommand::Away(None));
-                self.away_status = None;
-                self.auto_away_triggered = false;
-                self.add_server_message(ChatMessage::system(
-                    "You are no longer away (auto-detected activity)",
-                ));
-            }
-        }
-
-        // Queued auto-perform, auto-away idle check and lag ping
-        self.run_timed_tasks();
-
-        // Connect dialog
-        if self.show_connect_dialog && !self.connected && !self.connecting {
-            self.show_connect_window(ctx);
-        }
-
-        // Settings dialog
-        if self.show_settings {
-            self.show_settings_window(ctx);
-        }
-
-        // Channel list dialog
-        if self.show_channel_list {
-            self.show_channel_list_window(ctx);
-        }
-
-        // Channel info dialog
-        if self.show_channel_info {
-            self.show_channel_info_window(ctx);
-        }
-
-        // Color picker dialog
-        if self.show_color_picker
-            && let Some(color_code) = self.show_color_picker_window(ctx)
-        {
-            self.input_text.push_str(&color_code);
-        }
-
-        // Top panel - toolbar
-        egui::Panel::top("toolbar").show(root_ui, |ui| {
-            ui.horizontal(|ui| {
-                ui.heading("Linefeed");
-                ui.separator();
-
-                if self.connected {
-                    // Show yellow if away, green if active
-                    if self.away_status.is_some() {
-                        ui.label(RichText::new("●").color(Color32::from_rgb(255, 200, 0)));
-                    } else {
-                        ui.label(RichText::new("●").color(Color32::GREEN));
-                    }
-                    ui.label(&self.my_nick);
-                    ui.label("@");
-                    ui.label(self.active_endpoint_label());
-
-                    // Show lag meter
-                    if let Some(lag) = self.lag_ms {
-                        let lag_color = if lag < 100 {
-                            Color32::GREEN
-                        } else if lag < 300 {
-                            Color32::YELLOW
-                        } else {
-                            Color32::from_rgb(255, 100, 100)
-                        };
-                        ui.label(
-                            RichText::new(format!("({}ms)", lag))
-                                .color(lag_color)
-                                .small(),
-                        );
-                    }
-
-                    // Show away status
-                    if let Some(away_msg) = &self.away_status {
-                        ui.separator();
-                        ui.label(
-                            RichText::new(format!("Away: {}", away_msg))
-                                .color(Color32::from_rgb(255, 200, 0)),
-                        );
-                    }
-                } else if self.connecting {
-                    ui.label(RichText::new("●").color(Color32::YELLOW));
-                    ui.label("Connecting...");
-                } else {
-                    ui.label(RichText::new("●").color(Color32::RED));
-                    ui.label("Disconnected");
-                }
-
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.button("Settings").clicked() {
-                        self.show_settings = true;
-                    }
-                    ui.separator();
-                    if !self.connected && !self.connecting {
-                        if ui.button("Connect").clicked() {
-                            self.show_connect_dialog = true;
-                        }
-                    } else if self.connected && ui.button("Disconnect").clicked() {
-                        let reason = if self.quit_message.is_empty() {
-                            "Linefeed".to_string()
-                        } else {
-                            self.quit_message.clone()
-                        };
-                        self.request_manual_disconnect(Some(reason));
-                    }
-                });
-            });
-        });
-
-        // Left panel - channel list
-        egui::Panel::left("channels")
-            .resizable(true)
-            .default_size(150.0)
-            .show(root_ui, |ui| {
-                ui.heading("Channels");
-                ui.separator();
-
-                // Server buffer with unread notification
-                let server_selected = self.current_channel.is_none();
-                let server_label = if self.server_unread > 0 {
-                    format!("Server ({})", self.server_unread)
-                } else {
-                    "Server".to_string()
-                };
-                let server_text = if self.server_unread > 0 {
-                    // Yellow for server notifications
-                    RichText::new(server_label)
-                        .strong()
-                        .color(Color32::from_rgb(255, 255, 100))
-                } else {
-                    RichText::new(server_label)
-                };
-                if ui.selectable_label(server_selected, server_text).clicked() {
-                    // Clears the unread count, user selection and completion state.
-                    self.select_tab(None);
-                }
-
-                ui.separator();
-
-                // Join channel input
-                if self.connected {
-                    ui.horizontal(|ui| {
-                        let response = ui.add(
-                            TextEdit::singleline(&mut self.join_channel)
-                                .hint_text("#channel")
-                                .desired_width(100.0),
-                        );
-                        if ((response.lost_focus()
-                            && ui.input(|i| i.key_pressed(egui::Key::Enter)))
-                            || ui.button("+").clicked())
-                            && !self.join_channel.is_empty()
-                        {
-                            let channel = self.normalize_channel_name(&self.join_channel);
-                            self.send_join(channel, None);
-                            self.join_channel.clear();
-                        }
-                    });
-                    ui.separator();
-                }
-
-                // Channel list
-                let mut part_channel: Option<String> = None;
-                let mut close_target: Option<String> = None;
-                ScrollArea::vertical().show(ui, |ui| {
-                    let channels: Vec<_> = self.channels.keys().cloned().collect();
-                    for channel_name in channels {
-                        let is_selected = self.current_channel.as_ref() == Some(&channel_name);
-                        let unread = self
-                            .channels
-                            .get(&channel_name)
-                            .map(|c| c.unread)
-                            .unwrap_or(0);
-                        let is_pm = !self.is_channel_name(&channel_name);
-
-                        let label = if unread > 0 {
-                            format!("{} ({})", channel_name, unread)
-                        } else {
-                            channel_name.clone()
-                        };
-
-                        // Color based on type and unread status
-                        let text = if unread > 0 {
-                            if is_pm {
-                                // PM with unread - orange/red for attention
-                                RichText::new(label)
-                                    .strong()
-                                    .color(Color32::from_rgb(255, 150, 50))
-                            } else {
-                                // Channel with unread - light green
-                                RichText::new(label)
-                                    .strong()
-                                    .color(Color32::from_rgb(100, 255, 100))
-                            }
-                        } else if is_pm {
-                            // PM without unread - light blue to distinguish from channels
-                            RichText::new(label).color(Color32::from_rgb(150, 200, 255))
-                        } else {
-                            RichText::new(label)
-                        };
-
-                        let response = ui.selectable_label(is_selected, text);
-                        if response.clicked() {
-                            self.select_tab(Some(channel_name.clone()));
-                        }
-
-                        // Double-click to open channel info
-                        if response.double_clicked() && self.is_channel_name(&channel_name) {
-                            self.channel_info_target = Some(channel_name.clone());
-                            self.show_channel_info = true;
-                            // Request fresh mode info
-                            self.send_command(IrcCommand::Mode(
-                                channel_name.clone(),
-                                None,
-                                Vec::new(),
-                            ));
-                        }
-
-                        // Context menu for channels
-                        let chan_for_menu = channel_name.clone();
-                        let needs_part = self.tab_close_needs_part(&chan_for_menu);
-                        response.context_menu(|ui| {
-                            if self.is_channel_name(&chan_for_menu) {
-                                if ui.button("Channel Info").clicked() {
-                                    self.channel_info_target = Some(chan_for_menu.clone());
-                                    self.show_channel_info = true;
-                                    self.send_command(IrcCommand::Mode(
-                                        chan_for_menu.clone(),
-                                        None,
-                                        Vec::new(),
-                                    ));
-                                    ui.close();
-                                }
-                                if needs_part {
-                                    if ui.button("Part Channel").clicked() {
-                                        part_channel = Some(chan_for_menu.clone());
-                                        ui.close();
-                                    }
-                                } else if ui.button("Close").clicked() {
-                                    // Kicked/disconnected tab: a PART would
-                                    // only draw a 442 and keep the tab (#256).
-                                    close_target = Some(chan_for_menu.clone());
-                                    ui.close();
-                                }
-                            } else {
-                                // Query window (private message)
-                                if ui.button("Close").clicked() {
-                                    close_target = Some(chan_for_menu.clone());
-                                    ui.close();
-                                }
-                            }
-                        });
-                    }
-                });
-
-                // Handle channel context menu actions
-                if let Some(channel) = part_channel {
-                    self.send_command(IrcCommand::Part(channel, None));
-                }
-                if let Some(target) = close_target {
-                    self.close_tab(&target);
-                }
-            });
-
-        // Right panel - user list (only for channels)
-        let mut pm_to_open: Option<String> = None;
-        let mut whois_nick: Option<String> = None;
-        let mut op_nick: Option<(String, String)> = None; // (channel, nick)
-        let mut voice_nick: Option<(String, String)> = None;
-        let mut kick_nick: Option<(String, String)> = None;
-        if let Some(channel_name) = &self.current_channel
-            && self.is_channel_name(channel_name)
-        {
-            let chan_for_context = channel_name.clone();
-            egui::Panel::right("users")
-                .resizable(true)
-                .default_size(140.0)
-                .show(root_ui, |ui| {
-                    if let Some(channel) = self.channels.get(&chan_for_context) {
-                        // Show user count with away count if any
-                        let away_count = channel.away_count();
-                        if away_count > 0 {
-                            ui.heading(format!(
-                                "Users ({}, {} away)",
-                                channel.users.len(),
-                                away_count
-                            ));
-                        } else {
-                            ui.heading(format!("Users ({})", channel.users.len()));
-                        }
-                        ui.separator();
-                        // Get selected user for this render
-                        let current_selected = self.selected_user.clone();
-                        let mut new_selected: Option<String> = current_selected.clone();
-
-                        // Row virtualization: only the visible slice is built each
-                        // frame, which matters for channels with thousands of users.
-                        let row_height = ui.text_style_height(&egui::TextStyle::Body);
-                        ScrollArea::vertical().show_rows(
-                            ui,
-                            row_height,
-                            channel.users.len(),
-                            |ui, row_range| {
-                                for user in &channel.users[row_range] {
-                                    let nick = &user.nick;
-                                    let mode = &user.mode;
-                                    let prefix = user.prefix();
-                                    let is_selected = current_selected.as_ref() == Some(nick);
-                                    // The loop already holds the user entry; a
-                                    // channel.is_user_away(nick) lookup here would be a
-                                    // redundant O(n) scan per user (O(n²) per frame).
-                                    let is_away = user.is_away();
-
-                                    // Color based on mode, dimmed if away
-                                    let base_color = match mode {
-                                        UserMode::Owner => Color32::from_rgb(255, 100, 100),
-                                        UserMode::Admin => Color32::from_rgb(255, 150, 100),
-                                        UserMode::Op => Color32::from_rgb(100, 200, 100),
-                                        UserMode::HalfOp => Color32::from_rgb(100, 200, 200),
-                                        UserMode::Voice => Color32::from_rgb(200, 200, 100),
-                                        UserMode::Normal => Color32::WHITE,
-                                    };
-
-                                    // Dim color for away users (reduce to ~50% brightness)
-                                    let color = if is_away {
-                                        Color32::from_rgb(
-                                            base_color.r() / 2,
-                                            base_color.g() / 2,
-                                            base_color.b() / 2,
-                                        )
-                                    } else {
-                                        base_color
-                                    };
-
-                                    let state = match (is_away, user.bot) {
-                                        (true, true) => " (away, bot)",
-                                        (true, false) => " (away)",
-                                        (false, true) => " (bot)",
-                                        (false, false) => "",
-                                    };
-                                    let display_text = format!("{prefix}{nick}{state}");
-
-                                    let text = RichText::new(display_text).color(color);
-                                    let response = ui.selectable_label(is_selected, text);
-
-                                    // Show away message on hover
-                                    if let Some(away_msg) = &user.away {
-                                        response
-                                            .clone()
-                                            .on_hover_text(format!("Away: {}", away_msg));
-                                    }
-
-                                    // Single click to select
-                                    if response.clicked() {
-                                        new_selected = Some(nick.clone());
-                                    }
-
-                                    // Double click to open PM
-                                    if response.double_clicked() {
-                                        pm_to_open = Some(nick.clone());
-                                    }
-
-                                    // Context menu for user
-                                    let nick_clone = nick.clone();
-                                    let chan_clone = chan_for_context.clone();
-                                    response.context_menu(|ui| {
-                                        if ui.button("Private Message").clicked() {
-                                            pm_to_open = Some(nick_clone.clone());
-                                            ui.close();
-                                        }
-                                        if ui.button("WHOIS").clicked() {
-                                            whois_nick = Some(nick_clone.clone());
-                                            ui.close();
-                                        }
-                                        ui.separator();
-                                        if ui.button("Op (+o)").clicked() {
-                                            op_nick =
-                                                Some((chan_clone.clone(), nick_clone.clone()));
-                                            ui.close();
-                                        }
-                                        if ui.button("Voice (+v)").clicked() {
-                                            voice_nick =
-                                                Some((chan_clone.clone(), nick_clone.clone()));
-                                            ui.close();
-                                        }
-                                        ui.separator();
-                                        if ui.button("Kick").clicked() {
-                                            kick_nick =
-                                                Some((chan_clone.clone(), nick_clone.clone()));
-                                            ui.close();
-                                        }
-                                    });
-                                }
-                            },
-                        );
-
-                        // Update selected user
-                        self.selected_user = new_selected;
-                    }
-                });
-        }
-
-        // Handle user list actions
-        if let Some(nick) = pm_to_open {
-            self.open_query(&nick);
-        }
-        if let Some(nick) = whois_nick {
-            // Double target: the reply comes from the user's own server,
-            // revealing the real host behind a cloak plus idle/signon (#164).
-            self.send_command(IrcCommand::Whois(commands::whois_query_target(&nick)));
-        }
-        if let Some((channel, nick)) = op_nick {
-            self.send_command(IrcCommand::Mode(
-                channel,
-                Some("+o".to_string()),
-                vec![nick],
-            ));
-        }
-        if let Some((channel, nick)) = voice_nick {
-            self.send_command(IrcCommand::Mode(
-                channel,
-                Some("+v".to_string()),
-                vec![nick],
-            ));
-        }
-        if let Some((channel, nick)) = kick_nick {
-            self.send_command(IrcCommand::Kick(channel, nick, None));
-        }
-
-        // Central panel - chat area
-        egui::CentralPanel::default().show(root_ui, |ui| {
-            // Channel header with modes and topic
-            if let Some(channel_name) = &self.current_channel
-                && let Some(channel) = self.channels.get(channel_name)
-            {
-                // Show channel name and modes for channels
-                if self.is_channel_name(channel_name) && !channel.modes.is_empty() {
-                    ui.horizontal(|ui| {
-                        ui.label(RichText::new(channel_name).strong());
-                        ui.label(
-                            RichText::new(format!("[{}]", channel.modes))
-                                .color(Color32::from_rgb(150, 150, 150)),
-                        );
-                        ui.label(
-                            RichText::new(format!("({} users)", channel.users.len()))
-                                .small()
-                                .color(Color32::GRAY),
-                        );
-                    });
-                }
-                if let Some(topic) = &channel.topic {
-                    ui.horizontal(|ui| {
-                        ui.label(RichText::new("Topic:").strong());
-                        render_irc_text(ui, topic, Color32::WHITE);
-                    });
-                }
-                if self.is_channel_name(channel_name) || channel.topic.is_some() {
-                    ui.separator();
-                }
-            }
-
-            // Messages area
-            let available_height = ui.available_height() - 30.0;
-            self.draw_scrollback(ui, available_height);
-
-            // Input area
-            ui.separator();
-            let mut history_up = false;
-            let mut history_down = false;
-            let mut tab_complete = false;
-            let mut insert_bold = false;
-            let mut insert_underline = false;
-            let mut insert_italic = false;
-            let mut insert_color = false;
-            let mut insert_reset = false;
-            let input_before = self.input_text.clone();
-
-            ui.horizontal(|ui| {
-                // Compact formatting buttons
-                if ui
-                    .small_button("B")
-                    .on_hover_text("Bold (Ctrl+B)")
-                    .clicked()
-                {
-                    insert_bold = true;
-                }
-                if ui
-                    .small_button("U")
-                    .on_hover_text("Underline (Ctrl+U)")
-                    .clicked()
-                {
-                    insert_underline = true;
-                }
-                if ui
-                    .small_button("I")
-                    .on_hover_text("Italic (Ctrl+I)")
-                    .clicked()
-                {
-                    insert_italic = true;
-                }
-                if ui
-                    .small_button("C")
-                    .on_hover_text("Color (Ctrl+K)")
-                    .clicked()
-                {
-                    insert_color = true;
-                }
-
-                // Show formatting indicator
-                let has_formatting = self.input_text.contains('\x02')
-                    || self.input_text.contains('\x1F')
-                    || self.input_text.contains('\x1D')
-                    || self.input_text.contains('\x03');
-                if has_formatting {
-                    ui.label(RichText::new("*").color(Color32::YELLOW).small());
-                }
-
-                let response = ui.add(
-                    TextEdit::singleline(&mut self.input_text)
-                        .hint_text("Type a message...")
-                        .desired_width(ui.available_width() - 50.0),
-                );
-
-                if response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
-                    self.process_input();
-                    response.request_focus();
-                }
-
-                // Check for history navigation and tab completion while input has focus
-                if response.has_focus() {
-                    if ui.input(|i| i.key_pressed(egui::Key::ArrowUp)) {
-                        history_up = true;
-                    }
-                    if ui.input(|i| i.key_pressed(egui::Key::ArrowDown)) {
-                        history_down = true;
-                    }
-                    if ui.input(|i| !i.modifiers.ctrl && i.key_pressed(egui::Key::Tab)) {
-                        tab_complete = true;
-                    }
-
-                    // Formatting shortcuts (Ctrl+B/U/I/K/O)
-                    if ui.input(|i| i.modifiers.ctrl && i.key_pressed(egui::Key::B)) {
-                        insert_bold = true;
-                    }
-                    if ui.input(|i| i.modifiers.ctrl && i.key_pressed(egui::Key::U)) {
-                        insert_underline = true;
-                    }
-                    // Note: Ctrl+I may be captured by system, use button instead
-                    if ui.input(|i| i.modifiers.ctrl && i.key_pressed(egui::Key::K)) {
-                        insert_color = true;
-                    }
-                    if ui.input(|i| i.modifiers.ctrl && i.key_pressed(egui::Key::O)) {
-                        insert_reset = true;
-                    }
-                }
-
-                if ui.button("Send").clicked() {
-                    self.process_input();
-                }
-            });
-
-            // Handle history navigation outside the closure
-            if history_up {
-                self.history_up();
-            }
-            if history_down {
-                self.history_down();
-            }
-
-            // Handle tab completion
-            if tab_complete {
-                self.handle_tab_completion();
-            } else if self.input_text != input_before {
-                // Reset tab completion if input changed (not by Tab)
-                self.reset_tab_completion();
-            }
-
-            // Handle formatting insertions
-            if insert_bold {
-                self.input_text.push('\x02');
-            }
-            if insert_underline {
-                self.input_text.push('\x1F');
-            }
-            if insert_italic {
-                self.input_text.push('\x1D');
-            }
-            if insert_color {
-                self.show_color_picker = true;
-                self.color_picker_fg = true;
-            }
-            if insert_reset {
-                self.input_text.push('\x0F');
-            }
-        });
-    }
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     fn temporary_log_dir(test_name: &str) -> std::path::PathBuf {
@@ -8344,7 +7619,7 @@ mod tests {
     }
 
     /// Run `f` under a TRACE-level subscriber and return everything it logged.
-    fn capture_logs(f: impl FnOnce()) -> String {
+    pub(crate) fn capture_logs(f: impl FnOnce()) -> String {
         use std::sync::{Arc, Mutex};
 
         #[derive(Clone, Default)]
@@ -8399,13 +7674,11 @@ mod tests {
         // Skipped notifications (disabled or focused) must not leak the body
         // to the default-level log either (#228).
         let mut app = test_app();
-        app.notifications_enabled = false;
         let logs = capture_logs(|| {
             app.send_notification("PM from alice", "meet me at the secret place", true);
         });
         assert!(!logs.contains("secret place"), "{logs}");
 
-        app.notifications_enabled = true;
         app.window_focused = true;
         let logs = capture_logs(|| {
             app.send_notification(
@@ -9357,6 +8630,8 @@ mod tests {
             accept_invalid_certs: true,
             pre_away_message: "syncing".into(),
             persistence_profile: "mobile".into(),
+            id: "0123456789abcdef".into(),
+            auto_connect: false,
         };
         app.load_favorite(&favorite);
         assert!(app.start_session_from_form());
@@ -12152,7 +11427,6 @@ mod tests {
     #[test]
     fn known_users_are_pruned_when_leaving_channels() {
         let mut app = test_app();
-        app.notifications_enabled = false;
         app.set_session_nick("me".to_string(), true);
         let know = |app: &mut Session, nick: &str| {
             app.update_user_identity(nick, None, None, None, None, None, None, Some(true));
@@ -12861,6 +12135,19 @@ mod tests {
 
     /// Deliver a complete two-line draft/multiline message through the same
     /// entry point the connection thread uses.
+    /// The desktop notifications the session asked the App for, in order.
+    /// Whether one is shown (focus, the setting, rate limits) is the App's
+    /// decision, tested in `app.rs`.
+    fn notified(app: &Session) -> Vec<(String, String)> {
+        app.events
+            .iter()
+            .filter_map(|event| match event {
+                SessionEvent::Notify { title, body, .. } => Some((title.clone(), body.clone())),
+                _ => None,
+            })
+            .collect()
+    }
+
     fn deliver_multiline(app: &mut Session, id: &str, prefix: &str, target: &str, lines: &[&str]) {
         app.handle_incoming_message(
             IrcMessage::parse(&format!(":{prefix} BATCH +{id} draft/multiline {target}")).unwrap(),
@@ -12878,7 +12165,6 @@ mod tests {
     fn multiline_messages_highlight_and_notify_like_single_line_messages() {
         let mut app = test_app();
         app.set_session_nick("me".to_string(), true);
-        app.notifications_enabled = true;
         app.window_focused = false;
 
         // A nick mention in a channel: highlighted row and a highlight
@@ -12893,41 +12179,38 @@ mod tests {
         let row = app.channels["#room"].messages.back().unwrap();
         assert_eq!(row.content, "hello me\nsecond line");
         assert!(row.is_highlight, "#289: multiline mention not highlighted");
-        assert_eq!(app.dispatched_notifications.len(), 1);
+        assert_eq!(notified(&app).len(), 1);
         assert_eq!(
-            app.dispatched_notifications[0].0,
+            notified(&app)[0].0,
             "alice mentioned you in #room"
         );
 
         // A multiline PM notifies even while the window is focused.
-        app.dispatched_notifications.clear();
-        app.last_notification_time = None;
+        app.events.clear();
         app.window_focused = true;
         deliver_multiline(&mut app, "m2", "bob!u@h", "me", &["psst", "are you there"]);
         let row = app.channels["bob"].messages.back().unwrap();
         assert_eq!(row.content, "psst\nare you there");
         assert!(!row.is_highlight);
         assert_eq!(
-            app.dispatched_notifications.len(),
+            notified(&app).len(),
             1,
             "#289: PM not notified"
         );
-        assert_eq!(app.dispatched_notifications[0].0, "PM from bob");
+        assert_eq!(notified(&app)[0].0, "PM from bob");
 
         // A plain channel message neither highlights nor notifies.
-        app.dispatched_notifications.clear();
-        app.last_notification_time = None;
+        app.events.clear();
         app.window_focused = false;
         deliver_multiline(&mut app, "m3", "alice!u@h", "#room", &["nothing", "here"]);
         assert!(!app.channels["#room"].messages.back().unwrap().is_highlight);
-        assert!(app.dispatched_notifications.is_empty());
+        assert!(notified(&app).is_empty());
     }
 
     #[test]
     fn multiline_action_mentions_highlight_and_own_or_replayed_messages_stay_silent() {
         let mut app = test_app();
         app.set_session_nick("me".to_string(), true);
-        app.notifications_enabled = true;
         app.window_focused = false;
 
         // CTCP ACTION multiline mention: highlighted action row.
@@ -12942,8 +12225,7 @@ mod tests {
         assert!(row.is_action && row.is_highlight, "#289: {row:?}");
 
         // Our own multiline message (echo-message) never notifies.
-        app.dispatched_notifications.clear();
-        app.last_notification_time = None;
+        app.events.clear();
         deliver_multiline(
             &mut app,
             "s1",
@@ -12951,7 +12233,7 @@ mod tests {
             "me",
             &["note to self", "me me me"],
         );
-        assert!(app.dispatched_notifications.is_empty());
+        assert!(notified(&app).is_empty());
 
         // A multiline message replayed inside a chathistory batch keeps its
         // highlight but never raises a notification.
@@ -12976,7 +12258,7 @@ mod tests {
             .find(|row| row.content == "old news for me\nsecond")
             .expect("replayed multiline row");
         assert!(replayed.is_highlight);
-        assert!(app.dispatched_notifications.is_empty());
+        assert!(notified(&app).is_empty());
     }
 
     #[test]
@@ -13120,7 +12402,6 @@ mod tests {
         app.set_session_nick("mynick".into(), true);
         app.logging_load_history = true;
         app.set_invisible = false;
-        app.notifications_enabled = true;
         app.handle_incoming_message(
             IrcMessage::parse(":srv CAP me ACK :draft/chathistory").unwrap(),
         );
@@ -13173,15 +12454,15 @@ mod tests {
         assert_eq!(alice.messages.back().unwrap().content, "on my way");
         assert_eq!(alice.unread, 2, "#306: catch-up PMs left no unread badge");
         assert_eq!(
-            app.dispatched_notifications.len(),
+            notified(&app).len(),
             1,
             "#306: no notification"
         );
         assert_eq!(
-            app.dispatched_notifications[0].0,
+            notified(&app)[0].0,
             "2 new messages from alice"
         );
-        assert_eq!(app.dispatched_notifications[0].1, "hello?");
+        assert_eq!(notified(&app)[0].1, "hello?");
     }
 
     #[test]
@@ -13234,9 +12515,9 @@ mod tests {
         app.handle_incoming_message(IrcMessage::parse(":srv BATCH -c").unwrap());
         assert_eq!(app.channels["#room"].unread, 2);
         assert!(
-            app.dispatched_notifications.is_empty(),
+            notified(&app).is_empty(),
             "no mention, no notification: {:?}",
-            app.dispatched_notifications
+            notified(&app)
         );
 
         app.handle_incoming_message(IrcMessage::parse(":mynick!u@h JOIN #fresh").unwrap());
@@ -13249,12 +12530,11 @@ mod tests {
         );
         app.handle_incoming_message(IrcMessage::parse(":srv BATCH -p").unwrap());
         assert!(
-            app.dispatched_notifications.is_empty(),
+            notified(&app).is_empty(),
             "old backlog (Prepend) never notifies"
         );
 
         // A mention inside the Append page does.
-        app.last_notification_time = None;
         assert!(app.request_latest_history("#room", None, HistoryPlacement::Append));
         app.handle_incoming_message(IrcMessage::parse(":srv BATCH +d chathistory #room").unwrap());
         app.handle_incoming_message(
@@ -13264,9 +12544,9 @@ mod tests {
             .unwrap(),
         );
         app.handle_incoming_message(IrcMessage::parse(":srv BATCH -d").unwrap());
-        assert_eq!(app.dispatched_notifications.len(), 1);
+        assert_eq!(notified(&app).len(), 1);
         assert_eq!(
-            app.dispatched_notifications[0].0,
+            notified(&app)[0].0,
             "bob mentioned you in #room"
         );
     }
@@ -13369,344 +12649,5 @@ mod tests {
             .filter(|row| row.content == "ok")
             .count();
         assert_eq!(ok_rows, 2);
-    }
-
-    /// An app that will pass the enabled/focus gates for non-forced
-    /// notifications too (window in the background).
-    fn notifying_app() -> Session {
-        let mut app = test_app();
-        app.notifications_enabled = true;
-        app.window_focused = false;
-        app
-    }
-
-    /// Pretend the rate-limit interval has elapsed for forced notifications.
-    fn age_forced_notification_clock(app: &mut Session) {
-        app.last_forced_notification_time =
-            std::time::Instant::now().checked_sub(std::time::Duration::from_secs(3));
-    }
-
-    #[test]
-    fn a_private_message_notification_is_not_muted_by_a_recent_highlight() {
-        let mut app = notifying_app();
-
-        app.send_notification("bob mentioned you in #room", "hey", false);
-        app.send_notification("PM from alice", "psst", true);
-
-        let titles: Vec<&str> = app
-            .dispatched_notifications
-            .iter()
-            .map(|(title, _)| title.as_str())
-            .collect();
-        assert_eq!(titles, ["bob mentioned you in #room", "PM from alice"]);
-    }
-
-    #[test]
-    fn a_highlight_notification_is_not_muted_by_a_recent_private_message() {
-        let mut app = notifying_app();
-
-        app.send_notification("PM from alice", "psst", true);
-        app.send_notification("bob mentioned you in #room", "hey", false);
-
-        assert_eq!(app.dispatched_notifications.len(), 2);
-    }
-
-    #[test]
-    fn private_messages_inside_the_interval_are_coalesced_not_dropped() {
-        let mut app = notifying_app();
-
-        app.send_notification("PM from alice", "one", true);
-        for body in ["two", "three", "four"] {
-            app.send_notification("PM from bob", body, true);
-        }
-        // Rate limited, so no OS helper per message...
-        assert_eq!(app.dispatched_notifications.len(), 1);
-
-        // ...but nothing is lost: once the interval passes the next tick
-        // delivers one summary of everything held back.
-        app.run_timed_tasks();
-        assert_eq!(
-            app.dispatched_notifications.len(),
-            1,
-            "interval has not elapsed yet"
-        );
-        age_forced_notification_clock(&mut app);
-        app.run_timed_tasks();
-        assert_eq!(app.dispatched_notifications.len(), 2);
-        let (title, body) = &app.dispatched_notifications[1];
-        assert_eq!(title, "3 new private messages");
-        assert!(
-            body.contains("PM from bob") && body.contains("four"),
-            "{body}"
-        );
-
-        // Delivered once only.
-        age_forced_notification_clock(&mut app);
-        app.run_timed_tasks();
-        assert_eq!(app.dispatched_notifications.len(), 2);
-    }
-
-    #[test]
-    fn a_single_held_back_private_message_is_delivered_unchanged() {
-        let mut app = notifying_app();
-
-        app.send_notification("PM from alice", "first", true);
-        app.send_notification("PM from bob", "second", true);
-        assert_eq!(app.dispatched_notifications.len(), 1);
-
-        age_forced_notification_clock(&mut app);
-        app.run_timed_tasks();
-
-        assert_eq!(
-            app.dispatched_notifications[1],
-            ("PM from bob".to_string(), "second".to_string())
-        );
-    }
-
-    #[test]
-    fn a_new_private_message_after_the_interval_dispatches_the_held_one_first() {
-        let mut app = notifying_app();
-
-        app.send_notification("PM from alice", "first", true);
-        app.send_notification("PM from bob", "second", true);
-        age_forced_notification_clock(&mut app);
-        // No tick ran in between: the held message must not be overtaken.
-        app.send_notification("PM from carol", "third", true);
-
-        let titles: Vec<&str> = app
-            .dispatched_notifications
-            .iter()
-            .map(|(title, _)| title.as_str())
-            .collect();
-        assert_eq!(titles, ["PM from alice", "PM from bob"]);
-        age_forced_notification_clock(&mut app);
-        app.run_timed_tasks();
-        assert_eq!(app.dispatched_notifications.len(), 3);
-        assert_eq!(app.dispatched_notifications[2].0, "PM from carol");
-    }
-
-    #[test]
-    fn highlight_floods_are_still_rate_limited_and_disabled_notifications_drop_held_ones() {
-        let mut app = notifying_app();
-        for n in 0..5 {
-            app.send_notification("bob mentioned you in #room", &format!("hey {n}"), false);
-        }
-        assert_eq!(app.dispatched_notifications.len(), 1);
-
-        app.send_notification("PM from alice", "first", true);
-        app.send_notification("PM from alice", "second", true);
-        app.notifications_enabled = false;
-        age_forced_notification_clock(&mut app);
-        app.run_timed_tasks();
-        assert_eq!(
-            app.dispatched_notifications.len(),
-            2,
-            "a notification held back must not appear after they were turned off"
-        );
-    }
-
-    /// A background app with chathistory negotiated and a notification-ready
-    /// window, plus a retained "#room" tab holding one local-log row (no
-    /// msgid, no server-time) and another tab being read.
-    fn restored_app_with_unanchored_room() -> (Session, mpsc::UnboundedReceiver<IrcCommand>) {
-        let (mut app, rx) = test_app_connected();
-        app.set_session_nick("mynick".into(), true);
-        app.logging_load_history = true;
-        app.notifications_enabled = true;
-        app.window_focused = false;
-        app.handle_incoming_message(
-            IrcMessage::parse(":srv CAP me ACK :draft/chathistory").unwrap(),
-        );
-        let mut room = Channel::new();
-        room.messages.push_back(ChatMessage::new_fmt(
-            "carol",
-            "restored from the log",
-            &app.timestamp_format,
-        ));
-        app.channels.insert("#room".into(), room);
-        app.channels.insert("#other".into(), Channel::new());
-        app.current_channel = Some("#other".into());
-        (app, rx)
-    }
-
-    fn deliver_history_page(app: &mut Session, target: &str, rows: &[(&str, &str)]) {
-        app.handle_incoming_message(
-            IrcMessage::parse(&format!(":srv BATCH +h chathistory {target}")).unwrap(),
-        );
-        for (n, (id, content)) in rows.iter().enumerate() {
-            app.handle_incoming_message(
-                IrcMessage::parse(&format!(
-                    "@batch=h;time=2026-09-12T10:0{n}:00.000Z;msgid={id} :alice!u@h PRIVMSG {target} :{content}"
-                ))
-                .unwrap(),
-            );
-        }
-        app.handle_incoming_message(IrcMessage::parse(":srv BATCH -h").unwrap());
-    }
-
-    #[test]
-    fn latest_fallback_catch_up_does_not_count_old_history_as_new_arrivals() {
-        let (mut app, mut rx) = restored_app_with_unanchored_room();
-
-        // Update-restart rejoin: no row to anchor on, so the request is
-        // CHATHISTORY LATEST * even though its placement is Append.
-        app.handle_incoming_message(IrcMessage::parse(":mynick!u@h JOIN #room").unwrap());
-        assert_eq!(
-            rx.try_recv().unwrap(),
-            IrcCommand::ChathistoryLatest("#room".into(), "*".into(), 100)
-        );
-        deliver_history_page(
-            &mut app,
-            "#room",
-            &[
-                ("o1", "ancient chatter"),
-                ("o2", "mynick said hello long ago"),
-                ("o3", "more chatter"),
-            ],
-        );
-
-        assert_eq!(
-            app.channels["#room"].unread, 0,
-            "#306: the LATEST * dump was counted as new arrivals"
-        );
-        assert!(app.dispatched_notifications.is_empty());
-        assert!(
-            app.channels["#room"]
-                .messages
-                .iter()
-                .any(|row| row.content == "more chatter"),
-            "the history itself is still shown"
-        );
-    }
-
-    #[test]
-    fn user_requested_history_after_never_raises_unread_or_notifications() {
-        let (mut app, mut rx) = restored_app_with_unanchored_room();
-        app.channels.get_mut("#room").unwrap().messages.push_back(
-            ChatMessage::new_fmt("carol", "anchor", &app.timestamp_format).with_irc_metadata(
-                Some("2026-09-12T09:00:00.000Z".into()),
-                Some("anchor".into()),
-                None,
-            ),
-        );
-
-        app.process_command("/chathistory AFTER #room msgid=anchor 50");
-        assert!(matches!(
-            rx.try_recv(),
-            Ok(IrcCommand::ChathistoryAfter(target, _, _)) if target == "#room"
-        ));
-        // The command may have selected the tab; the user then looks elsewhere.
-        app.current_channel = Some("#other".into());
-        deliver_history_page(
-            &mut app,
-            "#room",
-            &[("n1", "mynick are you there"), ("n2", "chatter")],
-        );
-
-        assert_eq!(app.channels["#room"].unread, 0, "#306: manual dump counted");
-        assert!(app.dispatched_notifications.is_empty());
-        assert!(
-            app.channels["#room"]
-                .messages
-                .iter()
-                .any(|row| row.content == "chatter")
-        );
-    }
-
-    /// A connected app reading a query, with its outgoing commands drained.
-    fn app_reading_a_query() -> (Session, mpsc::UnboundedReceiver<IrcCommand>) {
-        let (mut app, rx) = test_app_connected();
-        app.set_session_nick("me".to_string(), true);
-        app.add_message_to_channel("alice", ChatMessage::new_fmt("alice", "hi", "short"));
-        app.current_channel = Some("alice".to_string());
-        (app, rx)
-    }
-
-    #[test]
-    fn join_with_a_channel_list_focuses_each_channel_as_it_is_confirmed() {
-        let (mut app, _rx) = app_reading_a_query();
-
-        app.process_command("/join #a,#b");
-        app.handle_incoming_message(IrcMessage::parse(":me!u@h JOIN #a").unwrap());
-        assert_eq!(app.current_channel.as_deref(), Some("#a"), "#290");
-        app.handle_incoming_message(IrcMessage::parse(":me!u@h JOIN #b").unwrap());
-        assert_eq!(app.current_channel.as_deref(), Some("#b"));
-        assert!(app.join_focus_requests.is_empty());
-    }
-
-    #[test]
-    fn a_refused_join_does_not_leave_a_request_to_steal_focus_later() {
-        let (mut app, _rx) = app_reading_a_query();
-
-        app.process_command("/join #locked");
-        app.handle_numeric(
-            ERR_BANNEDFROMCHAN,
-            &[
-                "me".to_string(),
-                "#locked".to_string(),
-                "Cannot join channel (+b)".to_string(),
-            ],
-        );
-        assert!(app.join_focus_requests.is_empty(), "#290: stale request");
-
-        // Later the server joins us there unasked (an invite, a bouncer).
-        app.handle_incoming_message(IrcMessage::parse(":me!u@h JOIN #locked").unwrap());
-        assert_eq!(app.current_channel.as_deref(), Some("alice"));
-    }
-
-    #[test]
-    fn a_forwarded_join_focuses_the_channel_it_was_forwarded_to() {
-        let (mut app, _rx) = app_reading_a_query();
-
-        app.process_command("/join #old");
-        // 470 <me> <#old> <#new> :Forwarding to another channel
-        app.handle_numeric(
-            470,
-            &[
-                "me".to_string(),
-                "#old".to_string(),
-                "#new".to_string(),
-                "Forwarding to another channel".to_string(),
-            ],
-        );
-        app.handle_incoming_message(IrcMessage::parse(":me!u@h JOIN #new").unwrap());
-
-        assert_eq!(app.current_channel.as_deref(), Some("#new"));
-        assert!(app.join_focus_requests.is_empty());
-    }
-
-    #[test]
-    fn joining_an_already_joined_channel_focuses_it_without_leaving_a_request() {
-        let (mut app, mut rx) = app_reading_a_query();
-        let mut room = Channel::new();
-        room.joined = true;
-        app.channels.insert("#room".to_string(), room);
-
-        app.process_command("/join #ROOM");
-
-        assert!(matches!(
-            rx.try_recv(),
-            Ok(IrcCommand::Join(channel, _, _, _)) if channel == "#ROOM"
-        ));
-        assert_eq!(app.current_channel.as_deref(), Some("#room"));
-        assert!(
-            app.join_focus_requests.is_empty(),
-            "no JOIN echo will consume the request"
-        );
-    }
-
-    #[test]
-    fn cycling_the_current_channel_brings_the_user_back_to_it() {
-        let (mut app, _rx) = app_reading_a_query();
-        let mut room = Channel::new();
-        room.joined = true;
-        app.channels.insert("#room".to_string(), room);
-        app.current_channel = Some("#room".to_string());
-
-        app.process_command("/cycle");
-        app.handle_incoming_message(IrcMessage::parse(":me!u@h PART #room :Cycling").unwrap());
-        app.handle_incoming_message(IrcMessage::parse(":me!u@h JOIN #room").unwrap());
-
-        assert_eq!(app.current_channel.as_deref(), Some("#room"));
     }
 }

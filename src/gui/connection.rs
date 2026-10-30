@@ -13,6 +13,7 @@ use super::{ChatMessage, ConnectionIntent, Session};
 use crate::irc::{IrcClient, IrcCommand, IrcMessage};
 
 impl Session {
+    #[cfg(test)]
     pub(crate) fn background_tick(&mut self, ctx: &egui::Context) {
         self.update_minimal();
         self.process_connection_lifecycle(ctx);
@@ -165,7 +166,7 @@ fn run_worker_runtime<F: std::future::Future>(rt: tokio::runtime::Runtime, futur
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::gui::Settings;
 
@@ -191,7 +192,7 @@ mod tests {
 
     /// A plaintext IRC server that completes registration, then records every
     /// line until the client closes the socket (or goes silent).
-    fn scripted_server() -> (u16, std::sync::mpsc::Receiver<Vec<String>>) {
+    pub(crate) fn scripted_server() -> (u16, std::sync::mpsc::Receiver<Vec<String>>) {
         use std::io::{BufRead, Write};
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
