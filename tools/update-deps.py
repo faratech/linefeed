@@ -29,6 +29,20 @@ class SearchError(RuntimeError):
     """Raised when `cargo search` itself fails (distinct from not-found)."""
 
 
+def _record_dep(deps: dict[str, dict], name: str, version: str, line: str) -> None:
+    """Record one version spec of a crate.
+
+    A crate can appear several times with different specs (e.g. a normal and
+    a build dependency); every distinct spec is kept in ``specs`` so each is
+    checked on its own. ``current``/``line`` describe the first one found.
+    """
+    entry = deps.get(name)
+    if entry is None:
+        deps[name] = {"current": version, "line": line, "specs": [version]}
+    elif version not in entry["specs"]:
+        entry["specs"].append(version)
+
+
 def _collect_deps(deps: dict[str, dict], table: object, section: str) -> None:
     if not isinstance(table, dict):
         return
@@ -47,8 +61,7 @@ def _collect_deps(deps: dict[str, dict], table: object, section: str) -> None:
                 file=sys.stderr,
             )
             continue
-        if name not in deps:
-            deps[name] = {"current": version, "line": f'{name} = "{version}"'}
+        _record_dep(deps, name, version, f'{name} = "{version}"')
 
 
 def _fallback_parse_deps(content: str) -> dict[str, dict]:
@@ -83,8 +96,8 @@ def _fallback_parse_deps(content: str) -> dict[str, dict]:
             continue
         if subdep is not None:
             m = re.match(r"""\s*version\s*=\s*"([^"]+)\"""", raw)
-            if m and subdep not in deps:
-                deps[subdep] = {"current": m.group(1), "line": raw}
+            if m:
+                _record_dep(deps, subdep, m.group(1), raw)
             continue
         # Accumulate multi-line inline table / array values.
         entry = raw
@@ -116,8 +129,7 @@ def _fallback_parse_deps(content: str) -> dict[str, dict]:
                 file=sys.stderr,
             )
             continue
-        if name not in deps:
-            deps[name] = {"current": version, "line": entry.strip().splitlines()[0]}
+        _record_dep(deps, name, version, entry.strip().splitlines()[0])
     return deps
 
 
@@ -283,36 +295,47 @@ def is_prerelease(version: str) -> bool:
 
 
 def _rewrite_crate_versions(
-    content: str, crate_name: str, new_version: str
+    content: str,
+    crate_name: str,
+    new_version: str,
+    only: set[str] | None = None,
 ) -> tuple[str, int]:
-    """Rewrite every version spec of one crate; return (content, specs rewritten).
+    """Rewrite version specs of one crate; return (content, specs rewritten).
 
     Handles every form the parsers accept: ``crate = "1"``,
     ``crate = { version = "1", ... }``, ``crate.version = "1"`` and
     ``[dependencies.crate]`` tables with a ``version = "1"`` line.
+    When ``only`` is given, just specs whose current text is in it are
+    rewritten; other specs of the same crate (e.g. a deliberately held
+    build-dependency) are left alone.
     """
     name = re.escape(crate_name)
     count = 0
 
+    def wanted(old: str) -> bool:
+        return only is None or old in only
+
     def sub(pattern: str, text: str) -> str:
-        nonlocal count
-        text, n = re.subn(
-            pattern, lambda m: f'{m.group(1)}{m.group(2)}"{new_version}"', text
-        )
-        count += n
-        return text
+        def repl(m: re.Match) -> str:
+            nonlocal count
+            if not wanted(m.group(3)):
+                return m.group(0)
+            count += 1
+            return f'{m.group(1)}{m.group(2)}"{new_version}"'
+
+        return re.sub(pattern, repl, text)
 
     # Use word boundary (^|\n) to avoid matching 'rustls' in 'tokio-rustls'
     # Simple: crate = "1.0" (also indented / quoted-key forms)
-    content = sub(rf'(^|\n)([ \t]*["\']?{name}["\']?\s*=\s*)"[^"]+"', content)
+    content = sub(rf'(^|\n)([ \t]*["\']?{name}["\']?\s*=\s*)"([^"]+)"', content)
     # Complex: crate = { version = "1.0", ... } (may span lines)
     content = sub(
-        rf'(^|\n)([ \t]*["\']?{name}["\']?\s*=\s*\{{[^}}]*?version\s*=\s*)"[^"]+"',
+        rf'(^|\n)([ \t]*["\']?{name}["\']?\s*=\s*\{{[^}}]*?version\s*=\s*)"([^"]+)"',
         content,
     )
     # Dotted key: crate.version = "1.0"
     content = sub(
-        rf'(^|\n)([ \t]*["\']?{name}["\']?[ \t]*\.[ \t]*version[ \t]*=[ \t]*)"[^"]+"',
+        rf'(^|\n)([ \t]*["\']?{name}["\']?[ \t]*\.[ \t]*version[ \t]*=[ \t]*)"([^"]+)"',
         content,
     )
 
@@ -322,7 +345,7 @@ def _rewrite_crate_versions(
         r"(?:dependencies|dev-dependencies|build-dependencies)"
         rf"\.(?:\"{name}\"|'{name}'|{name})[ \t]*\]"
     )
-    version_line = re.compile(r'([ \t]*version[ \t]*=[ \t]*)"[^"]+"')
+    version_line = re.compile(r'([ \t]*version[ \t]*=[ \t]*)"([^"]+)"')
     lines = content.splitlines(keepends=True)
     in_table = False
     for idx, line in enumerate(lines):
@@ -330,14 +353,22 @@ def _rewrite_crate_versions(
             in_table = header.match(line) is not None
         elif in_table:
             m = version_line.match(line)
-            if m:
+            if m and wanted(m.group(2)):
                 lines[idx] = f'{m.group(1)}"{new_version}"' + line[m.end():]
                 count += 1
     return "".join(lines), count
 
 
-def update_cargo_toml(updates: dict[str, str], dry_run: bool = False) -> None:
+def update_cargo_toml(
+    updates: dict[str, str],
+    dry_run: bool = False,
+    targets: dict[str, set[str]] | None = None,
+) -> None:
     """Update Cargo.toml with new versions.
+
+    ``targets`` maps a crate to the exact current specs to rewrite; specs of
+    that crate not listed there are left untouched. Without it every spec of
+    each crate in ``updates`` is rewritten.
 
     Raises RuntimeError when a crate's version spec cannot be located in a
     form the writer understands, so callers never report a silent no-op.
@@ -345,7 +376,10 @@ def update_cargo_toml(updates: dict[str, str], dry_run: bool = False) -> None:
     content = CARGO_TOML.read_text()
 
     for crate_name, new_version in updates.items():
-        content, rewritten = _rewrite_crate_versions(content, crate_name, new_version)
+        only = targets.get(crate_name) if targets is not None else None
+        content, rewritten = _rewrite_crate_versions(
+            content, crate_name, new_version, only
+        )
         if rewritten == 0:
             raise RuntimeError(
                 f"could not rewrite the version spec of '{crate_name}' in "
@@ -360,13 +394,17 @@ def update_cargo_toml(updates: dict[str, str], dry_run: bool = False) -> None:
         print(f"\nUpdated Cargo.toml with {len(updates)} changes")
 
 
-def update_manifest_and_lock(updates: dict[str, str], pin: bool = False) -> bool:
+def update_manifest_and_lock(
+    updates: dict[str, str],
+    pin: bool = False,
+    targets: dict[str, set[str]] | None = None,
+) -> bool:
     """Update Cargo.toml and Cargo.lock as one rollback-safe operation."""
     original_toml = CARGO_TOML.read_bytes()
     original_lock = CARGO_LOCK.read_bytes() if CARGO_LOCK.exists() else None
 
     try:
-        update_cargo_toml(updates)
+        update_cargo_toml(updates, targets=targets)
         if pin:
             # --precise applies to a single -p package, so update per crate.
             for crate_name, new_version in updates.items():
@@ -427,11 +465,14 @@ def main():
         return
 
     updates = {}
+    targets: dict[str, set[str]] = {}
     outdated = []
 
     search_failed = False
     for name, info in deps.items():
-        current = info["current"]
+        # A crate can carry several distinct specs (e.g. a normal and a build
+        # dependency); each one is evaluated on its own.
+        specs = info.get("specs") or [info["current"]]
         print(f"Checking {name}...", end=" ", flush=True)
 
         try:
@@ -445,21 +486,26 @@ def main():
             print("not found on crates.io")
             continue
         if is_prerelease(latest) and not args.allow_prerelease:
-            print(f"{current} (latest {latest} is prerelease; skipped)")
+            print(f"{', '.join(specs)} (latest {latest} is prerelease; skipped)")
             continue
 
-        if is_newer(latest, current):
-            print(f"{current} -> {latest} (outdated)")
-            outdated.append((name, current, latest))
-            updates[name] = latest
-        elif args.pin and current != latest and not is_newer(current, latest):
-            print(f"{current} -> {latest} (pinning)")
-            outdated.append((name, current, latest))
-            updates[name] = latest
-        elif is_compatible(latest, current):
-            print(f"{current} (ok, resolves to {latest})")
-        else:
-            print(f"{current} (up to date)")
+        for index, current in enumerate(specs):
+            if index:
+                print(f"  {name}:", end=" ")
+            if is_newer(latest, current):
+                print(f"{current} -> {latest} (outdated)")
+                outdated.append((name, current, latest))
+                updates[name] = latest
+                targets.setdefault(name, set()).add(current)
+            elif args.pin and current != latest and not is_newer(current, latest):
+                print(f"{current} -> {latest} (pinning)")
+                outdated.append((name, current, latest))
+                updates[name] = latest
+                targets.setdefault(name, set()).add(current)
+            elif is_compatible(latest, current):
+                print(f"{current} (ok, resolves to {latest})")
+            else:
+                print(f"{current} (up to date)")
 
     print(f"\n{'='*50}")
 
@@ -482,12 +528,12 @@ def main():
 
     if args.dry_run:
         try:
-            update_cargo_toml(updates, dry_run=True)
+            update_cargo_toml(updates, dry_run=True, targets=targets)
         except RuntimeError as exc:
             print(f"Error: {exc}", file=sys.stderr)
             sys.exit(1)
     else:
-        if not update_manifest_and_lock(updates, pin=args.pin):
+        if not update_manifest_and_lock(updates, pin=args.pin, targets=targets):
             sys.exit(1)
         print("\nDependency files are ready for a --locked build.")
         print("Note: Major version updates may require code changes!")

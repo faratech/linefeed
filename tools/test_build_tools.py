@@ -204,6 +204,81 @@ class DependencyVersionAndParsingTests(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 u.update_cargo_toml({"serde": "2"}, dry_run=True)
 
+    DIVERGENT_SERDE = (
+        '[dependencies]\nserde = "1"\n\n[build-dependencies]\nserde = "0.9"\n'
+    )
+
+    def _run_main(self, argv, latest):
+        import contextlib
+        import io
+
+        out, err = io.StringIO(), io.StringIO()
+        code = None
+        with mock.patch("sys.argv", ["update-deps.py", *argv]), mock.patch.object(
+            self.updater, "get_latest_version", return_value=latest
+        ), contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            try:
+                self.updater.main()
+            except SystemExit as exc:
+                code = exc.code
+        return code, out.getvalue()
+
+    def test_every_distinct_spec_of_a_crate_is_checked(self):
+        # `serde = "1"` must not shadow a divergent build-dependency (#327).
+        u = self.updater
+        with tempfile.TemporaryDirectory() as tmp:
+            manifest = Path(tmp) / "Cargo.toml"
+            manifest.write_text(self.DIVERGENT_SERDE)
+            u.CARGO_TOML = manifest
+            self.assertEqual(u.get_outdated_deps()["serde"]["specs"], ["1", "0.9"])
+            # tomllib-free path must agree.
+            self.assertEqual(
+                u._fallback_parse_deps(self.DIVERGENT_SERDE)["serde"]["specs"],
+                ["1", "0.9"],
+            )
+            # Identical duplicates (e.g. eframe) collapse to one spec.
+            dup = '[dependencies]\neframe = "1"\n[target.\'cfg(unix)\'.dependencies]\neframe = "1"\n'
+            manifest.write_text(dup)
+            self.assertEqual(u.get_outdated_deps()["eframe"]["specs"], ["1"])
+
+            manifest.write_text(self.DIVERGENT_SERDE)
+            code, out = self._run_main(["--check"], latest="1.0.5")
+            self.assertEqual(code, 1, out)
+            self.assertIn("serde: 0.9 -> 1.0.5", out)
+            self.assertNotIn("serde: 1 ->", out)
+
+    def test_update_rewrites_only_the_specs_that_were_evaluated_outdated(self):
+        u = self.updater
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            manifest, lock = root / "Cargo.toml", root / "Cargo.lock"
+            manifest.write_text(self.DIVERGENT_SERDE)
+            lock.write_text("orig\n")
+            u.CARGO_TOML, u.CARGO_LOCK = manifest, lock
+            ok = subprocess.CompletedProcess(["cargo"], 0, stdout="ok", stderr="")
+            with mock.patch.object(u, "run_cmd", return_value=ok):
+                code, out = self._run_main([], latest="1.0.5")
+            self.assertIsNone(code, out)
+            self.assertEqual(
+                manifest.read_text(),
+                '[dependencies]\nserde = "1"\n\n[build-dependencies]\nserde = "1.0.5"\n',
+            )
+
+            # The writer itself honours the per-crate spec filter and still
+            # rewrites every section holding an identical outdated spec.
+            manifest.write_text(
+                '[dependencies]\nserde = "1"\n\n[build-dependencies]\nserde = "1"\n\n'
+                '[dev-dependencies]\nserde = "0.9"\n'
+            )
+            u.update_cargo_toml({"serde": "2.0.0"}, targets={"serde": {"1"}})
+            self.assertEqual(
+                manifest.read_text(),
+                '[dependencies]\nserde = "2.0.0"\n\n[build-dependencies]\nserde = "2.0.0"\n\n'
+                '[dev-dependencies]\nserde = "0.9"\n',
+            )
+            with self.assertRaises(RuntimeError):
+                u.update_cargo_toml({"serde": "2.0.0"}, targets={"serde": {"5"}})
+
     def test_search_failure_is_fatal_not_not_found(self):
         u = self.updater
         failed = subprocess.CompletedProcess(
