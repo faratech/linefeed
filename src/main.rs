@@ -356,6 +356,24 @@ fn main() -> eframe::Result<()> {
     result
 }
 
+impl LinefeedApp {
+    /// While the main window is minimized or occluded (and no detached
+    /// window is on screen), eframe runs no ui pass at all, only
+    /// `App::logic`. Keep every connection drained and its timers,
+    /// reconnects and lag pings running then, or the incoming buffers fill
+    /// and connections time out. When a ui pass follows, it does this work.
+    fn hidden_logic(&mut self, ctx: &egui::Context) {
+        let hidden = ctx.input(|i| i.viewport().visible() == Some(false));
+        if !hidden || self.app.needs_detached_frames() {
+            return;
+        }
+        self.app.updater.poll();
+        self.app.background_tick(ctx);
+        // Nothing else wakes a hidden window: keep `logic` coming.
+        ctx.request_repaint_after(std::time::Duration::from_millis(250));
+    }
+}
+
 struct LinefeedApp {
     startup_ack: Option<updater::install::Transaction>,
     shutdown: Arc<std::sync::Mutex<Option<updater::install::Armed>>>,
@@ -371,6 +389,10 @@ struct LinefeedApp {
 }
 
 impl eframe::App for LinefeedApp {
+    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.hidden_logic(ctx);
+    }
+
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         let ctx = &ctx;
@@ -579,6 +601,62 @@ impl eframe::App for LinefeedApp {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn hermetic_linefeed() -> LinefeedApp {
+        let mut app = App::with_settings(
+            gui::Settings {
+                logging_enabled: false,
+                ..gui::Settings::default()
+            },
+            Default::default(),
+        );
+        app.start(None);
+        LinefeedApp {
+            startup_ack: None,
+            shutdown: Arc::new(std::sync::Mutex::new(None)),
+            app,
+            last_message_time: std::time::Instant::now(),
+            window_size_ok: true,
+            list_loading_since: None,
+        }
+    }
+
+    fn run_hidden(linefeed: &mut LinefeedApp, minimized: bool) {
+        let ctx = egui::Context::default();
+        let mut input = egui::RawInput::default();
+        input.viewports.insert(
+            egui::ViewportId::ROOT,
+            egui::ViewportInfo {
+                minimized: Some(minimized),
+                occluded: Some(false),
+                ..Default::default()
+            },
+        );
+        ctx.run_ui(input, |ui| linefeed.hidden_logic(ui.ctx()))
+            .textures_delta
+            .clear();
+    }
+
+    #[test]
+    fn connections_keep_draining_while_the_window_is_minimized() {
+        let mut linefeed = hermetic_linefeed();
+        let (tx, rx) = tokio::sync::mpsc::channel(4);
+        linefeed.app.sessions[0].msg_rx = Some(rx);
+        tx.try_send(irc::IrcMessage::parse(":srv NOTICE * :while minimized").unwrap())
+            .unwrap();
+
+        // Visible: the ui pass does this work, `logic` must not.
+        run_hidden(&mut linefeed, false);
+        assert!(!tx.is_closed() && tx.capacity() == 3, "drained by logic while visible");
+
+        run_hidden(&mut linefeed, true);
+        assert!(
+            linefeed.app.sessions[0]
+                .server_messages
+                .iter()
+                .any(|m| m.content.contains("while minimized"))
+        );
+    }
 
     #[test]
     fn single_instance_gate_runs_before_recovery_except_when_supervised() {
