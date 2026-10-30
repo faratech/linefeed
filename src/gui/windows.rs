@@ -279,6 +279,15 @@ impl WindowManager {
         self.dirty = true;
     }
 
+    /// Put one attached window at `rect` (a snap layout zone).
+    pub(crate) fn place(&mut self, key: &WindowKey, rect: Rect) {
+        if let Some(window) = self.get_mut(key).filter(|w| !w.detached) {
+            window.pending_place = Some(rect);
+            window.child_rect = Some(rect);
+            self.dirty = true;
+        }
+    }
+
     fn attached_count(&self) -> usize {
         self.windows.iter().filter(|w| !w.detached).count()
     }
@@ -357,7 +366,7 @@ const MAX_SAVED_WINDOWS: usize = 500;
 const LAYOUT_VERSION: u32 = 1;
 
 /// Gap left between tiled windows and around the area, in points.
-const TILE_GAP: f32 = 4.0;
+pub(crate) const TILE_GAP: f32 = 4.0;
 /// Diagonal step between cascaded windows, in points.
 const CASCADE_STEP: f32 = 26.0;
 

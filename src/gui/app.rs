@@ -15,6 +15,7 @@ use std::time::{Duration, Instant};
 
 use egui::{Color32, RichText};
 
+use super::snap::CaptionAction;
 use super::windows::{
     ConnId, LayoutFile, LayoutMode, PersistKey, PresentWindow, TargetView, WindowKey, WindowManager,
 };
@@ -129,9 +130,12 @@ pub struct App {
     /// A window that should take input focus once it exists (activated
     /// before its first sync, e.g. a query opened by /query).
     pending_focus: Option<WindowKey>,
-    /// The detached windows were hidden because the main window was
-    /// minimized; they are shown again with it.
+    /// The detached windows were hidden because the main window went to
+    /// the tray; they are shown again with it.
     detached_hidden: bool,
+    /// Snap layouts of the floating windows (caption drags, the layout
+    /// flyout and bar, Snap Assist).
+    pub(crate) snap: super::snap::SnapUi,
     /// The window a session's Channel List / Channel Info dialog was opened
     /// from. When that window is detached, the dialogs show in its OS window
     /// instead of the main one.
@@ -220,6 +224,7 @@ impl App {
             pending_focus: None,
             dialog_owner: HashMap::new(),
             detached_hidden: false,
+            snap: Default::default(),
         }
     }
 
@@ -400,6 +405,7 @@ impl App {
         if self.windows.mode == LayoutMode::Floating {
             self.draw_floating(&ctx, central.inner);
         }
+        self.draw_snap(&ctx, central.inner);
         self.draw_detached(&ctx);
         self.finish_frame();
     }
@@ -1492,6 +1498,7 @@ impl App {
         };
         let title = self.window_title(&key);
         let mut action = None;
+        let mut restore = None;
         ui.horizontal(|ui| {
             ui.label(RichText::new(&title).strong());
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -1509,15 +1516,18 @@ impl App {
                 {
                     action = Some(WindowAction::Detach);
                 }
-                if ui
-                    .small_button("Restore")
-                    .on_hover_text("Show windows side by side (Ctrl+M)")
-                    .clicked()
-                {
+                // Resting on it opens the snap layouts, as on a floating
+                // window's maximize button.
+                let response = ui.small_button("Restore");
+                if response.clicked() {
                     action = Some(WindowAction::Restore);
                 }
+                restore = Some(response);
             });
         });
+        if let Some(restore) = restore {
+            self.track_maximize_hover(ui.ctx(), &key, &restore);
+        }
         ui.separator();
         self.draw_window_contents(ui, &key);
         match action {
@@ -1553,6 +1563,8 @@ impl App {
         });
         let mut activate = None;
         let mut close = Vec::new();
+        let mut maximize = None;
+        let mut detach = None;
         let cascade = super::windows::cascade_rects(area, keys.len().max(1));
         for (n, key) in keys.iter().enumerate() {
             let title = self.window_title(key);
@@ -1570,22 +1582,36 @@ impl App {
                 pending = Some(cascade[n % cascade.len()]);
             }
             let default = known.or(pending).unwrap_or(cascade[0]);
-            let mut open = true;
+            let active = self.windows.active.as_ref() == Some(key);
+            // Our own caption (`draw_caption`) moves the window, so egui's
+            // title bar and dragging by the background are off.
             let mut window = egui::Window::new(title)
                 .id(id)
-                .open(&mut open)
+                .title_bar(false)
+                .movable(false)
                 .collapsible(false)
                 .default_rect(default);
-            window = match pending {
-                // A tile/cascade placement lies inside the area by
+            window = match (pending, self.dragged_window_pos(ctx, key)) {
+                // A tile/cascade/snap placement lies inside the area by
                 // construction. Constraining this frame would use the
                 // window's previous, larger size and shift it out of its
                 // cell; from the next frame on the new size is known.
-                Some(rect) => window.constrain(false).fixed_rect(rect),
-                None => window.constrain_to(area),
+                (Some(rect), _) => window.constrain(false).fixed_rect(rect),
+                (None, Some(pos)) => window.current_pos(pos).constrain_to(area),
+                (None, None) => window.constrain_to(area),
             };
-            let shown = window.show(ctx, |ui| self.draw_window_contents(ui, key));
+            let shown = window.show(ctx, |ui| {
+                let action = self.draw_caption(ui, key, active);
+                self.draw_window_contents(ui, key);
+                action
+            });
             if let Some(shown) = shown {
+                match shown.inner.flatten() {
+                    Some(CaptionAction::Close) => close.push(key.clone()),
+                    Some(CaptionAction::Maximize) => maximize = Some(key.clone()),
+                    Some(CaptionAction::Detach) => detach = Some(key.clone()),
+                    None => {}
+                }
                 let rect = shown.response.rect;
                 if let Some(pos) = pressed_at
                     && rect.contains(pos)
@@ -1600,14 +1626,19 @@ impl App {
                     self.windows.dirty = true;
                 }
             }
-            if !open {
-                close.push(key.clone());
-            }
         }
         if let Some(key) = activate
             && self.windows.active.as_ref() != Some(&key)
         {
             self.user_activate(key);
+        }
+        if let Some(key) = maximize {
+            self.user_activate(key);
+            self.windows.mode = LayoutMode::Maximized;
+            self.windows.dirty = true;
+        }
+        if let Some(key) = detach {
+            self.toggle_detached(&key);
         }
         // The active window is always the front one. egui raises a window on
         // its first visible frame and on a click; a click also makes that
@@ -2122,6 +2153,7 @@ fn clamp_settings(settings: &mut Settings) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::gui::snap;
     use crate::irc::{IrcCommand, IrcMessage};
     use tokio::sync::mpsc;
 
@@ -3194,6 +3226,334 @@ mod tests {
         .textures_delta
         .clear();
         assert_eq!(drain(&mut rx_b), ["PRIVMSG #debian :still here"]);
+    }
+
+    fn pointer_frame(
+        app: &mut App,
+        ctx: &egui::Context,
+        time: f64,
+        events: Vec<egui::Event>,
+    ) -> egui::FullOutput {
+        let mut output = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1024.0, 768.0),
+                )),
+                time: Some(time),
+                events,
+                ..Default::default()
+            },
+            |ui| app.ui(ui),
+        );
+        output.textures_delta.clear();
+        output
+    }
+
+    fn primary(pos: egui::Pos2, pressed: bool) -> egui::Event {
+        egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        }
+    }
+
+    /// Floating windows for two networks, drawn a few times; returns the
+    /// next frame time.
+    fn floating_windows(app: &mut App, ctx: &egui::Context) -> f64 {
+        app.windows.mode = LayoutMode::Floating;
+        let mut time = 1.0;
+        for _ in 0..4 {
+            pointer_frame(app, ctx, time, vec![]);
+            time += 0.05;
+        }
+        time
+    }
+
+    fn assert_placed(app: &App, key: &WindowKey, expected: egui::Rect) {
+        let rect = app.windows.get(key).unwrap().child_rect.unwrap();
+        assert!(
+            (rect.min - expected.min).length() < 1.0
+                && (rect.size() - expected.size()).length() < 1.0,
+            "{key:?} at {rect:?}, expected {expected:?}"
+        );
+    }
+
+    /// Press on `from`, drag through `path` and release on its last point;
+    /// returns the next frame time.
+    fn drag(
+        app: &mut App,
+        ctx: &egui::Context,
+        mut time: f64,
+        from: egui::Pos2,
+        path: &[egui::Pos2],
+    ) -> f64 {
+        let mut step = |app: &mut App, events| {
+            pointer_frame(app, ctx, time, events);
+            time += 0.05;
+        };
+        step(app, vec![egui::Event::PointerMoved(from)]);
+        step(app, vec![primary(from, true)]);
+        for &pos in path {
+            step(app, vec![egui::Event::PointerMoved(pos)]);
+        }
+        step(app, vec![primary(*path.last().unwrap(), false)]);
+        step(app, vec![]);
+        step(app, vec![]);
+        time
+    }
+
+    #[test]
+    fn resting_on_the_maximize_button_offers_layouts_that_snap_the_window() {
+        let (mut app, _rx_a, _rx_b) = two_networks();
+        let ctx = egui::Context::default();
+        let mut time = floating_windows(&mut app, &ctx);
+        let key = app.windows.active.clone().unwrap();
+        let button = ctx
+            .read_response(snap::maximize_button_id(&key))
+            .unwrap()
+            .rect;
+        pointer_frame(
+            &mut app,
+            &ctx,
+            time,
+            vec![egui::Event::PointerMoved(button.center())],
+        );
+        time += 0.1;
+        pointer_frame(&mut app, &ctx, time, vec![]);
+        assert!(
+            app.snap.flyout.is_none(),
+            "opened before the pointer rested"
+        );
+        time += 0.4;
+        pointer_frame(&mut app, &ctx, time, vec![]);
+        assert!(app.snap.flyout.is_some(), "no layouts after resting");
+        time += 0.05;
+        pointer_frame(&mut app, &ctx, time, vec![]);
+
+        // Left half of the halves layout.
+        let zone = ctx
+            .read_response(snap::zone_id(snap::flyout_id(), 0, 0))
+            .unwrap()
+            .rect;
+        for events in [
+            vec![egui::Event::PointerMoved(zone.center())],
+            vec![primary(zone.center(), true)],
+            vec![primary(zone.center(), false)],
+            vec![],
+            vec![],
+        ] {
+            time += 0.05;
+            pointer_frame(&mut app, &ctx, time, events);
+        }
+        let area = app.windows.area.unwrap();
+        let halves = snap::layout_rects(area, 0);
+        assert_placed(&app, &key, halves[0]);
+        assert!(app.snap.flyout.is_none());
+
+        // Snap Assist offers the other windows for the right half.
+        assert_eq!(app.snap.assist.as_ref().unwrap().zones, vec![halves[1]]);
+        let other = app
+            .ordered_windows()
+            .into_iter()
+            .find(|k| *k != key)
+            .unwrap();
+        let choice = ctx
+            .read_response(snap::assist_choice_id(0, &other))
+            .unwrap()
+            .rect;
+        for events in [
+            vec![egui::Event::PointerMoved(choice.center())],
+            vec![primary(choice.center(), true)],
+            vec![primary(choice.center(), false)],
+            vec![],
+            vec![],
+        ] {
+            time += 0.05;
+            pointer_frame(&mut app, &ctx, time, events);
+        }
+        assert_placed(&app, &other, halves[1]);
+        assert_eq!(app.windows.active, Some(other), "picked, not focused");
+        assert!(app.snap.assist.is_none(), "every zone is filled");
+    }
+
+    #[test]
+    fn dragging_a_caption_to_a_side_snaps_the_window_to_that_half() {
+        let (mut app, _rx_a, _rx_b) = two_networks();
+        let ctx = egui::Context::default();
+        let time = floating_windows(&mut app, &ctx);
+        let key = app.windows.active.clone().unwrap();
+        let caption = ctx.read_response(snap::caption_id(&key)).unwrap().rect;
+        let area = app.windows.area.unwrap();
+        let from = caption.left_center() + egui::vec2(40.0, 0.0);
+        let edge = egui::pos2(area.left() + 2.0, area.center().y);
+        drag(
+            &mut app,
+            &ctx,
+            time,
+            from,
+            &[from + egui::vec2(30.0, 10.0), edge],
+        );
+        let halves = snap::layout_rects(area, 0);
+        assert_placed(&app, &key, halves[0]);
+        assert_eq!(app.snap.assist.as_ref().unwrap().zones, vec![halves[1]]);
+    }
+
+    #[test]
+    fn dragging_a_caption_to_the_top_opens_the_layout_bar() {
+        let (mut app, _rx_a, _rx_b) = two_networks();
+        let ctx = egui::Context::default();
+        let mut time = floating_windows(&mut app, &ctx);
+        let key = app.windows.active.clone().unwrap();
+        let caption = ctx.read_response(snap::caption_id(&key)).unwrap().rect;
+        let area = app.windows.area.unwrap();
+        let from = caption.left_center() + egui::vec2(40.0, 0.0);
+        let top = area.center_top() + egui::vec2(0.0, 2.0);
+        for events in [
+            vec![egui::Event::PointerMoved(from)],
+            vec![primary(from, true)],
+            vec![egui::Event::PointerMoved(from + egui::vec2(20.0, 20.0))],
+            vec![egui::Event::PointerMoved(top)],
+            vec![],
+        ] {
+            pointer_frame(&mut app, &ctx, time, events);
+            time += 0.05;
+        }
+        assert!(app.snap.bar.is_some(), "no layout bar at the top");
+        // Top right quarter.
+        let zone = ctx
+            .read_response(snap::zone_id(snap::bar_id(), 4, 1))
+            .unwrap()
+            .rect;
+        for events in [
+            vec![egui::Event::PointerMoved(zone.center())],
+            vec![primary(zone.center(), false)],
+            vec![],
+            vec![],
+        ] {
+            pointer_frame(&mut app, &ctx, time, events);
+            time += 0.05;
+        }
+        assert!(app.snap.bar.is_none());
+        assert_placed(&app, &key, snap::layout_rects(area, 4)[1]);
+        assert_eq!(app.snap.assist.as_ref().unwrap().zones.len(), 3);
+    }
+
+    #[test]
+    fn a_window_dropped_away_from_the_edges_just_moves() {
+        let (mut app, _rx_a, _rx_b) = two_networks();
+        let ctx = egui::Context::default();
+        let time = floating_windows(&mut app, &ctx);
+        let key = app.windows.active.clone().unwrap();
+        let before = app.windows.get(&key).unwrap().child_rect.unwrap();
+        let caption = ctx.read_response(snap::caption_id(&key)).unwrap().rect;
+        let from = caption.left_center() + egui::vec2(40.0, 0.0);
+        drag(
+            &mut app,
+            &ctx,
+            time,
+            from,
+            &[from + egui::vec2(20.0, 20.0), from + egui::vec2(60.0, 40.0)],
+        );
+        let after = app.windows.get(&key).unwrap().child_rect.unwrap();
+        assert!(
+            ((after.min - before.min) - egui::vec2(60.0, 40.0)).length() < 1.5,
+            "{before:?} -> {after:?}"
+        );
+        assert!(app.snap.assist.is_none());
+    }
+
+    #[test]
+    fn snapping_a_maximized_window_returns_to_floating_windows() {
+        let (mut app, _rx_a, _rx_b) = two_networks();
+        let ctx = egui::Context::default();
+        frame(&mut app, &ctx);
+        assert_eq!(app.windows.mode, LayoutMode::Maximized);
+        let key = app.windows.active.clone().unwrap();
+        let area = egui::Rect::from_min_size(egui::pos2(0.0, 60.0), egui::vec2(1024.0, 700.0));
+        let target = snap::SnapTarget::layout(area, 1, 0);
+        app.snap_window(&key, target.clone());
+        assert_eq!(app.windows.mode, LayoutMode::Floating);
+        assert_eq!(
+            app.windows.get(&key).unwrap().child_rect,
+            Some(target.rect())
+        );
+        assert_eq!(
+            app.snap.assist.as_ref().unwrap().zones,
+            vec![target.zones[1]]
+        );
+    }
+
+    #[test]
+    fn escape_or_a_click_elsewhere_dismisses_snap_assist() {
+        let (mut app, _rx_a, _rx_b) = two_networks();
+        let ctx = egui::Context::default();
+        let mut time = floating_windows(&mut app, &ctx);
+        let key = app.windows.active.clone().unwrap();
+        let area = app.windows.area.unwrap();
+        app.snap_window(
+            &key,
+            snap::SnapTarget::layout(area, snap::LAYOUTS.len() - 1, 0),
+        );
+        pointer_frame(&mut app, &ctx, time, vec![]);
+        time += 0.05;
+        assert_eq!(app.snap.assist.as_ref().unwrap().zones.len(), 3);
+        let escape = egui::Event::Key {
+            key: egui::Key::Escape,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        };
+        pointer_frame(&mut app, &ctx, time, vec![escape]);
+        time += 0.05;
+        assert!(app.snap.assist.is_none());
+
+        // A click inside the snapped window, outside the free zones.
+        app.snap_window(&key, snap::SnapTarget::layout(area, 0, 0));
+        for _ in 0..2 {
+            pointer_frame(&mut app, &ctx, time, vec![]);
+            time += 0.05;
+        }
+        assert!(app.snap.assist.is_some());
+        let inside = snap::layout_rects(area, 0)[0].center();
+        for events in [
+            vec![egui::Event::PointerMoved(inside)],
+            vec![primary(inside, true)],
+            vec![primary(inside, false)],
+        ] {
+            pointer_frame(&mut app, &ctx, time, events);
+            time += 0.05;
+        }
+        assert!(app.snap.assist.is_none());
+    }
+
+    #[test]
+    fn double_clicking_a_caption_maximizes_its_window() {
+        let (mut app, _rx_a, _rx_b) = two_networks();
+        let ctx = egui::Context::default();
+        let mut time = floating_windows(&mut app, &ctx);
+        let other = app.ordered_windows()[0].clone();
+        app.activate(other.clone());
+        for _ in 0..2 {
+            pointer_frame(&mut app, &ctx, time, vec![]);
+            time += 0.05;
+        }
+        let caption = ctx.read_response(snap::caption_id(&other)).unwrap().rect;
+        let at = caption.left_center() + egui::vec2(30.0, 0.0);
+        for events in [
+            vec![egui::Event::PointerMoved(at)],
+            vec![primary(at, true)],
+            vec![primary(at, false)],
+            vec![primary(at, true)],
+            vec![primary(at, false)],
+        ] {
+            pointer_frame(&mut app, &ctx, time, events);
+            time += 0.05;
+        }
+        assert_eq!(app.windows.mode, LayoutMode::Maximized);
+        assert_eq!(app.windows.active, Some(other));
     }
 
     #[test]

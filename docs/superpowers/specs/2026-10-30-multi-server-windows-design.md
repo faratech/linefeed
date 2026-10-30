@@ -271,16 +271,20 @@ Recorded after building it, so the design and the code agree.
 - **Startup focus** starts on the first network; later selection changes are
   followed only for the active network (#290 keeps unsolicited JOINs from
   moving focus at all).
-- **Minimized, detached windows hide.** The plan kept detached windows
-  usable while the main window was minimized. eframe 0.37 runs only
-  `App::logic` for a minimized root, and forcing a ui pass
-  (`RequestPaintWhileHidden`) presents to the minimized window, which can
-  block on Windows. So `logic` ticks every connection and sends the detached
-  viewports `Visible(false)`; the next ui pass after a restore recreates them
-  from their saved geometry. Minimize-to-tray is also driven from `logic`,
-  with a posted `ShowWindowAsync`: a synchronous `ShowWindow` or
-  `GetWindowTextW` on our own window from inside eframe's event-loop
-  callback deadlocks.
+- **Minimized main window.** eframe 0.37 runs only `App::logic` for a
+  minimized or covered main window, unless one of its child viewports is
+  visible: then it runs the ui pass too, without painting the main window.
+  `logic` ticks every connection whenever the main window is not visible,
+  and the ui pass that follows draws only the detached windows, which stay
+  usable as planned. They hide (`Visible(false)`) only with the tray.
+  Minimize-to-tray is driven from `logic` with a posted `ShowWindowAsync`:
+  a synchronous `ShowWindow` or `GetWindowTextW` on our own window from
+  inside eframe's event-loop callback deadlocks, which was what had looked
+  like a hang in painting a minimized window.
+- **Snap layouts** (added after the plan, `snap.rs`): floating windows draw
+  their own caption, so a drag can be followed for edge snaps and the
+  Windows 11 layout bar; the maximize button opens the layout flyout, and
+  Snap Assist offers the other windows for the zones left.
 - **Dialogs follow the window that asked.** Channel info, the channel list
   and the colour picker open in the detached OS window they were requested
   from (`App::dialog_owner`, `App::color_target`). The global Settings and

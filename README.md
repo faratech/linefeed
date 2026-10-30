@@ -18,8 +18,9 @@ InspIRCd, UnrealIRCd, Solanum, Ergo, Bahamut, ircu, Hybrid, and Plexus features.
 ### Several Servers and Windows
 - Several networks at once, each with its own status window, channels and queries
 - mIRC-style windows: one maximized window at a time, or floating windows you can tile, cascade, move and resize
+- Windows 11 style snap layouts inside the main window: rest the pointer on a window's maximize button, or drag a window to the top, a side or a corner, and the other windows are offered for the space left (Snap Assist)
 - Switchbar of every window, grouped by network, with unread counts
-- Any window can be detached into its own OS window and reattached
+- Any window can be detached into its own OS window and reattached; detached windows keep working while the main window is minimized
 - Closing a window parts its channel or closes its query; closing a status window disconnects that server (after asking)
 - Server favorites are network profiles that can connect automatically at startup
 - Window placement is remembered between runs

@@ -5,6 +5,7 @@ mod dialogs;
 mod formatting;
 mod helpers;
 mod logging;
+mod snap;
 mod types;
 mod view;
 mod windows;

@@ -33,6 +33,25 @@ new server messages in yellow. Click a window to make it active.
   open in a cascade slot behind the window you are typing in.
 
 `Ctrl+M` (or **Window → Maximize/Restore windows**) switches between the two.
+
+### Snap layouts
+
+As in Windows 11, floating windows snap into layouts inside the chat area:
+
+- Rest the pointer on a window's maximize button (□), or on **Restore**
+  when windows are maximized, and a grid of layouts opens: halves, two
+  thirds and a third, thirds, a half and two quarters, and quarters. Click
+  a zone of a layout to put the window there.
+- Drag a window by its caption to the top of the chat area and the same
+  grid appears; drop the window on a zone. Drag it to the left or right
+  edge for that half, or into a corner for that quarter.
+- After a window snaps, each zone left over lists the other windows
+  (Snap Assist): click one to fill the zone. `Escape` or a click elsewhere
+  dismisses it.
+
+In a chat area taller than it is wide, the layouts are turned on their
+side. Clicking the maximize button, or double-clicking a caption,
+maximizes that window.
 `Ctrl+Tab` / `Ctrl+Shift+Tab` and `Alt+1`..`Alt+9` move between windows in
 switchbar order across all networks.
 
@@ -43,10 +62,12 @@ window, or `/window detach`) to move it into its own OS window, for example
 onto another monitor. The detached window has its own topic, user list and
 input line; **Reattach** (or `/window attach`) puts it back.
 
-Detached windows minimize with the main window, and hide with it when it
-goes to the system tray (Windows). Restoring Linefeed, from the taskbar, the
-tray or by starting it again, brings them back where they were. Connections
-keep running throughout, so nothing is missed while they are away.
+Detached windows stay on screen and keep working while the main window is
+minimized or covered, for example with the main window minimized and a
+channel on a second monitor. When Linefeed goes to the system tray
+(Windows), they hide with it, and restoring it from the tray or by starting
+it again brings them back where they were. Connections keep running
+throughout.
 
 Channel info, the channel list and the colour picker open inside the
 detached window they were asked for from. Settings and Connect belong to
