@@ -370,11 +370,14 @@ impl IrcMessage {
                 params.get(2).cloned(),
             ),
             _ => {
-                // Try to parse as numeric
-                if let Ok(num) = cmd.parse::<u16>() {
-                    IrcCommand::Numeric(num, params)
-                } else {
-                    Self::raw_command(cmd, &params)
+                // A numeric reply is exactly three ASCII digits. parse::<u16>
+                // alone would also take "1", "+001" and "0001" (aliasing
+                // RPL_WELCOME) and "1234".
+                match cmd.parse::<u16>() {
+                    Ok(num) if cmd.len() == 3 && cmd.bytes().all(|b| b.is_ascii_digit()) => {
+                        IrcCommand::Numeric(num, params)
+                    }
+                    _ => Self::raw_command(cmd, &params),
                 }
             }
         }
@@ -1075,6 +1078,29 @@ mod tests {
             join.command,
             IrcCommand::Join("#c".into(), None, None, None)
         );
+    }
+
+    #[test]
+    fn only_three_digit_tokens_parse_as_numerics() {
+        // #284: IRC numerics are exactly three ASCII digits; "1", "+001" and
+        // "0001" must not alias RPL_WELCOME and "1234" is not a numeric.
+        for canonical in [("001", 1), ("000", 0), ("372", 372), ("999", 999)] {
+            let message = IrcMessage::parse(&format!(":srv {} me :hi", canonical.0)).unwrap();
+            assert_eq!(
+                message.command,
+                IrcCommand::Numeric(canonical.1, vec!["me".into(), "hi".into()])
+            );
+        }
+        for token in ["1", "01", "+001", "0001", "1234", "-01", "00１"] {
+            let line = format!(":srv {token} me :hi");
+            let message = IrcMessage::parse(&line).unwrap();
+            assert!(
+                matches!(message.command, IrcCommand::Raw(_)),
+                "{token:?} was typed as {:?}",
+                message.command
+            );
+            assert_eq!(message.raw, line);
+        }
     }
 
     #[test]
