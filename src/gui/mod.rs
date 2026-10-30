@@ -4235,10 +4235,11 @@ impl IrcApp {
                         ch.set_user_realname(&sender, realname.clone());
                     }
                 }
+                // A prefix without user@host must not erase what is known.
                 self.update_user_identity(
                     &sender,
-                    Some(username),
-                    Some(hostname),
+                    username.map(Some),
+                    hostname.map(Some),
                     account.clone().map(Some),
                     realname.clone().map(Some),
                     None,
@@ -5902,8 +5903,8 @@ impl IrcApp {
                         .insert(self.network_support.canonicalize(nick));
                     self.update_user_identity(
                         nick,
-                        Some(username),
-                        Some(hostname),
+                        username.map(Some),
+                        hostname.map(Some),
                         None,
                         None,
                         None,
@@ -6193,10 +6194,12 @@ impl IrcApp {
             let (username, hostname) = Self::prefix_user_host(Some(target));
             let key = self.network_support.canonicalize(nick);
             self.monitored_users.insert(key);
+            // A bare nick says nothing about user@host; keep what JOIN, NAMES
+            // or WHO already taught us rather than clearing it.
             self.update_user_identity(
                 nick,
-                Some(username),
-                Some(hostname),
+                username.map(Some),
+                hostname.map(Some),
                 None,
                 None,
                 None,
@@ -10995,6 +10998,54 @@ mod tests {
             }
             other => panic!("expected Monitor, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn bare_nick_presence_replies_keep_the_known_user_and_host() {
+        let (mut app, _rx) = test_app_connected();
+        app.set_session_nick("me".to_string(), true);
+        app.channels.insert("#chan".to_string(), Channel::new());
+        app.handle_incoming_message(IrcMessage::parse(":alice!user@host JOIN #chan").unwrap());
+        let identity = |app: &IrcApp| {
+            let known = &app.known_users["alice"];
+            let in_channel = app.channels["#chan"].get_user("alice").unwrap();
+            assert_eq!(known.username, in_channel.username);
+            assert_eq!(known.hostname, in_channel.hostname);
+            (known.username.clone(), known.hostname.clone(), known.online)
+        };
+        assert_eq!(
+            identity(&app),
+            (Some("user".to_string()), Some("host".to_string()), true)
+        );
+
+        // MONITOR may report a target as a bare nick; that teaches nothing
+        // new about the user and host already learned.
+        app.handle_incoming_message(IrcMessage::parse(":srv 731 me :alice").unwrap());
+        assert_eq!(
+            identity(&app),
+            (Some("user".to_string()), Some("host".to_string()), false)
+        );
+        app.handle_incoming_message(IrcMessage::parse(":srv 730 me :alice").unwrap());
+        assert_eq!(
+            identity(&app),
+            (Some("user".to_string()), Some("host".to_string()), true)
+        );
+
+        // A full mask still replaces what was known.
+        app.handle_incoming_message(IrcMessage::parse(":srv 730 me :alice!new@place").unwrap());
+        assert_eq!(
+            identity(&app),
+            (Some("new".to_string()), Some("place".to_string()), true)
+        );
+
+        // A JOIN whose prefix is a bare nick (some bouncers and servers omit
+        // user@host) and a WATCH reply without them keep it as well.
+        app.handle_incoming_message(IrcMessage::parse(":alice JOIN #chan").unwrap());
+        app.handle_numeric(RPL_NOWON, &["me".into(), "alice".into()]);
+        assert_eq!(
+            identity(&app),
+            (Some("new".to_string()), Some("place".to_string()), true)
+        );
     }
 
     #[test]
