@@ -1982,9 +1982,14 @@ impl IrcClient {
             });
         }
 
+        // Canonicalise exactly like the pending/NAK bookkeeping above, so an
+        // ACK carrying a `~`/`=` modifier still counts as enabled. A `-`
+        // token acknowledges a capability being disabled and enables nothing
+        // (#298).
         let acked_tokens: std::collections::HashSet<String> = acked_caps
             .split_whitespace()
-            .map(|t| t.split('=').next().unwrap_or(t).to_ascii_lowercase())
+            .filter(|token| !token.starts_with('-'))
+            .map(cap_token_name)
             .collect();
         tracing::info!("Enabled capabilities: {}", acked_caps);
 
@@ -3991,6 +3996,159 @@ mod tests {
                 .expect("SASL registration timed out")
                 .unwrap();
             server.await.unwrap();
+        });
+    }
+
+    /// Config for the loopback CAP ACK tests.
+    fn cap_ack_test_config(port: u16) -> ServerConfig {
+        ServerConfig {
+            host: "127.0.0.1".to_string(),
+            port,
+            use_tls: false,
+            nick: "tester".to_string(),
+            ..Default::default()
+        }
+    }
+
+    /// Connect `config` to a fake server on `listener` that checks the
+    /// registration lines and then plays `script`. Returns the client's
+    /// result. Server and client run on the same task, so a failed server
+    /// assertion fails the calling test directly.
+    async fn connect_with_script(
+        config: ServerConfig,
+        listener: tokio::net::TcpListener,
+        script: impl AsyncFnOnce(
+            BufReader<tokio::net::tcp::OwnedReadHalf>,
+            tokio::net::tcp::OwnedWriteHalf,
+        ),
+    ) -> Result<(), String> {
+        let server = async {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (read_half, write_half) = stream.into_split();
+            let mut reader = BufReader::new(read_half);
+            assert_eq!(read_wire_line(&mut reader).await, "CAP LS 302");
+            assert_eq!(read_wire_line(&mut reader).await, "NICK tester");
+            assert!(read_wire_line(&mut reader).await.starts_with("USER "));
+            script(reader, write_half).await;
+        };
+        let client = async {
+            let (msg_tx, _msg_rx) = mpsc::channel(100);
+            let (_cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+            let mut client = IrcClient::new(config);
+            timeout(Duration::from_secs(1), client.connect(msg_tx, cmd_rx))
+                .await
+                .expect("registration timed out")
+                .map_err(|error| error.to_string())
+        };
+        tokio::join!(server, client).1
+    }
+
+    #[test]
+    fn sasl_runs_when_the_cap_ack_carries_a_modifier_prefix() {
+        test_runtime().block_on(async {
+            // #298: `~sasl` acknowledges the sasl capability like `sasl`
+            // does; the ACK bookkeeping honoured that but the SASL gate did
+            // not, so authentication was skipped (and a required-SASL
+            // connection failed despite the successful ACK).
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let config = ServerConfig {
+                sasl_username: Some("user".to_string()),
+                sasl_password: Some("password".to_string()),
+                sasl_required: true,
+                ..cap_ack_test_config(listener.local_addr().unwrap().port())
+            };
+            let result = connect_with_script(config, listener, async |mut reader, mut writer| {
+                writer
+                    .write_all(b":srv CAP * LS :sasl=PLAIN\r\n")
+                    .await
+                    .unwrap();
+                assert_eq!(read_wire_line(&mut reader).await, "CAP REQ :sasl");
+                writer
+                    .write_all(b":srv CAP * ACK :~sasl\r\n")
+                    .await
+                    .unwrap();
+                assert_eq!(read_wire_line(&mut reader).await, "AUTHENTICATE PLAIN");
+                writer.write_all(b"AUTHENTICATE +\r\n").await.unwrap();
+                let expected = BASE64_STANDARD.encode(b"\0user\0password");
+                assert_eq!(
+                    read_wire_line(&mut reader).await,
+                    format!("AUTHENTICATE {expected}")
+                );
+                writer
+                    .write_all(b":srv 903 tester :SASL successful\r\n")
+                    .await
+                    .unwrap();
+                assert_eq!(read_wire_line(&mut reader).await, "CAP END");
+                writer
+                    .write_all(b":srv 001 tester :Welcome\r\n")
+                    .await
+                    .unwrap();
+            })
+            .await;
+            assert_eq!(result, Ok(()));
+        });
+    }
+
+    #[test]
+    fn pre_away_is_sent_when_the_cap_ack_carries_a_sticky_prefix() {
+        test_runtime().block_on(async {
+            // #298: `=draft/pre-away` used to be recorded as the empty name.
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let config = ServerConfig {
+                pre_away_message: Some("brb".to_string()),
+                ..cap_ack_test_config(listener.local_addr().unwrap().port())
+            };
+            let result = connect_with_script(config, listener, async |mut reader, mut writer| {
+                writer
+                    .write_all(b":srv CAP * LS :draft/pre-away\r\n")
+                    .await
+                    .unwrap();
+                assert_eq!(read_wire_line(&mut reader).await, "CAP REQ :draft/pre-away");
+                writer
+                    .write_all(b":srv CAP * ACK :=draft/pre-away\r\n")
+                    .await
+                    .unwrap();
+                assert_eq!(read_wire_line(&mut reader).await, "AWAY :brb");
+                assert_eq!(read_wire_line(&mut reader).await, "CAP END");
+                writer
+                    .write_all(b":srv 001 tester :Welcome\r\n")
+                    .await
+                    .unwrap();
+            })
+            .await;
+            assert_eq!(result, Ok(()));
+        });
+    }
+
+    #[test]
+    fn sasl_is_skipped_when_the_cap_ack_removes_the_capability() {
+        test_runtime().block_on(async {
+            // Guard for the #298 fix: a `-` prefix disables a capability, so
+            // it must not be canonicalised into "sasl is enabled".
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let config = ServerConfig {
+                sasl_username: Some("user".to_string()),
+                sasl_password: Some("password".to_string()),
+                ..cap_ack_test_config(listener.local_addr().unwrap().port())
+            };
+            let result = connect_with_script(config, listener, async |mut reader, mut writer| {
+                writer
+                    .write_all(b":srv CAP * LS :sasl=PLAIN\r\n")
+                    .await
+                    .unwrap();
+                assert_eq!(read_wire_line(&mut reader).await, "CAP REQ :sasl");
+                writer
+                    .write_all(b":srv CAP * ACK :-sasl\r\n")
+                    .await
+                    .unwrap();
+                assert_eq!(read_wire_line(&mut reader).await, "CAP END");
+                writer
+                    .write_all(b":srv 001 tester :Welcome\r\n")
+                    .await
+                    .unwrap();
+            })
+            .await;
+            assert_eq!(result, Ok(()));
         });
     }
 
