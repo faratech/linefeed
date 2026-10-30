@@ -1469,10 +1469,16 @@ impl Channel {
                 }
             }
         }
-        // Servers that hide the key from non-operators answer `+k *`; the
-        // placeholder is not a key and must not displace the one we hold.
-        if self.mode_parameters.get(&'k').map(String::as_str) == Some("*") {
-            self.key = known_key;
+        // Servers that hide the key from non-operators answer `+k *` (or
+        // InspIRCd's `+k <key>`); the placeholder is not a key and must not
+        // displace the one we hold.
+        match self.mode_parameters.get(&'k').map(String::as_str) {
+            Some("*" | "<key>") => self.key = known_key,
+            // The reply is the complete mode set of a channel we are in: with
+            // no +k, a key kept from an earlier visit is stale, and a rejoin
+            // or /cycle would present it.
+            None if self.joined => self.key = None,
+            _ => {}
         }
         self.rebuild_mode_params();
     }

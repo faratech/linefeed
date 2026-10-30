@@ -8970,8 +8970,50 @@ mod tests {
 
         // Servers that hide the key from the reply show a placeholder; it is
         // not a key and must not replace the real one.
-        app.handle_incoming_message(IrcMessage::parse(":srv 324 me #sec +ntk *").unwrap());
-        assert_eq!(app.channels["#sec"].key.as_deref(), Some("rotated"));
+        for placeholder in ["*", "<key>"] {
+            app.handle_incoming_message(
+                IrcMessage::parse(&format!(":srv 324 me #sec +ntk {placeholder}")).unwrap(),
+            );
+            assert_eq!(
+                app.channels["#sec"].key.as_deref(),
+                Some("rotated"),
+                "{placeholder}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_channel_modes_reply_without_a_key_clears_the_stale_stored_key() {
+        let (mut app, mut rx) = test_app_connected();
+        app.set_session_nick("me".to_string(), true);
+        app.process_command("/join #sec oldkey");
+        app.handle_incoming_message(IrcMessage::parse(":me!u@h JOIN #sec").unwrap());
+        assert_eq!(app.channels["#sec"].key.as_deref(), Some("oldkey"));
+
+        // The key was removed while we were away; we come back without one.
+        app.handle_incoming_message(IrcMessage::parse(":op!u@h KICK #sec me :bye").unwrap());
+        assert!(!app.channels["#sec"].joined);
+        app.process_command("/join #sec");
+        app.handle_incoming_message(IrcMessage::parse(":me!u@h JOIN #sec").unwrap());
+        assert!(app.channels["#sec"].joined);
+        assert_eq!(app.channels["#sec"].key.as_deref(), Some("oldkey"));
+
+        app.handle_incoming_message(IrcMessage::parse(":srv 324 me #sec +nt").unwrap());
+        assert_eq!(app.channels["#sec"].key, None);
+        drain_commands(&mut rx);
+        app.current_channel = Some("#sec".to_string());
+        app.process_command("/cycle");
+        assert_eq!(
+            drain_commands(&mut rx),
+            vec![
+                IrcCommand::Part("#sec".into(), Some("Cycling".into())),
+                IrcCommand::Join("#sec".into(), None, None, None),
+            ]
+        );
+        assert_eq!(
+            app.update_session().tabs,
+            vec![("#sec".to_string(), None, true)]
+        );
     }
 
     #[test]
