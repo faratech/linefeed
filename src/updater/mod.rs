@@ -373,8 +373,13 @@ fn worker(
             match command {
                 Command::Check => {
                     emit(&events, &context, Event::Status(Status::Checking));
-                    let (checked, found) = stamped_check(&paths, check_release)
-                        .inspect_err(|_| retry_at = Some(Instant::now() + CHECK_RETRY))?;
+                    let (checked, found) =
+                        stamped_check(&paths, check_release).map_err(|error| {
+                            if matches!(error, CheckError::Request(_)) {
+                                retry_at = Some(Instant::now() + CHECK_RETRY);
+                            }
+                            error.into_io()
+                        })?;
                     emit(&events, &context, Event::Checked(checked));
                     offer = found;
                     emit(&events, &context, Event::Offer(offer.clone()));
@@ -432,20 +437,42 @@ fn record_check(paths: &Paths) -> io::Result<u64> {
     Ok(checked)
 }
 
+/// Why a release check failed.
+#[derive(Debug)]
+enum CheckError {
+    /// The request did not complete (offline, rate limited, GitHub 5xx), or the
+    /// check could not be recorded: it found nothing out, and asking again
+    /// soon may well work.
+    Request(io::Error),
+    /// GitHub answered with a release the updater rejects (incomplete assets,
+    /// invalid metadata, an unusable tag). It would answer the same again soon.
+    Release(io::Error),
+}
+impl CheckError {
+    fn into_io(self) -> io::Error {
+        match self {
+            Self::Request(e) | Self::Release(e) => e,
+        }
+    }
+}
+
 /// Stamp the check cadence, then run `check`. The stamp goes first so that
-/// instances launched meanwhile skip their own check, but a check that fails
-/// (offline, rate limited, GitHub 5xx) takes it back: it found nothing out, and
-/// must not suppress automatic checks for a whole interval (#297).
+/// instances launched meanwhile skip their own check. A request that fails takes
+/// it back, so that it does not suppress automatic checks for a whole interval
+/// (#297); a release GitHub answered with and the updater rejected keeps it,
+/// since that check completed and repeating it would change nothing.
 fn stamped_check(
     paths: &Paths,
-    check: impl FnOnce() -> io::Result<Option<Offer>>,
-) -> io::Result<(u64, Option<Offer>)> {
+    check: impl FnOnce() -> Result<Option<Offer>, CheckError>,
+) -> Result<(u64, Option<Offer>), CheckError> {
     let previous = install::read_json::<u64>(&paths.state.join("last-check.json")).ok();
-    let checked = record_check(paths)?;
+    let checked = record_check(paths).map_err(CheckError::Request)?;
     match check() {
         Ok(offer) => Ok((checked, offer)),
         Err(error) => {
-            unrecord_check(paths, checked, previous);
+            if matches!(error, CheckError::Request(_)) {
+                unrecord_check(paths, checked, previous);
+            }
             Err(error)
         }
     }
@@ -563,17 +590,27 @@ fn limited_body(mut response: ureq::http::Response<ureq::Body>, limit: u64) -> i
     }
     Ok(bytes)
 }
-fn check_release() -> io::Result<Option<Offer>> {
-    let client = agent();
-    let release: Release = serde_json::from_slice(&limited_body(
-        response(
-            &client,
-            &format!("https://api.github.com/repos/{REPOSITORY}/releases/latest"),
-        )?,
-        1024 * 1024,
-    )?)
-    .map_err(|_| io::Error::other("GitHub returned invalid release metadata"))?;
-    select_release(release, env!("CARGO_PKG_VERSION"), current_asset())
+fn check_release() -> Result<Option<Offer>, CheckError> {
+    check_release_from(
+        &agent(),
+        &format!("https://api.github.com/repos/{REPOSITORY}/releases/latest"),
+        env!("CARGO_PKG_VERSION"),
+        current_asset(),
+    )
+}
+fn check_release_from(
+    client: &ureq::Agent,
+    url: &str,
+    current: &str,
+    asset: Option<&str>,
+) -> Result<Option<Offer>, CheckError> {
+    let body = response(client, url)
+        .and_then(|response| limited_body(response, 1024 * 1024))
+        .map_err(CheckError::Request)?;
+    let release: Release = serde_json::from_slice(&body).map_err(|_| {
+        CheckError::Release(io::Error::other("GitHub returned invalid release metadata"))
+    })?;
+    select_release(release, current, asset).map_err(CheckError::Release)
 }
 fn select_release(
     release: Release,
@@ -1172,14 +1209,14 @@ mod tests {
         // The very first check fails: no stamp may be left behind.
         let failed = stamped_check(&paths, || {
             assert!(install::read_json::<u64>(&stamp).is_ok());
-            Err(io::Error::other("offline"))
+            Err(CheckError::Request(io::Error::other("offline")))
         });
         assert!(failed.is_err());
         assert!(!stamp.exists());
 
         // A failure restores an earlier stamp instead of erasing it.
         install::write_json(&stamp, &1234u64).unwrap();
-        assert!(stamped_check(&paths, || Err(io::Error::other("503"))).is_err());
+        assert!(stamped_check(&paths, || Err(CheckError::Request(io::Error::other("503")))).is_err());
         assert_eq!(install::read_json::<u64>(&stamp).unwrap(), 1234);
 
         // A check recorded by another instance in the meantime stands.
@@ -1187,7 +1224,7 @@ mod tests {
         assert!(
             stamped_check(&paths, || {
                 install::write_json(&stamp, &newer).unwrap();
-                Err(io::Error::other("503"))
+                Err(CheckError::Request(io::Error::other("503")))
             })
             .is_err()
         );
@@ -1197,6 +1234,41 @@ mod tests {
         let (checked, offer) = stamped_check(&paths, || Ok(None)).unwrap();
         assert!(offer.is_none());
         assert_eq!(install::read_json::<u64>(&stamp).unwrap(), checked);
+        let _ = fs::remove_dir_all(root);
+    }
+    /// A loopback "GitHub" answering one request with `status` and `body`.
+    fn release_server(status: &str, body: &str) -> String {
+        let base = scripted_server(vec![vec![format!(
+            "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )]]);
+        format!("{base}/releases/latest")
+    }
+    #[test]
+    fn only_a_failed_request_gives_back_the_stamp_not_a_release_github_answered_with() {
+        // GitHub answering with data the updater rejects (incomplete assets,
+        // invalid metadata) would answer the same ten minutes later: that costs
+        // one request per day, not one per backoff (#297).
+        let check = |status: &str, body: &str| {
+            let url = release_server(status, body);
+            move || {
+                let client = build_agent(None, false);
+                check_release_from(&client, &url, "0.0.9", Some("linefeed_x64.exe"))
+            }
+        };
+        let incomplete = r#"{"tag_name":"v9.9.9","draft":false,"prerelease":false,"assets":[]}"#;
+        let (root, paths, _tx) = staged_fixture("0.0.10");
+        let stamp = paths.state.join("last-check.json");
+
+        // Rejected data: the check completed, so its stamp stands.
+        for (status, body) in [("200 OK", incomplete), ("200 OK", "not json")] {
+            assert!(stamped_check(&paths, check(status, body)).is_err());
+            assert!(install::read_json::<u64>(&stamp).is_ok(), "{body}");
+            fs::remove_file(&stamp).unwrap();
+        }
+        // The request itself failed (here a 503): nothing was learned.
+        assert!(stamped_check(&paths, check("503 Service Unavailable", "")).is_err());
+        assert!(!stamp.exists());
         let _ = fs::remove_dir_all(root);
     }
     #[test]

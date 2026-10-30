@@ -114,6 +114,7 @@ refuse to replace published assets; corrections require a new version.
 
 The updater uses public HTTPS requests and does not require GitHub authentication.
 A completed check, whether or not it finds an update, counts toward the daily
-interval. A check that fails (offline, rate-limited, GitHub unavailable) does
-not: it is retried automatically after about ten minutes, and **Check for
-updates** remains available for an immediate retry.
+interval, as does a response that arrives but cannot be used (an incomplete
+release, say). A check whose request fails (offline, rate-limited, GitHub
+unavailable) does not: it is retried automatically after about ten minutes.
+**Check for updates** remains available for an immediate retry.
