@@ -1,4 +1,5 @@
 mod commands;
+mod connection;
 mod dialogs;
 mod formatting;
 mod helpers;
@@ -371,6 +372,9 @@ pub struct Session {
     // worker has flushed the QUIT and exited, so the worker is not cancelled
     // before the QUIT reaches the wire. See request_manual_disconnect.
     pub(crate) closing_rx: Option<(mpsc::Receiver<IrcMessage>, std::time::Instant)>,
+    /// This session's connection worker thread, if one is running or has
+    /// exited without being observed yet (see `connection.rs`).
+    pub(crate) worker: Option<std::thread::JoinHandle<()>>,
 
     // UI state
     pub show_settings: bool,
@@ -635,6 +639,7 @@ impl Session {
             cmd_tx: None,
             msg_rx: None,
             closing_rx: None,
+            worker: None,
 
             show_settings: false,
             scroll_to_bottom: true,
