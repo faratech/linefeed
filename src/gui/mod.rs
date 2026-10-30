@@ -5094,7 +5094,10 @@ impl IrcApp {
         if let Some(v) = value("STATUSMSG") {
             support.status_prefixes = v;
         }
-        support.history_limit = value("CHATHISTORY").and_then(|v| v.parse().ok());
+        // CHATHISTORY=0 means the server sets no limit.
+        support.history_limit = value("CHATHISTORY")
+            .and_then(|v| v.parse().ok())
+            .filter(|limit| *limit > 0);
         support.history_reference_types = value("MSGREFTYPES").unwrap_or_default();
         support.history_retention_secs =
             value("EVILNET/CHATHISTORYRETENTION").and_then(|v| v.parse().ok());
@@ -12143,6 +12146,27 @@ mod tests {
             IrcMessage::parse(":srv 005 me -CHATHISTORY :are supported").unwrap(),
         );
         assert_eq!(app.chathistory_limit, None);
+    }
+
+    #[test]
+    fn isupport_chathistory_zero_means_no_limit_and_keeps_the_cap_limit() {
+        // CHATHISTORY=0 is "no limit", never a page size of zero.
+        let (mut app, _rx) = test_app_connected();
+        app.handle_incoming_message(
+            IrcMessage::parse(":srv 005 me CHATHISTORY=0 :are supported").unwrap(),
+        );
+        assert_eq!(app.chathistory_limit, None);
+        assert_eq!(app.history_page_limit(100), 100);
+
+        let (mut app, _rx) = test_app_connected();
+        app.handle_incoming_message(
+            IrcMessage::parse(":srv CAP me LS :draft/chathistory=37").unwrap(),
+        );
+        app.handle_incoming_message(
+            IrcMessage::parse(":srv 005 me CHATHISTORY=0 :are supported").unwrap(),
+        );
+        assert_eq!(app.chathistory_limit, Some(37));
+        assert_eq!(app.history_page_limit(100), 37);
     }
 
     #[test]
