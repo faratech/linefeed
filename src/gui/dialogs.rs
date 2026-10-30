@@ -1,7 +1,7 @@
 //! Dialog windows for connect, settings, and channel list
 
 use super::helpers::format_timestamp;
-use super::{ChatMessage, IrcApp, ServerFavorite, Settings};
+use super::{ChatMessage, Session, ServerFavorite, Settings};
 use crate::irc::IrcCommand;
 use crate::irc::client::SaslMechanism;
 use egui::{Color32, RichText, ScrollArea, TextEdit, Vec2};
@@ -41,7 +41,7 @@ fn channel_list_refresh_request(min_users: u32, elist: &str) -> (IrcCommand, boo
     (request, apply_client_filter)
 }
 
-impl IrcApp {
+impl Session {
     /// Restore every Connect-dialog form field from persisted settings,
     /// discarding scratch edits made since the dialog opened (#208).
     fn restore_connect_form_from(&mut self, persisted: &Settings) {
@@ -1750,7 +1750,7 @@ mod tests {
 
     #[test]
     fn channel_list_join_keeps_window_open_when_send_fails() {
-        let mut app = IrcApp::with_settings(Settings::default());
+        let mut app = Session::with_settings(Settings::default());
         app.show_channel_list = true;
         app.channel_list_selected = Some("#room".into());
 
@@ -1766,7 +1766,7 @@ mod tests {
 
     #[test]
     fn settings_close_keeps_window_open_on_invalid_connection_form() {
-        let mut app = IrcApp::with_settings(Settings::default());
+        let mut app = Session::with_settings(Settings::default());
         app.show_settings = true;
         app.settings_tab = 1;
         app.server_port = "abc".into();
@@ -1787,7 +1787,7 @@ mod tests {
             sasl_password: "persisted-sasl".into(),
             ..Settings::default()
         };
-        let mut app = IrcApp::with_settings(persisted.clone());
+        let mut app = Session::with_settings(persisted.clone());
         app.server_host = "scratch.example".into();
         app.server_port = "1234".into();
         app.nickname = "scratchnick".into();
@@ -1817,7 +1817,7 @@ mod tests {
             server_favorites: vec![ServerFavorite::default()],
             ..Settings::default()
         };
-        let mut app = IrcApp::with_settings(persisted.clone());
+        let mut app = Session::with_settings(persisted.clone());
         // The in-memory list outgrew the file (a failed save or an external
         // edit) and the last entry is selected (#268).
         app.server_favorites.push(ServerFavorite::default());
@@ -1831,7 +1831,7 @@ mod tests {
 
     #[test]
     fn deleting_a_favorite_ignores_an_out_of_range_index() {
-        let mut app = IrcApp::with_settings(Settings {
+        let mut app = Session::with_settings(Settings {
             server_favorites: vec![ServerFavorite::default()],
             ..Settings::default()
         });
@@ -1843,7 +1843,7 @@ mod tests {
 
     /// An app whose Connection form holds invalid and unsaved scratch edits
     /// over a clean persisted configuration (the "disk" is in memory).
-    fn app_with_dirty_connection_form() -> IrcApp {
+    fn app_with_dirty_connection_form() -> Session {
         let persisted = Settings {
             server_host: "persisted.example".into(),
             server_port: "6697".into(),
@@ -1853,7 +1853,7 @@ mod tests {
             list_min_users: 0,
             ..Settings::default()
         };
-        let mut app = IrcApp::with_settings(persisted);
+        let mut app = Session::with_settings(persisted);
         app.server_port = "abc".into();
         app.password = "scratch-pass".into();
         app.sasl_username = "scratch-user".into();
@@ -1863,7 +1863,7 @@ mod tests {
     }
 
     /// Nothing from the dirty Connection form may have reached the file.
-    fn assert_form_not_persisted(app: &IrcApp) {
+    fn assert_form_not_persisted(app: &Session) {
         let saved = app.load_persisted_settings();
         assert_eq!(saved.server_port, "6697");
         assert_eq!(saved.nickname, "persistednick");
@@ -1931,7 +1931,7 @@ mod tests {
         assert_eq!(app.load_persisted_settings().server_port, "6667");
     }
 
-    fn list_row(app: &mut IrcApp, channel: &str, users: &str) {
+    fn list_row(app: &mut Session, channel: &str, users: &str) {
         app.handle_numeric(
             crate::irc::numerics::RPL_LIST,
             &[
@@ -1945,7 +1945,7 @@ mod tests {
 
     #[test]
     fn min_users_filter_is_fixed_for_a_whole_streaming_list_response() {
-        let mut app = IrcApp::with_settings(Settings::default());
+        let mut app = Session::with_settings(Settings::default());
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         app.cmd_tx = Some(tx);
         app.connected = true;
@@ -1974,7 +1974,7 @@ mod tests {
 
     #[test]
     fn slash_list_snapshots_the_min_users_filter_for_its_response() {
-        let mut app = IrcApp::with_settings(Settings::default());
+        let mut app = Session::with_settings(Settings::default());
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         app.cmd_tx = Some(tx);
         app.connected = true;

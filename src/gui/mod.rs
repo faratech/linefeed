@@ -326,7 +326,7 @@ pub(crate) fn apply_font_size(ctx: &egui::Context, font_size: f32) {
     ctx.set_global_style(style);
 }
 
-pub struct IrcApp {
+pub struct Session {
     pub updater: crate::updater::Controller,
     pub automatic_updates: bool,
     update_rejoins: Option<Vec<(String, Option<String>)>>,
@@ -579,13 +579,13 @@ pub struct IrcApp {
     self_nick_keys: Vec<String>,
 }
 
-impl Default for IrcApp {
+impl Default for Session {
     fn default() -> Self {
         Self::with_settings(Settings::load())
     }
 }
 
-impl IrcApp {
+impl Session {
     pub(crate) fn with_settings(settings: Settings) -> Self {
         ChatMessage::configure_default_timestamp_format(&settings.timestamp_format);
         let nickname = if settings.nickname.is_empty() {
@@ -2776,7 +2776,7 @@ mod update_session_tests {
             auto_join_channels: "#configured".into(),
             ..Settings::default()
         };
-        let mut before = IrcApp::with_settings(settings.clone());
+        let mut before = Session::with_settings(settings.clone());
         assert!(before.start_session_from_form());
         before.connected = true;
         before.connecting = false;
@@ -2797,7 +2797,7 @@ mod update_session_tests {
         let snapshot = before.update_session();
         let encoded = serde_json::to_vec(&snapshot).unwrap();
         let snapshot = serde_json::from_slice(&encoded).unwrap();
-        let mut after = IrcApp::with_settings(settings);
+        let mut after = Session::with_settings(settings);
         after.restore_update_session(snapshot);
         assert_eq!(after.active_server_config().unwrap().host, "active.example");
         assert!(after.connecting);
@@ -2822,7 +2822,7 @@ mod update_session_tests {
 
     /// An app restored from an update snapshot of network A: a keyed channel
     /// to rejoin, a selected tab, and A's session active and connecting.
-    fn restored_from_network_a() -> IrcApp {
+    fn restored_from_network_a() -> Session {
         let settings = Settings {
             server_host: "a.example".into(),
             nickname: "me".into(),
@@ -2830,14 +2830,14 @@ mod update_session_tests {
             logging_load_history: false,
             ..Settings::default()
         };
-        let mut before = IrcApp::with_settings(settings.clone());
+        let mut before = Session::with_settings(settings.clone());
         assert!(before.start_session_from_form());
         let mut secret = Channel::new();
         secret.joined = true;
         secret.key = Some("a-channel-key".into());
         before.channels.insert("#secret".into(), secret);
         before.current_channel = Some("#secret".into());
-        let mut after = IrcApp::with_settings(settings);
+        let mut after = Session::with_settings(settings);
         after.restore_update_session(before.update_session());
         assert!(after.connecting);
         assert!(after.update_rejoins.is_some());
@@ -2895,7 +2895,7 @@ mod update_session_tests {
             "auto_join_channels":"#a","auto_perform":""},
             "reconnect":true,"tabs":[["#a",null,true]],"selected":"#a"}"##;
         let snapshot: UpdateSession = serde_json::from_str(older).unwrap();
-        let mut app = IrcApp::with_settings(Settings::default());
+        let mut app = Session::with_settings(Settings::default());
         app.restore_update_session(snapshot);
         let server = app.active_server_config().unwrap();
         assert_eq!(server.host, "old.example");
@@ -2946,8 +2946,8 @@ mod update_session_tests {
     fn update_restart_preserves_disconnected_state_and_old_settings_default_to_auto_updates() {
         let settings: Settings = serde_json::from_str("{}").unwrap();
         assert!(settings.automatic_updates);
-        let before = IrcApp::with_settings(settings.clone());
-        let mut after = IrcApp::with_settings(settings);
+        let before = Session::with_settings(settings.clone());
+        let mut after = Session::with_settings(settings);
         after.restore_update_session(before.update_session());
         assert!(!after.connecting);
         assert!(!after.connected);
@@ -2958,8 +2958,8 @@ mod update_session_tests {
 mod connection_lifecycle_tests {
     use super::*;
 
-    fn lifecycle_app() -> IrcApp {
-        IrcApp::with_settings(Settings {
+    fn lifecycle_app() -> Session {
+        Session::with_settings(Settings {
             // Keep unit tests from writing chat logs to the real config dir.
             logging_enabled: false,
             ..Settings::default()
@@ -3237,7 +3237,7 @@ mod connection_lifecycle_tests {
 
     #[test]
     fn names_burst_cut_off_by_a_disconnect_is_not_resumed_by_the_next_connection() {
-        type EndOfConnection = fn(&mut IrcApp);
+        type EndOfConnection = fn(&mut Session);
         let ways: [(&str, EndOfConnection); 3] = [
             ("lost", |app| app.mark_connection_lost()),
             ("manual disconnect", |app| {
@@ -3554,7 +3554,7 @@ fn wait_for_notification_helper(
     command.status()
 }
 
-impl IrcApp {
+impl Session {
     pub fn new(_cc: &eframe::CreationContext<'_>) -> Self {
         Self::default()
     }
@@ -7659,7 +7659,7 @@ impl IrcApp {
     }
 }
 
-impl eframe::App for IrcApp {
+impl eframe::App for Session {
     fn ui(&mut self, root_ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = root_ui.ctx().clone();
         let ctx = &ctx;
@@ -8321,8 +8321,8 @@ mod tests {
         path
     }
 
-    fn test_app() -> IrcApp {
-        IrcApp::with_settings(Settings {
+    fn test_app() -> Session {
+        Session::with_settings(Settings {
             // Keep unit tests from writing chat logs to the real config dir.
             logging_enabled: false,
             ..Settings::default()
@@ -8330,7 +8330,7 @@ mod tests {
     }
 
     /// A connected app whose outgoing commands can be inspected.
-    fn test_app_connected() -> (IrcApp, mpsc::UnboundedReceiver<IrcCommand>) {
+    fn test_app_connected() -> (Session, mpsc::UnboundedReceiver<IrcCommand>) {
         let mut app = test_app();
         let (tx, rx) = mpsc::unbounded_channel();
         app.cmd_tx = Some(tx);
@@ -9674,7 +9674,7 @@ mod tests {
                 "Alice".to_string(),
             ]
         };
-        let account = |app: &IrcApp| {
+        let account = |app: &Session| {
             app.channels["#chan"]
                 .get_user("alice")
                 .unwrap()
@@ -10158,23 +10158,23 @@ mod tests {
             IrcCommand::Raw("SQUERY NickServ :IDENTIFY hunter2".into()),
             IrcCommand::Raw("@label=1 PRIVMSG NickServ :IDENTIFY hunter2".into()),
         ] {
-            let summary = IrcApp::command_log_summary(&secret);
+            let summary = Session::command_log_summary(&secret);
             assert!(!summary.contains("bytes"), "{secret:?}: {summary}");
             assert!(!summary.contains("hunter2"), "{secret:?}: {summary}");
             assert!(!summary.is_empty());
         }
         assert_eq!(
-            IrcApp::command_log_summary(&IrcCommand::Pass("x".into())),
+            Session::command_log_summary(&IrcCommand::Pass("x".into())),
             "PASS"
         );
 
         // Everything else keeps its size, which is what makes the log useful.
         assert_eq!(
-            IrcApp::command_log_summary(&IrcCommand::Privmsg("#room".into(), "hello".into())),
+            Session::command_log_summary(&IrcCommand::Privmsg("#room".into(), "hello".into())),
             "PRIVMSG (20 bytes)"
         );
         assert_eq!(
-            IrcApp::command_log_summary(&IrcCommand::Privmsg(
+            Session::command_log_summary(&IrcCommand::Privmsg(
                 "NickServ".into(),
                 "INFO alice".into()
             )),
@@ -10184,7 +10184,7 @@ mod tests {
 
     #[test]
     fn send_failure_rows_are_not_persisted_to_logs() {
-        let mut app = IrcApp::with_settings(crate::gui::Settings::default());
+        let mut app = Session::with_settings(crate::gui::Settings::default());
         app.current_channel = Some("#chan".into());
         app.channels.insert("#chan".into(), Channel::new());
         app.report_send_failure(false, "Not connected - away status not changed");
@@ -10640,7 +10640,7 @@ mod tests {
 
     #[test]
     fn out_of_range_persisted_settings_self_heal_on_load() {
-        let app = IrcApp::with_settings(Settings {
+        let app = Session::with_settings(Settings {
             max_scrollback: 0,
             reconnect_delay_secs: 0,
             max_reconnect_attempts: 0,
@@ -10761,7 +10761,7 @@ mod tests {
         assert_eq!(drain_commands(&mut rx).len(), 1);
     }
 
-    fn topic_test_channel(app: &mut IrcApp) {
+    fn topic_test_channel(app: &mut Session) {
         let mut channel = Channel::new();
         channel.joined = true;
         channel.topic = Some("old topic".to_string());
@@ -11010,7 +11010,7 @@ mod tests {
         for (entry, end, mode) in lists {
             let mut app = test_app();
             app.channels.insert("#room".into(), Channel::new());
-            let list = |app: &IrcApp| -> Vec<String> {
+            let list = |app: &Session| -> Vec<String> {
                 let channel = &app.channels["#room"];
                 let masks: Vec<String> = channel
                     .mode_lists
@@ -11023,7 +11023,7 @@ mod tests {
                 }
                 masks
             };
-            let burst = |app: &mut IrcApp, masks: &[&str]| {
+            let burst = |app: &mut Session, masks: &[&str]| {
                 for mask in masks {
                     app.handle_numeric(
                         entry,
@@ -11079,14 +11079,14 @@ mod tests {
             IrcMessage::parse(":srv 005 me CHANMODES=eIbqZ,k,fl,imnt :are supported").unwrap(),
         );
         app.channels.insert("#chan".into(), Channel::new());
-        let masks = |app: &IrcApp, mode: char| -> Vec<String> {
+        let masks = |app: &Session, mode: char| -> Vec<String> {
             app.channels["#chan"]
                 .mode_lists
                 .get(&mode)
                 .map(|entries| entries.iter().map(|entry| entry.mask.clone()).collect())
                 .unwrap_or_default()
         };
-        let burst = |app: &mut IrcApp, mode: &str, entries: &[&str]| {
+        let burst = |app: &mut Session, mode: &str, entries: &[&str]| {
             for mask in entries {
                 app.handle_incoming_message(
                     IrcMessage::parse(&format!(":srv 728 me #chan {mode} {mask} op 100")).unwrap(),
@@ -11131,7 +11131,7 @@ mod tests {
             IrcMessage::parse(":srv 005 me EXCEPTS=x INVEX=y :are supported").unwrap(),
         );
         app.channels.insert("#chan".into(), Channel::new());
-        let masks = |app: &IrcApp, mode: char| -> Vec<String> {
+        let masks = |app: &Session, mode: char| -> Vec<String> {
             app.channels["#chan"]
                 .mode_lists
                 .get(&mode)
@@ -11498,7 +11498,7 @@ mod tests {
 
         let mut requested = Vec::new();
         while let Ok(command) = rx.try_recv() {
-            assert!(IrcApp::command_fits_irc_line(&command));
+            assert!(Session::command_fits_irc_line(&command));
             let IrcCommand::Cap(_, subcommand, params) = command else {
                 panic!("expected CAP REQ");
             };
@@ -11709,13 +11709,13 @@ mod tests {
 
     #[test]
     fn overlong_quit_reason_is_clamped_to_fit_one_line() {
-        let clamped = IrcApp::clamp_quit_reason(Some("é".repeat(600))).unwrap();
+        let clamped = Session::clamp_quit_reason(Some("é".repeat(600))).unwrap();
         let line = format!("{}", IrcCommand::Quit(Some(clamped.clone())));
         assert!(line.len() <= IRC_MAX_LINE_BYTES);
         assert!(clamped.is_char_boundary(clamped.len()));
         // Short reasons pass through untouched.
         assert_eq!(
-            IrcApp::clamp_quit_reason(Some("bye".to_string())).as_deref(),
+            Session::clamp_quit_reason(Some("bye".to_string())).as_deref(),
             Some("bye")
         );
     }
@@ -11841,7 +11841,7 @@ mod tests {
         app.set_session_nick("me".to_string(), true);
         app.channels.insert("#chan".to_string(), Channel::new());
         app.handle_incoming_message(IrcMessage::parse(":alice!user@host JOIN #chan").unwrap());
-        let identity = |app: &IrcApp| {
+        let identity = |app: &Session| {
             let known = &app.known_users["alice"];
             let in_channel = app.channels["#chan"].get_user("alice").unwrap();
             assert_eq!(known.username, in_channel.username);
@@ -12149,10 +12149,10 @@ mod tests {
         let mut app = test_app();
         app.notifications_enabled = false;
         app.set_session_nick("me".to_string(), true);
-        let know = |app: &mut IrcApp, nick: &str| {
+        let know = |app: &mut Session, nick: &str| {
             app.update_user_identity(nick, None, None, None, None, None, None, Some(true));
         };
-        let is_known = |app: &IrcApp, nick: &str| {
+        let is_known = |app: &Session, nick: &str| {
             app.known_users
                 .contains_key(&app.network_support.canonicalize(nick))
         };
@@ -12229,7 +12229,7 @@ mod tests {
     #[test]
     fn split_irc_text_payload_preserves_utf8_boundaries() {
         let text = "é".repeat(400);
-        let chunks = IrcApp::split_irc_text_payload("PRIVMSG", "#chan", &text, "", "").unwrap();
+        let chunks = Session::split_irc_text_payload("PRIVMSG", "#chan", &text, "", "").unwrap();
         assert!(chunks.len() > 1);
         for chunk in chunks {
             assert!(format!("PRIVMSG #chan :{}", chunk).len() <= IRC_MAX_LINE_BYTES);
@@ -12856,7 +12856,7 @@ mod tests {
 
     /// Deliver a complete two-line draft/multiline message through the same
     /// entry point the connection thread uses.
-    fn deliver_multiline(app: &mut IrcApp, id: &str, prefix: &str, target: &str, lines: &[&str]) {
+    fn deliver_multiline(app: &mut Session, id: &str, prefix: &str, target: &str, lines: &[&str]) {
         app.handle_incoming_message(
             IrcMessage::parse(&format!(":{prefix} BATCH +{id} draft/multiline {target}")).unwrap(),
         );
@@ -13110,7 +13110,7 @@ mod tests {
     /// A connected app with chathistory negotiated and a retained query tab
     /// ("alice") plus a channel the user is reading ("#room"), after a
     /// reconnect whose registration just requested catch-up for the query.
-    fn reconnected_app_reading_a_channel() -> (IrcApp, mpsc::UnboundedReceiver<IrcCommand>) {
+    fn reconnected_app_reading_a_channel() -> (Session, mpsc::UnboundedReceiver<IrcCommand>) {
         let (mut app, mut rx) = test_app_connected();
         app.set_session_nick("mynick".into(), true);
         app.logging_load_history = true;
@@ -13368,7 +13368,7 @@ mod tests {
 
     /// An app that will pass the enabled/focus gates for non-forced
     /// notifications too (window in the background).
-    fn notifying_app() -> IrcApp {
+    fn notifying_app() -> Session {
         let mut app = test_app();
         app.notifications_enabled = true;
         app.window_focused = false;
@@ -13376,7 +13376,7 @@ mod tests {
     }
 
     /// Pretend the rate-limit interval has elapsed for forced notifications.
-    fn age_forced_notification_clock(app: &mut IrcApp) {
+    fn age_forced_notification_clock(app: &mut Session) {
         app.last_forced_notification_time =
             std::time::Instant::now().checked_sub(std::time::Duration::from_secs(3));
     }
@@ -13503,7 +13503,7 @@ mod tests {
     /// A background app with chathistory negotiated and a notification-ready
     /// window, plus a retained "#room" tab holding one local-log row (no
     /// msgid, no server-time) and another tab being read.
-    fn restored_app_with_unanchored_room() -> (IrcApp, mpsc::UnboundedReceiver<IrcCommand>) {
+    fn restored_app_with_unanchored_room() -> (Session, mpsc::UnboundedReceiver<IrcCommand>) {
         let (mut app, rx) = test_app_connected();
         app.set_session_nick("mynick".into(), true);
         app.logging_load_history = true;
@@ -13524,7 +13524,7 @@ mod tests {
         (app, rx)
     }
 
-    fn deliver_history_page(app: &mut IrcApp, target: &str, rows: &[(&str, &str)]) {
+    fn deliver_history_page(app: &mut Session, target: &str, rows: &[(&str, &str)]) {
         app.handle_incoming_message(
             IrcMessage::parse(&format!(":srv BATCH +h chathistory {target}")).unwrap(),
         );
@@ -13609,7 +13609,7 @@ mod tests {
     }
 
     /// A connected app reading a query, with its outgoing commands drained.
-    fn app_reading_a_query() -> (IrcApp, mpsc::UnboundedReceiver<IrcCommand>) {
+    fn app_reading_a_query() -> (Session, mpsc::UnboundedReceiver<IrcCommand>) {
         let (mut app, rx) = test_app_connected();
         app.set_session_nick("me".to_string(), true);
         app.add_message_to_channel("alice", ChatMessage::new_fmt("alice", "hi", "short"));

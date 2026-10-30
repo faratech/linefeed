@@ -19,7 +19,7 @@ use std::sync::OnceLock;
 use tokio::sync::mpsc;
 
 use gui::ConnectionIntent;
-use gui::{ChatMessage, IrcApp};
+use gui::{ChatMessage, Session};
 use irc::{IrcClient, IrcCommand, IrcMessage};
 
 #[cfg(windows)]
@@ -329,7 +329,7 @@ fn main() -> eframe::Result<()> {
                 opts.reduce_texture_memory = true;
             });
 
-            let mut app = IrcApp::new(cc);
+            let mut app = Session::new(cc);
             if let Some(snapshot) = snapshot {
                 app.restore_update_session(snapshot);
             }
@@ -364,7 +364,7 @@ fn main() -> eframe::Result<()> {
 struct LinefeedApp {
     startup_ack: Option<updater::install::Transaction>,
     shutdown: Arc<std::sync::Mutex<Option<updater::install::Armed>>>,
-    app: IrcApp,
+    app: Session,
     connection_thread: Option<std::thread::JoinHandle<()>>,
     /// Track when we last received messages (for adaptive repaint intervals)
     last_message_time: std::time::Instant,
@@ -753,7 +753,7 @@ mod tests {
             std::thread::yield_now();
         }
 
-        let mut app = IrcApp::default();
+        let mut app = Session::default();
         app.connected = true;
         let mut linefeed = LinefeedApp {
             startup_ack: None,
@@ -807,7 +807,7 @@ mod tests {
     }
 
     fn linefeed_for_port(port: u16) -> LinefeedApp {
-        let mut app = IrcApp::with_settings(gui::Settings {
+        let mut app = Session::with_settings(gui::Settings {
             server_host: "127.0.0.1".to_string(),
             server_port: port.to_string(),
             use_tls: false,
