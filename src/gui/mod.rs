@@ -921,7 +921,7 @@ impl IrcApp {
         // Only the minimized/tray-hidden path runs this, and no frame refreshes
         // the focus flag meanwhile: a stale `true` would suppress highlight,
         // kick and invite notifications and mark unseen messages read (#237).
-        self.window_focused = false;
+        self.set_window_focused(false);
 
         // Drain all pending messages to prevent buffer overflow
         let messages: Vec<_> = if let Some(rx) = &mut self.msg_rx {
@@ -936,6 +936,31 @@ impl IrcApp {
         }
         self.log_manager.flush_all();
         self.run_timed_tasks();
+    }
+
+    /// Record whether the window has focus. Regaining it is the moment the
+    /// selected tab is actually seen, so whatever it accrued while the window
+    /// was minimised, hidden or in the background is acknowledged then (#305).
+    fn set_window_focused(&mut self, focused: bool) {
+        let regained = focused && !self.window_focused;
+        self.window_focused = focused;
+        if regained {
+            self.mark_selected_tab_seen();
+        }
+    }
+
+    /// The user is looking at the selected tab (or the server buffer): clear
+    /// its unread badge and report it read.
+    fn mark_selected_tab_seen(&mut self) {
+        match self.current_channel.clone() {
+            Some(target) => {
+                if let Some(channel) = self.channel_mut(&target) {
+                    channel.unread = 0;
+                }
+                self.mark_target_read(&target);
+            }
+            None => self.server_unread = 0,
+        }
     }
 
     /// Time-based work that must keep running whether or not a frame is
@@ -6221,14 +6246,18 @@ impl IrcApp {
             self.log_manager.log_message(&network, &log_key, &msg);
         }
 
-        let is_current = self.current_target_is(&key);
+        // Unread unless it lands in the current tab of a focused window: a
+        // selected tab nobody is looking at (minimised, tray-hidden, another
+        // window in front) accrues its badge and read marker is held back
+        // until focus returns (#305).
+        let seen = self.window_focused && self.current_target_is(&key);
         if let Some(ch) = self.channels.get_mut(&key) {
             ch.push_trimmed(msg, self.max_scrollback);
-            if !is_current {
+            if !seen {
                 ch.unread += 1;
             }
         }
-        if is_current && self.window_focused {
+        if seen {
             self.mark_target_read(&key);
         }
     }
@@ -6239,8 +6268,8 @@ impl IrcApp {
         while self.server_messages.len() > self.max_scrollback {
             self.server_messages.pop_front();
         }
-        // Increment unread if not viewing server buffer
-        if self.current_channel.is_some() {
+        // Unread unless the server buffer is shown in a focused window
+        if self.current_channel.is_some() || !self.window_focused {
             self.server_unread += 1;
         }
     }
@@ -7383,7 +7412,7 @@ impl eframe::App for IrcApp {
         self.handle_keyboard_shortcuts(ctx);
 
         // Track window focus for notifications
-        self.window_focused = ctx.input(|i| i.focused);
+        self.set_window_focused(ctx.input(|i| i.focused));
 
         // Track user activity for auto-away
         let has_activity = ctx
@@ -12554,5 +12583,69 @@ mod tests {
         app.handle_incoming_message(IrcMessage::parse(":me!u@h JOIN #first").unwrap());
         app.handle_incoming_message(IrcMessage::parse(":me!u@h JOIN #second").unwrap());
         assert_eq!(app.current_channel.as_deref(), Some("#first"));
+    }
+
+    #[test]
+    fn selected_tab_keeps_unread_while_the_window_is_unfocused_until_focus_returns() {
+        let (mut app, mut rx) = test_app_connected();
+        app.set_session_nick("me".into(), true);
+        app.current_channel = Some("#room".into());
+        app.channels.insert("#room".into(), Channel::new());
+        app.handle_incoming_message(
+            IrcMessage::parse(":srv CAP me ACK :draft/read-marker").unwrap(),
+        );
+
+        // Minimised to the tray: nothing is being read.
+        app.update_minimal();
+        for n in 1..=5 {
+            app.handle_incoming_message(
+                IrcMessage::parse(&format!(
+                    "@time=2026-09-12T12:00:0{n}.000Z;msgid=m{n} :alice!u@h PRIVMSG #room :msg {n}"
+                ))
+                .unwrap(),
+            );
+        }
+        assert_eq!(
+            app.channels["#room"].unread, 5,
+            "#305: unfocused current tab silently treated as read"
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "unseen messages must not be reported read to the server"
+        );
+
+        // Restoring the window is when the user sees them: badge cleared,
+        // read marker sent for the newest message.
+        app.set_window_focused(true);
+        assert_eq!(app.channels["#room"].unread, 0);
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            IrcCommand::Markread(
+                "#room".into(),
+                Some("timestamp=2026-09-12T12:00:05.000Z".into())
+            )
+        );
+
+        // Focused and selected: still read on arrival.
+        app.handle_incoming_message(
+            IrcMessage::parse("@time=2026-09-12T12:00:09.000Z :alice!u@h PRIVMSG #room :seen")
+                .unwrap(),
+        );
+        assert_eq!(app.channels["#room"].unread, 0);
+    }
+
+    #[test]
+    fn server_buffer_counts_unread_while_unfocused_and_clears_on_focus() {
+        let mut app = test_app();
+        assert!(app.current_channel.is_none());
+        app.add_server_message(ChatMessage::system("seen live"));
+        assert_eq!(app.server_unread, 0);
+
+        app.set_window_focused(false);
+        app.add_server_message(ChatMessage::system("missed"));
+        assert_eq!(app.server_unread, 1);
+
+        app.set_window_focused(true);
+        assert_eq!(app.server_unread, 0);
     }
 }
