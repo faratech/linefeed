@@ -1320,9 +1320,16 @@ impl Channel {
         if sign == '+' {
             if let Some(parameter) = parameter {
                 self.mode_parameters.insert(mode, parameter.to_string());
+                // The key a rejoin must present follows the channel's +k.
+                if mode == 'k' {
+                    self.key = Some(parameter.to_string());
+                }
             }
         } else if sign == '-' {
             self.mode_parameters.remove(&mode);
+            if mode == 'k' {
+                self.key = None;
+            }
         }
         self.apply_channel_mode_flag(sign, mode);
     }
@@ -1336,6 +1343,7 @@ impl Channel {
         self.modes.clear();
         self.mode_params.clear();
         self.mode_parameters.clear();
+        let known_key = self.key.clone();
         let mut sign = '+';
         let mut param_idx = 0;
         for mode in modes.chars() {
@@ -1359,6 +1367,11 @@ impl Channel {
                     self.apply_channel_mode(sign, mode, parameter);
                 }
             }
+        }
+        // Servers that hide the key from non-operators answer `+k *`; the
+        // placeholder is not a key and must not displace the one we hold.
+        if self.mode_parameters.get(&'k').map(String::as_str) == Some("*") {
+            self.key = known_key;
         }
         self.rebuild_mode_params();
     }

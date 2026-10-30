@@ -8524,6 +8524,55 @@ mod tests {
     }
 
     #[test]
+    fn live_key_changes_update_the_stored_channel_key_used_for_rejoin() {
+        let (mut app, mut rx) = test_app_connected();
+        app.set_session_nick("me".to_string(), true);
+        app.process_command("/join #sec oldkey");
+        app.handle_incoming_message(IrcMessage::parse(":me!u@h JOIN #sec").unwrap());
+        assert_eq!(app.channels["#sec"].key.as_deref(), Some("oldkey"));
+
+        app.handle_incoming_message(IrcMessage::parse(":op!u@h MODE #sec +k newkey").unwrap());
+        assert_eq!(app.channels["#sec"].key.as_deref(), Some("newkey"));
+        drain_commands(&mut rx);
+        app.current_channel = Some("#sec".to_string());
+        app.process_command("/cycle");
+        assert_eq!(
+            drain_commands(&mut rx),
+            vec![
+                IrcCommand::Part("#sec".into(), Some("Cycling".into())),
+                IrcCommand::Join("#sec".into(), Some("newkey".into()), None, None),
+            ]
+        );
+        assert_eq!(
+            app.update_session().tabs,
+            vec![("#sec".to_string(), Some("newkey".to_string()), true)]
+        );
+
+        // Removal names the old key on most servers; the stored key goes too.
+        app.handle_incoming_message(IrcMessage::parse(":op!u@h MODE #sec -k newkey").unwrap());
+        assert_eq!(app.channels["#sec"].key, None);
+        app.handle_incoming_message(IrcMessage::parse(":op!u@h MODE #sec +k again").unwrap());
+        app.handle_incoming_message(IrcMessage::parse(":op!u@h MODE #sec -k *").unwrap());
+        assert_eq!(app.channels["#sec"].key, None);
+    }
+
+    #[test]
+    fn the_channel_modes_reply_updates_the_stored_channel_key() {
+        let (mut app, _rx) = test_app_connected();
+        app.set_session_nick("me".to_string(), true);
+        app.process_command("/join #sec oldkey");
+        app.handle_incoming_message(IrcMessage::parse(":me!u@h JOIN #sec").unwrap());
+
+        app.handle_incoming_message(IrcMessage::parse(":srv 324 me #sec +ntk rotated").unwrap());
+        assert_eq!(app.channels["#sec"].key.as_deref(), Some("rotated"));
+
+        // Servers that hide the key from the reply show a placeholder; it is
+        // not a key and must not replace the real one.
+        app.handle_incoming_message(IrcMessage::parse(":srv 324 me #sec +ntk *").unwrap());
+        assert_eq!(app.channels["#sec"].key.as_deref(), Some("rotated"));
+    }
+
+    #[test]
     fn close_current_tab_parts_live_channels_and_removes_stale_ones() {
         let (mut connected, mut rx) = test_app_connected();
         let mut live = Channel::new();
