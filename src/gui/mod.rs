@@ -5,6 +5,7 @@ mod dialogs;
 mod formatting;
 mod helpers;
 mod logging;
+mod snap;
 mod types;
 mod view;
 mod windows;
@@ -3329,6 +3330,17 @@ pub(crate) fn show_desktop_notification(title: &str, body: &str) {
 }
 
 /// A random 16-hex-digit id for a network profile.
+/// The profile id for a favorite that has none: one saved before ids
+/// existed, or by 0.1.4, which also drops the id whenever it rewrites
+/// settings.json. Derived from what identifies the favorite, so after a
+/// downgrade and upgrade it gets the same id back, and with it its window
+/// placements in layout.json.
+pub(crate) fn derived_profile_id(name: &str, host: &str, port: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(format!("linefeed-profile\0{name}\0{host}\0{port}"));
+    digest[..8].iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
 pub(crate) fn new_profile_id() -> String {
     use std::hash::{BuildHasher, Hasher};
     let mut hasher = std::collections::hash_map::RandomState::new().build_hasher();

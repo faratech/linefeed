@@ -99,7 +99,7 @@ impl Session {
             accept_invalid_certs: self.accept_invalid_certs,
             pre_away_message: self.pre_away_message.clone(),
             persistence_profile: self.persistence_profile.clone(),
-            id: super::new_profile_id(),
+            id: super::derived_profile_id(name, &self.server_host, &self.server_port),
             auto_connect: false,
         };
         self.form_profile = Some(favorite.id.clone());
@@ -425,8 +425,14 @@ impl Session {
                         ui.label("Name:");
                         ui.add(TextEdit::singleline(&mut favorites_ui.new_name).desired_width(150.0));
                         if ui.button("Save").clicked()
-                            && let Some(favorite) = self.form_as_favorite(&favorites_ui.new_name)
+                            && let Some(mut favorite) =
+                                self.form_as_favorite(&favorites_ui.new_name)
                         {
+                            if favorites.iter().any(|f| f.id == favorite.id) {
+                                // Saved twice: ids must stay distinct.
+                                favorite.id = super::new_profile_id();
+                                self.form_profile = Some(favorite.id.clone());
+                            }
                             favorites.push(favorite);
                             favorites_ui.selected = Some(favorites.len() - 1);
                             // Only the list changed (#316).

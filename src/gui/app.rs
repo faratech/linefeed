@@ -15,6 +15,7 @@ use std::time::{Duration, Instant};
 
 use egui::{Color32, RichText};
 
+use super::snap::CaptionAction;
 use super::windows::{
     ConnId, LayoutFile, LayoutMode, PersistKey, PresentWindow, TargetView, WindowKey, WindowManager,
 };
@@ -129,13 +130,23 @@ pub struct App {
     /// A window that should take input focus once it exists (activated
     /// before its first sync, e.g. a query opened by /query).
     pending_focus: Option<WindowKey>,
-    /// The detached windows were hidden because the main window was
-    /// minimized; they are shown again with it.
+    /// The detached windows were hidden because the main window went to
+    /// the tray; they are shown again with it.
     detached_hidden: bool,
+    /// Snap layouts of the floating windows (caption drags, the layout
+    /// flyout and bar, Snap Assist).
+    pub(crate) snap: super::snap::SnapUi,
     /// The window a session's Channel List / Channel Info dialog was opened
     /// from. When that window is detached, the dialogs show in its OS window
     /// instead of the main one.
     dialog_owner: HashMap<ConnId, WindowKey>,
+    /// The detached window the application's own dialogs (Connect,
+    /// Settings, the disconnect confirmation) were asked for from; they
+    /// show in it, so they are seen even while the main window is
+    /// minimized. `None`: the main window.
+    global_dialog_owner: Option<WindowKey>,
+    /// Whether any of those dialogs was open last frame.
+    global_dialogs_were_open: bool,
 }
 
 impl App {
@@ -172,10 +183,17 @@ impl App {
         if settings.nickname.is_empty() {
             settings.nickname = format!("Linefeed_{}", super::rand_suffix());
         }
+        let mut ids = HashSet::new();
         for favorite in &mut settings.server_favorites {
             if favorite.id.is_empty() {
-                favorite.id = super::new_profile_id();
+                favorite.id =
+                    super::derived_profile_id(&favorite.name, &favorite.host, &favorite.port);
+                if ids.contains(&favorite.id) {
+                    // A duplicate favorite: ids must stay distinct.
+                    favorite.id = super::new_profile_id();
+                }
             }
+            ids.insert(favorite.id.clone());
         }
         ChatMessage::configure_default_timestamp_format(&settings.timestamp_format);
         Self {
@@ -219,7 +237,10 @@ impl App {
             restore_after_update: None,
             pending_focus: None,
             dialog_owner: HashMap::new(),
+            global_dialog_owner: None,
+            global_dialogs_were_open: false,
             detached_hidden: false,
+            snap: Default::default(),
         }
     }
 
@@ -400,16 +421,15 @@ impl App {
         if self.windows.mode == LayoutMode::Floating {
             self.draw_floating(&ctx, central.inner);
         }
+        self.draw_snap(&ctx, central.inner);
         self.draw_detached(&ctx);
         self.finish_frame();
     }
 
-    /// The main window is minimized: its detached windows go with it (as
-    /// owned windows do on Windows), and come back when it is restored.
-    /// eframe runs no ui pass for a minimized main window, and forcing one
-    /// would paint (present) a minimized window, which can block on Windows;
-    /// so the windows are hidden with a viewport command, which eframe also
-    /// applies on logic-only frames.
+    /// The main window went to the system tray: its detached windows go with
+    /// it, and come back where they were when it is restored. They are
+    /// hidden with a viewport command, which eframe also applies on the
+    /// logic-only passes a hidden main window gets.
     pub fn hide_detached_windows(&mut self, ctx: &egui::Context) {
         if !self.detached_hidden {
             for key in self.detached_keys() {
@@ -423,18 +443,25 @@ impl App {
         self.focused_detached = None;
     }
 
-    /// A ui pass while the main window is minimized: the detached windows
-    /// are not drawn, so egui closes them; they reopen where they last were
-    /// when the main window is restored.
-    pub fn forget_detached_windows(&mut self) {
-        self.spawn_geometry.clear();
-        self.focused_detached = None;
-        self.detached_hidden = false;
+    /// A ui pass while the main window is minimized or covered: eframe runs
+    /// one only while a detached window is on screen, and paints nothing of
+    /// the main window. Keep the detached windows drawn and working. The
+    /// pass's `logic` has already ticked every connection (`ticked`).
+    pub fn ui_detached_only(&mut self, ctx: &egui::Context, ticked: bool) {
+        if !ticked {
+            self.background_tick(ctx);
+        }
+        self.draw_detached(ctx);
+        self.finish_frame();
     }
 
     #[cfg(test)]
     pub(crate) fn detached_windows_hidden(&self) -> bool {
         self.detached_hidden
+    }
+
+    fn has_detached(&self) -> bool {
+        self.windows.windows.iter().any(|w| w.detached)
     }
 
     fn detached_keys(&self) -> Vec<WindowKey> {
@@ -446,17 +473,22 @@ impl App {
             .collect()
     }
 
-    /// Hidden or minimized with nothing to draw: drain every session so the
-    /// buffers cannot fill, keep timers and lifecycles running.
+    /// The main window is hidden, minimized or covered: drain every session
+    /// so the buffers cannot fill, keep timers and lifecycles running.
+    /// Unless the main window went to the tray, detached windows are still
+    /// on screen, and one of them may have focus.
     pub fn background_tick(&mut self, ctx: &egui::Context) {
-        self.focused = false;
-        self.focused_detached = None;
+        let detached_live = !self.tray_hidden && self.has_detached();
+        if !detached_live {
+            self.focused_detached = None;
+        }
+        self.focused = self.focused_detached.is_some();
         if self.tray_hidden {
             // Detached windows are not shown, so egui closes them; they are
             // recreated where they last were (`os_pos`/`os_size`) on restore.
             self.spawn_geometry.clear();
         }
-        self.tick(ctx, false);
+        self.tick(ctx, detached_live);
         self.finish_frame();
     }
 
@@ -528,6 +560,7 @@ impl App {
         self.process_events();
         self.flush_deferred_notification();
         self.sync_windows();
+        self.update_global_dialog_owner();
     }
 
     fn run_lifecycles(&mut self, ctx: &egui::Context) {
@@ -1104,6 +1137,26 @@ impl App {
     // ----- dialogs --------------------------------------------------------
 
     fn show_dialogs(&mut self, ctx: &egui::Context) {
+        if self.global_dialog_window().is_none() {
+            self.show_global_dialogs(ctx);
+        }
+        for index in 0..self.sessions.len() {
+            let conn = self.sessions[index].id;
+            if self.detached_dialog_owner(conn).is_some() {
+                continue;
+            }
+            self.show_session_dialogs(ctx, index);
+        }
+        if let Some(target) = self.color_target.clone()
+            && !self.windows.get(&target).is_some_and(|w| w.detached)
+        {
+            self.show_color_picker_for(ctx, &target);
+        }
+    }
+
+    /// The application's own dialogs: Connect (for the active session),
+    /// Settings, and the confirmation before disconnecting a server.
+    fn show_global_dialogs(&mut self, ctx: &egui::Context) {
         let active = self.active_index();
         {
             let App {
@@ -1128,21 +1181,41 @@ impl App {
             // Live edits apply to every session while the dialog is open.
             self.push_config();
         }
-        for index in 0..self.sessions.len() {
-            let conn = self.sessions[index].id;
-            if self.detached_dialog_owner(conn).is_some() {
-                continue;
-            }
-            self.show_session_dialogs(ctx, index);
-        }
-        if let Some(target) = self.color_target.clone()
-            && !self.windows.get(&target).is_some_and(|w| w.detached)
-        {
-            self.show_color_picker_for(ctx, &target);
-        }
         if let Some(conn) = self.confirm_disconnect {
             self.show_confirm_disconnect(ctx, conn);
         }
+    }
+
+    /// The detached window the application's dialogs show in, if they were
+    /// asked for from one that is still detached.
+    fn global_dialog_window(&self) -> Option<WindowKey> {
+        self.global_dialog_owner
+            .clone()
+            .filter(|key| self.windows.get(key).is_some_and(|w| w.detached))
+    }
+
+    /// When the application's dialogs open, note the detached window they
+    /// belong to: the status window being closed, or the window the user
+    /// is working in.
+    fn update_global_dialog_owner(&mut self) {
+        let open = self.show_settings
+            || self.confirm_disconnect.is_some()
+            || self
+                .sessions
+                .get(self.active_index())
+                .is_some_and(|s| s.show_connect_dialog && !s.connected && !s.connecting);
+        if !open {
+            self.global_dialog_owner = None;
+        } else if !self.global_dialogs_were_open {
+            let detached = |key: &WindowKey| self.windows.get(key).is_some_and(|w| w.detached);
+            let closing = self
+                .confirm_disconnect
+                .map(|conn| WindowKey::new(conn, None))
+                .filter(|key| detached(key));
+            self.global_dialog_owner =
+                closing.or_else(|| self.windows.active.clone().filter(|key| detached(key)));
+        }
+        self.global_dialogs_were_open = open;
     }
 
     /// The detached window a session's dialogs belong to, if any.
@@ -1168,6 +1241,9 @@ impl App {
 
     /// The dialogs a detached window opened, drawn inside its OS window.
     fn show_detached_window_dialogs(&mut self, ctx: &egui::Context, key: &WindowKey) {
+        if self.global_dialog_window().as_ref() == Some(key) {
+            self.show_global_dialogs(ctx);
+        }
         if self.detached_dialog_owner(key.conn).as_ref() == Some(key)
             && let Some(index) = self.session_index(key.conn)
         {
@@ -1482,6 +1558,7 @@ impl App {
         };
         let title = self.window_title(&key);
         let mut action = None;
+        let mut restore = None;
         ui.horizontal(|ui| {
             ui.label(RichText::new(&title).strong());
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -1499,21 +1576,27 @@ impl App {
                 {
                     action = Some(WindowAction::Detach);
                 }
-                if ui
-                    .small_button("Restore")
-                    .on_hover_text("Show windows side by side (Ctrl+M)")
-                    .clicked()
-                {
+                // Resting on it opens the snap layouts, as on a floating
+                // window's maximize button.
+                let response = ui.small_button("Restore");
+                if response.clicked() {
                     action = Some(WindowAction::Restore);
                 }
+                restore = Some(response);
             });
         });
+        if let Some(restore) = restore {
+            self.track_maximize_hover(ui.ctx(), &key, &restore);
+        }
         ui.separator();
         self.draw_window_contents(ui, &key);
         match action {
             Some(WindowAction::Close) => self.request_close(key),
             Some(WindowAction::Detach) => self.toggle_detached(&key),
-            Some(WindowAction::Restore) => self.toggle_maximized(),
+            Some(WindowAction::Restore) => {
+                self.dismiss_flyout();
+                self.toggle_maximized();
+            }
             None => {}
         }
     }
@@ -1543,6 +1626,8 @@ impl App {
         });
         let mut activate = None;
         let mut close = Vec::new();
+        let mut maximize = None;
+        let mut detach = None;
         let cascade = super::windows::cascade_rects(area, keys.len().max(1));
         for (n, key) in keys.iter().enumerate() {
             let title = self.window_title(key);
@@ -1560,22 +1645,37 @@ impl App {
                 pending = Some(cascade[n % cascade.len()]);
             }
             let default = known.or(pending).unwrap_or(cascade[0]);
-            let mut open = true;
+            let active = self.windows.active.as_ref() == Some(key);
+            // Our own caption (`draw_caption`) replaces egui's title bar.
+            // The window stays movable: egui 0.37 drops the left and top
+            // resize handles of a window that is not, and dragging the
+            // background moves it as before (without snapping).
             let mut window = egui::Window::new(title)
                 .id(id)
-                .open(&mut open)
+                .title_bar(false)
                 .collapsible(false)
                 .default_rect(default);
-            window = match pending {
-                // A tile/cascade placement lies inside the area by
+            window = match (pending, self.dragged_window_pos(ctx, key)) {
+                // A tile/cascade/snap placement lies inside the area by
                 // construction. Constraining this frame would use the
                 // window's previous, larger size and shift it out of its
                 // cell; from the next frame on the new size is known.
-                Some(rect) => window.constrain(false).fixed_rect(rect),
-                None => window.constrain_to(area),
+                (Some(rect), _) => window.constrain(false).fixed_rect(rect),
+                (None, Some(pos)) => window.current_pos(pos).constrain_to(area),
+                (None, None) => window.constrain_to(area),
             };
-            let shown = window.show(ctx, |ui| self.draw_window_contents(ui, key));
+            let shown = window.show(ctx, |ui| {
+                let action = self.draw_caption(ui, key, active);
+                self.draw_window_contents(ui, key);
+                action
+            });
             if let Some(shown) = shown {
+                match shown.inner.flatten() {
+                    Some(CaptionAction::Close) => close.push(key.clone()),
+                    Some(CaptionAction::Maximize) => maximize = Some(key.clone()),
+                    Some(CaptionAction::Detach) => detach = Some(key.clone()),
+                    None => {}
+                }
                 let rect = shown.response.rect;
                 if let Some(pos) = pressed_at
                     && rect.contains(pos)
@@ -1590,14 +1690,19 @@ impl App {
                     self.windows.dirty = true;
                 }
             }
-            if !open {
-                close.push(key.clone());
-            }
         }
         if let Some(key) = activate
             && self.windows.active.as_ref() != Some(&key)
         {
             self.user_activate(key);
+        }
+        if let Some(key) = maximize {
+            self.user_activate(key);
+            self.windows.mode = LayoutMode::Maximized;
+            self.windows.dirty = true;
+        }
+        if let Some(key) = detach {
+            self.toggle_detached(&key);
         }
         // The active window is always the front one. egui raises a window on
         // its first visible frame and on a click; a click also makes that
@@ -1757,18 +1862,13 @@ impl App {
             self.toggle_detached(&key);
         }
         for key in close {
-            self.spawn_geometry.remove(&key);
-            match key.target {
-                // Closing a status window still asks first; until then the
-                // window goes back inside the main window.
-                None => {
-                    if let Some(window) = self.windows.get_mut(&key) {
-                        window.detached = false;
-                    }
-                    self.request_close(key);
-                }
-                Some(_) => self.request_close(key),
+            // A status window asks before disconnecting, in its own OS
+            // window (the main one may be minimized), and stays if the
+            // user cancels.
+            if key.target.is_some() {
+                self.spawn_geometry.remove(&key);
             }
+            self.request_close(key);
         }
         // Forget geometry of viewports that are no longer detached.
         let detached: HashSet<WindowKey> = self
@@ -2112,6 +2212,7 @@ fn clamp_settings(settings: &mut Settings) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::gui::snap;
     use crate::irc::{IrcCommand, IrcMessage};
     use tokio::sync::mpsc;
 
@@ -2868,6 +2969,160 @@ mod tests {
         assert_eq!(app.windows.get(&key).unwrap().view.input_text, "half typed");
     }
 
+    /// A loopback IRC server that completes registration for any nick, echoes
+    /// JOINs, and streams every line it receives.
+    fn echo_server() -> (u16, std::sync::mpsc::Receiver<String>) {
+        use std::io::{BufRead, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut writer = stream.try_clone().unwrap();
+            let mut reader = std::io::BufReader::new(stream);
+            let mut nick = String::from("*");
+            let mut line = String::new();
+            while reader.read_line(&mut line).unwrap_or(0) > 0 {
+                let text = line.trim_end().to_string();
+                line.clear();
+                let words: Vec<&str> = text.split(' ').collect();
+                let reply = match words.as_slice() {
+                    ["CAP", "LS", ..] => ":srv CAP * LS :multi-prefix".to_string(),
+                    // Like a real server: a request for anything not
+                    // offered is refused whole.
+                    ["CAP", "REQ", caps @ ..] => {
+                        let caps = caps.join(" ");
+                        let reply = if caps.trim_start_matches(':') == "multi-prefix" {
+                            "ACK"
+                        } else {
+                            "NAK"
+                        };
+                        format!(":srv CAP * {reply} {caps}")
+                    }
+                    ["NICK", new] => {
+                        nick = new.trim_start_matches(':').to_string();
+                        String::new()
+                    }
+                    ["CAP", "END"] => format!(":srv 001 {nick} :Welcome"),
+                    ["JOIN", channels, ..] => channels
+                        .split(',')
+                        .map(|c| format!(":{nick}!u@h JOIN {c}"))
+                        .collect::<Vec<_>>()
+                        .join("\r\n"),
+                    _ => String::new(),
+                };
+                if !reply.is_empty() {
+                    let _ = writer.write_all(format!("{reply}\r\n").as_bytes());
+                }
+                if tx.send(text).is_err() {
+                    break;
+                }
+            }
+        });
+        (port, rx)
+    }
+
+    #[test]
+    fn a_snapshot_written_by_0_1_4_restores_its_connection_channels_and_draft() {
+        // The bytes 0.1.4's `update_session()` wrote (generated with that
+        // release's code), read the way the updater hands them over; only the
+        // port is pointed at a local server.
+        let (port, lines) = echo_server();
+        let fixture = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/gui/testdata/update_session_0_1_4.json"
+        );
+        let mut json: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(fixture).unwrap()).unwrap();
+        json["session"]["server"]["port"] = port.into();
+        let path = std::env::temp_dir().join(format!(
+            "linefeed-update-session-{}.json",
+            std::process::id()
+        ));
+        std::fs::write(&path, json.to_string()).unwrap();
+        let snapshot: UpdateSession = crate::updater::install::read_json(&path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+
+        let mut app = App::with_settings(test_settings(), LayoutFile::default());
+        app.start(Some(snapshot));
+        let ctx = egui::Context::default();
+        let mut seen = Vec::new();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !seen.iter().any(|l: &String| l.starts_with("AWAY")) {
+            assert!(Instant::now() < deadline, "restore incomplete: {seen:?}");
+            app.background_tick(&ctx);
+            seen.extend(lines.try_iter());
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        // The connection 0.1.4 had: its server password and nick, invisible
+        // mode, both channels (one keyed), the away message and auto-perform.
+        for line in [
+            "PASS :server-pass",
+            "NICK tester_",
+            "MODE tester_ +i",
+            "JOIN #rust",
+            "JOIN #secret k3y",
+            "AWAY :lunch",
+        ] {
+            assert!(seen.iter().any(|l| l == line), "{line} missing: {seen:?}");
+        }
+        while !seen.iter().any(|l| l.starts_with("PRIVMSG NickServ")) {
+            assert!(
+                Instant::now() < deadline,
+                "auto-perform never ran: {seen:?}"
+            );
+            app.background_tick(&ctx);
+            seen.extend(lines.try_iter());
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(
+            seen.iter().any(|l| l == "PRIVMSG NickServ :hello"),
+            "{seen:?}"
+        );
+        // The selected window and its unsent draft, and the query.
+        let conn = app.sessions[0].id;
+        let secret = WindowKey::new(conn, Some("#secret".into()));
+        assert_eq!(app.windows.active, Some(secret.clone()));
+        assert_eq!(
+            app.windows.get(&secret).unwrap().view.input_text,
+            "half typed draft"
+        );
+        assert!(
+            app.windows
+                .get(&WindowKey::new(conn, Some("carol".into())))
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn favorites_without_ids_get_the_same_ids_back_after_a_downgrade() {
+        // As 0.1.4 writes them: no `id`, and it drops one whenever it saves.
+        let old = r##"{"server_favorites":[
+            {"name":"Libera","host":"irc.libera.chat","port":"6697","use_tls":true,
+             "password":"","nickname":"","auto_join":"","auto_perform":""},
+            {"name":"Libera","host":"irc.libera.chat","port":"6697","use_tls":true,
+             "password":"","nickname":"","auto_join":"","auto_perform":""},
+            {"name":"OFTC","host":"irc.oftc.net","port":"6697","use_tls":true,
+             "password":"","nickname":"","auto_join":"","auto_perform":"","id":"kept"}]}"##;
+        let ids = || -> Vec<String> {
+            let settings: Settings = serde_json::from_str(old).unwrap();
+            App::with_settings(settings, LayoutFile::default())
+                .settings
+                .server_favorites
+                .iter()
+                .map(|f| f.id.clone())
+                .collect()
+        };
+        let first = ids();
+        assert_eq!(first[0], ids()[0], "derived ids are stable");
+        assert_eq!(
+            first[0],
+            crate::gui::derived_profile_id("Libera", "irc.libera.chat", "6697")
+        );
+        assert_ne!(first[0], first[1], "a duplicate favorite got the same id");
+        assert_eq!(first[2], "kept");
+    }
+
     #[test]
     fn settings_from_0_1_4_load_and_new_fields_default() {
         let old = r##"{"server_favorites":[{"name":"Libera","host":"irc.libera.chat",
@@ -3145,6 +3400,585 @@ mod tests {
         // Reattached: the dialogs go back to the main window.
         app.toggle_detached(&debian);
         assert_eq!(app.detached_dialog_owner(debian.conn), None);
+    }
+
+    #[test]
+    fn a_detached_window_sends_what_is_typed_while_the_main_window_is_minimized() {
+        let (mut app, _rx_a, mut rx_b) = two_networks();
+        let debian = WindowKey::new(app.sessions[1].id, Some("#debian".into()));
+        app.toggle_detached(&debian);
+        {
+            let window = app.windows.get_mut(&debian).unwrap();
+            window.view.input_text = "still here".into();
+            window.view.input_focus_request = true;
+        }
+        let ctx = egui::Context::default();
+        frame(&mut app, &ctx);
+        frame(&mut app, &ctx);
+        drain(&mut rx_b);
+        // The main window is minimized: eframe runs ui passes only for the
+        // detached window, after `logic` ticked the connections.
+        app.background_tick(&ctx);
+        ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1024.0, 768.0),
+                )),
+                events: vec![egui::Event::Key {
+                    key: egui::Key::Enter,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::NONE,
+                }],
+                ..Default::default()
+            },
+            |ui| app.ui_detached_only(ui.ctx(), true),
+        )
+        .textures_delta
+        .clear();
+        assert_eq!(drain(&mut rx_b), ["PRIVMSG #debian :still here"]);
+    }
+
+    fn pointer_frame(
+        app: &mut App,
+        ctx: &egui::Context,
+        time: f64,
+        events: Vec<egui::Event>,
+    ) -> egui::FullOutput {
+        let mut output = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1024.0, 768.0),
+                )),
+                time: Some(time),
+                events,
+                ..Default::default()
+            },
+            |ui| app.ui(ui),
+        );
+        output.textures_delta.clear();
+        output
+    }
+
+    fn primary(pos: egui::Pos2, pressed: bool) -> egui::Event {
+        egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        }
+    }
+
+    /// Floating windows for two networks, drawn a few times; returns the
+    /// next frame time.
+    fn floating_windows(app: &mut App, ctx: &egui::Context) -> f64 {
+        app.windows.mode = LayoutMode::Floating;
+        let mut time = 1.0;
+        for _ in 0..4 {
+            pointer_frame(app, ctx, time, vec![]);
+            time += 0.05;
+        }
+        time
+    }
+
+    fn assert_placed(app: &App, key: &WindowKey, expected: egui::Rect) {
+        let rect = app.windows.get(key).unwrap().child_rect.unwrap();
+        assert!(
+            (rect.min - expected.min).length() < 1.0
+                && (rect.size() - expected.size()).length() < 1.0,
+            "{key:?} at {rect:?}, expected {expected:?}"
+        );
+    }
+
+    /// Press on `from`, drag through `path` and release on its last point;
+    /// returns the next frame time.
+    fn drag(
+        app: &mut App,
+        ctx: &egui::Context,
+        mut time: f64,
+        from: egui::Pos2,
+        path: &[egui::Pos2],
+    ) -> f64 {
+        let mut step = |app: &mut App, events| {
+            pointer_frame(app, ctx, time, events);
+            time += 0.05;
+        };
+        step(app, vec![egui::Event::PointerMoved(from)]);
+        step(app, vec![primary(from, true)]);
+        for &pos in path {
+            step(app, vec![egui::Event::PointerMoved(pos)]);
+        }
+        step(app, vec![primary(*path.last().unwrap(), false)]);
+        step(app, vec![]);
+        step(app, vec![]);
+        time
+    }
+
+    #[test]
+    fn resting_on_the_maximize_button_offers_layouts_that_snap_the_window() {
+        let (mut app, _rx_a, _rx_b) = two_networks();
+        let ctx = egui::Context::default();
+        let mut time = floating_windows(&mut app, &ctx);
+        let key = app.windows.active.clone().unwrap();
+        let button = ctx
+            .read_response(snap::maximize_button_id(&key))
+            .unwrap()
+            .rect;
+        pointer_frame(
+            &mut app,
+            &ctx,
+            time,
+            vec![egui::Event::PointerMoved(button.center())],
+        );
+        time += 0.1;
+        pointer_frame(&mut app, &ctx, time, vec![]);
+        assert!(
+            app.snap.flyout.is_none(),
+            "opened before the pointer rested"
+        );
+        time += 0.4;
+        pointer_frame(&mut app, &ctx, time, vec![]);
+        assert!(app.snap.flyout.is_some(), "no layouts after resting");
+        time += 0.05;
+        pointer_frame(&mut app, &ctx, time, vec![]);
+
+        // Left half of the halves layout.
+        let zone = ctx
+            .read_response(snap::zone_id(snap::flyout_id(), 0, 0))
+            .unwrap()
+            .rect;
+        for events in [
+            vec![egui::Event::PointerMoved(zone.center())],
+            vec![primary(zone.center(), true)],
+            vec![primary(zone.center(), false)],
+            vec![],
+            vec![],
+        ] {
+            time += 0.05;
+            pointer_frame(&mut app, &ctx, time, events);
+        }
+        let area = app.windows.area.unwrap();
+        let halves = snap::layout_rects(area, 0);
+        assert_placed(&app, &key, halves[0]);
+        assert!(app.snap.flyout.is_none());
+
+        // Snap Assist offers the other windows for the right half.
+        assert_eq!(app.snap.assist.as_ref().unwrap().zones, vec![halves[1]]);
+        let other = app
+            .ordered_windows()
+            .into_iter()
+            .find(|k| *k != key)
+            .unwrap();
+        let choice = ctx
+            .read_response(snap::assist_choice_id(0, &other))
+            .unwrap()
+            .rect;
+        for events in [
+            vec![egui::Event::PointerMoved(choice.center())],
+            vec![primary(choice.center(), true)],
+            vec![primary(choice.center(), false)],
+            vec![],
+            vec![],
+        ] {
+            time += 0.05;
+            pointer_frame(&mut app, &ctx, time, events);
+        }
+        assert_placed(&app, &other, halves[1]);
+        assert_eq!(app.windows.active, Some(other), "picked, not focused");
+        assert!(app.snap.assist.is_none(), "every zone is filled");
+    }
+
+    #[test]
+    fn dragging_a_caption_to_a_side_snaps_the_window_to_that_half() {
+        let (mut app, _rx_a, _rx_b) = two_networks();
+        let ctx = egui::Context::default();
+        let time = floating_windows(&mut app, &ctx);
+        let key = app.windows.active.clone().unwrap();
+        let caption = ctx.read_response(snap::caption_id(&key)).unwrap().rect;
+        let area = app.windows.area.unwrap();
+        let from = caption.left_center() + egui::vec2(40.0, 0.0);
+        let edge = egui::pos2(area.left() + 2.0, area.center().y);
+        drag(
+            &mut app,
+            &ctx,
+            time,
+            from,
+            &[from + egui::vec2(30.0, 10.0), edge],
+        );
+        let halves = snap::layout_rects(area, 0);
+        assert_placed(&app, &key, halves[0]);
+        assert_eq!(app.snap.assist.as_ref().unwrap().zones, vec![halves[1]]);
+    }
+
+    #[test]
+    fn dragging_a_caption_to_the_top_opens_the_layout_bar() {
+        let (mut app, _rx_a, _rx_b) = two_networks();
+        let ctx = egui::Context::default();
+        let mut time = floating_windows(&mut app, &ctx);
+        let key = app.windows.active.clone().unwrap();
+        let caption = ctx.read_response(snap::caption_id(&key)).unwrap().rect;
+        let area = app.windows.area.unwrap();
+        let from = caption.left_center() + egui::vec2(40.0, 0.0);
+        let top = area.center_top() + egui::vec2(0.0, 2.0);
+        for events in [
+            vec![egui::Event::PointerMoved(from)],
+            vec![primary(from, true)],
+            vec![egui::Event::PointerMoved(from + egui::vec2(20.0, 20.0))],
+            vec![egui::Event::PointerMoved(top)],
+            vec![],
+        ] {
+            pointer_frame(&mut app, &ctx, time, events);
+            time += 0.05;
+        }
+        assert!(app.snap.bar.is_some(), "no layout bar at the top");
+        // Top right quarter.
+        let zone = ctx
+            .read_response(snap::zone_id(snap::bar_id(), 4, 1))
+            .unwrap()
+            .rect;
+        for events in [
+            vec![egui::Event::PointerMoved(zone.center())],
+            vec![primary(zone.center(), false)],
+            vec![],
+            vec![],
+        ] {
+            pointer_frame(&mut app, &ctx, time, events);
+            time += 0.05;
+        }
+        assert!(app.snap.bar.is_none());
+        assert_placed(&app, &key, snap::layout_rects(area, 4)[1]);
+        assert_eq!(app.snap.assist.as_ref().unwrap().zones.len(), 3);
+    }
+
+    #[test]
+    fn a_window_dropped_away_from_the_edges_just_moves() {
+        let (mut app, _rx_a, _rx_b) = two_networks();
+        let ctx = egui::Context::default();
+        let time = floating_windows(&mut app, &ctx);
+        let key = app.windows.active.clone().unwrap();
+        let before = app.windows.get(&key).unwrap().child_rect.unwrap();
+        let caption = ctx.read_response(snap::caption_id(&key)).unwrap().rect;
+        let from = caption.left_center() + egui::vec2(40.0, 0.0);
+        drag(
+            &mut app,
+            &ctx,
+            time,
+            from,
+            &[from + egui::vec2(20.0, 20.0), from + egui::vec2(60.0, 40.0)],
+        );
+        let after = app.windows.get(&key).unwrap().child_rect.unwrap();
+        assert!(
+            ((after.min - before.min) - egui::vec2(60.0, 40.0)).length() < 1.5,
+            "{before:?} -> {after:?}"
+        );
+        assert!(app.snap.assist.is_none());
+    }
+
+    #[test]
+    fn snapping_a_maximized_window_returns_to_floating_windows() {
+        let (mut app, _rx_a, _rx_b) = two_networks();
+        let ctx = egui::Context::default();
+        frame(&mut app, &ctx);
+        assert_eq!(app.windows.mode, LayoutMode::Maximized);
+        let key = app.windows.active.clone().unwrap();
+        let area = egui::Rect::from_min_size(egui::pos2(0.0, 60.0), egui::vec2(1024.0, 700.0));
+        let target = snap::SnapTarget::layout(area, 1, 0);
+        app.snap_window(&key, target.clone());
+        assert_eq!(app.windows.mode, LayoutMode::Floating);
+        assert_eq!(
+            app.windows.get(&key).unwrap().child_rect,
+            Some(target.rect())
+        );
+        assert_eq!(
+            app.snap.assist.as_ref().unwrap().zones,
+            vec![target.zones[1]]
+        );
+    }
+
+    #[test]
+    fn escape_or_a_click_elsewhere_dismisses_snap_assist() {
+        let (mut app, _rx_a, _rx_b) = two_networks();
+        let ctx = egui::Context::default();
+        let mut time = floating_windows(&mut app, &ctx);
+        let key = app.windows.active.clone().unwrap();
+        let area = app.windows.area.unwrap();
+        app.snap_window(
+            &key,
+            snap::SnapTarget::layout(area, snap::LAYOUTS.len() - 1, 0),
+        );
+        pointer_frame(&mut app, &ctx, time, vec![]);
+        time += 0.05;
+        assert_eq!(app.snap.assist.as_ref().unwrap().zones.len(), 3);
+        let escape = egui::Event::Key {
+            key: egui::Key::Escape,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        };
+        pointer_frame(&mut app, &ctx, time, vec![escape]);
+        time += 0.05;
+        assert!(app.snap.assist.is_none());
+
+        // A click inside the snapped window, outside the free zones.
+        app.snap_window(&key, snap::SnapTarget::layout(area, 0, 0));
+        for _ in 0..2 {
+            pointer_frame(&mut app, &ctx, time, vec![]);
+            time += 0.05;
+        }
+        assert!(app.snap.assist.is_some());
+        let inside = snap::layout_rects(area, 0)[0].center();
+        for events in [
+            vec![egui::Event::PointerMoved(inside)],
+            vec![primary(inside, true)],
+            vec![primary(inside, false)],
+        ] {
+            pointer_frame(&mut app, &ctx, time, events);
+            time += 0.05;
+        }
+        assert!(app.snap.assist.is_none());
+    }
+
+    fn button(pos: egui::Pos2, button: egui::PointerButton, pressed: bool) -> egui::Event {
+        egui::Event::PointerButton {
+            pos,
+            button,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        }
+    }
+
+    fn escape() -> egui::Event {
+        egui::Event::Key {
+            key: egui::Key::Escape,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        }
+    }
+
+    /// Rest the pointer on `key`'s maximize button until the layouts open;
+    /// returns the next frame time.
+    fn open_flyout(app: &mut App, ctx: &egui::Context, mut time: f64, key: &WindowKey) -> f64 {
+        let at = ctx
+            .read_response(snap::maximize_button_id(key))
+            .unwrap()
+            .rect
+            .center();
+        pointer_frame(app, ctx, time, vec![egui::Event::PointerMoved(at)]);
+        for _ in 0..2 {
+            time += 0.4;
+            pointer_frame(app, ctx, time, vec![]);
+        }
+        assert!(app.snap.flyout.is_some(), "no layouts after resting");
+        time + 0.05
+    }
+
+    #[test]
+    fn a_floating_window_still_resizes_from_its_left_edge() {
+        let (mut app, _rx_a, _rx_b) = two_networks();
+        let ctx = egui::Context::default();
+        let mut time = floating_windows(&mut app, &ctx);
+        let key = app.windows.active.clone().unwrap();
+        let placed = egui::Rect::from_min_max(egui::pos2(300.0, 200.0), egui::pos2(700.0, 600.0));
+        app.windows.place(&key, placed);
+        for _ in 0..3 {
+            pointer_frame(&mut app, &ctx, time, vec![]);
+            time += 0.05;
+        }
+        let edge = egui::pos2(placed.left() + 1.0, placed.center().y);
+        let to = edge - egui::vec2(60.0, 0.0);
+        drag(
+            &mut app,
+            &ctx,
+            time,
+            edge,
+            &[edge - egui::vec2(20.0, 0.0), to],
+        );
+        let rect = app.windows.get(&key).unwrap().child_rect.unwrap();
+        assert!(
+            (rect.left() - (placed.left() - 60.0)).abs() < 3.0,
+            "{rect:?}"
+        );
+        assert!((rect.right() - placed.right()).abs() < 3.0, "{rect:?}");
+    }
+
+    #[test]
+    fn escape_closes_the_layouts_while_the_pointer_still_rests_on_the_button() {
+        let (mut app, _rx_a, _rx_b) = two_networks();
+        let ctx = egui::Context::default();
+        let time = floating_windows(&mut app, &ctx);
+        let key = app.windows.active.clone().unwrap();
+        let mut time = open_flyout(&mut app, &ctx, time, &key);
+        pointer_frame(&mut app, &ctx, time, vec![escape()]);
+        for _ in 0..4 {
+            time += 0.4;
+            pointer_frame(&mut app, &ctx, time, vec![]);
+            assert!(app.snap.flyout.is_none(), "reopened while still resting");
+        }
+    }
+
+    #[test]
+    fn clicking_maximize_with_the_layouts_open_closes_them() {
+        let (mut app, _rx_a, _rx_b) = two_networks();
+        let ctx = egui::Context::default();
+        let time = floating_windows(&mut app, &ctx);
+        let key = app.windows.active.clone().unwrap();
+        let mut time = open_flyout(&mut app, &ctx, time, &key);
+        let at = ctx
+            .read_response(snap::maximize_button_id(&key))
+            .unwrap()
+            .rect
+            .center();
+        for events in [vec![primary(at, true)], vec![primary(at, false)], vec![]] {
+            pointer_frame(&mut app, &ctx, time, events);
+            time += 0.05;
+        }
+        assert_eq!(app.windows.mode, LayoutMode::Maximized);
+        assert!(app.snap.flyout.is_none());
+    }
+
+    #[test]
+    fn a_snap_made_while_maximized_lands_in_the_current_chat_area() {
+        let (mut app, _rx_a, _rx_b) = two_networks();
+        let ctx = egui::Context::default();
+        frame(&mut app, &ctx);
+        // The area floating windows were last laid out in, before the main
+        // window was resized.
+        app.windows.area = Some(egui::Rect::from_min_size(
+            egui::pos2(0.0, 60.0),
+            egui::vec2(600.0, 400.0),
+        ));
+        frame(&mut app, &ctx);
+        let area = app.windows.area.unwrap();
+        assert!(area.width() > 900.0, "area not followed while maximized");
+        let key = app.windows.active.clone().unwrap();
+        let target = snap::SnapTarget::layout(area, 0, 0);
+        app.snap_window(&key, target.clone());
+        for _ in 0..3 {
+            frame(&mut app, &ctx);
+        }
+        assert_placed(&app, &key, target.rect());
+    }
+
+    #[test]
+    fn a_right_button_drag_does_not_snap() {
+        let (mut app, _rx_a, _rx_b) = two_networks();
+        let ctx = egui::Context::default();
+        let mut time = floating_windows(&mut app, &ctx);
+        let key = app.windows.active.clone().unwrap();
+        let before = app.windows.get(&key).unwrap().child_rect.unwrap();
+        let caption = ctx.read_response(snap::caption_id(&key)).unwrap().rect;
+        let area = app.windows.area.unwrap();
+        let from = caption.left_center() + egui::vec2(40.0, 0.0);
+        let edge = egui::pos2(area.left() + 2.0, area.center().y);
+        let secondary = egui::PointerButton::Secondary;
+        // The drag starts with the pointer already at the edge.
+        for events in [
+            vec![egui::Event::PointerMoved(from)],
+            vec![button(from, secondary, true)],
+            vec![egui::Event::PointerMoved(edge)],
+            vec![button(edge, secondary, false)],
+            vec![escape()],
+            vec![],
+        ] {
+            pointer_frame(&mut app, &ctx, time, events);
+            time += 0.05;
+        }
+        assert_eq!(app.windows.get(&key).unwrap().child_rect.unwrap(), before);
+        assert!(app.snap.assist.is_none());
+    }
+
+    #[test]
+    fn settings_asked_for_in_a_detached_window_open_in_it_while_minimized() {
+        let (mut app, _rx_a, _rx_b) = two_networks();
+        let debian = WindowKey::new(app.sessions[1].id, Some("#debian".into()));
+        app.toggle_detached(&debian);
+        app.activate(debian.clone());
+        {
+            let window = app.windows.get_mut(&debian).unwrap();
+            window.view.input_text = "/settings".into();
+            window.view.input_focus_request = true;
+        }
+        let ctx = egui::Context::default();
+        frame(&mut app, &ctx);
+        frame(&mut app, &ctx);
+        // The main window is minimized: `logic` ticks, then a ui pass draws
+        // only the detached window.
+        let minimized = |app: &mut App, events: Vec<egui::Event>| {
+            app.background_tick(&ctx);
+            let mut output = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(1024.0, 768.0),
+                    )),
+                    events,
+                    ..Default::default()
+                },
+                |ui| app.ui_detached_only(ui.ctx(), true),
+            );
+            output.textures_delta.clear();
+            texts(&output)
+        };
+        let enter = egui::Event::Key {
+            key: egui::Key::Enter,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        };
+        minimized(&mut app, vec![enter]);
+        minimized(&mut app, vec![]);
+        let shown = minimized(&mut app, vec![]);
+        assert!(app.show_settings, "/settings was not run");
+        assert_eq!(app.global_dialog_window(), Some(debian));
+        assert!(shown.iter().any(|t| t == "Automation"), "{shown:?}");
+    }
+
+    #[test]
+    fn closing_a_detached_status_window_asks_in_it() {
+        let (mut app, _rx_a, _rx_b) = two_networks();
+        let status = WindowKey::new(app.sessions[1].id, None);
+        app.toggle_detached(&status);
+        let ctx = egui::Context::default();
+        frame(&mut app, &ctx);
+        app.request_close(status.clone());
+        frame(&mut app, &ctx);
+        assert_eq!(app.confirm_disconnect, Some(status.conn));
+        assert!(app.windows.get(&status).unwrap().detached);
+        assert_eq!(app.global_dialog_window(), Some(status));
+    }
+
+    #[test]
+    fn double_clicking_a_caption_maximizes_its_window() {
+        let (mut app, _rx_a, _rx_b) = two_networks();
+        let ctx = egui::Context::default();
+        let mut time = floating_windows(&mut app, &ctx);
+        let other = app.ordered_windows()[0].clone();
+        app.activate(other.clone());
+        for _ in 0..2 {
+            pointer_frame(&mut app, &ctx, time, vec![]);
+            time += 0.05;
+        }
+        let caption = ctx.read_response(snap::caption_id(&other)).unwrap().rect;
+        let at = caption.left_center() + egui::vec2(30.0, 0.0);
+        for events in [
+            vec![egui::Event::PointerMoved(at)],
+            vec![primary(at, true)],
+            vec![primary(at, false)],
+            vec![primary(at, true)],
+            vec![primary(at, false)],
+        ] {
+            pointer_frame(&mut app, &ctx, time, events);
+            time += 0.05;
+        }
+        assert_eq!(app.windows.mode, LayoutMode::Maximized);
+        assert_eq!(app.windows.active, Some(other));
     }
 
     #[test]

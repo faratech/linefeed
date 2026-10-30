@@ -124,6 +124,7 @@ src/
 │   ├── mod.rs           # Session: one connection's state, message routing, numeric handlers (~12700 lines)
 │   ├── connection.rs    # Per-session connection worker lifecycle (thread, intent, reconnect)
 │   ├── windows.rs       # WindowManager: placement, tile/cascade, layout.json
+│   ├── snap.rs          # Snap layouts: window captions, layout flyout/bar, edge snaps, Snap Assist
 │   ├── view.rs          # Drawing one window: topic, user list, scrollback, input line
 │   ├── types.rs         # Settings, ChatMessage, Channel, NetworkSupport, UserMode, BanEntry, TabCompletion
 │   ├── commands.rs      # process_command() - all /slash commands (~5100 lines)
@@ -165,6 +166,7 @@ src/
 - **gui/mod.rs**: `handle_incoming_message()` routes by IrcCommand type, `handle_numeric()` for server replies, lag meter, auto-away
 - **gui/connection.rs**: per-session worker thread, `ConnectionIntent` handling, auto-reconnect
 - **gui/windows.rs**: window set derived from the sessions, placement memory, tile/cascade geometry, layout.json (kept apart from settings.json)
+- **gui/snap.rs**: the floating windows' own captions (drag to move, maximize, close) and Windows 11 style snap layouts: flyout on the maximize button, layout bar when dragged to the top, halves/quarters at the edges, Snap Assist for the zones left
 - **commands.rs**: All /slash commands including service shortcuts (/ns, /cs), /monitor, /slap
 - **dialogs.rs**: Modal windows with tabbed Settings (Connection, Display, Automation, Behavior, About)
 - **formatting.rs**: `parse_irc_colors()` for IRC formatting controls, `render_irc_text()` with egui

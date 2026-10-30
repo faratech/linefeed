@@ -37,7 +37,7 @@ semver = "1.0.28"
 
 # Platform-specific: eframe with x11/wayland only on Linux
 [target.'cfg(target_os = "linux")'.dependencies]
-eframe = { version = "0.37.0", default-features = false, features = ["glow", "persistence", "x11", "wayland"] }
+eframe = { version = "0.37.0", default-features = false, features = ["glow", "persistence", "x11", "wayland", "clipboard"] }
 
 # Used by cfg(unix) code paths (local time conversion), so macOS needs it too
 [target.'cfg(unix)'.dependencies]
@@ -47,7 +47,7 @@ libc = "0.2"
 # glow cannot create a context on GPU-less Windows VMs, which only offer GDI's
 # OpenGL 1.1, so the app exited or crashed there before showing a window.
 [target.'cfg(not(target_os = "linux"))'.dependencies]
-eframe = { version = "0.37.0", default-features = false, features = ["wgpu", "persistence"] }
+eframe = { version = "0.37.0", default-features = false, features = ["wgpu", "persistence", "clipboard"] }
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.62.2", features = [

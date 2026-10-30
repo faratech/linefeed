@@ -342,6 +342,7 @@ fn main() -> eframe::Result<()> {
                 last_message_time: std::time::Instant::now(),
                 window_size_ok: false,
                 list_loading_since: None,
+                logic_ticked: false,
                 startup_ack: acknowledgment,
                 shutdown: app_shutdown,
             }))
@@ -357,11 +358,13 @@ fn main() -> eframe::Result<()> {
 }
 
 impl LinefeedApp {
-    /// While the main window is minimized or occluded, eframe runs no ui
-    /// pass at all, only `App::logic`. Keep every connection drained and its timers,
-    /// reconnects and lag pings running then, or the incoming buffers fill
-    /// and connections time out. When a ui pass follows, it does this work.
+    /// While the main window is minimized or occluded, eframe runs a ui pass
+    /// only if a detached window is on screen; otherwise just `App::logic`.
+    /// Keep every connection drained and its timers, reconnects and lag
+    /// pings running here, or the incoming buffers fill and connections time
+    /// out. A ui pass that follows in the same pass only draws.
     fn hidden_logic(&mut self, ctx: &egui::Context) {
+        self.logic_ticked = false;
         let hidden = ctx.input(|i| i.viewport().visible() == Some(false));
         if !hidden {
             return;
@@ -381,13 +384,26 @@ impl LinefeedApp {
             systray::hide_window_async();
             self.app.tray_hidden = true;
         }
-        // Detached windows minimize with the main window. Never force a ui
-        // pass instead: it would paint the minimized main window, and a
-        // present on a minimized window can block on Windows.
-        self.app.hide_detached_windows(ctx);
+        // Detached windows go to the tray with the main window. A minimized
+        // or covered main window leaves them on screen and working.
+        if self.app.tray_hidden {
+            self.app.hide_detached_windows(ctx);
+        }
         self.app.background_tick(ctx);
+        self.logic_ticked = true;
         // Nothing else wakes a hidden window: keep `logic` coming.
         ctx.request_repaint_after(std::time::Duration::from_millis(250));
+    }
+
+    /// Minimized or covered (cross-platform, including Linux): eframe paints
+    /// nothing of the main window and runs a ui pass only for the detached
+    /// windows still on screen. Returns whether this pass is handled.
+    fn hidden_ui(&mut self, ctx: &egui::Context) -> bool {
+        if ctx.input(|i| i.viewport().visible() == Some(false)) {
+            self.app.ui_detached_only(ctx, self.logic_ticked);
+            return true;
+        }
+        false
     }
 }
 
@@ -403,6 +419,9 @@ struct LinefeedApp {
     /// When the current /list started, so a server that never sends
     /// RPL_LISTEND cannot pin the fast repaint rate forever.
     list_loading_since: Option<std::time::Instant>,
+    /// `logic` ticked every connection in this pass (the main window is
+    /// hidden), so a ui pass that follows must not tick them again.
+    logic_ticked: bool,
 }
 
 impl eframe::App for LinefeedApp {
@@ -459,7 +478,9 @@ impl eframe::App for LinefeedApp {
                 // Detached windows hide with the main window and are
                 // recreated from their saved geometry on restore.
                 self.app.tray_hidden = true;
-                self.app.background_tick(ctx);
+                if !self.logic_ticked {
+                    self.app.background_tick(ctx);
+                }
                 if systray::is_window_visible() {
                     systray::clear_hidden();
                     self.app.tray_hidden = false;
@@ -488,21 +509,16 @@ impl eframe::App for LinefeedApp {
                     }
                     systray::hide_window();
                     self.app.tray_hidden = true;
-                    self.app.background_tick(ctx);
+                    if !self.logic_ticked {
+                        self.app.background_tick(ctx);
+                    }
                     ctx.request_repaint_after(std::time::Duration::from_millis(250));
                     return;
                 }
             }
         }
 
-        // Check if window is minimized (cross-platform, including Linux)
-        let is_minimized = ctx.input(|i| i.viewport().minimized.unwrap_or(false));
-        if is_minimized {
-            // `logic` already ticked every connection this frame (it runs
-            // before `ui`, and alone while the window is minimized). The
-            // detached windows are not drawn, so egui closes them; they
-            // reopen where they were when the window is restored.
-            self.app.forget_detached_windows();
+        if self.hidden_ui(ctx) {
             return;
         }
 
@@ -627,6 +643,7 @@ mod tests {
             last_message_time: std::time::Instant::now(),
             window_size_ok: true,
             list_loading_since: None,
+            logic_ticked: false,
         }
     }
 
@@ -673,19 +690,106 @@ mod tests {
         assert!(!commands.contains(&egui::ViewportCommand::RequestPaintWhileHidden));
     }
 
-    #[test]
-    fn detached_windows_hide_with_a_minimized_window_without_forcing_a_paint() {
+    /// One eframe pass for a main window that is not visible: `logic`, then
+    /// the ui pass eframe runs because a detached window is on screen.
+    fn hidden_pass(
+        linefeed: &mut LinefeedApp,
+        ctx: &egui::Context,
+        root: egui::ViewportInfo,
+    ) -> Vec<String> {
+        let mut input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1024.0, 768.0),
+            )),
+            ..Default::default()
+        };
+        input.viewports.insert(egui::ViewportId::ROOT, root);
+        let mut output = ctx.run_ui(input, |ui| {
+            linefeed.hidden_logic(ui.ctx());
+            assert!(linefeed.hidden_ui(ui.ctx()), "drawn as a visible window");
+        });
+        output.textures_delta.clear();
+        let root = output.viewport_output.get(&egui::ViewportId::ROOT);
+        assert!(
+            root.is_none_or(|o| !o
+                .commands
+                .contains(&egui::ViewportCommand::RequestPaintWhileHidden)),
+            "a paint of the hidden main window was forced"
+        );
+        let mut texts = Vec::new();
+        fn collect(shape: &egui::Shape, out: &mut Vec<String>) {
+            match shape {
+                egui::Shape::Text(text) => out.push(text.galley.text().to_string()),
+                egui::Shape::Vec(shapes) => shapes.iter().for_each(|s| collect(s, out)),
+                _ => {}
+            }
+        }
+        for clipped in &output.shapes {
+            collect(&clipped.shape, &mut texts);
+        }
+        texts
+    }
+
+    /// A Linefeed with its status window detached and one server message
+    /// queued; returns the sender so the queue stays open.
+    fn detached_linefeed(
+        ctx: &egui::Context,
+    ) -> (LinefeedApp, tokio::sync::mpsc::Sender<irc::IrcMessage>) {
         let mut linefeed = hermetic_linefeed();
         linefeed.app.detach_status_window_for_tests();
         let (tx, rx) = tokio::sync::mpsc::channel(4);
         linefeed.app.sessions[0].msg_rx = Some(rx);
-        tx.try_send(irc::IrcMessage::parse(":srv NOTICE * :still live").unwrap())
-            .unwrap();
-        let ctx = egui::Context::default();
         // A normal frame first: the detached window's viewport exists.
         ctx.run_ui(egui::RawInput::default(), |ui| linefeed.app.ui(ui))
             .textures_delta
             .clear();
+        tx.try_send(irc::IrcMessage::parse(":srv NOTICE * :still live").unwrap())
+            .unwrap();
+        (linefeed, tx)
+    }
+
+    #[test]
+    fn detached_windows_keep_working_while_the_main_window_is_minimized() {
+        let ctx = egui::Context::default();
+        let (mut linefeed, _tx) = detached_linefeed(&ctx);
+        let texts = hidden_pass(
+            &mut linefeed,
+            &ctx,
+            egui::ViewportInfo {
+                minimized: Some(true),
+                ..Default::default()
+            },
+        );
+        // Connections tick, the detached window stays on screen and shows
+        // what just arrived (a bare egui context embeds viewports, so the
+        // detached window's contents appear in this output).
+        assert!(!linefeed.app.detached_windows_hidden());
+        assert!(texts.iter().any(|t| t.contains("still live")), "{texts:?}");
+    }
+
+    #[test]
+    fn a_covered_main_window_leaves_detached_windows_on_screen() {
+        let ctx = egui::Context::default();
+        let (mut linefeed, _tx) = detached_linefeed(&ctx);
+        let texts = hidden_pass(
+            &mut linefeed,
+            &ctx,
+            egui::ViewportInfo {
+                minimized: Some(false),
+                occluded: Some(true),
+                ..Default::default()
+            },
+        );
+        assert!(!linefeed.app.detached_windows_hidden());
+        assert!(texts.iter().any(|t| t.contains("still live")), "{texts:?}");
+    }
+
+    #[test]
+    fn detached_windows_go_to_the_tray_with_the_main_window() {
+        let ctx = egui::Context::default();
+        let (mut linefeed, _tx) = detached_linefeed(&ctx);
+        linefeed.app.tray_hidden = true;
         let mut input = egui::RawInput::default();
         input.viewports.insert(
             egui::ViewportId::ROOT,
@@ -694,23 +798,18 @@ mod tests {
                 ..Default::default()
             },
         );
-        let mut output = ctx.run_ui(input, |ui| linefeed.hidden_logic(ui.ctx()));
-        output.textures_delta.clear();
-        // Connections still tick...
+        ctx.run_ui(input, |ui| linefeed.hidden_logic(ui.ctx()))
+            .textures_delta
+            .clear();
+        // Connections still tick, and the detached window is hidden (the
+        // command itself is only visible under eframe).
         assert!(
             linefeed.app.sessions[0]
                 .server_messages
                 .iter()
                 .any(|m| m.content.contains("still live"))
         );
-        // ...the detached window is hidden (a bare egui context embeds
-        // viewports, so the command itself is only visible under eframe)...
         assert!(linefeed.app.detached_windows_hidden());
-        // ...and no paint of the minimized main window is forced.
-        let root = output.viewport_output.get(&egui::ViewportId::ROOT);
-        assert!(root.is_none_or(|o| !o
-            .commands
-            .contains(&egui::ViewportCommand::RequestPaintWhileHidden)));
     }
 
     #[test]
