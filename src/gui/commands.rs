@@ -1695,44 +1695,50 @@ impl IrcApp {
                     ));
                 } else {
                     let (subcmd, targets) = monitor_args(args);
-                    match subcmd.as_str() {
-                        "+" => {
-                            if let Some(targets) = &targets {
-                                for nick in targets.split(',').filter(|nick| !nick.is_empty()) {
-                                    self.monitored_users
-                                        .insert(self.network_support.canonicalize(nick));
-                                }
-                            }
-                        }
-                        "-" => {
-                            if let Some(targets) = &targets {
-                                for nick in targets.split(',') {
-                                    self.monitored_users
-                                        .remove(&self.network_support.canonicalize(nick));
-                                }
-                            }
-                        }
-                        "C" => self.monitored_users.clear(),
-                        _ => {}
-                    }
                     // MONITOR wins when both are advertised; WATCH is the
                     // legacy fallback. With no ISUPPORT yet, MONITOR is assumed.
-                    if self.network_support.has_isupport("MONITOR")
+                    let sent = if self.network_support.has_isupport("MONITOR")
                         || !self.network_support.has_isupport("WATCH")
                     {
-                        self.send_command(IrcCommand::Monitor(subcmd, targets));
+                        self.send_command(IrcCommand::Monitor(subcmd.clone(), targets.clone()))
                     } else {
-                        let wire = match targets {
+                        let wire = match &targets {
                             Some(targets) if subcmd == "+" || subcmd == "-" => targets
                                 .split(',')
                                 .filter(|nick| !nick.is_empty())
                                 .map(|nick| format!("{subcmd}{nick}"))
                                 .collect::<Vec<_>>()
                                 .join(" "),
-                            _ => subcmd,
+                            _ => subcmd.clone(),
                         };
-                        self.send_command(IrcCommand::Raw(format!("WATCH {wire}")));
+                        self.send_command(IrcCommand::Raw(format!("WATCH {wire}")))
+                    };
+                    // The tracked set mirrors what the server monitors, so it
+                    // changes only once the command was actually sent (#313).
+                    if sent {
+                        match subcmd.as_str() {
+                            "+" => {
+                                if let Some(targets) = &targets {
+                                    for nick in targets.split(',').filter(|nick| !nick.is_empty())
+                                    {
+                                        self.monitored_users
+                                            .insert(self.network_support.canonicalize(nick));
+                                    }
+                                }
+                            }
+                            "-" => {
+                                if let Some(targets) = &targets {
+                                    for nick in targets.split(',') {
+                                        self.monitored_users
+                                            .remove(&self.network_support.canonicalize(nick));
+                                    }
+                                }
+                            }
+                            "C" => self.monitored_users.clear(),
+                            _ => {}
+                        }
                     }
+                    self.report_send_failure(sent, "Not connected - monitor command not sent");
                 }
             }
 
@@ -3827,6 +3833,77 @@ mod tests {
         );
         app.process_command("/silence");
         assert_eq!(rx.try_recv().unwrap(), IrcCommand::Raw("SILENCE".into()));
+    }
+
+    #[test]
+    fn monitor_changes_local_state_only_when_the_command_was_sent() {
+        // Disconnected: no MONITOR reaches the wire, so nothing is tracked
+        // (#313), and the user is told why.
+        let mut app = IrcApp::with_settings(crate::gui::Settings {
+            logging_enabled: false,
+            ..crate::gui::Settings::default()
+        });
+        app.process_command("/monitor +alice");
+        assert!(app.monitored_users.is_empty(), "a phantom add was kept");
+        assert!(
+            app.server_messages
+                .back()
+                .is_some_and(|row| row.content.contains("Not connected")),
+            "{:?}",
+            app.server_messages.back()
+        );
+
+        // Connected: the add is tracked, the same way as before.
+        let (mut app, mut rx) = connected_command_app();
+        app.process_command("/monitor +alice,bob");
+        assert!(rx.try_recv().is_ok());
+        assert_eq!(app.monitored_users.len(), 2);
+
+        // A nick list too long for one line is refused: no add...
+        let long_list = (0..100)
+            .map(|index| format!("longnick{index:03}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        app.process_command(&format!("/monitor + {long_list}"));
+        assert!(rx.try_recv().is_err(), "an over-long line must not be sent");
+        assert_eq!(app.monitored_users.len(), 2, "a phantom add was kept");
+        // ...and no remove, so retention does not drop what the server still
+        // monitors.
+        app.process_command(&format!("/monitor - alice {long_list}"));
+        assert!(rx.try_recv().is_err());
+        assert_eq!(app.monitored_users.len(), 2, "a phantom remove was kept");
+
+        // Dropped connection: neither removing one nick nor clearing the
+        // list takes effect locally.
+        app.cmd_tx = None;
+        app.connected = false;
+        app.process_command("/monitor - alice");
+        app.process_command("/monitor C");
+        assert_eq!(app.monitored_users.len(), 2);
+
+        // Back online, remove and clear apply once they are sent.
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        app.cmd_tx = Some(tx);
+        app.connected = true;
+        app.process_command("/monitor - alice");
+        assert!(rx.try_recv().is_ok());
+        assert_eq!(app.monitored_users.len(), 1);
+        assert!(app.monitored_users.contains("bob"));
+        app.process_command("/monitor C");
+        assert!(rx.try_recv().is_ok());
+        assert!(app.monitored_users.is_empty());
+
+        // The legacy WATCH fallback gates local state the same way.
+        let (mut app, mut rx) = connected_command_app();
+        app.network_support
+            .isupport
+            .insert("WATCH".into(), Some("128".into()));
+        app.process_command("/monitor +alice");
+        assert!(rx.try_recv().is_ok());
+        assert_eq!(app.monitored_users.len(), 1);
+        app.cmd_tx = None;
+        app.process_command("/monitor - alice");
+        assert_eq!(app.monitored_users.len(), 1);
     }
 
     #[test]
