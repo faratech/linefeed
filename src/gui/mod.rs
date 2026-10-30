@@ -2342,6 +2342,20 @@ impl IrcApp {
                 }
             }
         }
+        // Catch-up (Append) rows are genuinely new to this client, so they
+        // count as unread and notify like the identical live message (#306).
+        // Only others' chat rows qualify; backlog pages (Prepend) are old by
+        // design and stay silent.
+        let arrivals: Vec<(String, String, bool)> =
+            if batch.request.placement == HistoryPlacement::Append {
+                messages
+                    .iter()
+                    .filter(|row| !row.is_system && !self.sender_is_self(&row.sender))
+                    .map(|row| (row.sender.clone(), row.content.clone(), row.is_highlight))
+                    .collect()
+            } else {
+                Vec::new()
+            };
         history.extend(messages.drain(..));
 
         if let Some(channel) = self.channels.get_mut(&key) {
@@ -2355,11 +2369,47 @@ impl IrcApp {
                 channel.messages.pop_front();
             }
         }
+        if !arrivals.is_empty() {
+            if !(self.window_focused && self.current_target_is(&batch.target))
+                && let Some(channel) = self.channels.get_mut(&key)
+            {
+                channel.unread = channel.unread.saturating_add(arrivals.len());
+            }
+            self.notify_history_arrivals(&batch.target, &arrivals);
+        }
         if let Some((command, request)) = next {
             self.queue_history_request(&batch.target, command, request);
         } else if self.current_target_is(&batch.target) && self.window_focused {
             self.mark_target_read(&batch.target);
         }
+    }
+
+    /// One desktop notification for a catch-up page, whatever its size: a
+    /// reconnect can deliver dozens of missed messages at once. A query tab
+    /// notifies (forced, like a live PM) for any arrival; a channel only for
+    /// mentions. `arrivals` holds (sender, content, is_highlight) per new
+    /// chat row, oldest first.
+    fn notify_history_arrivals(&mut self, target: &str, arrivals: &[(String, String, bool)]) {
+        if !self.is_channel_name(target) {
+            let Some((sender, content, _)) = arrivals.last() else {
+                return;
+            };
+            let title = match arrivals.len() {
+                1 => format!("PM from {sender}"),
+                count => format!("{count} new messages from {target}"),
+            };
+            self.send_notification(&title, &truncate_chars(content, 50), true);
+            return;
+        }
+        let mentions: Vec<_> = arrivals.iter().filter(|(_, _, mention)| *mention).collect();
+        let Some((sender, content, _)) = mentions.last() else {
+            return;
+        };
+        let title = match mentions.len() {
+            1 => format!("{sender} mentioned you in {target}"),
+            count => format!("{count} mentions in {target}"),
+        };
+        self.send_notification(&title, &truncate_chars(content, 50), false);
     }
 
     /// Clamp a QUIT reason so the resulting line always fits in one IRC line.
@@ -12647,5 +12697,158 @@ mod tests {
 
         app.set_window_focused(true);
         assert_eq!(app.server_unread, 0);
+    }
+
+    /// A connected app with chathistory negotiated and a retained query tab
+    /// ("alice") plus a channel the user is reading ("#room"), after a
+    /// reconnect whose registration just requested catch-up for the query.
+    fn reconnected_app_reading_a_channel() -> (IrcApp, mpsc::UnboundedReceiver<IrcCommand>) {
+        let (mut app, mut rx) = test_app_connected();
+        app.set_session_nick("mynick".into(), true);
+        app.logging_load_history = true;
+        app.set_invisible = false;
+        app.notifications_enabled = true;
+        app.handle_incoming_message(
+            IrcMessage::parse(":srv CAP me ACK :draft/chathistory").unwrap(),
+        );
+        let mut query = Channel::new();
+        query.messages.push_back(
+            ChatMessage::new_fmt("alice", "last message", "short").with_irc_metadata(
+                Some("2026-09-12T12:00:00.000Z".into()),
+                Some("query-last".into()),
+                None,
+            ),
+        );
+        app.channels.insert("alice".into(), query);
+        let mut room = Channel::new();
+        room.joined = true;
+        app.channels.insert("#room".into(), room);
+        app.current_channel = Some("#room".into());
+        app.handle_numeric(RPL_WELCOME, &["mynick".into(), "welcome".into()]);
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            IrcCommand::ChathistoryAfter("alice".into(), "msgid=query-last".into(), 100)
+        );
+        (app, rx)
+    }
+
+    #[test]
+    fn reconnect_catch_up_raises_unread_and_notifies_for_new_private_messages() {
+        let (mut app, _rx) = reconnected_app_reading_a_channel();
+        app.window_focused = true;
+
+        app.handle_incoming_message(IrcMessage::parse(":srv BATCH +h chathistory alice").unwrap());
+        for (n, line) in [(1, "are you there?"), (2, "hello?")] {
+            app.handle_incoming_message(
+                IrcMessage::parse(&format!(
+                    "@batch=h;time=2026-09-12T12:0{n}:00.000Z;msgid=n{n} :alice!u@h PRIVMSG mynick :{line}"
+                ))
+                .unwrap(),
+            );
+        }
+        // Our own line sent from another client is catch-up too, but never
+        // counts as unread.
+        app.handle_incoming_message(
+            IrcMessage::parse(
+                "@batch=h;time=2026-09-12T12:03:00.000Z;msgid=n3 :mynick!u@h PRIVMSG alice :on my way",
+            )
+            .unwrap(),
+        );
+        app.handle_incoming_message(IrcMessage::parse(":srv BATCH -h").unwrap());
+
+        let alice = &app.channels["alice"];
+        assert_eq!(alice.messages.back().unwrap().content, "on my way");
+        assert_eq!(alice.unread, 2, "#306: catch-up PMs left no unread badge");
+        assert_eq!(app.dispatched_notifications.len(), 1, "#306: no notification");
+        assert_eq!(app.dispatched_notifications[0].0, "2 new messages from alice");
+        assert_eq!(app.dispatched_notifications[0].1, "hello?");
+    }
+
+    #[test]
+    fn catch_up_in_the_selected_focused_tab_is_already_seen() {
+        let (mut app, _rx) = reconnected_app_reading_a_channel();
+        app.current_channel = Some("alice".into());
+        app.window_focused = true;
+
+        app.handle_incoming_message(IrcMessage::parse(":srv BATCH +h chathistory alice").unwrap());
+        app.handle_incoming_message(
+            IrcMessage::parse(
+                "@batch=h;time=2026-09-12T12:01:00.000Z;msgid=n1 :alice!u@h PRIVMSG mynick :hi",
+            )
+            .unwrap(),
+        );
+        app.handle_incoming_message(IrcMessage::parse(":srv BATCH -h").unwrap());
+
+        assert_eq!(app.channels["alice"].unread, 0);
+    }
+
+    #[test]
+    fn channel_catch_up_notifies_only_for_mentions_and_old_backlog_stays_silent() {
+        let (mut app, mut rx) = reconnected_app_reading_a_channel();
+        app.window_focused = false;
+        app.current_channel = Some("alice".into());
+
+        // Retained channel rejoin: Append catch-up after the last known msgid.
+        app.channels
+            .get_mut("#room")
+            .unwrap()
+            .messages
+            .push_back(
+                ChatMessage::new_fmt("bob", "earlier", "short").with_irc_metadata(
+                    Some("2026-09-12T11:00:00.000Z".into()),
+                    Some("room-last".into()),
+                    None,
+                ),
+            );
+        while rx.try_recv().is_ok() {}
+        assert!(app.request_latest_history("#room", None, HistoryPlacement::Append));
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(IrcCommand::ChathistoryAfter(target, _, _)) if target == "#room"
+        ));
+        app.handle_incoming_message(IrcMessage::parse(":srv BATCH +c chathistory #room").unwrap());
+        for (n, line) in [(1, "chatter"), (2, "nothing to see here")] {
+            app.handle_incoming_message(
+                IrcMessage::parse(&format!(
+                    "@batch=c;time=2026-09-12T12:0{n}:00.000Z;msgid=c{n} :bob!u@h PRIVMSG #room :{line}"
+                ))
+                .unwrap(),
+            );
+        }
+        app.handle_incoming_message(IrcMessage::parse(":srv BATCH -c").unwrap());
+        assert_eq!(app.channels["#room"].unread, 2);
+        assert!(
+            app.dispatched_notifications.is_empty(),
+            "no mention, no notification: {:?}",
+            app.dispatched_notifications
+        );
+
+        app.handle_incoming_message(IrcMessage::parse(":mynick!u@h JOIN #fresh").unwrap());
+        app.handle_incoming_message(IrcMessage::parse(":srv BATCH +p chathistory #fresh").unwrap());
+        app.handle_incoming_message(
+            IrcMessage::parse(
+                "@batch=p;time=2026-09-12T10:00:00.000Z;msgid=p1 :bob!u@h PRIVMSG #fresh :mynick mynick",
+            )
+            .unwrap(),
+        );
+        app.handle_incoming_message(IrcMessage::parse(":srv BATCH -p").unwrap());
+        assert!(
+            app.dispatched_notifications.is_empty(),
+            "old backlog (Prepend) never notifies"
+        );
+
+        // A mention inside the Append page does.
+        app.last_notification_time = None;
+        assert!(app.request_latest_history("#room", None, HistoryPlacement::Append));
+        app.handle_incoming_message(IrcMessage::parse(":srv BATCH +d chathistory #room").unwrap());
+        app.handle_incoming_message(
+            IrcMessage::parse(
+                "@batch=d;time=2026-09-12T12:05:00.000Z;msgid=d1 :bob!u@h PRIVMSG #room :hey mynick, ping",
+            )
+            .unwrap(),
+        );
+        app.handle_incoming_message(IrcMessage::parse(":srv BATCH -d").unwrap());
+        assert_eq!(app.dispatched_notifications.len(), 1);
+        assert_eq!(app.dispatched_notifications[0].0, "bob mentioned you in #room");
     }
 }
