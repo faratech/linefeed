@@ -346,6 +346,11 @@ fn sweep_orphans(paths: &Paths) {
             // alone proves nothing (#326).
             if abandoned(paths, &path) {
                 remove_tombstone(&path);
+            } else {
+                // The leftover of a removal that finished the claim but not
+                // the directory. Non-recursive: it only ever removes an empty
+                // directory, which needs no proof of ownership.
+                let _ = fs::remove_dir(&path);
             }
         } else if is_directory
             && is_staging
@@ -1807,8 +1812,7 @@ mod tests {
             std::os::unix::fs::symlink(&outside, &link).unwrap();
             (outside, link)
         };
-        sweep_orphans(paths);
-        assert!(!tombstone.exists());
+        assert!(swept_eventually(paths, &tombstone));
         assert!(unrelated.exists());
         #[cfg(unix)]
         {
@@ -1851,6 +1855,32 @@ mod tests {
         assert!(swept_eventually(paths, &own_tombstone));
         assert!(unclaimed.join("important.txt").exists());
         assert!(foreign_tombstone.join(CLAIM).exists());
+    }
+    #[test]
+    fn sweep_removes_an_emptied_deleting_directory_whose_claim_is_already_gone() {
+        // The claim is deleted last; if the process died or the directory
+        // removal failed right after (an antivirus handle on Windows), an empty
+        // claimless tombstone remains and would never prove ownership. Removing
+        // an empty directory needs no proof, and removes nothing but itself.
+        let fixture = Fixture::new();
+        let paths = &fixture.tx.paths;
+        let parent = paths.target.parent().unwrap();
+        let tombstone = |attempt: &str| parent.join(format!(".linefeed-update-{attempt}.deleting"));
+        let emptied = tombstone(&nonce().unwrap());
+        fs::create_dir(&emptied).unwrap();
+        // Anything left in a claimless one still says it is not ours to delete.
+        let occupied = tombstone(&nonce().unwrap());
+        fs::create_dir(&occupied).unwrap();
+        fs::write(occupied.join("notes.txt"), b"user data").unwrap();
+        // Nor is a non-empty directory with a similar name, or an empty
+        // directory that is not a tombstone at all.
+        let unrelated = parent.join(".linefeed-update-notes");
+        fs::create_dir(&unrelated).unwrap();
+
+        sweep_orphans(paths);
+        assert!(!emptied.exists());
+        assert!(occupied.join("notes.txt").exists());
+        assert!(unrelated.exists());
     }
     #[test]
     fn tombstone_removal_deletes_the_claim_last_and_only_when_nothing_else_remains() {
