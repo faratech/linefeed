@@ -121,6 +121,20 @@ struct MultilineBatch {
 /// the connection lives (the multiline batches are capped alike, #191).
 const MAX_AUTHTOKEN_BYTES: usize = 8192;
 
+/// Rate limit for desktop notifications: each one spawns an OS thread (and on
+/// Linux/macOS a subprocess), so a netsplit replay or highlight flood must not
+/// spawn one per message.
+const MIN_NOTIFICATION_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// A forced (private message) notification held back by the rate limiter.
+/// Further ones arriving meanwhile are folded into it, so nothing is dropped
+/// and the OS still sees at most one helper per interval (#323).
+struct DeferredNotification {
+    title: String,
+    body: String,
+    count: usize,
+}
+
 struct AuthtokenBatch {
     service: String,
     token: String,
@@ -533,6 +547,10 @@ pub struct IrcApp {
     // Rate limiting for desktop notifications (each one spawns a thread and,
     // on Linux/macOS, a subprocess - a flood must not spawn one per message).
     last_notification_time: Option<std::time::Instant>,
+    /// Rate-limit clock for forced (private message) notifications, kept apart
+    /// from `last_notification_time` so a highlight never mutes a PM (#323).
+    last_forced_notification_time: Option<std::time::Instant>,
+    deferred_notification: Option<DeferredNotification>,
     /// Notifications that would have reached the OS (tests only).
     #[cfg(test)]
     dispatched_notifications: Vec<(String, String)>,
@@ -754,6 +772,8 @@ impl IrcApp {
             // CPU optimization
             had_messages_this_frame: false,
             last_notification_time: None,
+            last_forced_notification_time: None,
+            deferred_notification: None,
             #[cfg(test)]
             dispatched_notifications: Vec::new(),
             nick_retry_attempts: 0,
@@ -977,6 +997,8 @@ impl IrcApp {
     /// lag ping. Called from `ui()` and from `update_minimal()`, which is all
     /// that runs while minimized or hidden to the tray (#237).
     fn run_timed_tasks(&mut self) {
+        self.flush_deferred_notification();
+
         // Execute pending auto-perform commands (one per frame to avoid flooding)
         if let Some(ref mut commands) = self.pending_auto_perform.take()
             && let Some(cmd) = commands.first().cloned()
@@ -1047,6 +1069,37 @@ impl IrcApp {
         }
     }
 
+    /// Deliver the forced notification the rate limiter held back, once its
+    /// interval has passed. Several held messages go out as one summary.
+    fn flush_deferred_notification(&mut self) {
+        if self.deferred_notification.is_none() {
+            return;
+        }
+        if !self.notifications_enabled {
+            self.deferred_notification = None;
+            return;
+        }
+        if self
+            .last_forced_notification_time
+            .is_some_and(|last| last.elapsed() < MIN_NOTIFICATION_INTERVAL)
+        {
+            return;
+        }
+        let Some(held) = self.deferred_notification.take() else {
+            return;
+        };
+        let (title, body) = if held.count > 1 {
+            (
+                format!("{} new private messages", held.count),
+                format!("{}: {}", held.title, held.body),
+            )
+        } else {
+            (held.title, held.body)
+        };
+        self.last_forced_notification_time = Some(std::time::Instant::now());
+        self.dispatch_notification(&title, &body);
+    }
+
     /// Send a desktop notification
     pub fn send_notification(&mut self, title: &str, body: &str, force: bool) {
         // Title only, at debug: the body is message text, which must not reach
@@ -1064,17 +1117,41 @@ impl IrcApp {
             return;
         }
 
-        // Rate-limit: each notification spawns an OS thread (and on Linux/macOS a
-        // subprocess), so a netsplit replay or highlight flood must not spawn one
-        // per message.
-        const MIN_NOTIFICATION_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
-        if let Some(last) = self.last_notification_time
-            && last.elapsed() < MIN_NOTIFICATION_INTERVAL
-        {
-            tracing::debug!("Notification rate-limited");
-            return;
+        if force {
+            // Private messages are never dropped, only paced: inside the
+            // interval they are held and folded together, then delivered by
+            // the next timed tick. Their clock is separate from the highlight
+            // one, so a highlight cannot mute a PM (#323).
+            self.flush_deferred_notification();
+            if self
+                .last_forced_notification_time
+                .is_some_and(|last| last.elapsed() < MIN_NOTIFICATION_INTERVAL)
+            {
+                tracing::debug!("Private-message notification held back by the rate limit");
+                let held = self
+                    .deferred_notification
+                    .get_or_insert_with(|| DeferredNotification {
+                        title: String::new(),
+                        body: String::new(),
+                        count: 0,
+                    });
+                held.title = title.to_string();
+                held.body = body.to_string();
+                held.count += 1;
+                return;
+            }
+            self.last_forced_notification_time = Some(std::time::Instant::now());
+        } else {
+            // Highlights, kicks and invites are best-effort: a flood inside
+            // the interval is dropped.
+            if let Some(last) = self.last_notification_time
+                && last.elapsed() < MIN_NOTIFICATION_INTERVAL
+            {
+                tracing::debug!("Notification rate-limited");
+                return;
+            }
+            self.last_notification_time = Some(std::time::Instant::now());
         }
-        self.last_notification_time = Some(std::time::Instant::now());
         self.dispatch_notification(title, body);
     }
 
@@ -13012,5 +13089,137 @@ mod tests {
             .filter(|row| row.content == "ok")
             .count();
         assert_eq!(ok_rows, 2);
+    }
+
+
+    /// An app that will pass the enabled/focus gates for non-forced
+    /// notifications too (window in the background).
+    fn notifying_app() -> IrcApp {
+        let mut app = test_app();
+        app.notifications_enabled = true;
+        app.window_focused = false;
+        app
+    }
+
+    /// Pretend the rate-limit interval has elapsed for forced notifications.
+    fn age_forced_notification_clock(app: &mut IrcApp) {
+        app.last_forced_notification_time = std::time::Instant::now()
+            .checked_sub(std::time::Duration::from_secs(3));
+    }
+
+    #[test]
+    fn a_private_message_notification_is_not_muted_by_a_recent_highlight() {
+        let mut app = notifying_app();
+
+        app.send_notification("bob mentioned you in #room", "hey", false);
+        app.send_notification("PM from alice", "psst", true);
+
+        let titles: Vec<&str> = app
+            .dispatched_notifications
+            .iter()
+            .map(|(title, _)| title.as_str())
+            .collect();
+        assert_eq!(titles, ["bob mentioned you in #room", "PM from alice"]);
+    }
+
+    #[test]
+    fn a_highlight_notification_is_not_muted_by_a_recent_private_message() {
+        let mut app = notifying_app();
+
+        app.send_notification("PM from alice", "psst", true);
+        app.send_notification("bob mentioned you in #room", "hey", false);
+
+        assert_eq!(app.dispatched_notifications.len(), 2);
+    }
+
+    #[test]
+    fn private_messages_inside_the_interval_are_coalesced_not_dropped() {
+        let mut app = notifying_app();
+
+        app.send_notification("PM from alice", "one", true);
+        for body in ["two", "three", "four"] {
+            app.send_notification("PM from bob", body, true);
+        }
+        // Rate limited, so no OS helper per message...
+        assert_eq!(app.dispatched_notifications.len(), 1);
+
+        // ...but nothing is lost: once the interval passes the next tick
+        // delivers one summary of everything held back.
+        app.run_timed_tasks();
+        assert_eq!(
+            app.dispatched_notifications.len(),
+            1,
+            "interval has not elapsed yet"
+        );
+        age_forced_notification_clock(&mut app);
+        app.run_timed_tasks();
+        assert_eq!(app.dispatched_notifications.len(), 2);
+        let (title, body) = &app.dispatched_notifications[1];
+        assert_eq!(title, "3 new private messages");
+        assert!(body.contains("PM from bob") && body.contains("four"), "{body}");
+
+        // Delivered once only.
+        age_forced_notification_clock(&mut app);
+        app.run_timed_tasks();
+        assert_eq!(app.dispatched_notifications.len(), 2);
+    }
+
+    #[test]
+    fn a_single_held_back_private_message_is_delivered_unchanged() {
+        let mut app = notifying_app();
+
+        app.send_notification("PM from alice", "first", true);
+        app.send_notification("PM from bob", "second", true);
+        assert_eq!(app.dispatched_notifications.len(), 1);
+
+        age_forced_notification_clock(&mut app);
+        app.run_timed_tasks();
+
+        assert_eq!(
+            app.dispatched_notifications[1],
+            ("PM from bob".to_string(), "second".to_string())
+        );
+    }
+
+    #[test]
+    fn a_new_private_message_after_the_interval_dispatches_the_held_one_first() {
+        let mut app = notifying_app();
+
+        app.send_notification("PM from alice", "first", true);
+        app.send_notification("PM from bob", "second", true);
+        age_forced_notification_clock(&mut app);
+        // No tick ran in between: the held message must not be overtaken.
+        app.send_notification("PM from carol", "third", true);
+
+        let titles: Vec<&str> = app
+            .dispatched_notifications
+            .iter()
+            .map(|(title, _)| title.as_str())
+            .collect();
+        assert_eq!(titles, ["PM from alice", "PM from bob"]);
+        age_forced_notification_clock(&mut app);
+        app.run_timed_tasks();
+        assert_eq!(app.dispatched_notifications.len(), 3);
+        assert_eq!(app.dispatched_notifications[2].0, "PM from carol");
+    }
+
+    #[test]
+    fn highlight_floods_are_still_rate_limited_and_disabled_notifications_drop_held_ones() {
+        let mut app = notifying_app();
+        for n in 0..5 {
+            app.send_notification("bob mentioned you in #room", &format!("hey {n}"), false);
+        }
+        assert_eq!(app.dispatched_notifications.len(), 1);
+
+        app.send_notification("PM from alice", "first", true);
+        app.send_notification("PM from alice", "second", true);
+        app.notifications_enabled = false;
+        age_forced_notification_clock(&mut app);
+        app.run_timed_tasks();
+        assert_eq!(
+            app.dispatched_notifications.len(),
+            2,
+            "a notification held back must not appear after they were turned off"
+        );
     }
 }
