@@ -356,6 +356,7 @@ impl WindowManager {
             active,
             windows,
             area: self.area.map(rect_to_array),
+            auto_connect: Vec::new(),
         }
     }
 }
@@ -451,6 +452,10 @@ pub(crate) struct LayoutFile {
     pub windows: Vec<SavedWindow>,
     /// The chat area the floating windows were laid out in.
     pub area: Option<[f32; 4]>,
+    /// A copy of which favorites connect at startup, by
+    /// `derived_profile_id`. An older version that rewrites settings.json
+    /// drops their `auto_connect` (and `id`); it comes back from here.
+    pub auto_connect: Vec<String>,
 }
 
 impl LayoutFile {

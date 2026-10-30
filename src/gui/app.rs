@@ -191,6 +191,10 @@ impl App {
                 if ids.contains(&favorite.id) {
                     // A duplicate favorite: ids must stay distinct.
                     favorite.id = super::new_profile_id();
+                } else if layout.auto_connect.contains(&favorite.id) {
+                    // Rewritten by an older version, which dropped the tick
+                    // with the id.
+                    favorite.auto_connect = true;
                 }
             }
             ids.insert(favorite.id.clone());
@@ -384,7 +388,23 @@ impl App {
         self.store_settings();
     }
 
+    /// What layout.json holds: the window layout, and the copy of which
+    /// favorites connect at startup.
+    pub(crate) fn layout_file(&self) -> LayoutFile {
+        let mut layout = self.windows.layout();
+        layout.auto_connect = self
+            .settings
+            .server_favorites
+            .iter()
+            .filter(|f| f.auto_connect)
+            .map(|f| super::derived_profile_id(&f.name, &f.host, &f.port))
+            .collect();
+        layout
+    }
+
     fn store_settings(&mut self) {
+        // layout.json keeps a copy of the auto-connect ticks.
+        self.windows.dirty = true;
         if !self.settings_writable {
             tracing::warn!("Not saving settings: settings.json could not be read at startup");
             return;
@@ -989,7 +1009,7 @@ impl App {
         {
             self.layout_dirty_since = None;
             if self.persist_layout {
-                self.windows.layout().save();
+                self.layout_file().save();
             }
         }
     }
@@ -2019,7 +2039,7 @@ impl App {
     /// Before an update restart or exit: save, and send QUIT everywhere.
     pub fn prepare_update_shutdown(&mut self) {
         if self.persist_layout {
-            self.windows.layout().save();
+            self.layout_file().save();
         }
         if !self.sessions.is_empty() {
             let active = self.active_index();
@@ -3124,6 +3144,58 @@ mod tests {
     }
 
     #[test]
+    fn auto_connect_ticks_come_back_after_0_1_4_rewrote_settings() {
+        let favorite = |name: &str, host: &str, auto: bool| ServerFavorite {
+            name: name.into(),
+            host: host.into(),
+            port: "6697".into(),
+            use_tls: true,
+            auto_connect: auto,
+            ..ServerFavorite::default()
+        };
+        // This version ticked Libera; layout.json keeps a copy.
+        let mut settings = test_settings();
+        settings.server_favorites = vec![
+            favorite("Libera", "irc.libera.chat", true),
+            favorite("OFTC", "irc.oftc.net", false),
+        ];
+        let layout = App::with_settings(settings.clone(), LayoutFile::default()).layout_file();
+        assert_eq!(
+            layout.auto_connect,
+            [crate::gui::derived_profile_id(
+                "Libera",
+                "irc.libera.chat",
+                "6697"
+            )]
+        );
+        let layout: LayoutFile =
+            serde_json::from_str(&serde_json::to_string(&layout).unwrap()).unwrap();
+
+        // 0.1.4 saved settings.json without `id` and `auto_connect`.
+        let mut rewritten = settings.clone();
+        for f in &mut rewritten.server_favorites {
+            f.id.clear();
+            f.auto_connect = false;
+        }
+        let app = App::with_settings(rewritten, layout.clone());
+        let ticks: Vec<bool> = app
+            .settings
+            .server_favorites
+            .iter()
+            .map(|f| f.auto_connect)
+            .collect();
+        assert_eq!(ticks, [true, false]);
+
+        // A favorite this version saved (it has its id) keeps its own tick.
+        let mut untick = App::with_settings(settings, LayoutFile::default())
+            .settings
+            .clone();
+        untick.server_favorites[0].auto_connect = false;
+        let app = App::with_settings(untick, layout);
+        assert!(!app.settings.server_favorites[0].auto_connect);
+    }
+
+    #[test]
     fn settings_from_0_1_4_load_and_new_fields_default() {
         let old = r##"{"server_favorites":[{"name":"Libera","host":"irc.libera.chat",
             "port":"6697","use_tls":true,"password":"","nickname":"",
@@ -3952,6 +4024,53 @@ mod tests {
         assert_eq!(app.confirm_disconnect, Some(status.conn));
         assert!(app.windows.get(&status).unwrap().detached);
         assert_eq!(app.global_dialog_window(), Some(status));
+    }
+
+    #[test]
+    fn the_caption_close_button_parts_a_channel_and_tile_still_fills_the_area() {
+        let (mut app, mut rx_a, _rx_b) = two_networks();
+        let ctx = egui::Context::default();
+        let mut time = floating_windows(&mut app, &ctx);
+        app.tile_request = Some(TileRequest::Tile);
+        for _ in 0..3 {
+            pointer_frame(&mut app, &ctx, time, vec![]);
+            time += 0.05;
+        }
+        // Tiled: every attached window in its own cell inside the area.
+        let area = app.windows.area.unwrap();
+        let rects: Vec<egui::Rect> = app
+            .windows
+            .windows
+            .iter()
+            .map(|w| w.child_rect.unwrap())
+            .collect();
+        for (i, a) in rects.iter().enumerate() {
+            assert!(area.expand(1.0).contains_rect(*a), "{a:?} outside {area:?}");
+            for b in &rects[i + 1..] {
+                assert!(
+                    !a.shrink(1.0).intersects(b.shrink(1.0)),
+                    "{a:?} overlaps {b:?}"
+                );
+            }
+        }
+
+        drain(&mut rx_a);
+        let rust = WindowKey::new(app.sessions[0].id, Some("#rust".into()));
+        let close = ctx
+            .read_response(snap::close_button_id(&rust))
+            .unwrap()
+            .rect
+            .center();
+        for events in [
+            vec![egui::Event::PointerMoved(close)],
+            vec![primary(close, true)],
+            vec![primary(close, false)],
+            vec![],
+        ] {
+            pointer_frame(&mut app, &ctx, time, events);
+            time += 0.05;
+        }
+        assert_eq!(drain(&mut rx_a), ["PART #rust"]);
     }
 
     #[test]

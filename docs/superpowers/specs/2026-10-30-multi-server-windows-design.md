@@ -281,6 +281,12 @@ Recorded after building it, so the design and the code agree.
   a synchronous `ShowWindow` or `GetWindowTextW` on our own window from
   inside eframe's event-loop callback deadlocks, which was what had looked
   like a hang in painting a minimized window.
+- **Downgrades.** 0.1.4 reads settings written by this version but drops
+  the fields it does not know when it saves. A favorite without an id gets
+  one derived from its name, host and port (`derived_profile_id`), so its
+  window placements in layout.json survive a downgrade and upgrade, and
+  layout.json (which 0.1.4 never touches) keeps a copy of the auto-connect
+  ticks by that id, restored for favorites that come back without one.
 - **Snap layouts** (added after the plan, `snap.rs`): floating windows draw
   their own caption, so a drag can be followed for edge snaps and the
   Windows 11 layout bar; the maximize button opens the layout flyout, and
