@@ -4,6 +4,8 @@ Automatic Cargo dependency updater.
 Checks for outdated dependencies and updates Cargo.toml to latest versions.
 """
 
+import contextlib
+import io
 import subprocess
 import re
 import sys
@@ -95,9 +97,9 @@ def _fallback_parse_deps(content: str) -> dict[str, dict]:
         if not is_dep_section or not stripped or stripped.startswith("#"):
             continue
         if subdep is not None:
-            m = re.match(r"""\s*version\s*=\s*"([^"]+)\"""", raw)
+            m = re.match(r"""\s*version\s*=\s*(?:"([^"]+)"|'([^']+)')""", raw)
             if m:
-                _record_dep(deps, subdep, m.group(1), raw)
+                _record_dep(deps, subdep, m.group(1) or m.group(2), raw)
             continue
         # Accumulate multi-line inline table / array values.
         entry = raw
@@ -106,7 +108,7 @@ def _fallback_parse_deps(content: str) -> dict[str, dict]:
             entry += "\n" + lines[i]
             i += 1
         m = re.match(
-            r"""\s*(?:"([^"]+)"|'([^']+)'|([A-Za-z0-9_-]+))\s*=\s*(?:"([^"]+)"|\{(.*)\})\s*(?:#.*)?$""",
+            r"""\s*(?:"([^"]+)"|'([^']+)'|([A-Za-z0-9_-]+))\s*=\s*(?:"([^"]+)"|'([^']+)'|\{(.*)\})\s*(?:#.*)?$""",
             entry,
             re.DOTALL,
         )
@@ -118,10 +120,10 @@ def _fallback_parse_deps(content: str) -> dict[str, dict]:
             )
             continue
         name = m.group(1) or m.group(2) or m.group(3)
-        version = m.group(4)
-        if version is None and m.group(5) is not None:
-            vm = re.search(r"""version\s*=\s*"([^"]+)\"""", m.group(5))
-            version = vm.group(1) if vm else None
+        version = m.group(4) or m.group(5)
+        if version is None and m.group(6) is not None:
+            vm = re.search(r"""version\s*=\s*(?:"([^"]+)"|'([^']+)')""", m.group(6))
+            version = (vm.group(1) or vm.group(2)) if vm else None
         if version is None:
             print(
                 f"Warning: skipping unparsed dependency '{name}' in "
@@ -130,6 +132,22 @@ def _fallback_parse_deps(content: str) -> dict[str, dict]:
             )
             continue
         _record_dep(deps, name, version, entry.strip().splitlines()[0])
+    return deps
+
+
+def _deps_from_toml(data: dict) -> dict[str, dict]:
+    deps: dict[str, dict] = {}
+    for section in ("dependencies", "dev-dependencies", "build-dependencies"):
+        _collect_deps(deps, data.get(section), section)
+    workspace = data.get("workspace")
+    if isinstance(workspace, dict):
+        _collect_deps(deps, workspace.get("dependencies"), "workspace.dependencies")
+    target = data.get("target")
+    if isinstance(target, dict):
+        for cfg, table in target.items():
+            if isinstance(table, dict):
+                for section in ("dependencies", "dev-dependencies", "build-dependencies"):
+                    _collect_deps(deps, table.get(section), f"target.{cfg}.{section}")
     return deps
 
 
@@ -158,19 +176,18 @@ def get_outdated_deps() -> dict[str, dict]:
         )
         return _fallback_parse_deps(content)
 
-    deps: dict[str, dict] = {}
-    for section in ("dependencies", "dev-dependencies", "build-dependencies"):
-        _collect_deps(deps, data.get(section), section)
-    workspace = data.get("workspace")
-    if isinstance(workspace, dict):
-        _collect_deps(deps, workspace.get("dependencies"), "workspace.dependencies")
-    target = data.get("target")
-    if isinstance(target, dict):
-        for cfg, table in target.items():
-            if isinstance(table, dict):
-                for section in ("dependencies", "dev-dependencies", "build-dependencies"):
-                    _collect_deps(deps, table.get(section), f"target.{cfg}.{section}")
-    return deps
+    return _deps_from_toml(data)
+
+
+def _parse_dep_specs(content: str) -> dict[str, dict]:
+    """Parse manifest text with tomllib, else the line parser; stays silent."""
+    with contextlib.redirect_stderr(io.StringIO()):
+        if tomllib is not None:
+            try:
+                return _deps_from_toml(tomllib.loads(content))
+            except Exception:
+                pass
+        return _fallback_parse_deps(content)
 
 
 def get_latest_version(crate_name: str) -> str | None:
@@ -304,7 +321,8 @@ def _rewrite_crate_versions(
 
     Handles every form the parsers accept: ``crate = "1"``,
     ``crate = { version = "1", ... }``, ``crate.version = "1"`` and
-    ``[dependencies.crate]`` tables with a ``version = "1"`` line.
+    ``[dependencies.crate]`` tables with a ``version = "1"`` line, each with
+    basic ("1") or literal ('1') strings; the quote style is preserved.
     When ``only`` is given, just specs whose current text is in it are
     rewritten; other specs of the same crate (e.g. a deliberately held
     build-dependency) are left alone.
@@ -318,24 +336,25 @@ def _rewrite_crate_versions(
     def sub(pattern: str, text: str) -> str:
         def repl(m: re.Match) -> str:
             nonlocal count
-            if not wanted(m.group(3)):
+            if not wanted(m.group(4)):
                 return m.group(0)
             count += 1
-            return f'{m.group(1)}{m.group(2)}"{new_version}"'
+            quote = m.group(3)
+            return f'{m.group(1)}{m.group(2)}{quote}{new_version}{quote}'
 
         return re.sub(pattern, repl, text)
 
     # Use word boundary (^|\n) to avoid matching 'rustls' in 'tokio-rustls'
     # Simple: crate = "1.0" (also indented / quoted-key forms)
-    content = sub(rf'(^|\n)([ \t]*["\']?{name}["\']?\s*=\s*)"([^"]+)"', content)
+    content = sub(rf'(^|\n)([ \t]*["\']?{name}["\']?\s*=\s*)(["\'])([^"\'\n]+)\3', content)
     # Complex: crate = { version = "1.0", ... } (may span lines)
     content = sub(
-        rf'(^|\n)([ \t]*["\']?{name}["\']?\s*=\s*\{{[^}}]*?version\s*=\s*)"([^"]+)"',
+        rf'(^|\n)([ \t]*["\']?{name}["\']?\s*=\s*\{{[^}}]*?version\s*=\s*)(["\'])([^"\'\n]+)\3',
         content,
     )
     # Dotted key: crate.version = "1.0"
     content = sub(
-        rf'(^|\n)([ \t]*["\']?{name}["\']?[ \t]*\.[ \t]*version[ \t]*=[ \t]*)"([^"]+)"',
+        rf'(^|\n)([ \t]*["\']?{name}["\']?[ \t]*\.[ \t]*version[ \t]*=[ \t]*)(["\'])([^"\'\n]+)\3',
         content,
     )
 
@@ -345,7 +364,7 @@ def _rewrite_crate_versions(
         r"(?:dependencies|dev-dependencies|build-dependencies)"
         rf"\.(?:\"{name}\"|'{name}'|{name})[ \t]*\]"
     )
-    version_line = re.compile(r'([ \t]*version[ \t]*=[ \t]*)"([^"]+)"')
+    version_line = re.compile(r'([ \t]*version[ \t]*=[ \t]*)(["\'])([^"\'\n]+)\2')
     lines = content.splitlines(keepends=True)
     in_table = False
     for idx, line in enumerate(lines):
@@ -353,10 +372,40 @@ def _rewrite_crate_versions(
             in_table = header.match(line) is not None
         elif in_table:
             m = version_line.match(line)
-            if m and wanted(m.group(2)):
-                lines[idx] = f'{m.group(1)}"{new_version}"' + line[m.end():]
+            if m and wanted(m.group(3)):
+                quote = m.group(2)
+                lines[idx] = (
+                    f'{m.group(1)}{quote}{new_version}{quote}' + line[m.end():]
+                )
                 count += 1
     return "".join(lines), count
+
+
+def _verify_rewritten(
+    content: str,
+    updates: dict[str, str],
+    targets: dict[str, set[str]] | None,
+) -> None:
+    """Re-parse rewritten manifest text and fail if any targeted spec survived.
+
+    Guards against partial rewrites: the parsers collapse identical specs
+    written in different forms into one, so a writer that missed one of them
+    would otherwise still report success.
+    """
+    remaining = _parse_dep_specs(content)
+    for crate_name, new_version in updates.items():
+        only = targets.get(crate_name) if targets is not None else None
+        stale = [
+            spec
+            for spec in remaining.get(crate_name, {}).get("specs", [])
+            if spec != new_version and (only is None or spec in only)
+        ]
+        if stale:
+            raise RuntimeError(
+                f"could not rewrite every version spec of '{crate_name}' in "
+                f"{CARGO_TOML.name} (still found {', '.join(stale)}): "
+                "unsupported dependency form"
+            )
 
 
 def update_cargo_toml(
@@ -370,8 +419,8 @@ def update_cargo_toml(
     that crate not listed there are left untouched. Without it every spec of
     each crate in ``updates`` is rewritten.
 
-    Raises RuntimeError when a crate's version spec cannot be located in a
-    form the writer understands, so callers never report a silent no-op.
+    Raises RuntimeError when a crate's version spec cannot be located, or is
+    only partly rewritten, so callers never report a silent (partial) no-op.
     """
     content = CARGO_TOML.read_text()
 
@@ -385,6 +434,7 @@ def update_cargo_toml(
                 f"could not rewrite the version spec of '{crate_name}' in "
                 f"{CARGO_TOML.name}: unsupported dependency form"
             )
+    _verify_rewritten(content, updates, targets)
 
     if dry_run:
         print("\n[Dry run] Would update Cargo.toml with:")

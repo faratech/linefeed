@@ -189,20 +189,68 @@ class DependencyVersionAndParsingTests(unittest.TestCase):
         # A spec the writer cannot rewrite must not be reported as a
         # successful update (#325): the whole operation rolls back.
         u = self.updater
-        original = "[dependencies]\nserde = { version = '1' }\n"
+        # A multi-line basic string is valid TOML the writer does not edit.
+        for original in (
+            '[dependencies]\nserde = """1"""\n',
+            # Partial rewrite: the first spec is editable, the second is not.
+            '[dependencies]\nserde = "1"\n'
+            "[target.'cfg(unix)'.dependencies]\nserde = \"\"\"1\"\"\"\n",
+        ):
+            with tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                manifest, lock = root / "Cargo.toml", root / "Cargo.lock"
+                manifest.write_text(original)
+                lock.write_text("orig\n")
+                u.CARGO_TOML, u.CARGO_LOCK = manifest, lock
+                ok = subprocess.CompletedProcess(["cargo"], 0, stdout="ok", stderr="")
+                with mock.patch.object(u, "run_cmd", return_value=ok):
+                    self.assertFalse(u.update_manifest_and_lock({"serde": "2"}))
+                self.assertEqual(manifest.read_text(), original)
+                self.assertEqual(lock.read_text(), "orig\n")
+                with self.assertRaises(RuntimeError):
+                    u.update_cargo_toml({"serde": "2"}, dry_run=True)
+                self.assertEqual(manifest.read_text(), original)
+
+    def test_single_quoted_literal_specs_are_rewritten_too(self):
+        # The parser collapses `serde = "1"` and `serde = '1'` into one spec,
+        # so the writer must edit both, never just one (#325).
+        u = self.updater
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             manifest, lock = root / "Cargo.toml", root / "Cargo.lock"
-            manifest.write_text(original)
+            manifest.write_text(
+                '[dependencies]\nserde = "1"\n'
+                "[target.'cfg(unix)'.dependencies]\nserde = '1'\n"
+                "[build-dependencies]\nserde = { version = '1', features = ['x'] }\n"
+                "[dev-dependencies.serde]\nversion = '1'\n"
+            )
             lock.write_text("orig\n")
             u.CARGO_TOML, u.CARGO_LOCK = manifest, lock
+            self.assertEqual(u.get_outdated_deps()["serde"]["specs"], ["1"])
             ok = subprocess.CompletedProcess(["cargo"], 0, stdout="ok", stderr="")
             with mock.patch.object(u, "run_cmd", return_value=ok):
-                self.assertFalse(u.update_manifest_and_lock({"serde": "2"}))
-            self.assertEqual(manifest.read_text(), original)
-            self.assertEqual(lock.read_text(), "orig\n")
-            with self.assertRaises(RuntimeError):
-                u.update_cargo_toml({"serde": "2"}, dry_run=True)
+                self.assertTrue(u.update_manifest_and_lock({"serde": "2"}))
+            self.assertEqual(
+                manifest.read_text(),
+                '[dependencies]\nserde = "2"\n'
+                "[target.'cfg(unix)'.dependencies]\nserde = '2'\n"
+                "[build-dependencies]\nserde = { version = '2', features = ['x'] }\n"
+                "[dev-dependencies.serde]\nversion = '2'\n",
+            )
+
+    def test_fallback_parser_reads_single_quoted_specs(self):
+        u = self.updater
+        deps = u._fallback_parse_deps(
+            "[dependencies]\n"
+            "plain = '1'\n"
+            "inline = { version = '2' }\n"
+            "[dependencies.table]\n"
+            "version = '3'\n"
+        )
+        self.assertEqual(
+            {n: d["specs"] for n, d in deps.items()},
+            {"plain": ["1"], "inline": ["2"], "table": ["3"]},
+        )
 
     DIVERGENT_SERDE = (
         '[dependencies]\nserde = "1"\n\n[build-dependencies]\nserde = "0.9"\n'
