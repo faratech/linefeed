@@ -1922,7 +1922,10 @@ impl IrcClient {
             mechanism if offered(mechanism) => sasl_mechanisms.push(mechanism),
             _ => {}
         }
-        if want_sasl && !sasl_mechanisms.is_empty() {
+        // Only when advertised: a server refuses a request naming anything it
+        // did not offer, so an unadvertised `sasl` would cost a refusal and a
+        // retry of every other capability.
+        if want_sasl && sasl_available && !sasl_mechanisms.is_empty() {
             caps_to_request.push("sasl");
         }
 
@@ -3132,6 +3135,110 @@ mod tests {
                 started.elapsed()
             );
             server.abort();
+        });
+    }
+
+    #[test]
+    fn sasl_is_not_requested_from_a_server_that_does_not_offer_it() {
+        test_runtime().block_on(async {
+            // Asking anyway got the whole request refused, then every other
+            // capability re-requested one by one.
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                let (read_half, mut write_half) = stream.into_split();
+                let mut reader = BufReader::new(read_half);
+                assert_eq!(read_wire_line(&mut reader).await, "CAP LS 302");
+                assert_eq!(read_wire_line(&mut reader).await, "NICK tester");
+                assert!(read_wire_line(&mut reader).await.starts_with("USER "));
+                write_half
+                    .write_all(b":srv CAP * LS :multi-prefix\r\n")
+                    .await
+                    .unwrap();
+                assert_eq!(read_wire_line(&mut reader).await, "CAP REQ :multi-prefix");
+                write_half
+                    .write_all(b":srv CAP * ACK :multi-prefix\r\n")
+                    .await
+                    .unwrap();
+                assert_eq!(read_wire_line(&mut reader).await, "CAP END");
+                write_half
+                    .write_all(b":srv 001 tester :Welcome\r\n")
+                    .await
+                    .unwrap();
+            });
+            let config = ServerConfig {
+                host: "127.0.0.1".into(),
+                port: addr.port(),
+                use_tls: false,
+                nick: "tester".into(),
+                sasl_username: Some("tester".into()),
+                sasl_password: Some("secret".into()),
+                ..Default::default()
+            };
+            let (msg_tx, mut msg_rx) = mpsc::channel(100);
+            let (_cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+            let mut client = IrcClient::new(config);
+            timeout(Duration::from_secs(2), client.connect(msg_tx, cmd_rx))
+                .await
+                .expect("negotiation stalled")
+                .unwrap();
+            server.await.unwrap();
+            let mut notices = Vec::new();
+            while let Ok(message) = msg_rx.try_recv() {
+                if let IrcCommand::Notice(_, text) = message.command {
+                    notices.push(text);
+                }
+            }
+            assert!(
+                notices.iter().any(|n| n == "Server does not support SASL"),
+                "{notices:?}"
+            );
+        });
+    }
+
+    #[test]
+    fn required_sasl_still_fails_on_a_server_that_does_not_offer_it() {
+        test_runtime().block_on(async {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                let (read_half, mut write_half) = stream.into_split();
+                let mut reader = BufReader::new(read_half);
+                let mut lines = Vec::new();
+                for _ in 0..3 {
+                    lines.push(read_wire_line(&mut reader).await);
+                }
+                write_half
+                    .write_all(b":srv CAP * LS :multi-prefix\r\n")
+                    .await
+                    .unwrap();
+                lines.push(read_wire_line(&mut reader).await);
+                let _ = write_half
+                    .write_all(b":srv CAP * ACK :multi-prefix\r\n")
+                    .await;
+                lines
+            });
+            let config = ServerConfig {
+                host: "127.0.0.1".into(),
+                port: addr.port(),
+                use_tls: false,
+                nick: "tester".into(),
+                sasl_username: Some("tester".into()),
+                sasl_password: Some("secret".into()),
+                sasl_required: true,
+                ..Default::default()
+            };
+            let (msg_tx, _msg_rx) = mpsc::channel(100);
+            let (_cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+            let mut client = IrcClient::new(config);
+            let result = timeout(Duration::from_secs(5), client.connect(msg_tx, cmd_rx))
+                .await
+                .expect("negotiation stalled");
+            assert!(result.is_err(), "registered without the required SASL");
+            let lines = server.await.unwrap();
+            assert_eq!(lines[3], "CAP REQ :multi-prefix", "{lines:?}");
         });
     }
 
