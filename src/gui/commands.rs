@@ -282,6 +282,13 @@ impl IrcApp {
                 let new_nick = args.split_whitespace().next().unwrap_or("");
                 if new_nick.is_empty() {
                     self.add_message_to_current(ChatMessage::system("Usage: /nick <newnick>"));
+                } else if new_nick.starts_with(':') {
+                    // A leading ':' makes the nick the trailing parameter
+                    // on the wire, so `NICK :alice` would silently become
+                    // `alice` (#303).
+                    self.add_message_to_current(ChatMessage::system(
+                        "Nickname must not start with ':'",
+                    ));
                 } else {
                     self.send_command(IrcCommand::Nick(new_nick.to_string()));
                 }
@@ -5030,5 +5037,20 @@ mod tests {
         }
         assert_eq!(parse_server_port("1"), Ok(1));
         assert_eq!(parse_server_port("65535"), Ok(65535));
+    }
+
+    #[test]
+    fn nick_command_refuses_a_leading_colon_instead_of_sending_a_mutated_nick() {
+        let (mut app, mut rx) = connected_command_app();
+        app.process_command("/nick :alice");
+        assert!(rx.try_recv().is_err(), "a mutated NICK was sent");
+        assert!(
+            app.server_messages
+                .iter()
+                .chain(app.channels.values().flat_map(|c| c.messages.iter()))
+                .any(|m| m.content.contains("must not start with ':'"))
+        );
+        app.process_command("/nick alice");
+        assert!(matches!(rx.try_recv(), Ok(IrcCommand::Nick(nick)) if nick == "alice"));
     }
 }
