@@ -2615,7 +2615,11 @@ pub(super) fn command_line_contains_credentials(line: &str) -> bool {
         // Bare service commands (/identify pw, /ghost nick pw, ...) fall
         // through to the catch-all arm and reach the wire as-is (#226).
         "IDENTIFY" | "ID" | "SIDENTIFY" | "GHOST" | "RECOVER" | "RELEASE" | "REGAIN" | "GROUP"
-        | "SETPASS" => true,
+        | "SETPASS" | "NEWPASS" | "RESETPASS" => true,
+        // DROP, SET and SASET are ordinary words: only the service shapes
+        // (a channel or a second argument; a PASSWORD keyword) are secrets,
+        // exactly as in a service message (#291). `line` starts at the verb.
+        "DROP" | "SET" | "SASET" => content_has_auth_command(line),
         "TOKEN" => args
             .split_whitespace()
             .next()
@@ -4021,6 +4025,68 @@ mod tests {
         app.process_input();
         assert_eq!(app.command_history, vec!["/join #x".to_string()]);
         while rx.try_recv().is_ok() {}
+    }
+
+    #[test]
+    fn bare_newpass_resetpass_drop_set_and_saset_credential_lines_never_enter_history() {
+        // These verbs reach the wire through the catch-all arm exactly like
+        // /identify does, so the history filter has to know them as
+        // top-level commands (#291).
+        for line in [
+            "/newpass oldpw newpw newpw",
+            "/NEWPASS oldpw newpw newpw",
+            "/resetpass hunter2",
+            "/drop alice hunter2",
+            "/drop #chan",
+            "/set password hunter2",
+            "/set #chan password hunter2",
+            "/set pass hunter2",
+            "/saset alice password hunter2",
+            "/raw NEWPASS oldpw newpw newpw",
+            "/quote @label=1 DROP alice hunter2",
+            "/label x /saset alice password hunter2",
+            "/perform /resetpass hunter2",
+        ] {
+            assert!(command_line_contains_credentials(line), "{line}");
+        }
+        // DROP, SET and SASET stay conditional: ordinary uses are history.
+        for line in [
+            "/drop alice",
+            "/drop",
+            "/set email me@example.test",
+            "/set",
+            "/saset alice email me@example.test",
+            "/raw DROP alice",
+        ] {
+            assert!(!command_line_contains_credentials(line), "{line}");
+        }
+
+        let (mut app, mut rx) = connected_command_app();
+        app.set_session_nick("me".into(), true);
+        for input in [
+            "/newpass oldpw newpw newpw",
+            "/resetpass hunter2",
+            "/drop alice hunter2",
+            "/set password hunter2",
+            "/saset alice password hunter2",
+        ] {
+            app.input_text = input.into();
+            app.process_input();
+        }
+        assert!(app.command_history.is_empty(), "{:?}", app.command_history);
+        // The commands still reach the wire: only the history differs.
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            IrcCommand::Raw("NEWPASS oldpw newpw newpw".into())
+        );
+
+        // Positive control: an ordinary bare command is still recorded.
+        app.input_text = "/set email me@example.test".into();
+        app.process_input();
+        assert_eq!(
+            app.command_history,
+            vec!["/set email me@example.test".to_string()]
+        );
     }
 
     #[test]
