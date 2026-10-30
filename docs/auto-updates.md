@@ -111,5 +111,7 @@ group. Dispatch each stage after the previous stage completes. These workflows
 refuse to replace published assets; corrections require a new version.
 
 The updater uses public HTTPS requests and does not require GitHub authentication.
-Offline or rate-limited automatic attempts count toward the daily interval;
-**Check for updates** remains available for an immediate retry.
+A completed check, whether or not it finds an update, counts toward the daily
+interval. A check that fails (offline, rate-limited, GitHub unavailable) does
+not: it is retried automatically after about ten minutes, and **Check for
+updates** remains available for an immediate retry.
