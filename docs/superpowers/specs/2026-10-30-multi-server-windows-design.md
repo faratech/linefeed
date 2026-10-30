@@ -228,3 +228,46 @@ Each step compiles, passes `cargo test --locked`, and is clippy-clean.
 - **Step 1 is the large one.** It touches about 11.8k + 4.5k lines, mostly mechanically. Keep it free of behaviour changes so the existing 406 tests act as the safety net.
 - **Removing the root-minimized early return** changes the CPU profile while minimized. Keep the 250 ms repaint cap when no detached window is open.
 - **Wayland** cannot place windows, so detached-window positions are not restored there. Sizes still are.
+
+## Implementation notes (what changed from this plan)
+
+Recorded after building it, so the design and the code agree.
+
+- **Each session keeps its own connect form.** The plan moved the Quick
+  Connect form to `App`. Keeping it on `Session` matches mIRC (the Connect
+  dialog edits the active status window), leaves `/server`'s form borrowing
+  untouched, and kept ~200 test touches unchanged. `App.settings` is the
+  canonical persisted state and only ever adopts a form that validates
+  (`SessionEvent::SaveSettings`); config-only saves (`SaveConfig`,
+  `SaveAutoPerform`) never touch the form, which carries the #316 rule over
+  to several sessions. A transient read failure of settings.json at startup
+  disables saving for the run instead of letting defaults overwrite it.
+- **Behaviour settings are mirrored, not shared.** Instead of
+  `Rc<ConfigSnapshot>`, sessions keep their existing fields and `App`
+  pushes the canonical values with `Session::apply_config` (and adopts a
+  session's own edits, e.g. `/ignore`, with `export_config`). The protocol
+  code is unchanged.
+- **Per-session `LogManager`.** Sessions to the same endpoint are refused,
+  so log paths never collide and the shared `Rc` was unnecessary.
+- **Window set is derived, not tracked.** `WindowManager::sync` rebuilds the
+  window list from the sessions' tabs every frame, so no open/close events
+  are needed; `SessionEvent` covers only notifications, settings, `/server -m`
+  and `/window`.
+- **Per-window input by swapping.** A window's input line, history position,
+  completion and user selection (`TargetView`) are swapped into its session,
+  with `current_channel` pointed at the window, while it draws or handles
+  input (`app::with_window_view`), so the session's input code serves every
+  window unchanged. Command history is shared by all windows.
+- **Focus.** `Session::set_window_focused` (from #305) is driven per session:
+  a session counts as focused only when one of our OS windows has focus and
+  its window is the active one. Detached windows activate on focus or click.
+- **Floating windows** get an explicit placement on their first frame (egui's
+  first-frame sizing pass would otherwise give chat panels the whole screen),
+  the constraint is skipped on the frame a placement is applied (it would use
+  the previous size), and the active window is raised every frame so windows
+  that open on their own never cover the one the user is typing in.
+- **Notification policy** (focus, the setting, #323's separate PM clock and
+  held summary) lives in `App::notify`; sessions only request notifications.
+- **Startup focus** starts on the first network; later selection changes are
+  followed only for the active network (#290 keeps unsolicited JOINs from
+  moving focus at all).

@@ -11,9 +11,13 @@ Manual checks bypass the daily interval. Disabling automatic updates also
 disables installation on exit; an explicitly requested restart can still install
 an update. Background checks never interrupt a connection or restart the app.
 
-Restarting to update reconnects the active server, rejoins actual channel
-memberships with their keys, reopens query tabs, and restores the selected tab,
-away state, and unsent text. A disconnected session stays disconnected. The
+Restarting to update reconnects every server that was connected, rejoins
+actual channel memberships with their keys, reopens query windows, and restores
+the selected window, away state, and the active window's unsent text. A
+disconnected session stays disconnected. The snapshot keeps the active session
+at the top level, where an older binary reads it, and every other session in a
+list the older binary ignores, so updating to or recovering from a release
+without several-server support still restores the active one. The
 temporary session snapshot is private and deleted after successful startup.
 Chat history uses the existing local logs and IRCv3 history mechanisms.
 

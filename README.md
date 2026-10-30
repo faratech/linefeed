@@ -15,6 +15,15 @@ InspIRCd, UnrealIRCd, Solanum, Ergo, Bahamut, ircu, Hybrid, and Plexus features.
 - **SASL authentication**: SCRAM-SHA-256, EXTERNAL, and PLAIN with optional required-auth policy
 - **Modern UI**: Clean interface built with egui/eframe
 
+### Several Servers and Windows
+- Several networks at once, each with its own status window, channels and queries
+- mIRC-style windows: one maximized window at a time, or floating windows you can tile, cascade, move and resize
+- Switchbar of every window, grouped by network, with unread counts
+- Any window can be detached into its own OS window and reattached
+- Closing a window parts its channel or closes its query; closing a status window disconnects that server (after asking)
+- Server favorites are network profiles that can connect automatically at startup
+- Window placement is remembered between runs
+
 ### Connection
 - IRCv3 CAP negotiation with timeout fallback
 - Auto-reconnect with exponential backoff
@@ -26,7 +35,7 @@ InspIRCd, UnrealIRCd, Solanum, Ergo, Bahamut, ircu, Hybrid, and Plexus features.
 - TLS client certificates for SASL EXTERNAL
 
 ### Channels
-- Multiple channel support with tabbed interface
+- Multiple channels per network, each in its own window
 - Channel modes display (+nt, +k, etc.)
 - Server-aware channel/user prefix handling via ISUPPORT
 - Topic viewing and editing
@@ -151,7 +160,8 @@ python3 -m py_compile build.py tools/update-deps.py
 ### Connection
 | Command | Description |
 |---------|-------------|
-| `/server <host[:port]>` | Connect to server |
+| `/server <host[:port]>` | Switch this window's connection to another server |
+| `/server -m <host[:port]>` | Connect to another server in a new status window |
 | `/disconnect` | Disconnect from server |
 | `/reconnect` | Reconnect to server |
 | `/quit [message]` | Disconnect with optional message |
@@ -288,6 +298,8 @@ Nefarious persistence profile. These are sent during registration, before
 | `/shelp [topic]` | Request the server's HELP command |
 | `/perform [command]` | View/add auto-perform commands |
 | `/raw <command>` | Send raw IRC command |
+| `/window tile\|cascade\|max\|restore` | Arrange the windows |
+| `/window detach\|attach\|close\|new` | Detach, reattach or close this window, or open a new status window |
 | `/echo <text>` | Echo text to current window |
 | `/slap <nick>` | Slap someone with a trout |
 
@@ -297,9 +309,11 @@ Nefarious persistence profile. These are sent during registration, before
 |----------|--------|
 | `Tab` | Complete nick/command |
 | `Up/Down` | Command history |
-| `Ctrl+W` | Close current tab |
-| `Ctrl+Tab` | Next tab |
-| `Ctrl+Shift+Tab` | Previous tab |
+| `Ctrl+W` | Close the active window |
+| `Ctrl+Tab` | Next window (across networks) |
+| `Ctrl+Shift+Tab` | Previous window |
+| `Alt+1`-`Alt+9` | Go to a window by its switchbar position |
+| `Ctrl+M` | Maximize / restore the windows |
 | `Page Up/Down` | Scroll chat |
 
 ## Configuration
@@ -307,6 +321,10 @@ Nefarious persistence profile. These are sent during registration, before
 Settings are stored in:
 - **Linux**: `~/.config/linefeed/settings.json`
 - **Windows**: `%APPDATA%\linefeed\settings.json`
+
+Window placement is stored next to it in `layout.json`, apart from
+`settings.json` so moving a window never rewrites the file that holds
+credentials.
 
 Chat logs are stored in:
 - **Linux**: `~/.config/linefeed/logs/<network>/<channel>.log`
@@ -316,11 +334,17 @@ Chat logs are stored in:
 
 ```
 src/
-├── main.rs              # Entry point, connection management, system tray
+├── main.rs              # Entry point, frame loop, system tray integration
 ├── icon_data.rs         # Embedded application icon
 ├── systray.rs           # Windows system tray (Win32 API)
+├── opener.rs            # Opening links in the browser
+├── updater/             # Automatic updates (check, download, install on exit)
 ├── gui/
-│   ├── mod.rs           # Main UI logic, message handling
+│   ├── app.rs           # App: sessions, settings, notifications, windows
+│   ├── mod.rs           # Session: one connection's state and message handling
+│   ├── connection.rs    # Per-session connection worker lifecycle
+│   ├── windows.rs       # Window placement, tile/cascade, layout.json
+│   ├── view.rs          # Drawing one window's contents
 │   ├── types.rs         # Data structures, settings
 │   ├── commands.rs      # Slash command processing
 │   ├── dialogs.rs       # Settings, connect, channel list dialogs
