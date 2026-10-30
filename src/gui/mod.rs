@@ -1681,6 +1681,34 @@ impl IrcApp {
             && left.is_system == right.is_system
     }
 
+    /// Drop catch-up rows that repeat a row the tab already shows without any
+    /// message identity - rows restored from the local log (no msgid, no
+    /// server-time, so catch-up falls back to the latest page) or sent here
+    /// without echo-message. msgid dedup cannot see these; compare content
+    /// the way the Prepend fallback does. Each such row absorbs at most one
+    /// server row, so genuinely repeated lines survive (#320).
+    fn drop_rows_shown_without_identity(rows: &mut Vec<ChatMessage>, shown: &VecDeque<ChatMessage>) {
+        let mut candidates: Vec<&ChatMessage> = shown
+            .iter()
+            .filter(|row| row.msgid.is_none() && row.server_time.is_none())
+            .collect();
+        if candidates.is_empty() {
+            return;
+        }
+        rows.retain(|row| {
+            match candidates
+                .iter()
+                .position(|local| Self::same_history_row(local, row))
+            {
+                Some(index) => {
+                    candidates.swap_remove(index);
+                    false
+                }
+                None => true,
+            }
+        });
+    }
+
     fn queue_history_request(
         &mut self,
         target: &str,
@@ -2191,6 +2219,9 @@ impl IrcApp {
                 .as_ref()
                 .is_none_or(|msgid| !existing_ids.contains(msgid))
         });
+        if batch.request.placement == HistoryPlacement::Append {
+            Self::drop_rows_shown_without_identity(&mut messages, &self.channels[&key].messages);
+        }
         // Own-notice replays whose local confirmation row ("-> -target- text")
         // is already in the tab are display duplicates, and own-credential
         // chat rows replay the server's verbatim copy of a redacted local
@@ -12881,5 +12912,105 @@ mod tests {
         app.handle_incoming_message(IrcMessage::parse(":srv BATCH -d").unwrap());
         assert_eq!(app.dispatched_notifications.len(), 1);
         assert_eq!(app.dispatched_notifications[0].0, "bob mentioned you in #room");
+    }
+
+
+    #[test]
+    fn catch_up_does_not_duplicate_rows_restored_from_the_local_log() {
+        let (mut app, mut rx) = test_app_connected();
+        app.set_session_nick("mynick".into(), true);
+        app.logging_load_history = true;
+        app.handle_incoming_message(
+            IrcMessage::parse(":srv CAP me ACK :draft/chathistory").unwrap(),
+        );
+        // A retained tab preloaded from the local log: its rows carry no
+        // msgid and no server-time, so catch-up has no message to start after.
+        let stamp = epoch_time_formatted(1_789_511_400, &app.timestamp_format);
+        let mut room = Channel::new();
+        for (sender, content) in [("alice", "first"), ("bob", "first")] {
+            let mut row = ChatMessage::new_fmt(sender, content, &app.timestamp_format);
+            row.timestamp.clone_from(&stamp);
+            room.messages.push_back(row);
+        }
+        app.channels.insert("#room".into(), room);
+        app.current_channel = Some("#room".into());
+
+        app.handle_incoming_message(IrcMessage::parse(":mynick!u@h JOIN #room").unwrap());
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            IrcCommand::ChathistoryLatest("#room".into(), "*".into(), 100)
+        );
+
+        app.handle_incoming_message(IrcMessage::parse(":srv BATCH +h chathistory #room").unwrap());
+        for (id, time, sender, content) in [
+            ("s1", "22:30:00", "alice", "first"),
+            ("s2", "22:30:00", "bob", "first"),
+            ("s3", "22:31:00", "alice", "brand new"),
+        ] {
+            app.handle_incoming_message(
+                IrcMessage::parse(&format!(
+                    "@batch=h;time=2026-09-15T{time}.000Z;msgid={id} :{sender}!u@h PRIVMSG #room :{content}"
+                ))
+                .unwrap(),
+            );
+        }
+        app.handle_incoming_message(IrcMessage::parse(":srv BATCH -h").unwrap());
+
+        let rows: Vec<(&str, &str)> = app.channels["#room"]
+            .messages
+            .iter()
+            .filter(|row| !row.is_system)
+            .map(|row| (row.sender.as_str(), row.content.as_str()))
+            .collect();
+        assert_eq!(
+            rows,
+            [("alice", "first"), ("bob", "first"), ("alice", "brand new")],
+            "#320: server rows duplicated the restored local rows"
+        );
+    }
+
+    #[test]
+    fn catch_up_keeps_repeated_identical_lines_it_has_no_local_copy_of() {
+        let (mut app, _rx) = test_app_connected();
+        app.set_session_nick("mynick".into(), true);
+        let stamp = epoch_time_formatted(1_789_511_400, &app.timestamp_format);
+        let mut room = Channel::new();
+        room.joined = true;
+        let mut local = ChatMessage::new_fmt("alice", "ok", &app.timestamp_format);
+        local.timestamp.clone_from(&stamp);
+        room.messages.push_back(local);
+        app.channels.insert("#room".into(), room);
+        app.current_channel = Some("#room".into());
+        app.pending_history_requests
+            .entry("#room".into())
+            .or_default()
+            .push_back(PendingHistoryRequest {
+                placement: HistoryPlacement::Append,
+                direction: HistoryDirection::Before,
+                remaining: 100,
+                loaded: 0,
+                shown: 0,
+                page_limit: 100,
+            });
+
+        // The server holds two identical "ok" lines in that minute; only one
+        // is the row already shown, so exactly one new row remains.
+        app.handle_incoming_message(IrcMessage::parse(":srv BATCH +h chathistory #room").unwrap());
+        for id in ["s1", "s2"] {
+            app.handle_incoming_message(
+                IrcMessage::parse(&format!(
+                    "@batch=h;time=2026-09-15T22:30:00.000Z;msgid={id} :alice!u@h PRIVMSG #room :ok"
+                ))
+                .unwrap(),
+            );
+        }
+        app.handle_incoming_message(IrcMessage::parse(":srv BATCH -h").unwrap());
+
+        let ok_rows = app.channels["#room"]
+            .messages
+            .iter()
+            .filter(|row| row.content == "ok")
+            .count();
+        assert_eq!(ok_rows, 2);
     }
 }
