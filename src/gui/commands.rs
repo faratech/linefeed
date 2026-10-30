@@ -2658,6 +2658,12 @@ pub(super) fn command_line_contains_credentials(line: &str) -> bool {
             let content = message.next().unwrap_or("").trim_start();
             service_message_contains_credentials(target, content)
         }
+        // Channel-scoped message wrappers: <nick> <channel> <text>, so the
+        // text sits two words in rather than one (#311).
+        "CPRIVMSG" | "CNOTICE" => {
+            let (target, rest) = split_word(args);
+            service_message_contains_credentials(target, split_word(rest).1)
+        }
         "ME" | "SAY" => content_has_auth_command(args),
         // /reply <msgid> <text> sends the text to the current target like /say.
         "REPLY" => content_has_auth_command(split_word(args).1),
@@ -4181,6 +4187,63 @@ mod tests {
         assert_eq!(
             app.command_history,
             vec!["/set email me@example.test".to_string()]
+        );
+    }
+
+    #[test]
+    fn cprivmsg_and_cnotice_credential_lines_never_enter_history() {
+        // CPRIVMSG/CNOTICE carry a channel word between the target and the
+        // text, so they need their own two-word offset in the filter (#311).
+        for line in [
+            "/cprivmsg NickServ #room IDENTIFY hunter2",
+            "/CNOTICE NickServ #room identify hunter2",
+            "/cprivmsg NS #room id hunter2",
+            "/cprivmsg ChanServ #room identify #room key123",
+            "/cprivmsg  NickServ   #room   IDENTIFY hunter2",
+            "/cprivmsg NickServ@services.example #room identify hunter2",
+            "/raw CPRIVMSG NickServ #room :IDENTIFY hunter2",
+            "/quote @label=1 CNOTICE NickServ #room :identify hunter2",
+            "/perform /cprivmsg NickServ #room identify hunter2",
+            "/label x /cprivmsg NickServ #room identify hunter2",
+        ] {
+            assert!(command_line_contains_credentials(line), "{line}");
+        }
+        // Ordinary use, or a service-named word only in the channel slot, is
+        // not a credential.
+        for line in [
+            "/cprivmsg alice #room hello there",
+            "/cprivmsg alice #room identify hunter2",
+            "/cprivmsg alice NickServ identify hunter2",
+            "/cprivmsg NickServ #room info alice",
+            "/cprivmsg NickServ #room",
+            "/cprivmsg",
+            "/raw CPRIVMSG alice #room :hello",
+        ] {
+            assert!(!command_line_contains_credentials(line), "{line}");
+        }
+
+        // The command still reaches the wire; only history stays clean.
+        let (mut app, mut rx) = connected_command_app();
+        app.set_session_nick("me".into(), true);
+        for input in [
+            "/cprivmsg NickServ #room IDENTIFY hunter2",
+            "/cnotice NickServ #room identify hunter2",
+        ] {
+            app.input_text = input.into();
+            app.process_input();
+        }
+        assert!(app.command_history.is_empty(), "{:?}", app.command_history);
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            IrcCommand::Raw("CPRIVMSG NickServ #room :IDENTIFY hunter2".into())
+        );
+
+        // Positive control: an ordinary CPRIVMSG is recorded.
+        app.input_text = "/cprivmsg alice #room hello".into();
+        app.process_input();
+        assert_eq!(
+            app.command_history,
+            vec!["/cprivmsg alice #room hello".to_string()]
         );
     }
 
