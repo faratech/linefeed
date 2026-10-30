@@ -155,6 +155,13 @@ impl IrcMessage {
             None
         };
 
+        // Tags and/or a prefix with nothing after them have no command. The
+        // unterminated forms ("@t=1", ":srv") return None above, so the ones
+        // with trailing spaces must too, not become Raw(" ") (#304).
+        if remaining.is_empty() {
+            return None;
+        }
+
         // Parse command and params
         let parts: Vec<&str> = remaining.splitn(2, ' ').collect();
         let cmd = parts[0].to_uppercase();
@@ -1103,6 +1110,34 @@ mod tests {
             join.command,
             IrcCommand::Join("#c".into(), None, None, None)
         );
+    }
+
+    #[test]
+    fn lines_with_no_command_are_dropped_with_or_without_a_trailing_space() {
+        // #304: a tags-only or prefix-only fragment has no command, and one
+        // trailing space must not flip it from "dropped" to a Raw(" ") that
+        // the GUI shows as a spurious server message.
+        for line in [
+            "@t=1",
+            "@t=1 ",
+            "@t=1   ",
+            ":srv",
+            ":srv ",
+            ":srv   ",
+            "@t=1 :srv",
+            "@t=1 :srv ",
+            "   ",
+            "",
+        ] {
+            assert!(
+                IrcMessage::parse(line).is_none(),
+                "{line:?} parsed as a message"
+            );
+        }
+
+        // A command that follows is still found after the extra spaces.
+        let message = IrcMessage::parse("@t=1  :srv  PING  :x").unwrap();
+        assert_eq!(message.command, IrcCommand::Ping("x".into()));
     }
 
     #[test]
