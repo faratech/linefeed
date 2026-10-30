@@ -73,6 +73,38 @@ impl IrcApp {
         self.selected_favorite = None;
     }
 
+    /// Persist one setting changed outside the Connection form (the About-tab
+    /// updates toggle, a deleted favorite, the channel-list minimum). The
+    /// change is applied to the settings already on disk, never to the form's
+    /// unsaved or unvalidated fields: only Connect and a validated Close may
+    /// persist those (#316).
+    fn save_setting(&mut self, apply: impl FnOnce(&mut Settings)) {
+        let mut persisted = self.load_persisted_settings();
+        apply(&mut persisted);
+        self.store_persisted_settings(persisted);
+    }
+
+    fn set_automatic_updates(&mut self, enabled: bool) {
+        self.automatic_updates = enabled;
+        self.updater.set_automatic(enabled);
+        self.save_setting(|settings| settings.automatic_updates = enabled);
+    }
+
+    fn save_list_min_users(&mut self) {
+        let min_users = self.list_min_users;
+        self.save_setting(|settings| settings.list_min_users = min_users);
+    }
+
+    /// Delete a favorite and persist the shortened list.
+    fn delete_favorite(&mut self, idx: usize) -> bool {
+        let removed = self.remove_favorite(idx);
+        if removed {
+            let favorites = self.server_favorites.clone();
+            self.save_setting(|settings| settings.server_favorites = favorites);
+        }
+        removed
+    }
+
     /// Remove a favorite by index; false when the index is out of range.
     fn remove_favorite(&mut self, idx: usize) -> bool {
         if idx < self.server_favorites.len() {
@@ -86,7 +118,7 @@ impl IrcApp {
     /// Cancel the Connect dialog: discard scratch edits so a later unrelated
     /// `save_settings()` cannot persist them, then hide the dialog (#208).
     fn cancel_connect_dialog(&mut self) {
-        let persisted = Settings::load();
+        let persisted = self.load_persisted_settings();
         self.restore_connect_form_from(&persisted);
         self.show_connect_dialog = false;
     }
@@ -113,7 +145,7 @@ impl IrcApp {
         if sent {
             self.show_channel_list = false;
             self.channel_list_selected = None;
-            self.save_settings();
+            self.save_list_min_users();
             true
         } else {
             self.report_send_failure(
@@ -199,11 +231,8 @@ impl IrcApp {
                                 // Delete button
                                 if ui.add_enabled(has_selection, egui::Button::new("Delete")).clicked()
                                     && let Some(idx) = self.selected_favorite {
-                                        let removed = self.remove_favorite(idx);
+                                        self.delete_favorite(idx);
                                         self.selected_favorite = None;
-                                        if removed {
-                                            self.save_settings();
-                                        }
                                     }
 
                                 // Connect button
@@ -832,8 +861,7 @@ impl IrcApp {
                 .checkbox(&mut self.automatic_updates, "Automatic updates")
                 .changed()
             {
-                self.updater.set_automatic(self.automatic_updates);
-                self.save_settings();
+                self.set_automatic_updates(self.automatic_updates);
             }
             ui.label(
                 RichText::new("Downloads updates in the background and installs when you exit.")
@@ -1280,7 +1308,7 @@ impl IrcApp {
         if close {
             self.show_channel_list = false;
             self.channel_list_selected = None;
-            self.save_settings();
+            self.save_list_min_users();
         }
         if let Some(channel) = join_channel {
             self.join_from_channel_list(channel);
@@ -1785,5 +1813,96 @@ mod tests {
         assert_eq!(app.server_favorites.len(), 1);
         assert!(app.remove_favorite(0));
         assert!(app.server_favorites.is_empty());
+    }
+
+
+    /// An app whose Connection form holds invalid and unsaved scratch edits
+    /// over a clean persisted configuration (the "disk" is in memory).
+    fn app_with_dirty_connection_form() -> IrcApp {
+        let persisted = Settings {
+            server_host: "persisted.example".into(),
+            server_port: "6697".into(),
+            nickname: "persistednick".into(),
+            automatic_updates: true,
+            server_favorites: vec![ServerFavorite::default(), ServerFavorite::default()],
+            list_min_users: 0,
+            ..Settings::default()
+        };
+        let mut app = IrcApp::with_settings(persisted);
+        app.server_port = "abc".into();
+        app.password = "scratch-pass".into();
+        app.sasl_username = "scratch-user".into();
+        app.sasl_password = "scratch-sasl".into();
+        app.auto_perform = "/ns identify scratch-pass".into();
+        app
+    }
+
+    /// Nothing from the dirty Connection form may have reached the file.
+    fn assert_form_not_persisted(app: &IrcApp) {
+        let saved = app.load_persisted_settings();
+        assert_eq!(saved.server_port, "6697");
+        assert_eq!(saved.nickname, "persistednick");
+        assert!(saved.password.is_empty(), "scratch password persisted");
+        assert!(saved.sasl_username.is_empty());
+        assert!(saved.sasl_password.is_empty());
+        assert!(saved.auto_perform.is_empty());
+    }
+
+    #[test]
+    fn automatic_updates_toggle_persists_without_the_unvalidated_connection_form() {
+        let mut app = app_with_dirty_connection_form();
+
+        app.set_automatic_updates(false);
+
+        assert!(!app.load_persisted_settings().automatic_updates);
+        assert_form_not_persisted(&app);
+    }
+
+    #[test]
+    fn deleting_a_favorite_persists_without_the_unvalidated_connection_form() {
+        let mut app = app_with_dirty_connection_form();
+
+        assert!(app.delete_favorite(0));
+
+        assert_eq!(app.load_persisted_settings().server_favorites.len(), 1);
+        assert_form_not_persisted(&app);
+    }
+
+    #[test]
+    fn channel_list_minimum_persists_without_the_unvalidated_connection_form() {
+        let mut app = app_with_dirty_connection_form();
+        app.list_min_users = 12;
+
+        app.save_list_min_users();
+
+        assert_eq!(app.load_persisted_settings().list_min_users, 12);
+        assert_form_not_persisted(&app);
+    }
+
+    #[test]
+    fn closing_the_channel_list_after_a_join_does_not_persist_the_connection_form() {
+        let mut app = app_with_dirty_connection_form();
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        app.cmd_tx = Some(tx);
+        app.connected = true;
+        app.show_channel_list = true;
+        app.list_min_users = 3;
+
+        assert!(app.join_from_channel_list("#room".into()));
+
+        assert!(!app.show_channel_list);
+        assert_eq!(app.load_persisted_settings().list_min_users, 3);
+        assert_form_not_persisted(&app);
+    }
+
+    #[test]
+    fn validated_settings_close_still_persists_the_whole_form() {
+        let mut app = app_with_dirty_connection_form();
+        app.server_port = "6667".into();
+        app.show_settings = true;
+
+        assert!(app.close_settings_window(), "{:?}", app.connection_error());
+
+        assert_eq!(app.load_persisted_settings().server_port, "6667");
     }
 }

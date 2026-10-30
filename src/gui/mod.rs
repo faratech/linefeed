@@ -424,6 +424,10 @@ pub struct IrcApp {
 
     // Pending channel keys (for storing key when joining +k channels)
     pub pending_channel_keys: HashMap<String, String>,
+    /// In-memory stand-in for settings.json, so unit tests can observe what
+    /// would be persisted without reading or overwriting the real file.
+    #[cfg(test)]
+    settings_file: Settings,
     /// Channels the user asked to join (/join, the join box, the channel
     /// list). The matching own-JOIN echo moves focus to the new tab; any other
     /// own-JOIN (auto-join, bouncer replay, reconnect) leaves the tab the user
@@ -565,6 +569,8 @@ impl IrcApp {
         let self_nick_keys = vec![my_nick_lower.clone()];
 
         Self {
+            #[cfg(test)]
+            settings_file: settings.clone(),
             updater: crate::updater::Controller::default(),
             automatic_updates: settings.automatic_updates,
             update_rejoins: None,
@@ -1126,7 +1132,31 @@ impl IrcApp {
     fn save_settings(&mut self) {
         self.update_cached_lowercase();
         ChatMessage::configure_default_timestamp_format(&self.timestamp_format);
-        self.get_settings().save();
+        let settings = self.get_settings();
+        self.store_persisted_settings(settings);
+    }
+
+    /// The settings as last persisted. Unit tests read an in-memory copy.
+    fn load_persisted_settings(&self) -> Settings {
+        #[cfg(test)]
+        {
+            self.settings_file.clone()
+        }
+        #[cfg(not(test))]
+        {
+            Settings::load()
+        }
+    }
+
+    fn store_persisted_settings(&mut self, settings: Settings) {
+        #[cfg(test)]
+        {
+            self.settings_file = settings;
+        }
+        #[cfg(not(test))]
+        {
+            settings.save();
+        }
     }
 
     pub fn update_session(&self) -> UpdateSession {
