@@ -1886,27 +1886,8 @@ impl IrcApp {
                         }
                     }
                 } else {
-                    // Add to ignore list
-                    let mask = args.to_string();
-                    let mask_key = self.network_support.canonicalize(&mask);
-                    if !self
-                        .ignore_list
-                        .iter()
-                        .any(|m| self.network_support.canonicalize(m) == mask_key)
-                    {
-                        self.ignore_list_lower.push(mask_key);
-                        self.ignore_list.push(mask.clone());
-                        self.add_message_to_current(ChatMessage::system(&format!(
-                            "Now ignoring: {}",
-                            mask
-                        )));
-                        // Save settings
+                    if self.add_ignore_masks(args) {
                         self.get_settings().save();
-                    } else {
-                        self.add_message_to_current(ChatMessage::system(&format!(
-                            "Already ignoring: {}",
-                            mask
-                        )));
                     }
                 }
             }
@@ -1916,29 +1897,8 @@ impl IrcApp {
                     self.add_message_to_current(ChatMessage::system(
                         "Usage: /unignore <nick|mask>",
                     ));
-                } else {
-                    let mask_key = self.network_support.canonicalize(args);
-                    let case_mapping = self.network_support.case_mapping;
-                    let before_len = self.ignore_list.len();
-                    self.ignore_list
-                        .retain(|m| case_mapping.canonicalize(m) != mask_key);
-                    if self.ignore_list.len() < before_len {
-                        self.ignore_list_lower = self
-                            .ignore_list
-                            .iter()
-                            .map(|s| case_mapping.canonicalize(s))
-                            .collect();
-                        self.add_message_to_current(ChatMessage::system(&format!(
-                            "No longer ignoring: {}",
-                            args
-                        )));
-                        self.get_settings().save();
-                    } else {
-                        self.add_message_to_current(ChatMessage::system(&format!(
-                            "Not in ignore list: {}",
-                            args
-                        )));
-                    }
+                } else if self.remove_ignore_masks(args) {
+                    self.get_settings().save();
                 }
             }
 
@@ -2146,6 +2106,93 @@ impl IrcApp {
                     .without_logging(),
             );
         }
+    }
+
+    /// `/ignore <mask>...`: add each mask to the ignore list and report the
+    /// outcome. Returns whether the list changed, so the caller persists it;
+    /// kept apart from the arm so tests can run it without writing the real
+    /// settings.
+    fn add_ignore_masks(&mut self, args: &str) -> bool {
+        let mut added = Vec::new();
+        let mut existing = Vec::new();
+        // A mask never contains whitespace, so each word is its own entry:
+        // "alice bob" stored as one mask would match nobody (#315).
+        for mask in args.split_whitespace() {
+            let mask_key = self.network_support.canonicalize(mask);
+            if self
+                .ignore_list
+                .iter()
+                .any(|m| self.network_support.canonicalize(m) == mask_key)
+            {
+                existing.push(mask);
+            } else {
+                self.ignore_list_lower.push(mask_key);
+                self.ignore_list.push(mask.to_string());
+                added.push(mask);
+            }
+        }
+        if !added.is_empty() {
+            self.add_message_to_current(ChatMessage::system(&format!(
+                "Now ignoring: {}",
+                added.join(", ")
+            )));
+        }
+        if !existing.is_empty() {
+            self.add_message_to_current(ChatMessage::system(&format!(
+                "Already ignoring: {}",
+                existing.join(", ")
+            )));
+        }
+        !added.is_empty()
+    }
+
+    /// Drop the ignore entries equal to `mask` under the network's casemapping.
+    fn remove_ignore_entry(&mut self, mask: &str) -> bool {
+        let mask_key = self.network_support.canonicalize(mask);
+        let case_mapping = self.network_support.case_mapping;
+        let before_len = self.ignore_list.len();
+        self.ignore_list
+            .retain(|m| case_mapping.canonicalize(m) != mask_key);
+        self.ignore_list.len() < before_len
+    }
+
+    /// `/unignore <mask>...`: the counterpart of `add_ignore_masks`.
+    fn remove_ignore_masks(&mut self, args: &str) -> bool {
+        let args = args.trim();
+        let mut removed = Vec::new();
+        let mut missing = Vec::new();
+        // An entry saved whole by an older version ("alice bob" as one mask)
+        // is listed with its space and goes only by its full text.
+        if args.contains(char::is_whitespace) && self.remove_ignore_entry(args) {
+            removed.push(args);
+        } else {
+            for mask in args.split_whitespace() {
+                if self.remove_ignore_entry(mask) {
+                    removed.push(mask);
+                } else {
+                    missing.push(mask);
+                }
+            }
+        }
+        if !removed.is_empty() {
+            let case_mapping = self.network_support.case_mapping;
+            self.ignore_list_lower = self
+                .ignore_list
+                .iter()
+                .map(|s| case_mapping.canonicalize(s))
+                .collect();
+            self.add_message_to_current(ChatMessage::system(&format!(
+                "No longer ignoring: {}",
+                removed.join(", ")
+            )));
+        }
+        if !missing.is_empty() {
+            self.add_message_to_current(ChatMessage::system(&format!(
+                "Not in ignore list: {}",
+                missing.join(", ")
+            )));
+        }
+        !removed.is_empty()
     }
 
     /// Whether a message target reaches a channel: any CHANTYPES name, with
@@ -3692,6 +3739,67 @@ mod tests {
                 .all(|row| !row.contains("hello") && !row.contains("ignored")),
             "{confirmations:?}"
         );
+    }
+
+    #[test]
+    fn ignore_adds_each_word_as_its_own_mask_and_unignore_removes_them() {
+        // The helpers stand in for the /ignore and /unignore arms, which
+        // also persist the list and so cannot run against the real config
+        // directory from a test. "alice bob" used to become one mask with a
+        // space in it that matched nobody (#315).
+        let mut app = IrcApp::with_settings(crate::gui::Settings {
+            logging_enabled: false,
+            ..crate::gui::Settings::default()
+        });
+        let last = |app: &IrcApp| {
+            app.server_messages
+                .back()
+                .map(|row| row.content.clone())
+                .unwrap_or_default()
+        };
+
+        assert!(app.add_ignore_masks("alice bob"));
+        assert_eq!(app.ignore_list, ["alice", "bob"]);
+        assert_eq!(app.ignore_list_lower, ["alice", "bob"]);
+        assert_eq!(last(&app), "Now ignoring: alice, bob");
+        assert!(app.is_ignored("alice", None));
+        assert!(app.is_ignored("BOB", None));
+
+        // Any whitespace separates masks; hostmasks work like nicks.
+        assert!(app.add_ignore_masks("  carol \t *!*@spam.example  "));
+        assert!(app.is_ignored("x", Some("x!y@spam.example")));
+        assert_eq!(app.ignore_list.len(), 4);
+
+        // Known masks are reported, not added twice (even within one line).
+        assert!(!app.add_ignore_masks("ALICE"));
+        assert_eq!(last(&app), "Already ignoring: ALICE");
+        assert!(app.add_ignore_masks("dave DAVE"));
+        assert_eq!(app.ignore_list.len(), 5);
+
+        // Each word is removed on its own; unknown words are reported.
+        assert!(app.remove_ignore_masks("alice"));
+        assert!(!app.is_ignored("alice", None));
+        assert!(app.remove_ignore_masks("bob CAROL"));
+        assert_eq!(app.ignore_list, ["*!*@spam.example", "dave"]);
+        assert_eq!(app.ignore_list_lower, ["*!*@spam.example", "dave"]);
+        assert!(app.remove_ignore_masks("dave nobody"));
+        assert!(
+            app.server_messages
+                .iter()
+                .any(|row| row.content.contains("nobody") && row.content.contains("Not in")),
+            "{:?}",
+            app.server_messages
+        );
+        assert!(!app.remove_ignore_masks("nobody"));
+        assert_eq!(app.ignore_list, ["*!*@spam.example"]);
+
+        // An entry saved whole by an older version can still be removed by
+        // typing it as it is listed.
+        app.ignore_list = vec!["eve frank".into()];
+        app.ignore_list_lower = vec!["eve frank".into()];
+        assert!(app.remove_ignore_masks("eve frank"));
+        assert!(app.ignore_list.is_empty());
+        assert!(app.ignore_list_lower.is_empty());
     }
 
     #[test]
