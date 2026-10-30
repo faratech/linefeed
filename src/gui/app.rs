@@ -176,10 +176,17 @@ impl App {
         if settings.nickname.is_empty() {
             settings.nickname = format!("Linefeed_{}", super::rand_suffix());
         }
+        let mut ids = HashSet::new();
         for favorite in &mut settings.server_favorites {
             if favorite.id.is_empty() {
-                favorite.id = super::new_profile_id();
+                favorite.id =
+                    super::derived_profile_id(&favorite.name, &favorite.host, &favorite.port);
+                if ids.contains(&favorite.id) {
+                    // A duplicate favorite: ids must stay distinct.
+                    favorite.id = super::new_profile_id();
+                }
             }
+            ids.insert(favorite.id.clone());
         }
         ChatMessage::configure_default_timestamp_format(&settings.timestamp_format);
         Self {
@@ -2908,6 +2915,160 @@ mod tests {
         assert!(app.sessions[0].connecting);
         let key = WindowKey::new(app.sessions[0].id, Some("#rust".into()));
         assert_eq!(app.windows.get(&key).unwrap().view.input_text, "half typed");
+    }
+
+    /// A loopback IRC server that completes registration for any nick, echoes
+    /// JOINs, and streams every line it receives.
+    fn echo_server() -> (u16, std::sync::mpsc::Receiver<String>) {
+        use std::io::{BufRead, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut writer = stream.try_clone().unwrap();
+            let mut reader = std::io::BufReader::new(stream);
+            let mut nick = String::from("*");
+            let mut line = String::new();
+            while reader.read_line(&mut line).unwrap_or(0) > 0 {
+                let text = line.trim_end().to_string();
+                line.clear();
+                let words: Vec<&str> = text.split(' ').collect();
+                let reply = match words.as_slice() {
+                    ["CAP", "LS", ..] => ":srv CAP * LS :multi-prefix".to_string(),
+                    // Like a real server: a request for anything not
+                    // offered is refused whole.
+                    ["CAP", "REQ", caps @ ..] => {
+                        let caps = caps.join(" ");
+                        let reply = if caps.trim_start_matches(':') == "multi-prefix" {
+                            "ACK"
+                        } else {
+                            "NAK"
+                        };
+                        format!(":srv CAP * {reply} {caps}")
+                    }
+                    ["NICK", new] => {
+                        nick = new.trim_start_matches(':').to_string();
+                        String::new()
+                    }
+                    ["CAP", "END"] => format!(":srv 001 {nick} :Welcome"),
+                    ["JOIN", channels, ..] => channels
+                        .split(',')
+                        .map(|c| format!(":{nick}!u@h JOIN {c}"))
+                        .collect::<Vec<_>>()
+                        .join("\r\n"),
+                    _ => String::new(),
+                };
+                if !reply.is_empty() {
+                    let _ = writer.write_all(format!("{reply}\r\n").as_bytes());
+                }
+                if tx.send(text).is_err() {
+                    break;
+                }
+            }
+        });
+        (port, rx)
+    }
+
+    #[test]
+    fn a_snapshot_written_by_0_1_4_restores_its_connection_channels_and_draft() {
+        // The bytes 0.1.4's `update_session()` wrote (generated with that
+        // release's code), read the way the updater hands them over; only the
+        // port is pointed at a local server.
+        let (port, lines) = echo_server();
+        let fixture = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/gui/testdata/update_session_0_1_4.json"
+        );
+        let mut json: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(fixture).unwrap()).unwrap();
+        json["session"]["server"]["port"] = port.into();
+        let path = std::env::temp_dir().join(format!(
+            "linefeed-update-session-{}.json",
+            std::process::id()
+        ));
+        std::fs::write(&path, json.to_string()).unwrap();
+        let snapshot: UpdateSession = crate::updater::install::read_json(&path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+
+        let mut app = App::with_settings(test_settings(), LayoutFile::default());
+        app.start(Some(snapshot));
+        let ctx = egui::Context::default();
+        let mut seen = Vec::new();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !seen.iter().any(|l: &String| l.starts_with("AWAY")) {
+            assert!(Instant::now() < deadline, "restore incomplete: {seen:?}");
+            app.background_tick(&ctx);
+            seen.extend(lines.try_iter());
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        // The connection 0.1.4 had: its server password and nick, invisible
+        // mode, both channels (one keyed), the away message and auto-perform.
+        for line in [
+            "PASS :server-pass",
+            "NICK tester_",
+            "MODE tester_ +i",
+            "JOIN #rust",
+            "JOIN #secret k3y",
+            "AWAY :lunch",
+        ] {
+            assert!(seen.iter().any(|l| l == line), "{line} missing: {seen:?}");
+        }
+        while !seen.iter().any(|l| l.starts_with("PRIVMSG NickServ")) {
+            assert!(
+                Instant::now() < deadline,
+                "auto-perform never ran: {seen:?}"
+            );
+            app.background_tick(&ctx);
+            seen.extend(lines.try_iter());
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(
+            seen.iter().any(|l| l == "PRIVMSG NickServ :hello"),
+            "{seen:?}"
+        );
+        // The selected window and its unsent draft, and the query.
+        let conn = app.sessions[0].id;
+        let secret = WindowKey::new(conn, Some("#secret".into()));
+        assert_eq!(app.windows.active, Some(secret.clone()));
+        assert_eq!(
+            app.windows.get(&secret).unwrap().view.input_text,
+            "half typed draft"
+        );
+        assert!(
+            app.windows
+                .get(&WindowKey::new(conn, Some("carol".into())))
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn favorites_without_ids_get_the_same_ids_back_after_a_downgrade() {
+        // As 0.1.4 writes them: no `id`, and it drops one whenever it saves.
+        let old = r##"{"server_favorites":[
+            {"name":"Libera","host":"irc.libera.chat","port":"6697","use_tls":true,
+             "password":"","nickname":"","auto_join":"","auto_perform":""},
+            {"name":"Libera","host":"irc.libera.chat","port":"6697","use_tls":true,
+             "password":"","nickname":"","auto_join":"","auto_perform":""},
+            {"name":"OFTC","host":"irc.oftc.net","port":"6697","use_tls":true,
+             "password":"","nickname":"","auto_join":"","auto_perform":"","id":"kept"}]}"##;
+        let ids = || -> Vec<String> {
+            let settings: Settings = serde_json::from_str(old).unwrap();
+            App::with_settings(settings, LayoutFile::default())
+                .settings
+                .server_favorites
+                .iter()
+                .map(|f| f.id.clone())
+                .collect()
+        };
+        let first = ids();
+        assert_eq!(first[0], ids()[0], "derived ids are stable");
+        assert_eq!(
+            first[0],
+            crate::gui::derived_profile_id("Libera", "irc.libera.chat", "6697")
+        );
+        assert_ne!(first[0], first[1], "a duplicate favorite got the same id");
+        assert_eq!(first[2], "kept");
     }
 
     #[test]
