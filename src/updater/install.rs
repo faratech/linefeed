@@ -1076,6 +1076,11 @@ fn apply_transaction_within(tx: &mut Transaction, running_wait: Duration) -> io:
     }
     tx.phase = Phase::Replaced;
     tx.save()?;
+    // A failure an earlier attempt recorded (a deferral while another instance
+    // ran, say) is stale now; the GUI started next must not report it (#324).
+    // Taken only after the new phase is durable, so a crash before this point
+    // keeps the message.
+    let _ = fs::remove_file(tx.paths.state.join("result.json"));
     running.unlock()?;
     if tx.restart {
         let mut child = launch(tx).ok();
@@ -2083,6 +2088,31 @@ mod tests {
         assert!(journal.phase == Phase::Staged);
         assert_eq!(hash(&tx.candidate()).unwrap(), tx.new_hash);
         assert_eq!(hash(&tx.paths.target).unwrap(), tx.old_hash);
+    }
+    #[cfg(unix)]
+    #[test]
+    fn a_deferral_recorded_earlier_is_not_reported_after_a_later_install_succeeds() {
+        // Instance A's helper defers because instance B is still running and
+        // records why; B's own helper then installs the update. The next GUI
+        // runs the new version and must not announce a failure (#324).
+        let mut fixture = probe_fixture(true);
+        let tx = &mut fixture.tx;
+        let result = tx.paths.state.join("result.json");
+        let other_instance = tx.paths.run_lock().unwrap();
+        other_instance.lock_shared().unwrap();
+        let error = apply_transaction_within(tx, Duration::from_millis(200)).unwrap_err();
+        // What `helper` records for any failure, deferral included.
+        write_json(&result, &format!("Update could not complete: {error}")).unwrap();
+        assert!(tx.phase == Phase::Staged && result.exists());
+
+        // B exits and arms; its helper succeeds.
+        other_instance.unlock().unwrap();
+        tx.phase = Phase::Prepared;
+        tx.save().unwrap();
+        apply_transaction(tx).unwrap();
+        assert!(tx.phase == Phase::Replaced);
+        assert_eq!(hash(&tx.paths.target).unwrap(), tx.new_hash);
+        assert!(!result.exists());
     }
     #[cfg(unix)]
     #[test]
