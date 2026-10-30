@@ -78,8 +78,20 @@ impl IrcApp {
     /// change is applied to the settings already on disk, never to the form's
     /// unsaved or unvalidated fields: only Connect and a validated Close may
     /// persist those (#316).
-    fn save_setting(&mut self, apply: impl FnOnce(&mut Settings)) {
-        let mut persisted = self.load_persisted_settings();
+    ///
+    /// If the settings file exists but cannot be read, nothing is written:
+    /// starting from defaults would replace the real file (favorites,
+    /// passwords) with defaults plus this one field.
+    pub(super) fn save_setting(&mut self, apply: impl FnOnce(&mut Settings)) {
+        let mut persisted = match self.try_load_persisted_settings() {
+            Ok(Some(settings)) => settings,
+            // First save: nothing to preserve.
+            Ok(None) => Settings::default(),
+            Err(error) => {
+                tracing::warn!("Not saving settings: the existing file could not be read: {error}");
+                return;
+            }
+        };
         apply(&mut persisted);
         self.store_persisted_settings(persisted);
     }
@@ -88,6 +100,43 @@ impl IrcApp {
         self.automatic_updates = enabled;
         self.updater.set_automatic(enabled);
         self.save_setting(|settings| settings.automatic_updates = enabled);
+    }
+
+    /// Store the validated Connection form as a named favorite and persist the
+    /// favorites list. Returns whether a favorite was saved.
+    fn save_form_as_favorite(&mut self) -> bool {
+        if self.new_favorite_name.is_empty() || !self.validate_connection_form() {
+            return false;
+        }
+        let new_fav = ServerFavorite {
+            name: self.new_favorite_name.clone(),
+            host: self.server_host.clone(),
+            port: self.server_port.clone(),
+            use_tls: self.use_tls,
+            password: self.password.clone(),
+            nickname: self.nickname.clone(),
+            auto_join: self.auto_join_channels.clone(),
+            auto_perform: self.auto_perform.clone(),
+            sasl_username: self.sasl_username.clone(),
+            sasl_password: self.sasl_password.clone(),
+            sasl_mechanism: self.sasl_mechanism,
+            sasl_required: self.sasl_required,
+            tls_client_cert_path: self.tls_client_cert_path.clone(),
+            tls_client_key_path: self.tls_client_key_path.clone(),
+            username: self.username.clone(),
+            realname: self.realname.clone(),
+            accept_invalid_certs: self.accept_invalid_certs,
+            pre_away_message: self.pre_away_message.clone(),
+            persistence_profile: self.persistence_profile.clone(),
+        };
+        self.server_favorites.push(new_fav);
+        self.selected_favorite = Some(self.server_favorites.len() - 1);
+        // Only the list: the form's other fields are not saved settings yet.
+        let favorites = self.server_favorites.clone();
+        self.save_setting(|settings| settings.server_favorites = favorites);
+        self.new_favorite_name.clear();
+        self.show_save_favorite_dialog = false;
+        true
     }
 
     /// Request a fresh channel list from the Channel List window.
@@ -416,36 +465,8 @@ impl IrcApp {
                     ui.horizontal(|ui| {
                         ui.label("Name:");
                         ui.add(TextEdit::singleline(&mut self.new_favorite_name).desired_width(150.0));
-                        if ui.button("Save").clicked()
-                            && !self.new_favorite_name.is_empty()
-                            && self.validate_connection_form()
-                        {
-                            let new_fav = ServerFavorite {
-                                name: self.new_favorite_name.clone(),
-                                host: self.server_host.clone(),
-                                port: self.server_port.clone(),
-                                use_tls: self.use_tls,
-                                password: self.password.clone(),
-                                nickname: self.nickname.clone(),
-                                auto_join: self.auto_join_channels.clone(),
-                                auto_perform: self.auto_perform.clone(),
-                                sasl_username: self.sasl_username.clone(),
-                                sasl_password: self.sasl_password.clone(),
-                                sasl_mechanism: self.sasl_mechanism,
-                                sasl_required: self.sasl_required,
-                                tls_client_cert_path: self.tls_client_cert_path.clone(),
-                                tls_client_key_path: self.tls_client_key_path.clone(),
-                                username: self.username.clone(),
-                                realname: self.realname.clone(),
-                                accept_invalid_certs: self.accept_invalid_certs,
-                                pre_away_message: self.pre_away_message.clone(),
-                                persistence_profile: self.persistence_profile.clone(),
-                            };
-                            self.server_favorites.push(new_fav);
-                            self.selected_favorite = Some(self.server_favorites.len() - 1);
-                            self.save_settings();
-                            self.new_favorite_name.clear();
-                            self.show_save_favorite_dialog = false;
+                        if ui.button("Save").clicked() {
+                            self.save_form_as_favorite();
                         }
                         if ui.button("Cancel").clicked() {
                             self.new_favorite_name.clear();
@@ -1966,5 +1987,97 @@ mod tests {
 
         let names: Vec<&str> = app.channel_list.iter().map(|e| e.name.as_str()).collect();
         assert_eq!(names, ["#kept"]);
+    }
+
+    fn settings_json(settings: &Settings) -> String {
+        serde_json::to_string(settings).unwrap()
+    }
+
+    #[test]
+    fn saving_a_favorite_persists_only_the_favorites_list() {
+        let mut app = app_with_dirty_connection_form();
+        app.server_port = "6667".into();
+        app.new_favorite_name = "mine".into();
+
+        assert!(app.save_form_as_favorite());
+
+        let saved = app.load_persisted_settings();
+        assert_eq!(saved.server_favorites.len(), 3);
+        let favorite = saved.server_favorites.last().unwrap();
+        assert_eq!(favorite.name, "mine");
+        assert_eq!(
+            favorite.password, "scratch-pass",
+            "favorites keep credentials"
+        );
+        // ...but the co-open Connect dialog's scratch values are not top-level
+        // settings until Connect or a validated Close saves them.
+        assert_eq!(saved.server_port, "6697");
+        assert!(saved.password.is_empty(), "scratch password persisted");
+        assert!(saved.sasl_password.is_empty());
+        assert!(saved.auto_perform.is_empty());
+    }
+
+    #[test]
+    fn ignore_commands_persist_only_the_ignore_list() {
+        let mut app = app_with_dirty_connection_form();
+
+        app.process_command("/ignore troll");
+        let saved = app.load_persisted_settings();
+        assert_eq!(saved.ignore_list, app.ignore_list);
+        assert_eq!(saved.ignore_list.len(), 1);
+        assert_form_not_persisted(&app);
+
+        app.process_command("/unignore troll");
+        assert!(app.load_persisted_settings().ignore_list.is_empty());
+        assert_form_not_persisted(&app);
+    }
+
+    #[test]
+    fn perform_commands_persist_only_the_auto_perform_list() {
+        let mut app = app_with_dirty_connection_form();
+        app.auto_perform.clear();
+
+        app.process_command("/perform /mode +i");
+        let saved = app.load_persisted_settings();
+        assert_eq!(saved.auto_perform, "/mode +i");
+        assert_eq!(saved.server_port, "6697");
+        assert!(saved.password.is_empty());
+        assert!(saved.sasl_username.is_empty());
+
+        app.process_command("/perform clear");
+        let saved = app.load_persisted_settings();
+        assert!(saved.auto_perform.is_empty());
+        assert_eq!(saved.server_port, "6697");
+        assert!(saved.password.is_empty());
+    }
+
+    #[test]
+    fn an_unreadable_settings_file_is_never_overwritten_by_a_field_save() {
+        let mut app = app_with_dirty_connection_form();
+        let before = settings_json(app.settings_file.as_ref().unwrap());
+        app.settings_file_unreadable = true;
+
+        app.set_automatic_updates(false);
+        assert!(app.delete_favorite(0));
+        app.process_command("/ignore troll");
+        app.save_list_min_users();
+
+        assert_eq!(
+            settings_json(app.settings_file.as_ref().unwrap()),
+            before,
+            "a read failure must skip the save, not write defaults over the file"
+        );
+    }
+
+    #[test]
+    fn a_missing_settings_file_is_created_by_a_field_save() {
+        let mut app = app_with_dirty_connection_form();
+        app.settings_file = None;
+
+        app.set_automatic_updates(false);
+
+        let saved = app.settings_file.as_ref().expect("file created");
+        assert!(!saved.automatic_updates);
+        assert!(saved.password.is_empty());
     }
 }

@@ -1902,7 +1902,8 @@ impl IrcApp {
                     }
                 } else {
                     if self.add_ignore_masks(args) {
-                        self.get_settings().save();
+                        let ignored = self.ignore_list.clone();
+                        self.save_setting(|settings| settings.ignore_list = ignored);
                     }
                 }
             }
@@ -1913,7 +1914,8 @@ impl IrcApp {
                         "Usage: /unignore <nick|mask>",
                     ));
                 } else if self.remove_ignore_masks(args) {
-                    self.get_settings().save();
+                    let ignored = self.ignore_list.clone();
+                    self.save_setting(|settings| settings.ignore_list = ignored);
                 }
             }
 
@@ -2012,7 +2014,8 @@ impl IrcApp {
                     }
                 } else if args.eq_ignore_ascii_case("clear") {
                     self.auto_perform.clear();
-                    self.get_settings().save();
+                    let perform = self.auto_perform.clone();
+                    self.save_setting(|settings| settings.auto_perform = perform);
                     self.add_message_to_current(ChatMessage::system(
                         "Auto-perform commands cleared.",
                     ));
@@ -2022,7 +2025,8 @@ impl IrcApp {
                         self.auto_perform.push('\n');
                     }
                     self.auto_perform.push_str(args);
-                    self.get_settings().save();
+                    let perform = self.auto_perform.clone();
+                    self.save_setting(|settings| settings.auto_perform = perform);
                     self.add_message_to_current(
                         ChatMessage::system("Added command to auto-perform.").without_logging(),
                     );

@@ -449,7 +449,10 @@ pub struct IrcApp {
     /// In-memory stand-in for settings.json, so unit tests can observe what
     /// would be persisted without reading or overwriting the real file.
     #[cfg(test)]
-    settings_file: Settings,
+    settings_file: Option<Settings>,
+    /// Test switch: the settings file exists but cannot be read.
+    #[cfg(test)]
+    settings_file_unreadable: bool,
     /// Channels the user asked to join (/join, the join box, the channel
     /// list). The matching own-JOIN echo moves focus to the new tab; any other
     /// own-JOIN (auto-join, bouncer replay, reconnect) leaves the tab the user
@@ -596,7 +599,9 @@ impl IrcApp {
 
         Self {
             #[cfg(test)]
-            settings_file: settings.clone(),
+            settings_file: Some(settings.clone()),
+            #[cfg(test)]
+            settings_file_unreadable: false,
             updater: crate::updater::Controller::default(),
             automatic_updates: settings.automatic_updates,
             update_rejoins: None,
@@ -1225,7 +1230,7 @@ impl IrcApp {
     fn load_persisted_settings(&self) -> Settings {
         #[cfg(test)]
         {
-            self.settings_file.clone()
+            self.settings_file.clone().unwrap_or_default()
         }
         #[cfg(not(test))]
         {
@@ -1233,10 +1238,28 @@ impl IrcApp {
         }
     }
 
+    /// The persisted settings, telling "no file yet" (`Ok(None)`) apart from
+    /// "a file exists but cannot be read" (`Err`), unlike `load`, which turns
+    /// both into defaults.
+    fn try_load_persisted_settings(&self) -> std::io::Result<Option<Settings>> {
+        #[cfg(test)]
+        {
+            if self.settings_file_unreadable {
+                Err(std::io::Error::other("settings file unreadable (test)"))
+            } else {
+                Ok(self.settings_file.clone())
+            }
+        }
+        #[cfg(not(test))]
+        {
+            Settings::try_load()
+        }
+    }
+
     fn store_persisted_settings(&mut self, settings: Settings) {
         #[cfg(test)]
         {
-            self.settings_file = settings;
+            self.settings_file = Some(settings);
         }
         #[cfg(not(test))]
         {

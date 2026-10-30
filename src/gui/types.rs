@@ -190,6 +190,29 @@ impl Settings {
         dirs::config_dir().map(|p| p.join("linefeed").join("settings.json"))
     }
 
+    /// Read the settings file without any fallback: `Ok(None)` when there is
+    /// none yet, `Err` when it exists but cannot be read or parsed. A caller
+    /// that read-modify-writes must stop on `Err`, or it would overwrite the
+    /// real file with defaults.
+    #[cfg_attr(test, allow(dead_code))]
+    pub fn try_load() -> std::io::Result<Option<Self>> {
+        match Self::config_path() {
+            Some(path) => Self::try_load_from(&path),
+            None => Ok(None),
+        }
+    }
+
+    fn try_load_from(path: &std::path::Path) -> std::io::Result<Option<Self>> {
+        let data = match std::fs::read_to_string(path) {
+            Ok(data) => data,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        serde_json::from_str(&data)
+            .map(Some)
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
+    }
+
     pub fn load() -> Self {
         if let Some(path) = Self::config_path()
             && path.exists()
@@ -222,6 +245,7 @@ impl Settings {
         Self::default()
     }
 
+    #[cfg_attr(test, allow(dead_code))]
     pub fn save(&self) {
         let Some(path) = Self::config_path() else {
             return;
@@ -2214,5 +2238,35 @@ mod tests {
         assert_eq!(e.name_lower, "#rust");
         assert_eq!(e.topic_clean, "Hot topic");
         assert_eq!(e.topic_lower, "hot topic");
+    }
+
+    #[test]
+    fn try_load_tells_a_missing_file_from_an_unreadable_one() {
+        let dir = std::env::temp_dir().join(format!("linefeed-try-load-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // No file yet: not an error.
+        let path = dir.join("settings.json");
+        assert!(Settings::try_load_from(&path).unwrap().is_none());
+
+        // A valid file parses.
+        std::fs::write(
+            &path,
+            r#"{"server_host":"irc.example","server_port":"6667"}"#,
+        )
+        .unwrap();
+        let loaded = Settings::try_load_from(&path).unwrap().unwrap();
+        assert_eq!(loaded.server_host, "irc.example");
+
+        // A torn file is an error, not defaults.
+        std::fs::write(&path, r#"{"server_host":"irc.exa"#).unwrap();
+        assert!(Settings::try_load_from(&path).is_err());
+
+        // So is a path that cannot be read as a file.
+        let unreadable = dir.join("is-a-directory");
+        std::fs::create_dir_all(&unreadable).unwrap();
+        assert!(Settings::try_load_from(&unreadable).is_err());
+
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }
