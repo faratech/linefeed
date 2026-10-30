@@ -380,6 +380,11 @@ impl App {
     pub fn background_tick(&mut self, ctx: &egui::Context) {
         self.focused = false;
         self.focused_detached = None;
+        if self.tray_hidden {
+            // Detached windows are not shown, so egui closes them; they are
+            // recreated where they last were (`os_pos`/`os_size`) on restore.
+            self.spawn_geometry.clear();
+        }
         self.tick(ctx, false);
         self.finish_frame();
     }
@@ -2440,6 +2445,7 @@ mod tests {
 
         app.tray_hidden = true;
         app.background_tick(&ctx);
+        assert!(app.spawn_geometry.is_empty(), "stale creation geometry kept");
         let output = ctx.run_ui(egui::RawInput::default(), |_ui| app.draw_detached(&ctx));
         assert!(!texts(&output).iter().any(|t| t.contains("apt is fine")));
         assert!(app.spawn_geometry.is_empty());
