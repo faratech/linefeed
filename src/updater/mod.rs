@@ -148,8 +148,12 @@ impl Controller {
             && tx.paths.state == paths.state
             && tx.validate().is_ok()
         {
+            // A candidate that was quarantined or truncated since staging is not
+            // an update to offer: leaving it unstaged lets the same release be
+            // downloaded again, which replaces the damaged stage (#296).
             if tx.phase == Phase::Staged
                 && install::hash(&paths.target).ok().as_deref() == Some(&tx.old_hash)
+                && install::hash(&tx.candidate()).ok().as_deref() == Some(&tx.new_hash)
             {
                 // A failure the helper recorded stays visible; the staged
                 // update remains installable below it.
@@ -999,6 +1003,35 @@ mod tests {
         controller.start(Some(paths), egui::Context::default(), false);
         assert!(matches!(&controller.status, Status::Error(message) if message == failure));
         assert!(controller.staged.is_some());
+        drop(controller);
+        let _ = fs::remove_dir_all(root);
+    }
+    #[test]
+    fn a_staged_update_whose_candidate_was_damaged_is_not_ready_and_can_be_downloaded_again() {
+        // Antivirus truncated only the candidate after staging. Startup must not
+        // call that update ready/verified, or the same release can never be
+        // fetched again from the UI (#296).
+        let (root, paths, tx) = staged_fixture("0.0.10");
+        fs::write(tx.candidate(), b"new exec").unwrap();
+        let mut controller = Controller::default();
+        controller.start(Some(paths.clone()), egui::Context::default(), false);
+        assert!(controller.staged.is_none());
+        assert!(!matches!(controller.status, Status::Ready));
+        controller.offer = Some(
+            select_release(release("v0.0.10"), "0.0.9", Some("linefeed_x64.exe"))
+                .unwrap()
+                .unwrap(),
+        );
+        assert!(controller.download_available());
+        // The journal and staging stay for the re-download to replace.
+        assert!(paths.journal().exists() && tx.directory.exists());
+        drop(controller);
+        // A missing candidate is the same damage.
+        fs::remove_file(tx.candidate()).unwrap();
+        let mut controller = Controller::default();
+        controller.start(Some(paths), egui::Context::default(), false);
+        assert!(controller.staged.is_none());
+        assert!(!matches!(controller.status, Status::Ready));
         drop(controller);
         let _ = fs::remove_dir_all(root);
     }
