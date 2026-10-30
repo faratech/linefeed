@@ -404,12 +404,10 @@ impl App {
         self.finish_frame();
     }
 
-    /// The main window is minimized: its detached windows go with it (as
-    /// owned windows do on Windows), and come back when it is restored.
-    /// eframe runs no ui pass for a minimized main window, and forcing one
-    /// would paint (present) a minimized window, which can block on Windows;
-    /// so the windows are hidden with a viewport command, which eframe also
-    /// applies on logic-only frames.
+    /// The main window went to the system tray: its detached windows go with
+    /// it, and come back where they were when it is restored. They are
+    /// hidden with a viewport command, which eframe also applies on the
+    /// logic-only passes a hidden main window gets.
     pub fn hide_detached_windows(&mut self, ctx: &egui::Context) {
         if !self.detached_hidden {
             for key in self.detached_keys() {
@@ -423,18 +421,25 @@ impl App {
         self.focused_detached = None;
     }
 
-    /// A ui pass while the main window is minimized: the detached windows
-    /// are not drawn, so egui closes them; they reopen where they last were
-    /// when the main window is restored.
-    pub fn forget_detached_windows(&mut self) {
-        self.spawn_geometry.clear();
-        self.focused_detached = None;
-        self.detached_hidden = false;
+    /// A ui pass while the main window is minimized or covered: eframe runs
+    /// one only while a detached window is on screen, and paints nothing of
+    /// the main window. Keep the detached windows drawn and working. The
+    /// pass's `logic` has already ticked every connection (`ticked`).
+    pub fn ui_detached_only(&mut self, ctx: &egui::Context, ticked: bool) {
+        if !ticked {
+            self.background_tick(ctx);
+        }
+        self.draw_detached(ctx);
+        self.finish_frame();
     }
 
     #[cfg(test)]
     pub(crate) fn detached_windows_hidden(&self) -> bool {
         self.detached_hidden
+    }
+
+    fn has_detached(&self) -> bool {
+        self.windows.windows.iter().any(|w| w.detached)
     }
 
     fn detached_keys(&self) -> Vec<WindowKey> {
@@ -446,17 +451,22 @@ impl App {
             .collect()
     }
 
-    /// Hidden or minimized with nothing to draw: drain every session so the
-    /// buffers cannot fill, keep timers and lifecycles running.
+    /// The main window is hidden, minimized or covered: drain every session
+    /// so the buffers cannot fill, keep timers and lifecycles running.
+    /// Unless the main window went to the tray, detached windows are still
+    /// on screen, and one of them may have focus.
     pub fn background_tick(&mut self, ctx: &egui::Context) {
-        self.focused = false;
-        self.focused_detached = None;
+        let detached_live = !self.tray_hidden && self.has_detached();
+        if !detached_live {
+            self.focused_detached = None;
+        }
+        self.focused = self.focused_detached.is_some();
         if self.tray_hidden {
             // Detached windows are not shown, so egui closes them; they are
             // recreated where they last were (`os_pos`/`os_size`) on restore.
             self.spawn_geometry.clear();
         }
-        self.tick(ctx, false);
+        self.tick(ctx, detached_live);
         self.finish_frame();
     }
 
@@ -3145,6 +3155,45 @@ mod tests {
         // Reattached: the dialogs go back to the main window.
         app.toggle_detached(&debian);
         assert_eq!(app.detached_dialog_owner(debian.conn), None);
+    }
+
+    #[test]
+    fn a_detached_window_sends_what_is_typed_while_the_main_window_is_minimized() {
+        let (mut app, _rx_a, mut rx_b) = two_networks();
+        let debian = WindowKey::new(app.sessions[1].id, Some("#debian".into()));
+        app.toggle_detached(&debian);
+        {
+            let window = app.windows.get_mut(&debian).unwrap();
+            window.view.input_text = "still here".into();
+            window.view.input_focus_request = true;
+        }
+        let ctx = egui::Context::default();
+        frame(&mut app, &ctx);
+        frame(&mut app, &ctx);
+        drain(&mut rx_b);
+        // The main window is minimized: eframe runs ui passes only for the
+        // detached window, after `logic` ticked the connections.
+        app.background_tick(&ctx);
+        ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1024.0, 768.0),
+                )),
+                events: vec![egui::Event::Key {
+                    key: egui::Key::Enter,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::NONE,
+                }],
+                ..Default::default()
+            },
+            |ui| app.ui_detached_only(ui.ctx(), true),
+        )
+        .textures_delta
+        .clear();
+        assert_eq!(drain(&mut rx_b), ["PRIVMSG #debian :still here"]);
     }
 
     #[test]
