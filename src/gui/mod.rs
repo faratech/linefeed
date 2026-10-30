@@ -521,6 +521,9 @@ pub struct IrcApp {
     // Rate limiting for desktop notifications (each one spawns a thread and,
     // on Linux/macOS, a subprocess - a flood must not spawn one per message).
     last_notification_time: Option<std::time::Instant>,
+    /// Notifications that would have reached the OS (tests only).
+    #[cfg(test)]
+    dispatched_notifications: Vec<(String, String)>,
 
     nick_retry_attempts: u8,
     /// Nicks this client has held this session (newest first, capped). Own
@@ -736,6 +739,8 @@ impl IrcApp {
             // CPU optimization
             had_messages_this_frame: false,
             last_notification_time: None,
+            #[cfg(test)]
+            dispatched_notifications: Vec::new(),
             nick_retry_attempts: 0,
             past_nicks: Vec::new(),
             nick_confirmed: false,
@@ -972,6 +977,36 @@ impl IrcApp {
         }
     }
 
+    /// Desktop notification for an incoming chat message: PMs always notify
+    /// (force=true), highlights only while the window is unfocused. Shared by
+    /// live PRIVMSGs and completed multiline batches so both deliver alike
+    /// (#289). `preview` is the already-truncated message text.
+    fn notify_incoming_message(
+        &mut self,
+        sender: &str,
+        target_name: &str,
+        preview: &str,
+        is_pm: bool,
+        is_highlight: bool,
+    ) {
+        // Skip if we sent it ourselves. Current nick only, not held nicks: a
+        // peer squatting a nick we vacated must not suppress the user's
+        // notifications (#168) - a racing echo under the old nick costs at
+        // worst a duplicate row.
+        if self.identifiers_equal(sender, &self.my_nick) {
+            return;
+        }
+        if is_pm {
+            self.send_notification(&format!("PM from {sender}"), preview, true);
+        } else if is_highlight {
+            self.send_notification(
+                &format!("{sender} mentioned you in {target_name}"),
+                preview,
+                false,
+            );
+        }
+    }
+
     /// Send a desktop notification
     pub fn send_notification(&mut self, title: &str, body: &str, force: bool) {
         // Title only, at debug: the body is message text, which must not reach
@@ -1000,7 +1035,21 @@ impl IrcApp {
             return;
         }
         self.last_notification_time = Some(std::time::Instant::now());
+        self.dispatch_notification(title, body);
+    }
 
+    /// Hand a notification that passed the policy gates to the OS. Unit tests
+    /// record it instead of spawning helpers.
+    fn dispatch_notification(&mut self, title: &str, body: &str) {
+        #[cfg(test)]
+        self.dispatched_notifications
+            .push((title.to_string(), body.to_string()));
+        #[cfg(not(test))]
+        Self::spawn_os_notification(title, body);
+    }
+
+    #[cfg_attr(test, allow(dead_code))]
+    fn spawn_os_notification(title: &str, body: &str) {
         // Use notify-send on Linux/BSD (usually pre-installed on Linux desktops)
         #[cfg(all(unix, not(target_os = "macos")))]
         {
@@ -1847,15 +1896,20 @@ impl IrcApp {
         } else {
             &batch.content
         };
+        // Highlight like a live PRIVMSG (#289): without it a nick mention in a
+        // multiline message rendered as a plain row.
+        let is_highlight = !batch.is_notice && self.check_nick_mention(content);
+        let fmt = &self.timestamp_format;
         let message = if batch.is_notice {
-            ChatMessage::system_fmt(
-                &format!("-{}- {}", batch.sender, content),
-                &self.timestamp_format,
-            )
+            ChatMessage::system_fmt(&format!("-{}- {}", batch.sender, content), fmt)
+        } else if is_action && is_highlight {
+            ChatMessage::action_highlighted_fmt(&batch.sender, content, fmt)
         } else if is_action {
-            ChatMessage::action_fmt(&batch.sender, content, &self.timestamp_format)
+            ChatMessage::action_fmt(&batch.sender, content, fmt)
+        } else if is_highlight {
+            ChatMessage::highlighted_fmt(&batch.sender, content, fmt)
         } else {
-            ChatMessage::new_fmt(&batch.sender, content, &self.timestamp_format)
+            ChatMessage::new_fmt(&batch.sender, content, fmt)
         }
         .with_irc_metadata(batch.server_time, batch.msgid, batch.account)
         .with_oper(batch.oper)
@@ -1866,13 +1920,24 @@ impl IrcApp {
             return;
         }
 
-        let target = self.strip_status_prefix(&batch.target).to_string();
-        let target =
-            if !self.is_channel_name(&target) && self.identifiers_equal(&target, &self.my_nick) {
-                batch.sender
-            } else {
-                target
-            };
+        let routed_target = self.strip_status_prefix(&batch.target).to_string();
+        let is_pm = !self.is_channel_name(&routed_target)
+            && self.identifiers_equal(&routed_target, &self.my_nick);
+        let target = if is_pm {
+            batch.sender.clone()
+        } else {
+            routed_target
+        };
+        if !batch.is_notice {
+            let notified_content = truncate_chars(content, 50);
+            self.notify_incoming_message(
+                &batch.sender,
+                &target,
+                &notified_content,
+                is_pm,
+                is_highlight,
+            );
+        }
         if !self.merge_server_echo(&target, &message) {
             self.add_message_to_channel(&target, message);
         }
@@ -3742,26 +3807,14 @@ impl IrcApp {
                 );
 
                 // Send desktop notification for highlights and PMs
-                // Skip if we sent it ourselves. Current nick only, not held
-                // nicks: a peer squatting a nick we vacated must not
-                // suppress the user's notifications (#168) — a racing echo
-                // under the old nick costs at worst a duplicate row.
+                self.notify_incoming_message(
+                    &sender,
+                    &target_name,
+                    &truncate_chars(content, 50),
+                    is_pm,
+                    is_highlight,
+                );
                 let is_from_self = self.identifiers_equal(&sender, &self.my_nick);
-                if is_pm && !is_from_self {
-                    // PMs always notify (force=true)
-                    self.send_notification(
-                        &format!("PM from {}", sender),
-                        &truncate_chars(content, 50),
-                        true,
-                    );
-                } else if is_highlight && !is_from_self {
-                    // Highlights only notify when not focused
-                    self.send_notification(
-                        &format!("{} mentioned you in {}", sender, target_name),
-                        &truncate_chars(content, 50),
-                        false,
-                    );
-                }
 
                 if !is_from_self || !self.merge_server_echo(&target_name, &chat_msg) {
                     self.add_message_to_channel(&target_name, chat_msg);
@@ -12271,4 +12324,115 @@ mod tests {
         drop(app);
         std::fs::remove_dir_all(dir).unwrap();
     }
+
+    /// Deliver a complete two-line draft/multiline message through the same
+    /// entry point the connection thread uses.
+    fn deliver_multiline(app: &mut IrcApp, id: &str, prefix: &str, target: &str, lines: &[&str]) {
+        app.handle_incoming_message(
+            IrcMessage::parse(&format!(":{prefix} BATCH +{id} draft/multiline {target}")).unwrap(),
+        );
+        for line in lines {
+            app.handle_incoming_message(
+                IrcMessage::parse(&format!("@batch={id} :{prefix} PRIVMSG {target} :{line}"))
+                    .unwrap(),
+            );
+        }
+        app.handle_incoming_message(IrcMessage::parse(&format!(":{prefix} BATCH -{id}")).unwrap());
+    }
+
+    #[test]
+    fn multiline_messages_highlight_and_notify_like_single_line_messages() {
+        let mut app = test_app();
+        app.set_session_nick("me".to_string(), true);
+        app.notifications_enabled = true;
+        app.window_focused = false;
+
+        // A nick mention in a channel: highlighted row and a highlight
+        // notification, exactly as the single-line message gets.
+        deliver_multiline(
+            &mut app,
+            "m1",
+            "alice!u@h",
+            "#room",
+            &["hello me", "second line"],
+        );
+        let row = app.channels["#room"].messages.back().unwrap();
+        assert_eq!(row.content, "hello me\nsecond line");
+        assert!(row.is_highlight, "#289: multiline mention not highlighted");
+        assert_eq!(app.dispatched_notifications.len(), 1);
+        assert_eq!(
+            app.dispatched_notifications[0].0,
+            "alice mentioned you in #room"
+        );
+
+        // A multiline PM notifies even while the window is focused.
+        app.dispatched_notifications.clear();
+        app.last_notification_time = None;
+        app.window_focused = true;
+        deliver_multiline(&mut app, "m2", "bob!u@h", "me", &["psst", "are you there"]);
+        let row = app.channels["bob"].messages.back().unwrap();
+        assert_eq!(row.content, "psst\nare you there");
+        assert!(!row.is_highlight);
+        assert_eq!(app.dispatched_notifications.len(), 1, "#289: PM not notified");
+        assert_eq!(app.dispatched_notifications[0].0, "PM from bob");
+
+        // A plain channel message neither highlights nor notifies.
+        app.dispatched_notifications.clear();
+        app.last_notification_time = None;
+        app.window_focused = false;
+        deliver_multiline(&mut app, "m3", "alice!u@h", "#room", &["nothing", "here"]);
+        assert!(!app.channels["#room"].messages.back().unwrap().is_highlight);
+        assert!(app.dispatched_notifications.is_empty());
+    }
+
+    #[test]
+    fn multiline_action_mentions_highlight_and_own_or_replayed_messages_stay_silent() {
+        let mut app = test_app();
+        app.set_session_nick("me".to_string(), true);
+        app.notifications_enabled = true;
+        app.window_focused = false;
+
+        // CTCP ACTION multiline mention: highlighted action row.
+        deliver_multiline(
+            &mut app,
+            "a1",
+            "alice!u@h",
+            "#room",
+            &["\x01ACTION waves at me", "and smiles\x01"],
+        );
+        let row = app.channels["#room"].messages.back().unwrap();
+        assert!(row.is_action && row.is_highlight, "#289: {row:?}");
+
+        // Our own multiline message (echo-message) never notifies.
+        app.dispatched_notifications.clear();
+        app.last_notification_time = None;
+        deliver_multiline(&mut app, "s1", "me!u@h", "me", &["note to self", "me me me"]);
+        assert!(app.dispatched_notifications.is_empty());
+
+        // A multiline message replayed inside a chathistory batch keeps its
+        // highlight but never raises a notification.
+        app.prepare_history_target("#room");
+        app.handle_incoming_message(
+            IrcMessage::parse("@draft/chathistory-end :srv BATCH +hist chathistory #room").unwrap(),
+        );
+        app.handle_incoming_message(
+            IrcMessage::parse("@batch=hist :bob!u@h BATCH +hm draft/multiline #room").unwrap(),
+        );
+        app.handle_incoming_message(
+            IrcMessage::parse("@batch=hm :bob!u@h PRIVMSG #room :old news for me").unwrap(),
+        );
+        app.handle_incoming_message(
+            IrcMessage::parse("@batch=hm :bob!u@h PRIVMSG #room :second").unwrap(),
+        );
+        app.handle_incoming_message(IrcMessage::parse(":bob!u@h BATCH -hm").unwrap());
+        app.handle_incoming_message(IrcMessage::parse(":srv BATCH -hist").unwrap());
+        let replayed = app.channels["#room"]
+            .messages
+            .iter()
+            .find(|row| row.content == "old news for me\nsecond")
+            .expect("replayed multiline row");
+        assert!(replayed.is_highlight);
+        assert!(app.dispatched_notifications.is_empty());
+    }
+
 }
