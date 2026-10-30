@@ -316,9 +316,11 @@ impl LogManager {
                 .and_then(|cached| cached.writer.flush().err())
         };
         if let Some(e) = flush_error {
+            // Evict the broken writer so the next write reopens, but still read:
+            // the history already on disk is complete and readable even when
+            // the pending bytes could not be written (e.g. disk full) (#319).
             tracing::error!("Failed to flush log file {:?} before reading: {}", path, e);
             self.writers.borrow_mut().remove(&path);
-            return Vec::new();
         }
 
         let mut file = match File::open(&path) {
@@ -1139,5 +1141,49 @@ mod tests {
         // "[HH:MM:SS]" in the log line must be the marker's clock.
         let clock = line_stamp.trim_matches(|c| c == '[' || c == ']');
         assert!(marker.contains(&format!(" {clock} ")), "{marker} vs {line_stamp}");
+    }
+
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn failed_pre_history_flush_still_returns_the_history_already_on_disk() {
+        let (manager, dir) = test_manager("flush-failure-history");
+        let network = "tls:irc.example:6697";
+        manager.log_message(
+            network,
+            "#room",
+            &msg("[09:30]", "alice", "older line one", false, false),
+        );
+        manager.log_message(
+            network,
+            "#room",
+            &msg("[09:31]", "bob", "older line two", false, false),
+        );
+        manager.flush_all();
+
+        // The disk is now full: the writer for this log holds pending bytes it
+        // cannot flush. Reading the file needs no free space (#319).
+        let path = manager.log_path(network, "#room");
+        let identity = same_file::Handle::from_path(&path).unwrap();
+        let full = OpenOptions::new().write(true).open("/dev/full").unwrap();
+        let mut writer = std::io::BufWriter::new(full);
+        writeln!(writer, "pending line that cannot be flushed").unwrap();
+        manager.writers.borrow_mut().insert(
+            path.clone(),
+            CachedWriter {
+                writer,
+                identity,
+                last_used: std::time::Instant::now(),
+            },
+        );
+
+        let history = manager.load_history_with_legacy(network, network, "#room", 10, false);
+
+        let contents: Vec<&str> = history.iter().map(|m| m.content.as_str()).collect();
+        assert_eq!(contents, ["older line one", "older line two"]);
+        // The broken writer is still evicted so the next write reopens.
+        assert!(!manager.writers.borrow().contains_key(&path));
+        drop(manager);
+        fs::remove_dir_all(dir).expect("remove temporary log directory");
     }
 }
