@@ -467,7 +467,9 @@ pub struct IrcApp {
     pending_history_requests: HashMap<String, VecDeque<PendingHistoryRequest>>,
     known_users: HashMap<String, KnownUser>,
     monitored_users: std::collections::HashSet<String>,
-    pending_whox: HashMap<String, String>,
+    /// Outstanding WHOX queries as (token, channel), oldest first: a 315 names
+    /// no token, so it completes the oldest query still open for its channel.
+    pending_whox: VecDeque<(String, String)>,
     next_whox_token: u16,
 
     // Cached lowercase versions for efficient comparison (updated when source changes)
@@ -690,7 +692,7 @@ impl IrcApp {
             pending_history_requests: HashMap::new(),
             known_users: HashMap::new(),
             monitored_users: std::collections::HashSet::new(),
-            pending_whox: HashMap::new(),
+            pending_whox: VecDeque::new(),
             next_whox_token: 1,
 
             // Reconnect settings
@@ -2831,7 +2833,7 @@ mod connection_lifecycle_tests {
         );
         app.monitored_users.insert("alice".to_string());
         app.pending_whox
-            .insert("7".to_string(), "#chan".to_string());
+            .push_back(("7".to_string(), "#chan".to_string()));
         app.next_whox_token = 8;
         app.known_users
             .insert("alice".to_string(), KnownUser::default());
@@ -5196,7 +5198,11 @@ impl IrcApp {
                             } else {
                                 self.next_whox_token + 1
                             };
-                            self.pending_whox.insert(token.clone(), channel.clone());
+                            // Tokens wrap at 999; a reused one replaces the
+                            // query it outlived, which keeps the queue bounded.
+                            self.pending_whox.retain(|(pending, _)| *pending != token);
+                            self.pending_whox
+                                .push_back((token.clone(), channel.clone()));
                             self.send_command(IrcCommand::Raw(format!(
                                 "WHO {channel} %tcuhnafr,{token}"
                             )));
@@ -5705,7 +5711,7 @@ impl IrcApp {
                     params.get(5),
                     params.get(6),
                     params.get(7),
-                ) && self.pending_whox.contains_key(token)
+                ) && self.pending_whox.iter().any(|(pending, _)| pending == token)
                 {
                     let account = if account == "0" || account == "*" {
                         None
@@ -5730,12 +5736,16 @@ impl IrcApp {
             }
 
             RPL_ENDOFWHO => {
-                // WHOX replies include their token but 315 does not. Remove any
-                // completed request for this channel.
-                if let Some(mask) = params.get(1) {
-                    self.pending_whox.retain(|_, channel| {
-                        !self.network_support.identifiers_equal(channel, mask)
-                    });
+                // WHOX replies include their token but 315 does not. Queries
+                // are answered in the order they were sent, so each 315
+                // completes only the oldest request for this channel; the
+                // tokens of overlapping requests stay valid for their replies.
+                if let Some(mask) = params.get(1)
+                    && let Some(index) = self.pending_whox.iter().position(|(_, channel)| {
+                        self.network_support.identifiers_equal(channel, mask)
+                    })
+                {
+                    self.pending_whox.remove(index);
                 }
             }
 
@@ -9043,7 +9053,7 @@ mod tests {
         channel.add_user("bob", UserMode::Normal);
         app.channels.insert("#chan".to_string(), channel);
         app.pending_whox
-            .insert("7".to_string(), "#chan".to_string());
+            .push_back(("7".to_string(), "#chan".to_string()));
 
         // Request is %tcuhnafr, but WHOX always replies in the fixed order
         // `t c u i h s n f d l a o r` regardless of request order:
@@ -9095,7 +9105,7 @@ mod tests {
         channel.add_user("carol", UserMode::Normal);
         app.channels.insert("#chan".to_string(), channel);
         app.pending_whox
-            .insert("9".to_string(), "#chan".to_string());
+            .push_back(("9".to_string(), "#chan".to_string()));
 
         // Present user (flags "H") whose services account is "Guest42".
         app.handle_numeric(
@@ -9115,6 +9125,71 @@ mod tests {
         let carol = app.channels["#chan"].get_user("carol").unwrap();
         assert_eq!(carol.account.as_deref(), Some("Guest42"));
         assert!(!carol.is_away(), "an account starting with G is not away");
+    }
+
+    #[test]
+    fn end_of_who_completes_only_the_oldest_whox_request_for_the_channel() {
+        let (mut app, _rx) = test_app_connected();
+        app.set_session_nick("me".into(), true);
+        app.network_support.whox = true;
+        let mut channel = Channel::new();
+        channel.joined = true;
+        channel.add_user("alice", UserMode::Normal);
+        app.channels.insert("#chan".to_string(), channel);
+        let whox_reply = |token: &str, account: &str| {
+            [
+                "me".to_string(),
+                token.to_string(),
+                "#chan".to_string(),
+                "u".to_string(),
+                "h".to_string(),
+                "alice".to_string(),
+                "H".to_string(),
+                account.to_string(),
+                "Alice".to_string(),
+            ]
+        };
+        let account = |app: &IrcApp| {
+            app.channels["#chan"]
+                .get_user("alice")
+                .unwrap()
+                .account
+                .clone()
+        };
+
+        // Two overlapping NAMES bursts (a manual /names during the automatic
+        // WHOX window) each queue a WHOX query; tokens count up from 1.
+        app.handle_numeric(RPL_ENDOFNAMES, &["me".into(), "#chan".into()]);
+        app.handle_numeric(RPL_ENDOFNAMES, &["me".into(), "#chan".into()]);
+
+        // 315 carries no token: it ends the first query only.
+        app.handle_numeric(
+            RPL_ENDOFWHO,
+            &["me".into(), "#chan".into(), "End of /WHO list".into()],
+        );
+        app.handle_numeric(RPL_WHOSPCRPL, &whox_reply("1", "stale"));
+        assert_eq!(account(&app), None, "the finished query's token is spent");
+        app.handle_numeric(RPL_WHOSPCRPL, &whox_reply("2", "acc"));
+        assert_eq!(
+            account(&app).as_deref(),
+            Some("acc"),
+            "the second query is still being answered"
+        );
+
+        // A 315 for another channel completes nothing here.
+        app.handle_numeric(
+            RPL_ENDOFWHO,
+            &["me".into(), "#other".into(), "End of /WHO list".into()],
+        );
+        app.handle_numeric(RPL_WHOSPCRPL, &whox_reply("2", "acc2"));
+        assert_eq!(account(&app).as_deref(), Some("acc2"));
+
+        app.handle_numeric(
+            RPL_ENDOFWHO,
+            &["me".into(), "#chan".into(), "End of /WHO list".into()],
+        );
+        app.handle_numeric(RPL_WHOSPCRPL, &whox_reply("2", "late"));
+        assert_eq!(account(&app).as_deref(), Some("acc2"));
     }
 
     #[test]
