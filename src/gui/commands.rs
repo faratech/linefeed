@@ -288,7 +288,11 @@ impl IrcApp {
             }
 
             "TOPIC" => {
-                if let Some(channel) = &self.current_channel.clone() {
+                // current_channel is a nick in a query tab: TOPIC <nick> is
+                // a server error, so only a channel tab qualifies (#314).
+                if let Some(channel) = &self.current_channel.clone()
+                    && self.is_channel_name(channel)
+                {
                     if args.is_empty() {
                         self.send_command(IrcCommand::Topic(channel.clone(), None));
                     } else {
@@ -297,6 +301,10 @@ impl IrcApp {
                             Some(args.to_string()),
                         ));
                     }
+                } else {
+                    self.add_message_to_current(ChatMessage::system(
+                        "/topic works in a channel tab",
+                    ));
                 }
             }
 
@@ -936,8 +944,13 @@ impl IrcApp {
             "NAMES" => {
                 if !args.is_empty() {
                     self.send_command(IrcCommand::Names(Some(args.to_string())));
-                } else if let Some(channel) = &self.current_channel.clone() {
+                } else if let Some(channel) = &self.current_channel.clone()
+                    && self.is_channel_name(channel)
+                {
                     self.send_command(IrcCommand::Names(Some(channel.clone())));
+                } else {
+                    // Not a channel tab: NAMES <nick> is meaningless (#314).
+                    self.add_message_to_current(ChatMessage::system("Usage: /names <#channel>"));
                 }
             }
 
@@ -1507,7 +1520,12 @@ impl IrcApp {
                 let channel = Some(channel)
                     .filter(|channel| !channel.is_empty())
                     .map(str::to_string)
-                    .or_else(|| self.current_channel.clone())
+                    // The fallback must be a channel: a query tab holds a nick (#314).
+                    .or_else(|| {
+                        self.current_channel
+                            .clone()
+                            .filter(|current| self.is_channel_name(current))
+                    })
                     .unwrap_or_default();
                 if nick.is_empty() || channel.is_empty() {
                     self.add_message_to_current(ChatMessage::system(
@@ -3673,6 +3691,60 @@ mod tests {
                 .iter()
                 .all(|row| !row.contains("hello") && !row.contains("ignored")),
             "{confirmations:?}"
+        );
+    }
+
+    #[test]
+    fn channel_only_commands_do_not_reuse_a_query_nick_as_the_channel() {
+        // In a query tab current_channel holds the partner's nick: TOPIC bob,
+        // NAMES bob and INVITE carol bob are all server errors (#314).
+        let (mut app, mut rx) = connected_command_app();
+        assert!(app.open_query("bob"));
+        for input in ["/topic hi", "/topic", "/names", "/invite carol"] {
+            let before = app.channels["bob"].messages.len();
+            app.process_command(input);
+            assert!(rx.try_recv().is_err(), "{input} must not reach the wire");
+            assert_eq!(
+                app.channels["bob"].messages.len(),
+                before + 1,
+                "{input} tells the user why nothing happened"
+            );
+        }
+
+        // Explicit channels still work from inside a query.
+        app.process_command("/names #other");
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            IrcCommand::Names(Some("#other".into()))
+        );
+        app.process_command("/invite carol #other");
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            IrcCommand::Invite("carol".into(), "#other".into())
+        );
+
+        // In a channel tab the shorthand forms fall back to that channel.
+        app.channels.insert("#room".into(), Channel::new());
+        app.current_channel = Some("#room".into());
+        app.process_command("/topic hi");
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            IrcCommand::Topic("#room".into(), Some("hi".into()))
+        );
+        app.process_command("/topic");
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            IrcCommand::Topic("#room".into(), None)
+        );
+        app.process_command("/names");
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            IrcCommand::Names(Some("#room".into()))
+        );
+        app.process_command("/invite carol");
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            IrcCommand::Invite("carol".into(), "#room".into())
         );
     }
 
