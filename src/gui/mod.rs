@@ -116,9 +116,17 @@ struct MultilineBatch {
     reply_to: Option<String>,
 }
 
+/// Longest draft/authtoken token kept: a token is a short credential, and a
+/// batch that streams chunks without end must not grow memory for as long as
+/// the connection lives (the multiline batches are capped alike, #191).
+const MAX_AUTHTOKEN_BYTES: usize = 8192;
+
 struct AuthtokenBatch {
     service: String,
     token: String,
+    /// The token outgrew `MAX_AUTHTOKEN_BYTES`; it was dropped and the rest
+    /// of the batch is ignored.
+    oversized: bool,
 }
 
 impl SessionConfig {
@@ -1776,8 +1784,15 @@ impl IrcApp {
         {
             return false;
         }
-        if let Some(chunk) = params.get(2) {
-            batch.token.push_str(chunk);
+        if let Some(chunk) = params.get(2)
+            && !batch.oversized
+        {
+            if batch.token.len() + chunk.len() > MAX_AUTHTOKEN_BYTES {
+                batch.oversized = true;
+                batch.token = String::new();
+            } else {
+                batch.token.push_str(chunk);
+            }
         }
         true
     }
@@ -1786,6 +1801,19 @@ impl IrcApp {
         let Some(batch) = self.authtoken_batches.remove(batch_id) else {
             return;
         };
+        if batch.oversized {
+            self.add_server_message(
+                ChatMessage::system_fmt(
+                    &format!(
+                        "[TOKEN GENERATE {}] token longer than {MAX_AUTHTOKEN_BYTES} bytes discarded",
+                        batch.service
+                    ),
+                    &self.timestamp_format,
+                )
+                .without_logging(),
+            );
+            return;
+        }
         if batch.token.is_empty() {
             return;
         }
@@ -4622,6 +4650,7 @@ impl IrcApp {
                             AuthtokenBatch {
                                 service: params.clone().unwrap_or_else(|| "*".to_string()),
                                 token: String::new(),
+                                oversized: false,
                             },
                         );
                     }
@@ -11913,6 +11942,51 @@ mod tests {
             "[TOKEN GENERATE web-api] abcdef"
         );
         assert!(app.server_messages[0].no_log);
+    }
+
+    #[test]
+    fn authtoken_batches_stop_accumulating_at_a_size_cap() {
+        let mut app = test_app();
+        app.handle_incoming_message(
+            IrcMessage::parse(":srv BATCH +tok draft/authtoken web-api").unwrap(),
+        );
+        let chunk = "x".repeat(400);
+        let mut longest = 0;
+        for _ in 0..200 {
+            app.handle_incoming_message(
+                IrcMessage::parse(&format!("@batch=tok :srv TOKEN GENERATE * :{chunk}")).unwrap(),
+            );
+            longest = longest.max(app.authtoken_batches["tok"].token.len());
+        }
+        assert!(
+            longest <= MAX_AUTHTOKEN_BYTES,
+            "the token buffer reached {longest} bytes"
+        );
+
+        // Closing the batch reports the refusal instead of printing a blob.
+        app.handle_incoming_message(IrcMessage::parse(":srv BATCH -tok").unwrap());
+        assert!(app.authtoken_batches.is_empty());
+        assert_eq!(app.server_messages.len(), 1);
+        let shown = &app.server_messages[0];
+        assert!(shown.content.len() < 200, "{}", shown.content);
+        assert!(shown.content.contains("web-api"), "{}", shown.content);
+        assert!(!shown.content.contains("xxxx"), "{}", shown.content);
+        assert!(shown.no_log);
+
+        // A token inside the cap is still delivered whole.
+        app.handle_incoming_message(
+            IrcMessage::parse(":srv BATCH +ok draft/authtoken web-api").unwrap(),
+        );
+        for part in ["abc", "def"] {
+            app.handle_incoming_message(
+                IrcMessage::parse(&format!("@batch=ok :srv TOKEN GENERATE * :{part}")).unwrap(),
+            );
+        }
+        app.handle_incoming_message(IrcMessage::parse(":srv BATCH -ok").unwrap());
+        assert_eq!(
+            app.server_messages.back().unwrap().content,
+            "[TOKEN GENERATE web-api] abcdef"
+        );
     }
 
     #[test]
