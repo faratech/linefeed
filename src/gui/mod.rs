@@ -1764,7 +1764,10 @@ impl IrcApp {
     /// without echo-message. msgid dedup cannot see these; compare content
     /// the way the Prepend fallback does. Each such row absorbs at most one
     /// server row, so genuinely repeated lines survive (#320).
-    fn drop_rows_shown_without_identity(rows: &mut Vec<ChatMessage>, shown: &VecDeque<ChatMessage>) {
+    fn drop_rows_shown_without_identity(
+        rows: &mut Vec<ChatMessage>,
+        shown: &VecDeque<ChatMessage>,
+    ) {
         let mut candidates: Vec<&ChatMessage> = shown
             .iter()
             .filter(|row| row.msgid.is_none() && row.server_time.is_none())
@@ -12642,7 +12645,11 @@ mod tests {
         let row = app.channels["bob"].messages.back().unwrap();
         assert_eq!(row.content, "psst\nare you there");
         assert!(!row.is_highlight);
-        assert_eq!(app.dispatched_notifications.len(), 1, "#289: PM not notified");
+        assert_eq!(
+            app.dispatched_notifications.len(),
+            1,
+            "#289: PM not notified"
+        );
         assert_eq!(app.dispatched_notifications[0].0, "PM from bob");
 
         // A plain channel message neither highlights nor notifies.
@@ -12675,7 +12682,13 @@ mod tests {
         // Our own multiline message (echo-message) never notifies.
         app.dispatched_notifications.clear();
         app.last_notification_time = None;
-        deliver_multiline(&mut app, "s1", "me!u@h", "me", &["note to self", "me me me"]);
+        deliver_multiline(
+            &mut app,
+            "s1",
+            "me!u@h",
+            "me",
+            &["note to self", "me me me"],
+        );
         assert!(app.dispatched_notifications.is_empty());
 
         // A multiline message replayed inside a chathistory batch keeps its
@@ -12703,7 +12716,6 @@ mod tests {
         assert!(replayed.is_highlight);
         assert!(app.dispatched_notifications.is_empty());
     }
-
 
     #[test]
     fn unsolicited_self_join_keeps_the_tab_the_user_is_reading() {
@@ -12898,8 +12910,15 @@ mod tests {
         let alice = &app.channels["alice"];
         assert_eq!(alice.messages.back().unwrap().content, "on my way");
         assert_eq!(alice.unread, 2, "#306: catch-up PMs left no unread badge");
-        assert_eq!(app.dispatched_notifications.len(), 1, "#306: no notification");
-        assert_eq!(app.dispatched_notifications[0].0, "2 new messages from alice");
+        assert_eq!(
+            app.dispatched_notifications.len(),
+            1,
+            "#306: no notification"
+        );
+        assert_eq!(
+            app.dispatched_notifications[0].0,
+            "2 new messages from alice"
+        );
         assert_eq!(app.dispatched_notifications[0].1, "hello?");
     }
 
@@ -12928,17 +12947,13 @@ mod tests {
         app.current_channel = Some("alice".into());
 
         // Retained channel rejoin: Append catch-up after the last known msgid.
-        app.channels
-            .get_mut("#room")
-            .unwrap()
-            .messages
-            .push_back(
-                ChatMessage::new_fmt("bob", "earlier", "short").with_irc_metadata(
-                    Some("2026-09-12T11:00:00.000Z".into()),
-                    Some("room-last".into()),
-                    None,
-                ),
-            );
+        app.channels.get_mut("#room").unwrap().messages.push_back(
+            ChatMessage::new_fmt("bob", "earlier", "short").with_irc_metadata(
+                Some("2026-09-12T11:00:00.000Z".into()),
+                Some("room-last".into()),
+                None,
+            ),
+        );
         while rx.try_recv().is_ok() {}
         assert!(app.request_latest_history("#room", None, HistoryPlacement::Append));
         assert!(matches!(
@@ -12988,9 +13003,11 @@ mod tests {
         );
         app.handle_incoming_message(IrcMessage::parse(":srv BATCH -d").unwrap());
         assert_eq!(app.dispatched_notifications.len(), 1);
-        assert_eq!(app.dispatched_notifications[0].0, "bob mentioned you in #room");
+        assert_eq!(
+            app.dispatched_notifications[0].0,
+            "bob mentioned you in #room"
+        );
     }
-
 
     #[test]
     fn catch_up_does_not_duplicate_rows_restored_from_the_local_log() {
@@ -13091,7 +13108,6 @@ mod tests {
         assert_eq!(ok_rows, 2);
     }
 
-
     /// An app that will pass the enabled/focus gates for non-forced
     /// notifications too (window in the background).
     fn notifying_app() -> IrcApp {
@@ -13103,8 +13119,8 @@ mod tests {
 
     /// Pretend the rate-limit interval has elapsed for forced notifications.
     fn age_forced_notification_clock(app: &mut IrcApp) {
-        app.last_forced_notification_time = std::time::Instant::now()
-            .checked_sub(std::time::Duration::from_secs(3));
+        app.last_forced_notification_time =
+            std::time::Instant::now().checked_sub(std::time::Duration::from_secs(3));
     }
 
     #[test]
@@ -13156,7 +13172,10 @@ mod tests {
         assert_eq!(app.dispatched_notifications.len(), 2);
         let (title, body) = &app.dispatched_notifications[1];
         assert_eq!(title, "3 new private messages");
-        assert!(body.contains("PM from bob") && body.contains("four"), "{body}");
+        assert!(
+            body.contains("PM from bob") && body.contains("four"),
+            "{body}"
+        );
 
         // Delivered once only.
         age_forced_notification_clock(&mut app);

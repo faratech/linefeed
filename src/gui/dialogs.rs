@@ -1820,7 +1820,6 @@ mod tests {
         assert!(app.server_favorites.is_empty());
     }
 
-
     /// An app whose Connection form holds invalid and unsaved scratch edits
     /// over a clean persisted configuration (the "disk" is in memory).
     fn app_with_dirty_connection_form() -> IrcApp {
@@ -1910,7 +1909,6 @@ mod tests {
 
         assert_eq!(app.load_persisted_settings().server_port, "6667");
     }
-
 
     fn list_row(app: &mut IrcApp, channel: &str, users: &str) {
         app.handle_numeric(

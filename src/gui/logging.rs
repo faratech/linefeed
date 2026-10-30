@@ -1140,9 +1140,11 @@ mod tests {
         let line_stamp = crate::gui::helpers::epoch_time_formatted(secs, "long");
         // "[HH:MM:SS]" in the log line must be the marker's clock.
         let clock = line_stamp.trim_matches(|c| c == '[' || c == ']');
-        assert!(marker.contains(&format!(" {clock} ")), "{marker} vs {line_stamp}");
+        assert!(
+            marker.contains(&format!(" {clock} ")),
+            "{marker} vs {line_stamp}"
+        );
     }
-
 
     #[cfg(target_os = "linux")]
     #[test]
