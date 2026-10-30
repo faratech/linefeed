@@ -74,10 +74,12 @@ version with its session.
 
 A download claims its staging directory with a locked `owner.lock`. At startup,
 staging directories whose claim is no longer held (an exit or crash during a
-download) are renamed to `.deleting` and removed; interrupted removals are
-finished on a later launch. Directories without a claim, which includes
-filesystems that cannot lock files, are never removed automatically; delete a
-stray `.linefeed-update-*` folder by hand when no Linefeed is running.
+download) are renamed to `.deleting` and removed, the claim last; interrupted removals
+are finished on a later launch, again only for a folder that still carries this
+installation's claim. Directories without a claim, which includes filesystems
+that cannot lock files, are never removed automatically; delete a stray
+`.linefeed-update-*` folder (`.deleting` ones included) by hand when no
+Linefeed is running.
 
 Installation on ordinary exit validates the new executable without reopening
 the GUI. GUI initialization is confirmed on the next launch. A failure before

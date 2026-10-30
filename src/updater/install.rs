@@ -341,8 +341,12 @@ fn sweep_orphans(paths: &Paths) {
         let path = entry.path();
         if is_directory && is_tombstone {
             // Only a directory found abandoned (or reset by the user) is ever
-            // renamed to one, and its claim may already be gone.
-            let _ = fs::remove_dir_all(&path);
+            // renamed to one, and `remove_tombstone` deletes its claim last, so
+            // the claim is still there to prove that this one is ours. A name
+            // alone proves nothing (#326).
+            if abandoned(paths, &path) {
+                remove_tombstone(&path);
+            }
         } else if is_directory
             && is_staging
             && keep.as_ref() != Some(&path)
@@ -356,10 +360,11 @@ fn sweep_orphans(paths: &Paths) {
 const TOMBSTONE: &str = ".deleting";
 
 /// Delete a directory that was found abandoned. The rename comes first and is
-/// atomic: a crash while deleting a large download after `owner.lock` is gone
-/// would otherwise leave an unclaimed remainder nothing ever reclaims. The
-/// tombstone name is swept on its own. Returns false if the rename failed
-/// (e.g. a running helper on Windows) and the directory is left intact.
+/// atomic: a crash while deleting a large download would otherwise leave a
+/// remainder under the staging name, where nothing says it is abandoned. The
+/// tombstone name is swept on its own, while the claim inside still proves it
+/// is ours. Returns false if the rename failed (e.g. a running helper on
+/// Windows) and the directory is left intact.
 fn reap(directory: &Path) -> bool {
     let mut tombstone = directory.as_os_str().to_owned();
     tombstone.push(TOMBSTONE);
@@ -367,8 +372,43 @@ fn reap(directory: &Path) -> bool {
     if fs::rename(directory, &tombstone).is_err() {
         return false;
     }
-    let _ = fs::remove_dir_all(&tombstone);
+    remove_tombstone(&tombstone);
     true
+}
+
+/// Delete a tombstone's contents, then its claim, then the directory. The claim
+/// goes last, and only once everything else is gone, so a deletion interrupted
+/// or failing anywhere still leaves the proof of ownership a later sweep needs
+/// to finish the job (#326).
+fn remove_tombstone(tombstone: &Path) {
+    remove_tombstone_with(tombstone, |path| {
+        fs::remove_file(path).or_else(|_| fs::remove_dir_all(path))
+    });
+}
+
+fn remove_tombstone_with(tombstone: &Path, remove: impl Fn(&Path) -> io::Result<()>) {
+    let Ok(entries) = fs::read_dir(tombstone) else {
+        return;
+    };
+    let mut emptied = true;
+    for entry in entries {
+        match entry {
+            Ok(entry) if entry.file_name() == CLAIM => {}
+            Ok(entry) => emptied &= remove(&entry.path()).is_ok(),
+            Err(_) => emptied = false,
+        }
+    }
+    if !emptied {
+        return;
+    }
+    // A directory from a release that predates claims has none to remove.
+    let claim_gone = match remove(&tombstone.join(CLAIM)) {
+        Ok(()) => true,
+        Err(e) => e.kind() == io::ErrorKind::NotFound,
+    };
+    if claim_gone {
+        let _ = fs::remove_dir(tombstone);
+    }
 }
 
 /// Whether `directory` carries this installation's claim and no live download
@@ -1748,9 +1788,13 @@ mod tests {
         let tombstone = parent.join(format!(".linefeed-update-{attempt}.deleting"));
         assert!(reap(&orphan));
         assert!(!orphan.exists() && !tombstone.exists());
-        // What a crash right after the rename (or mid-delete) leaves behind.
-        fs::create_dir(&tombstone).unwrap();
-        fs::write(tombstone.join("download.part"), vec![0u8; 4096]).unwrap();
+        // What a crash right after the rename leaves behind: the claim that
+        // proved ownership travels with the directory (#326).
+        let (attempt, orphan, claim) = stage_directory(paths).unwrap();
+        drop(claim);
+        fs::write(orphan.join("download.part"), vec![0u8; 4096]).unwrap();
+        let tombstone = parent.join(format!(".linefeed-update-{attempt}.deleting"));
+        fs::rename(&orphan, &tombstone).unwrap();
         // Not a tombstone name, and a link is never followed.
         let unrelated = parent.join(".linefeed-update-notes.deleting");
         fs::create_dir(&unrelated).unwrap();
@@ -1771,6 +1815,94 @@ mod tests {
             assert!(outside.join("precious").exists());
             assert!(fs::symlink_metadata(&link).is_ok());
         }
+    }
+    #[test]
+    fn sweep_never_deletes_a_deleting_directory_this_installation_did_not_claim() {
+        // A tombstone is only ever made from a directory found abandoned, so
+        // one is deleted only with the same proof a staging directory needs:
+        // this installation's claim. A look-alike name proves nothing (#326).
+        let fixture = Fixture::new();
+        let paths = &fixture.tx.paths;
+        let parent = paths.target.parent().unwrap();
+        let tombstone = |attempt: &str| parent.join(format!(".linefeed-update-{attempt}.deleting"));
+
+        // Created by hand, or from a release that predates claims: no claim.
+        let unclaimed = tombstone(&nonce().unwrap());
+        fs::create_dir(&unclaimed).unwrap();
+        fs::write(unclaimed.join("important.txt"), b"user data").unwrap();
+
+        // Another installation's abandoned download, beside the same folder.
+        let other = Paths {
+            target: paths.target.clone(),
+            state: fixture.root.join("other-state"),
+        };
+        let (attempt, foreign, claim) = stage_directory(&other).unwrap();
+        drop(claim);
+        let foreign_tombstone = tombstone(&attempt);
+        fs::rename(&foreign, &foreign_tombstone).unwrap();
+
+        // This installation's own interrupted removal is still finished.
+        let (attempt, ours, claim) = stage_directory(paths).unwrap();
+        drop(claim);
+        fs::write(ours.join("download.part"), vec![0u8; 4096]).unwrap();
+        let own_tombstone = tombstone(&attempt);
+        fs::rename(&ours, &own_tombstone).unwrap();
+
+        assert!(swept_eventually(paths, &own_tombstone));
+        assert!(unclaimed.join("important.txt").exists());
+        assert!(foreign_tombstone.join(CLAIM).exists());
+    }
+    #[test]
+    fn tombstone_removal_deletes_the_claim_last_and_only_when_nothing_else_remains() {
+        // The claim is what lets a later sweep finish an interrupted removal, so
+        // no interruption or failure may take it before the rest is gone (#326).
+        let fixture = Fixture::new();
+        let (_, directory, claim) = stage_directory(&fixture.tx.paths).unwrap();
+        drop(claim);
+        fs::write(directory.join("download.part"), b"partial").unwrap();
+        fs::create_dir(directory.join("nested")).unwrap();
+        fs::write(directory.join("nested").join("file"), b"x").unwrap();
+        let removed = std::cell::RefCell::new(Vec::new());
+        let real = |path: &Path| fs::remove_file(path).or_else(|_| fs::remove_dir_all(path));
+
+        // One entry cannot be removed: the claim and the directory stay.
+        remove_tombstone_with(&directory, |path| {
+            if path.ends_with("download.part") {
+                return Err(io::Error::other("in use"));
+            }
+            removed.borrow_mut().push(path.file_name().unwrap().to_owned());
+            real(path)
+        });
+        assert!(directory.join(CLAIM).exists() && directory.join("download.part").exists());
+        assert!(!removed.borrow().iter().any(|name| name == CLAIM));
+
+        // Everything removable: the claim goes after every other entry. (The
+        // nested directory went on the first pass.)
+        removed.borrow_mut().clear();
+        remove_tombstone_with(&directory, |path| {
+            removed.borrow_mut().push(path.file_name().unwrap().to_owned());
+            real(path)
+        });
+        assert!(!directory.exists());
+        let order = removed.borrow();
+        assert_eq!(order.len(), 2);
+        assert_eq!(order[0], "download.part");
+        assert_eq!(order[1], CLAIM);
+    }
+    #[test]
+    fn reaping_a_directory_without_a_claim_still_removes_it() {
+        // Staging from a release that predates claims, discarded by the user's
+        // reset, has no claim to remove last.
+        let fixture = Fixture::new();
+        let (_, directory, claim) = stage_directory(&fixture.tx.paths).unwrap();
+        drop(claim);
+        fs::remove_file(directory.join(CLAIM)).unwrap();
+        fs::write(directory.join("candidate"), b"bytes").unwrap();
+        assert!(reap(&directory));
+        assert!(!directory.exists());
+        let mut tombstone = directory.into_os_string();
+        tombstone.push(TOMBSTONE);
+        assert!(!Path::new(&tombstone).exists());
     }
     #[test]
     fn updater_infrastructure_failure_does_not_stop_a_normal_launch() {
