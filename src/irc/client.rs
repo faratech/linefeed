@@ -658,7 +658,49 @@ impl SaslChallengeAccumulator {
 /// chunks cannot grow client memory without limit.
 const MAX_SASL_CHALLENGE_LEN: usize = 16 * 1024;
 
+/// Most STS policy writes one established connection may trigger through
+/// `CAP NEW`. A legitimate server advertises its policy once or twice; the
+/// cap bounds the disk I/O a hostile one can force by churning values.
+const MAX_LIVE_STS_UPDATES: usize = 8;
+
+/// Admits STS policies advertised by `CAP NEW` on an established connection.
+/// Each admitted policy costs a synchronous read-modify-write of the policy
+/// file inside the read loop, so identical repeats and floods are dropped
+/// (#280).
+#[derive(Default)]
+struct LiveStsGate {
+    last: Option<(u16, u64)>,
+    writes: usize,
+}
+
+impl LiveStsGate {
+    fn admit(&mut self, port: u16, duration: u64) -> bool {
+        if self.last == Some((port, duration)) || self.writes >= MAX_LIVE_STS_UPDATES {
+            return false;
+        }
+        self.last = Some((port, duration));
+        self.writes += 1;
+        true
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Policy writes requested on this thread. Unit tests record them instead
+    /// of touching the real policy store in the user's config directory.
+    static STS_POLICY_WRITES: std::cell::RefCell<Vec<(String, u16, u64)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
 fn update_sts_policy(host: &str, port: u16, duration: u64) {
+    #[cfg(test)]
+    STS_POLICY_WRITES.with_borrow_mut(|writes| writes.push((host.to_string(), port, duration)));
+    #[cfg(not(test))]
+    persist_sts_policy(host, port, duration);
+}
+
+#[cfg_attr(test, allow(dead_code))]
+fn persist_sts_policy(host: &str, port: u16, duration: u64) {
     let mut policies = load_sts_policies();
     let key = host.to_ascii_lowercase();
     if duration == 0 {
@@ -2350,6 +2392,7 @@ impl IrcClient {
         // link is treated as dead. Without this, silent TCP death (suspend/resume,
         // expired NAT entries) leaves the app showing "connected" forever.
         let mut probe_sent = false;
+        let mut sts_gate = LiveStsGate::default();
         loop {
             if incoming_tx.is_closed() {
                 tracing::info!("GUI receiver dropped; stopping read loop");
@@ -2446,6 +2489,7 @@ impl IrcClient {
                                         .find_map(|cap| cap.strip_prefix("sts="))
                                     && let Some((port, duration)) =
                                         sts_policy_target(sts, self.config.port)
+                                    && sts_gate.admit(port, duration)
                                 {
                                     update_sts_policy(&self.config.host, port, duration);
                                 }
@@ -2638,6 +2682,72 @@ mod tests {
             Some((6697, 7776000))
         );
         assert_eq!(sts_policy_target("port=6698", 6697), None);
+    }
+
+    /// Feed `wire` to `read_loop` as an established TLS connection to
+    /// irc.example.test:6697 and return the STS policy writes it requested.
+    fn live_sts_policy_writes(wire: &str) -> Vec<(String, u16, u64)> {
+        STS_POLICY_WRITES.with_borrow_mut(Vec::clear);
+        test_runtime().block_on(async {
+            let mut client = IrcClient::new(ServerConfig {
+                host: "irc.example.test".into(),
+                port: 6697,
+                use_tls: true,
+                ..Default::default()
+            });
+            // The channel must outlive the loop (a dropped receiver stops it)
+            // and hold every forwarded message so the loop never blocks.
+            let (msg_tx, _msg_rx) = mpsc::channel(1024);
+            client.read_loop(wire.as_bytes(), msg_tx).await;
+        });
+        STS_POLICY_WRITES.with_borrow(Clone::clone)
+    }
+
+    #[test]
+    fn repeated_identical_cap_new_sts_persists_the_policy_once() {
+        // #280: every repeat used to cost a policy-file read, write and
+        // rename inside the read loop.
+        let line = ":srv CAP tester NEW :sts=port=6697,duration=86400\r\n";
+        let writes = live_sts_policy_writes(&line.repeat(200));
+        assert_eq!(writes.len(), 1, "policy written once per repeat");
+        assert_eq!(writes[0], ("irc.example.test".to_string(), 6697, 86400));
+    }
+
+    #[test]
+    fn changed_cap_new_sts_policy_is_still_persisted() {
+        // The dedup must not swallow a real change, including the duration=0
+        // removal that clears the policy.
+        let wire = [86400, 86400, 0, 0]
+            .iter()
+            .map(|duration| format!(":srv CAP tester NEW :sts=port=6697,duration={duration}\r\n"))
+            .collect::<String>();
+        assert_eq!(
+            live_sts_policy_writes(&wire),
+            [
+                ("irc.example.test".to_string(), 6697, 86400),
+                ("irc.example.test".to_string(), 6697, 0),
+            ]
+        );
+    }
+
+    #[test]
+    fn cap_new_sts_churn_cannot_force_unbounded_policy_writes() {
+        // #280: a hostile server varying the value defeats plain dedup.
+        let wire = (0..500)
+            .map(|i| {
+                format!(
+                    ":srv CAP tester NEW :sts=port=6697,duration={}\r\n",
+                    1000 + i
+                )
+            })
+            .collect::<String>();
+        let writes = live_sts_policy_writes(&wire);
+        assert!(!writes.is_empty());
+        assert!(
+            writes.len() <= MAX_LIVE_STS_UPDATES,
+            "{} policy writes for 500 CAP NEW lines",
+            writes.len()
+        );
     }
 
     #[test]
