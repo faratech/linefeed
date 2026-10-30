@@ -488,7 +488,9 @@ pub struct Session {
     pub scroll_to_bottom: bool,
     pub show_connect_dialog: bool,
 
-    // Command history
+    // Command history. While a window draws, its own history is swapped
+    // in from its TargetView, so this holds the window's lines then; the
+    // resting value serves input submitted outside any window.
     pub command_history: Vec<String>,
     pub history_index: Option<usize>,
     pub history_temp: String,
@@ -665,6 +667,10 @@ pub struct Session {
     /// and CASEMAPPING refresh so sender_is_self costs one canonicalize of
     /// the incoming nick (the held-nick side is precomputed).
     self_nick_keys: Vec<String>,
+    /// Memoized switchbar tab order with the fingerprint it was sorted
+    /// under: the order is rebuilt every frame, but the tab set (and the
+    /// casemapping that orders it) rarely changes.
+    tab_order_cache: std::cell::RefCell<Option<(u64, Vec<Option<String>>)>>,
 }
 
 impl Default for Session {
@@ -864,6 +870,7 @@ impl Session {
             past_nicks: Vec::new(),
             nick_confirmed: false,
             self_nick_keys,
+            tab_order_cache: std::cell::RefCell::new(None),
         }
     }
 
@@ -5100,7 +5107,11 @@ impl Session {
         let previous_history_limit = self.network_support.history_limit;
 
         for token in params.iter().skip(1) {
-            if token.starts_with(':') {
+            // The last parameter is the trailing explanation ("are supported
+            // by this server"): the parser strips its ':', leaving one
+            // parameter containing spaces. Real tokens never contain spaces,
+            // so stop there instead of recording the text as a token.
+            if token.starts_with(':') || token.contains(' ') {
                 break;
             }
             if let Some(name) = token.strip_prefix('-') {
@@ -7063,10 +7074,26 @@ impl Session {
     /// bookkeeping as `send_join`, but the confirmed tab never takes focus.
     fn send_join_in_background(&mut self, channel: String, key: Option<String>) -> bool {
         let sent = self.send_command(IrcCommand::Join(channel.clone(), key.clone(), None, None));
-        // Store the key only for a channel actually being joined.
+        // Store the key only for a channel actually being joined. A comma
+        // list joins several channels with one command and the server
+        // confirms each with its own JOIN echo, so the key list is paired
+        // with the channel list positionally (an absent or empty entry
+        // means that channel got no key).
         if sent && let Some(key) = key {
-            self.pending_channel_keys
-                .insert(self.network_support.canonicalize(&channel), key);
+            if channel.contains(',') {
+                let mut keys = key.split(',');
+                for name in channel.split(',').map(str::trim) {
+                    if let Some(entry) = keys.next().filter(|entry| !entry.is_empty())
+                        && !name.is_empty()
+                    {
+                        self.pending_channel_keys
+                            .insert(self.network_support.canonicalize(name), entry.to_string());
+                    }
+                }
+            } else {
+                self.pending_channel_keys
+                    .insert(self.network_support.canonicalize(&channel), key);
+            }
         }
         sent
     }
@@ -7439,9 +7466,57 @@ impl Session {
     }
 
     fn ordered_tabs(&self) -> Vec<Option<String>> {
+        let fingerprint = self.tab_order_fingerprint();
+        if let Some((cached, tabs)) = &*self.tab_order_cache.borrow()
+            && *cached == fingerprint
+        {
+            return tabs.clone();
+        }
+        let tabs: Vec<Option<String>> = self
+            .ordered_tab_names()
+            .into_iter()
+            .map(|name| name.map(str::to_string))
+            .collect();
+        *self.tab_order_cache.borrow_mut() = Some((fingerprint, tabs.clone()));
+        tabs
+    }
+
+    /// Allocation-free fingerprint of everything the tab order depends
+    /// on: the tab names and the casemapping that orders them (including
+    /// the channel types its UTF-8 form preserves). Order-independent,
+    /// since channel iteration order is not stable.
+    fn tab_order_fingerprint(&self) -> u64 {
+        fn fnv(hash: u64, bytes: &[u8]) -> u64 {
+            bytes.iter().fold(hash, |hash, byte| {
+                (hash ^ u64::from(*byte)).wrapping_mul(0x0000_0100_0000_01b3)
+            })
+        }
+        let mut session_hash = fnv(0xcbf2_9ce4_8422_2325, &self.channels.len().to_le_bytes());
+        session_hash = fnv(
+            session_hash,
+            self.network_support.channel_types.as_bytes(),
+        );
+        let mapping = match self.network_support.case_mapping {
+            CaseMapping::Ascii => 0u8,
+            CaseMapping::StrictRfc1459 => 1,
+            CaseMapping::Rfc1459 => 2,
+            CaseMapping::Utf8Rfc8265 => 3,
+        };
+        session_hash = fnv(session_hash, &[mapping]);
+        let mut total = session_hash;
+        for name in self.channels.keys() {
+            total = total.wrapping_add(fnv(session_hash, name.as_bytes()).rotate_left(17));
+        }
+        total
+    }
+
+    /// The switchbar's tab order, borrowing the channel names: this runs
+    /// every frame, so it must neither clone every name nor build a
+    /// canonical key per name just to compare them.
+    fn ordered_tab_names(&self) -> Vec<Option<&str>> {
         let mut tabs = vec![None];
-        let mut names: Vec<_> = self.channels.keys().cloned().collect();
-        names.sort_by_key(|name| self.network_support.canonicalize(name));
+        let mut names: Vec<&str> = self.channels.keys().map(String::as_str).collect();
+        names.sort_by(|a, b| self.network_support.cmp_canonical(a, b));
         tabs.extend(names.into_iter().map(Some));
         tabs
     }
@@ -8039,6 +8114,50 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn cached_tab_order_tracks_tabs_and_casemapping() {
+        let mut app = test_app();
+        for name in ["#delta", "#Alpha", "#charlie"] {
+            app.channels.insert(name.to_string(), Channel::new());
+        }
+        let expected: Vec<Option<String>> = vec![
+            None,
+            Some("#Alpha".into()),
+            Some("#charlie".into()),
+            Some("#delta".into()),
+        ];
+        assert_eq!(app.ordered_tabs(), expected);
+        // Second call is the memoized path and must agree.
+        assert_eq!(app.ordered_tabs(), expected);
+
+        app.channels.insert("#bravo".to_string(), Channel::new());
+        app.channels.remove("#charlie");
+        assert_eq!(
+            app.ordered_tabs(),
+            vec![
+                None,
+                Some("#Alpha".into()),
+                Some("#bravo".into()),
+                Some("#delta".into())
+            ]
+        );
+
+        // Casemapping changes the order: under RFC1459 "#Z" folds to "#z"
+        // and sorts before "#[a" (folded "#{a"); ASCII keeps '[' first.
+        app.channels.clear();
+        app.channels.insert("#[a".to_string(), Channel::new());
+        app.channels.insert("#Z".to_string(), Channel::new());
+        assert_eq!(
+            app.ordered_tabs(),
+            vec![None, Some("#Z".into()), Some("#[a".into())]
+        );
+        app.network_support.case_mapping = CaseMapping::Ascii;
+        assert_eq!(
+            app.ordered_tabs(),
+            vec![None, Some("#[a".into()), Some("#Z".into())]
+        );
+    }
+
+    #[test]
     fn scrollback_virtualizes_large_history() {
         let mut app = test_app();
         let mut channel = Channel::new();
@@ -8227,6 +8346,31 @@ pub(crate) mod tests {
 
     fn drain_commands(rx: &mut mpsc::UnboundedReceiver<IrcCommand>) -> Vec<IrcCommand> {
         std::iter::from_fn(|| rx.try_recv().ok()).collect()
+    }
+
+    #[test]
+    fn comma_list_join_stores_each_channels_own_key() {
+        let (mut app, mut rx) = test_app_connected();
+        app.set_session_nick("me".to_string(), true);
+        app.process_command("/join #a,#b keya,keyb");
+        assert_eq!(
+            drain_commands(&mut rx),
+            vec![IrcCommand::Join(
+                "#a,#b".into(),
+                Some("keya,keyb".into()),
+                None,
+                None
+            )]
+        );
+        // The server confirms each channel with its own JOIN echo.
+        app.handle_incoming_message(IrcMessage::parse(":me!u@h JOIN #a").unwrap());
+        app.handle_incoming_message(IrcMessage::parse(":me!u@h JOIN #b").unwrap());
+        assert_eq!(app.channels["#a"].key.as_deref(), Some("keya"));
+        assert_eq!(app.channels["#b"].key.as_deref(), Some("keyb"));
+        assert!(
+            app.pending_channel_keys.is_empty(),
+            "no stale pending key for the list as a whole is left behind"
+        );
     }
 
     #[test]
@@ -10233,6 +10377,35 @@ pub(crate) mod tests {
         assert_eq!(app.network_support.case_mapping, CaseMapping::StrictRfc1459);
         assert!(app.identifiers_equal("[Nick]", "{nick}"));
         assert!(!app.identifiers_equal("Nick^", "nick~"));
+    }
+
+    #[test]
+    fn isupport_trailing_text_is_not_a_token() {
+        let mut app = test_app();
+        // The final 005 parameter is the trailing explanation text; on the
+        // wire it is one parameter containing spaces, never a token.
+        app.handle_numeric(
+            RPL_ISUPPORT,
+            &[
+                "nick".to_string(),
+                "CHANTYPES=#".to_string(),
+                "are supported by this server".to_string(),
+            ],
+        );
+        assert_eq!(app.network_support.isupport.len(), 1);
+        assert!(app.network_support.has_isupport("CHANTYPES"));
+
+        // A 005 carrying no real token leaves ISUPPORT unknown, so early
+        // /perform commands are still sent rather than reported unsupported.
+        let mut app = test_app();
+        app.handle_numeric(
+            RPL_ISUPPORT,
+            &[
+                "nick".to_string(),
+                "are supported by this server".to_string(),
+            ],
+        );
+        assert!(app.network_support.isupport.is_empty());
     }
 
     #[test]
@@ -12724,5 +12897,108 @@ pub(crate) mod tests {
             .filter(|row| row.content == "ok")
             .count();
         assert_eq!(ok_rows, 2);
+    }
+
+    #[test]
+    fn typed_credentials_never_enter_command_history() {
+        let (mut app, _rx) = test_app_connected();
+        app.set_session_nick("me".into(), true);
+        let mut room = Channel::new();
+        room.joined = true;
+        app.channels.insert("#room".into(), room);
+        app.channels.insert("NickServ".into(), Channel::new());
+        let secret_lines = [
+            "IDENTIFY hunter2",
+            "identify hunter2",
+            "ID hunter2",
+            "/msg NickServ IDENTIFY hunter2",
+            "/msg ns identify hunter2",
+            "/msg NickServ@services. IDENTIFY hunter2",
+            "/notice NickServ IDENTIFY hunter2",
+            "/query NickServ IDENTIFY hunter2",
+            "/say IDENTIFY hunter2",
+            "/me IDENTIFY hunter2",
+            "//ns identify hunter2",
+            "/ns IDENTIFY hunter2",
+            "/cs IDENTIFY #room hunter2",
+            "/msg ChanServ SET #room PASSWORD hunter2",
+            "/msg NickServ SET PASSWORD hunter2",
+            "/msg NickServ DROP me hunter2",
+            "/raw PRIVMSG NickServ :IDENTIFY hunter2",
+            "/quote PRIVMSG NickServ :IDENTIFY hunter2",
+            "/msg\tNickServ\tIDENTIFY hunter2",
+            "/msg NickServ :IDENTIFY hunter2",
+            "/cprivmsg NickServ #room IDENTIFY hunter2",
+            "/pass hunter2",
+            "/oper admin hunter2",
+            "/server irc.example.test 6667 hunter2",
+            "/server irc.example.test hunter2",
+            "/identify hunter2",
+            "/ghost me hunter2",
+        ];
+        for current in ["#room", "NickServ"] {
+            app.current_channel = Some(current.into());
+            for line in secret_lines {
+                app.input_text = line.to_string();
+                app.process_input();
+            }
+            // Ordinary typed text in a service query is a credential risk
+            // only with an auth keyword; plain chat in a channel is history.
+            app.input_text = "hello world".to_string();
+            app.process_input();
+        }
+        assert!(
+            !app.command_history
+                .iter()
+                .any(|entry| entry.contains("hunter2")),
+            "a credential reached command history: {:?}",
+            app.command_history
+        );
+    }
+
+    #[test]
+    fn incoming_routing_never_panics_on_hostile_lines() {
+        let (mut app, _rx) = test_app_connected();
+        app.set_session_nick("me".into(), true);
+        app.channels.insert("#a".into(), Channel::new());
+        app.current_channel = Some("#a".into());
+        // Wire-line soup: commands, numerics and tags assembled from a small
+        // alphabet so state (channels, batches, lists) actually builds up.
+        let tokens = [
+            ":alice!u@h", ":bob!u@h", ":srv", "PRIVMSG", "NOTICE", "JOIN", "PART", "QUIT",
+            "NICK", "MODE", "KICK", "TOPIC", "BATCH", "+b1", "-b1", "chathistory",
+            "draft/multiline", "#a", "#b", "me", "alice", "bob", "+o", "-o", "+b", "*!*@h",
+            "001", "005", "324", "329", "332", "333", "353", "366", "367", "368", "352",
+            "354", "315", "322", "323", "728", "729", "730", "731", "CAP", "ACK", "LS",
+            "multi-prefix", "CHANTYPES=#", "@batch=b1", "@time=2025-01-01T00:00:00.000Z",
+            ":", ":hi there", "hello", "\u{1}ACTION waves\u{1}", "%", "@", "=", "42",
+        ];
+        let mut state: u64 = 0x5eed_5eed_5eed_5eed;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for _case in 0..8000 {
+            let count = 1 + (next() % 7) as usize;
+            let line = (0..count)
+                .map(|_| tokens[(next() as usize) % tokens.len()])
+                .collect::<Vec<_>>()
+                .join(" ");
+            if let Some(msg) = IrcMessage::parse(&line) {
+                app.handle_incoming_message(msg);
+            }
+        }
+        // The session must still be usable afterwards.
+        app.handle_incoming_message(
+            IrcMessage::parse(":alice!u@h PRIVMSG #a :still alive").unwrap(),
+        );
+        assert!(
+            app.channels["#a"]
+                .messages
+                .iter()
+                .any(|m| m.content == "still alive")
+        );
     }
 }

@@ -676,6 +676,7 @@ fn parse_sts_value(value: &str) -> (Option<u16>, Option<u64>) {
     let mut port = None;
     let mut duration = None;
     for token in value.split(',') {
+        let token = token.trim();
         if let Some(value) = token.strip_prefix("port=") {
             port = value.parse::<u16>().ok().filter(|port| *port > 0);
         } else if let Some(value) = token.strip_prefix("duration=") {
@@ -962,6 +963,10 @@ pub struct IrcClient {
     connect_timeout: Duration,
     /// Budget for the TLS handshake after TCP connects; overridable in tests.
     tls_handshake_timeout: Duration,
+    /// Called after a server message has been queued for the GUI, so the
+    /// UI can repaint immediately instead of waiting for its poll timer.
+    /// Kept as a plain callback so this layer stays GUI-toolkit agnostic.
+    wake_ui: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
 }
 
 /// Capabilities whose semantics Linefeed implements safely. Keep this list
@@ -1004,12 +1009,26 @@ pub const DESIRED_CAPS: &[&str] = &[
 ];
 
 impl IrcClient {
+    /// Register a callback invoked each time a server message has been
+    /// queued for the GUI (see the `wake_ui` field). The GUI uses it to
+    /// repaint on arrival rather than on its idle poll timer.
+    pub fn set_wake_callback(&mut self, wake: std::sync::Arc<dyn Fn() + Send + Sync>) {
+        self.wake_ui = Some(wake);
+    }
+
+    fn wake_ui(&self) {
+        if let Some(wake) = &self.wake_ui {
+            wake();
+        }
+    }
+
     pub fn new(config: ServerConfig) -> Self {
         Self {
             config,
             tx: None,
             connect_timeout: TCP_CONNECT_TIMEOUT,
             tls_handshake_timeout: TLS_HANDSHAKE_TIMEOUT,
+            wake_ui: None,
         }
     }
 
@@ -2639,6 +2658,9 @@ impl IrcClient {
                                     tracing::warn!("GUI receiver dropped; stopping read loop");
                                     break;
                                 }
+                                // The message is queued: let the UI paint
+                                // it now, not at its next poll deadline.
+                                self.wake_ui();
                             }
                         }
                     }
@@ -2700,6 +2722,16 @@ mod tests {
             (Some(6697), Some(86400))
         );
         assert_eq!(parse_sts_value("port=0,duration=nope"), (None, None));
+        // Whitespace after the comma must not lose the duration (which
+        // would silently drop the whole policy in sts_policy_target).
+        assert_eq!(
+            parse_sts_value("port=6697, duration=86400"),
+            (Some(6697), Some(86400))
+        );
+        assert_eq!(
+            sts_policy_target("duration=86400, port=6697", 6667),
+            Some((6697, 86400))
+        );
         assert_eq!(redact_for_log("AUTH account secret\r\n"), "AUTH <redacted>");
         assert_eq!(
             redact_for_log("PRIVMSG Q@CServe.quakenet.org :AUTH account secret\r\n"),
@@ -3194,6 +3226,84 @@ mod tests {
                 notices.iter().any(|n| n == "Server does not support SASL"),
                 "{notices:?}"
             );
+        });
+    }
+
+    #[test]
+    fn wake_callback_fires_when_a_message_is_forwarded() {
+        test_runtime().block_on(async {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                let (read_half, mut write_half) = stream.into_split();
+                let mut reader = BufReader::new(read_half);
+                assert_eq!(read_wire_line(&mut reader).await, "CAP LS 302");
+                assert_eq!(read_wire_line(&mut reader).await, "NICK tester");
+                assert!(read_wire_line(&mut reader).await.starts_with("USER "));
+                write_half
+                    .write_all(b":srv CAP * LS :multi-prefix\r\n")
+                    .await
+                    .unwrap();
+                assert_eq!(read_wire_line(&mut reader).await, "CAP REQ :multi-prefix");
+                write_half
+                    .write_all(b":srv CAP * ACK :multi-prefix\r\n")
+                    .await
+                    .unwrap();
+                assert_eq!(read_wire_line(&mut reader).await, "CAP END");
+                write_half
+                    .write_all(
+                        b":srv 001 tester :Welcome\r\n:alice!a@h PRIVMSG #chan :hello\r\n",
+                    )
+                    .await
+                    .unwrap();
+            });
+            let config = ServerConfig {
+                host: "127.0.0.1".into(),
+                port: addr.port(),
+                use_tls: false,
+                nick: "tester".into(),
+                ..Default::default()
+            };
+            let (msg_tx, mut msg_rx) = mpsc::channel(100);
+            let (_cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+            let wakes = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let wake_counter = wakes.clone();
+            let mut client = IrcClient::new(config);
+            client.set_wake_callback(std::sync::Arc::new(move || {
+                wake_counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }));
+            let client_task = tokio::spawn(async move {
+                let _ = client.connect(msg_tx, cmd_rx).await;
+            });
+
+            // Drain until the post-registration PRIVMSG arrives.
+            let mut saw_privmsg = false;
+            let drained = tokio::time::timeout(Duration::from_secs(5), async {
+                while let Some(msg) = msg_rx.recv().await {
+                    if matches!(msg.command, IrcCommand::Privmsg(..)) {
+                        saw_privmsg = true;
+                        break;
+                    }
+                }
+            })
+            .await;
+            assert!(drained.is_ok() && saw_privmsg, "PRIVMSG was not forwarded");
+
+            // The wake is invoked on the client task right after queueing;
+            // allow a short settle so scheduling cannot flake the count.
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+            while wakes.load(std::sync::atomic::Ordering::SeqCst) == 0
+                && tokio::time::Instant::now() < deadline
+            {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            assert!(
+                wakes.load(std::sync::atomic::Ordering::SeqCst) >= 1,
+                "wake callback never fired for a forwarded message"
+            );
+            client_task.abort();
+            server.abort();
         });
     }
 

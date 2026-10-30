@@ -26,9 +26,15 @@ pub fn nick_to_mask(arg: &str) -> String {
     if is_extended_ban(arg) {
         return arg.to_string();
     }
-    // Already a full nick!user@host mask? Pass it through.
-    if let Some(bang) = arg.find('!')
-        && arg[bang + 1..].contains('@')
+    // Already a full nick!user@host mask? Pass it through. A mask with an
+    // empty component ("!user@host", "nick!@host", "nick!user@") is not
+    // full: it falls through to the completion below, which fills the
+    // empty component with '*'.
+    if let Some((nick, user_host)) = arg.split_once('!')
+        && !nick.is_empty()
+        && let Some((user, host)) = user_host.split_once('@')
+        && !user.is_empty()
+        && !host.is_empty()
     {
         return arg.to_string();
     }
@@ -295,6 +301,16 @@ mod tests {
     use super::*;
 
     #[test]
+    fn nick_to_mask_fills_empty_components() {
+        assert_eq!(nick_to_mask("!user@host"), "*!user@host");
+        assert_eq!(nick_to_mask("nick!@host"), "nick!*@host");
+        assert_eq!(nick_to_mask("nick!user@"), "nick!user@*");
+        assert_eq!(nick_to_mask("!@"), "*!*@*");
+        assert_eq!(nick_to_mask("!user"), "*!user@*");
+        assert_eq!(nick_to_mask("@host"), "*!*@host");
+    }
+
+    #[test]
     fn nick_to_mask_completes_partials() {
         assert_eq!(nick_to_mask("nick"), "nick!*@*");
         assert_eq!(nick_to_mask("nick!user@host"), "nick!user@host");
@@ -342,6 +358,64 @@ mod tests {
             "",
         ] {
             assert!(!is_extended_ban(plain), "{plain}");
+        }
+    }
+
+    fn naive_glob(pattern: &[char], text: &[char]) -> bool {
+        if pattern.is_empty() {
+            return text.is_empty();
+        }
+        match pattern[0] {
+            '*' => (0..=text.len()).any(|skip| naive_glob(&pattern[1..], &text[skip..])),
+            '?' => !text.is_empty() && naive_glob(&pattern[1..], &text[1..]),
+            c => !text.is_empty() && text[0] == c && naive_glob(&pattern[1..], &text[1..]),
+        }
+    }
+
+    #[test]
+    fn mask_matches_agrees_with_a_naive_glob() {
+        let alphabet: Vec<char> = vec!['a', 'b', '*', '?'];
+        let mut state: u64 = 0xdead_beef_cafe_f00d;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for case in 0..20000 {
+            let plen = (next() % 7) as usize;
+            let tlen = (next() % 7) as usize;
+            let pattern: String = (0..plen)
+                .map(|_| alphabet[(next() as usize) % alphabet.len()])
+                .collect();
+            let text: String = (0..tlen).map(|_| alphabet[(next() as usize) % 2]).collect();
+            let p: Vec<char> = pattern.chars().collect();
+            let t: Vec<char> = text.chars().collect();
+            assert_eq!(
+                mask_matches(&pattern, &text),
+                naive_glob(&p, &t),
+                "case {case} pattern {pattern:?} text {text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn days_to_ymd_matches_a_datetime_oracle() {
+        // (days since epoch, year, month, day) generated with Python datetime.
+        for (days, y, m, d) in [
+            (0u64, 1970, 1, 1),
+            (58, 1970, 2, 28),
+            (59, 1970, 3, 1),
+            (365, 1971, 1, 1),
+            (730, 1972, 1, 1),
+            (789, 1972, 2, 29),
+            (10957, 2000, 1, 1),
+            (11016, 2000, 2, 29),
+            (47482, 2100, 1, 1),
+            (47541, 2100, 3, 1),
+            (719162, 3939, 1, 1),
+        ] {
+            assert_eq!(days_to_ymd(days), (y, m, d), "days {days}");
         }
     }
 

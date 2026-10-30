@@ -50,6 +50,7 @@ pub(crate) struct PersistKey {
 }
 
 /// A window that should exist this frame, as reported by the sessions.
+#[derive(Clone, PartialEq)]
 pub(crate) struct PresentWindow {
     pub key: WindowKey,
     pub persist: PersistKey,
@@ -70,6 +71,9 @@ pub(crate) enum LayoutMode {
 #[derive(Default)]
 pub(crate) struct TargetView {
     pub input_text: String,
+    /// This window's own sent-line history: lines sent here are recallable
+    /// here (Up/Down), never in another channel or on another network.
+    pub command_history: Vec<String>,
     pub history_index: Option<usize>,
     pub history_temp: String,
     pub tab_completion: Option<TabCompletion>,
@@ -147,6 +151,9 @@ pub(crate) struct WindowManager {
     /// changes (the main window is resized, the switchbar wraps onto a
     /// second line) the windows are scaled into the new area.
     pub area: Option<Rect>,
+    /// The window set last reconciled by `sync`: an unchanged set makes
+    /// the next `sync` a no-op, so steady-state frames skip the reconcile.
+    last_present: Vec<PresentWindow>,
 }
 
 impl WindowManager {
@@ -164,6 +171,7 @@ impl WindowManager {
             restore_match: None,
             dirty: false,
             area: layout.area.map(rect_from_array),
+            last_present: Vec::new(),
         }
     }
 
@@ -178,10 +186,24 @@ impl WindowManager {
     /// Reconcile the window list with the windows the sessions currently
     /// have. New windows pick up any saved placement; vanished windows leave
     /// theirs behind for when they come back. Returns the keys that appeared.
-    pub(crate) fn sync(&mut self, present: Vec<PresentWindow>) -> Vec<WindowKey> {
-        let mut seen: HashMap<WindowKey, PersistKey> = HashMap::with_capacity(present.len());
+    pub(crate) fn sync(&mut self, present: &[PresentWindow]) -> Vec<WindowKey> {
+        // Borrowed input: the App rebuilds this list only when the window
+        // set changes, so the steady-state frame must not pay to clone or
+        // re-key it. Only windows that appear or whose persist key changed
+        // are cloned below. An unchanged set (the common frame) reconciles
+        // to nothing at all.
+        if self.last_present.len() == present.len()
+            && self
+                .last_present
+                .iter()
+                .zip(present.iter())
+                .all(|(old, new)| old == new)
+        {
+            return Vec::new();
+        }
+        let mut seen: HashMap<&WindowKey, &PersistKey> = HashMap::with_capacity(present.len());
         for window in present {
-            seen.insert(window.key, window.persist);
+            seen.insert(&window.key, &window.persist);
         }
 
         let mut removed = Vec::new();
@@ -211,12 +233,14 @@ impl WindowManager {
         // Keep each persist key current: a casemapping or rename can change
         // it while the window stays open.
         for window in &mut self.windows {
-            if let Some(persist) = seen.remove(&window.key) {
-                window.persist = persist;
+            if let Some(persist) = seen.remove(&window.key)
+                && window.persist != *persist
+            {
+                window.persist = persist.clone();
             }
         }
 
-        let mut appeared: Vec<(WindowKey, PersistKey)> = seen.into_iter().collect();
+        let mut appeared: Vec<(&WindowKey, &PersistKey)> = seen.into_iter().collect();
         // Deterministic order for windows that appear in the same frame.
         appeared.sort_by(|a, b| {
             (a.0.conn, a.0.target.is_some(), &a.0.target).cmp(&(
@@ -227,15 +251,19 @@ impl WindowManager {
         });
         let mut keys = Vec::with_capacity(appeared.len());
         for (key, persist) in appeared {
-            let saved = self.saved.remove(&persist);
-            if self.restore_active.as_ref() == Some(&persist) {
+            let saved = self.saved.remove(persist);
+            if self.restore_active.as_ref() == Some(persist) {
                 self.restore_active = None;
                 self.restore_match = Some(key.clone());
             }
-            self.windows
-                .push(TargetWindow::new(key.clone(), persist, saved.as_ref()));
-            keys.push(key);
+            self.windows.push(TargetWindow::new(
+                key.clone(),
+                persist.clone(),
+                saved.as_ref(),
+            ));
+            keys.push(key.clone());
         }
+        self.last_present = present.to_vec();
         keys
     }
 
@@ -562,7 +590,7 @@ mod tests {
     #[test]
     fn tile_puts_the_active_window_last_and_switches_to_floating() {
         let mut manager = WindowManager::default();
-        manager.sync(vec![
+        manager.sync(&[
             present(1, "net", None),
             present(1, "net", Some("#a")),
             present(1, "net", Some("#b")),
@@ -577,7 +605,7 @@ mod tests {
     #[test]
     fn closed_windows_keep_their_placement_for_when_they_reopen() {
         let mut manager = WindowManager::default();
-        manager.sync(vec![present(1, "net", None), present(1, "net", Some("#a"))]);
+        manager.sync(&[present(1, "net", None), present(1, "net", Some("#a"))]);
         let rect = Rect::from_min_size(Pos2::new(20.0, 30.0), Vec2::new(300.0, 200.0));
         let window = manager.get_mut(&key(1, Some("#a"))).unwrap();
         window.child_rect = Some(rect);
@@ -585,9 +613,9 @@ mod tests {
 
         // Parted: the window goes away, then the channel is joined again on
         // a later connection with a different connection id.
-        manager.sync(vec![present(1, "net", None)]);
+        manager.sync(&[present(1, "net", None)]);
         assert!(manager.get(&key(1, Some("#a"))).is_none());
-        let appeared = manager.sync(vec![present(2, "net", None), present(2, "net", Some("#A"))]);
+        let appeared = manager.sync(&[present(2, "net", None), present(2, "net", Some("#A"))]);
         assert_eq!(appeared.len(), 2);
         let window = manager.get(&key(2, Some("#A"))).unwrap();
         assert_eq!(window.child_rect, Some(rect));
@@ -608,7 +636,7 @@ mod tests {
             mode: LayoutMode::Floating,
             ..WindowManager::default()
         };
-        manager.sync(vec![present(1, "tls://irc.example:6697", Some("#rust"))]);
+        manager.sync(&[present(1, "tls://irc.example:6697", Some("#rust"))]);
         manager.active = Some(key(1, Some("#rust")));
         {
             let window = manager.get_mut(&key(1, Some("#rust"))).unwrap();
@@ -622,7 +650,7 @@ mod tests {
 
         let mut restored = WindowManager::from_layout(LayoutFile::load_from(&path));
         assert_eq!(restored.mode, LayoutMode::Floating);
-        restored.sync(vec![present(7, "tls://irc.example:6697", Some("#Rust"))]);
+        restored.sync(&[present(7, "tls://irc.example:6697", Some("#Rust"))]);
         // Reported for the App to apply, never applied behind its back.
         assert_eq!(restored.active, None);
         assert_eq!(restored.restore_match, Some(key(7, Some("#Rust"))));
@@ -660,7 +688,7 @@ mod tests {
     #[test]
     fn windows_of_a_session_that_never_connected_are_not_persisted() {
         let mut manager = WindowManager::default();
-        manager.sync(vec![
+        manager.sync(&[
             present(1, "tls://irc.example:6697", None),
             present(2, &format!("{UNCONNECTED_PREFIX}2"), None),
         ]);
@@ -674,7 +702,7 @@ mod tests {
     #[test]
     fn tiled_windows_are_rescaled_when_the_chat_area_changes() {
         let mut manager = WindowManager::default();
-        manager.sync(vec![
+        manager.sync(&[
             present(1, "net", None),
             present(1, "net", Some("#a")),
             present(1, "net", Some("#b")),
@@ -722,9 +750,9 @@ mod tests {
     #[test]
     fn active_window_is_cleared_when_it_disappears() {
         let mut manager = WindowManager::default();
-        manager.sync(vec![present(1, "net", None), present(1, "net", Some("#a"))]);
+        manager.sync(&[present(1, "net", None), present(1, "net", Some("#a"))]);
         manager.active = Some(key(1, Some("#a")));
-        manager.sync(vec![present(1, "net", None)]);
+        manager.sync(&[present(1, "net", None)]);
         assert_eq!(manager.active, None);
     }
 }

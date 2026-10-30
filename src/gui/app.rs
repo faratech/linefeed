@@ -57,8 +57,6 @@ pub struct App {
     pub(crate) favorites_ui: FavoritesUi,
     pub(crate) show_settings: bool,
     pub(crate) settings_tab: usize,
-    /// Input history shared by every window.
-    command_history: Vec<String>,
     last_activity: Instant,
     /// Rate-limit clock for best-effort notifications (highlights, kicks,
     /// invites); a flood inside the interval is dropped.
@@ -97,6 +95,12 @@ pub struct App {
     /// The window whose formatting bar opened the colour picker.
     color_target: Option<WindowKey>,
     layout_dirty_since: Option<Instant>,
+    /// The window set reported to `WindowManager::sync`, rebuilt only when
+    /// its fingerprint changes (tabs opened/closed/renamed, casemapping or
+    /// network identity changes): rebuilding it canonicalizes and clones
+    /// every tab name, which is pure churn on a steady-state frame.
+    present_cache: Vec<PresentWindow>,
+    present_fingerprint: Option<u64>,
     /// Off in tests: layout.json lives in the real config directory.
     persist_layout: bool,
     /// False when settings.json existed at startup but could not be read:
@@ -110,7 +114,7 @@ pub struct App {
     tile_request: Option<TileRequest>,
     /// Restored unsent input, placed into the session's selected window once
     /// that window exists.
-    pending_inputs: Vec<(ConnId, String)>,
+    pending_inputs: Vec<(ConnId, Option<String>, String)>,
     /// When the App started: the persisted active window is only restored
     /// while startup auto-joins are still arriving.
     started: Instant,
@@ -209,7 +213,6 @@ impl App {
             favorites_ui: FavoritesUi::default(),
             show_settings: false,
             settings_tab: 0,
-            command_history: Vec::new(),
             last_activity: Instant::now(),
             last_notification_time: None,
             last_forced_notification_time: None,
@@ -228,6 +231,8 @@ impl App {
             spawn_geometry: HashMap::new(),
             color_target: None,
             layout_dirty_since: None,
+            present_cache: Vec::new(),
+            present_fingerprint: None,
             persist_layout: false,
             settings_writable: true,
             tray_hidden: false,
@@ -852,29 +857,69 @@ impl App {
 
     /// Reconcile windows with the sessions' tabs and follow focus changes a
     /// session made itself (own JOIN of a requested channel, /query).
-    fn sync_windows(&mut self) {
-        let mut present = Vec::new();
+    /// Allocation-free fingerprint of everything the reported window set
+    /// is built from: the sessions, their network identities, the tab names
+    /// and the casemapping that canonicalizes them into persist keys.
+    /// Order-independent, since channel iteration order is not stable.
+    fn window_set_fingerprint(&self) -> u64 {
+        fn fnv(hash: u64, bytes: &[u8]) -> u64 {
+            bytes.iter().fold(hash, |hash, byte| {
+                (hash ^ u64::from(*byte)).wrapping_mul(0x0000_0100_0000_01b3)
+            })
+        }
+        let mut total = fnv(0xcbf2_9ce4_8422_2325, &self.sessions.len().to_le_bytes());
         for session in &self.sessions {
-            let network = Self::network_identity(session);
-            present.push(PresentWindow {
-                key: WindowKey::new(session.id, None),
-                persist: PersistKey {
-                    network: network.clone(),
-                    target: None,
-                },
-            });
+            let identity = Self::network_identity(session);
+            let mut session_hash = fnv(0xcbf2_9ce4_8422_2325, &session.id.to_le_bytes());
+            session_hash = fnv(session_hash, identity.as_bytes());
+            session_hash = fnv(session_hash, session.network_support.channel_types.as_bytes());
+            let mapping = match session.network_support.case_mapping {
+                super::CaseMapping::Ascii => 0u8,
+                super::CaseMapping::StrictRfc1459 => 1,
+                super::CaseMapping::Rfc1459 => 2,
+                super::CaseMapping::Utf8Rfc8265 => 3,
+            };
+            session_hash = fnv(session_hash, &[mapping]);
             for name in session.channels.keys() {
-                present.push(PresentWindow {
-                    key: WindowKey::new(session.id, Some(name.clone())),
+                let key_hash = fnv(session_hash, name.as_bytes());
+                total = total.wrapping_add(key_hash.rotate_left(17));
+            }
+            total = total.wrapping_add(session_hash);
+        }
+        total
+    }
+
+    fn sync_windows(&mut self) {
+        // Rebuild the reported window set only when it can have changed;
+        // the fingerprint is allocation-free, the rebuild is not.
+        let fingerprint = self.window_set_fingerprint();
+        if self.present_fingerprint != Some(fingerprint) {
+            self.present_fingerprint = Some(fingerprint);
+            self.present_cache.clear();
+            for session in &self.sessions {
+                let network = Self::network_identity(session);
+                self.present_cache.push(PresentWindow {
+                    key: WindowKey::new(session.id, None),
                     persist: PersistKey {
                         network: network.clone(),
-                        target: Some(session.network_support.canonicalize(name)),
+                        target: None,
                     },
                 });
+                for name in session.channels.keys() {
+                    self.present_cache.push(PresentWindow {
+                        key: WindowKey::new(session.id, Some(name.clone())),
+                        persist: PersistKey {
+                            network: network.clone(),
+                            target: Some(session.network_support.canonicalize(name)),
+                        },
+                    });
+                }
             }
         }
         let previous_active = self.windows.active.clone();
-        let appeared = self.windows.sync(present);
+        // Unchanged sets reconcile inside `sync` to nothing, so this costs
+        // a slice comparison on steady-state frames.
+        let appeared = self.windows.sync(&self.present_cache);
         if !appeared.is_empty() {
             self.windows.dirty = true;
         }
@@ -886,11 +931,13 @@ impl App {
         }
         let sessions = &self.sessions;
         let windows = &mut self.windows;
-        self.pending_inputs.retain(|(conn, input)| {
-            let Some(session) = sessions.iter().find(|s| s.id == *conn) else {
+        self.pending_inputs.retain(|(conn, target, input)| {
+            if !sessions.iter().any(|s| s.id == *conn) {
                 return false;
-            };
-            let key = WindowKey::new(*conn, session.current_channel.clone());
+            }
+            // The draft belongs to the window it was captured from, never
+            // to whatever window the session happens to select by now.
+            let key = WindowKey::new(*conn, target.clone());
             match windows.get_mut(&key) {
                 Some(window) => {
                     window.view.input_text = input.clone();
@@ -1908,10 +1955,7 @@ impl App {
             return;
         };
         let App {
-            sessions,
-            windows,
-            command_history,
-            ..
+            sessions, windows, ..
         } = self;
         let Some(window) = windows.get_mut(key) else {
             return;
@@ -1921,7 +1965,6 @@ impl App {
         let (changed_to, (picker, dialog)) = with_window_view(
             session,
             &mut window.view,
-            command_history,
             &key.target,
             |s| {
                 let before = (
@@ -1968,10 +2011,7 @@ impl App {
             return;
         };
         let App {
-            sessions,
-            windows,
-            command_history,
-            ..
+            sessions, windows, ..
         } = self;
         let Some(window) = windows.get_mut(key) else {
             return;
@@ -1979,7 +2019,6 @@ impl App {
         let (changed_to, ()) = with_window_view(
             &mut sessions[index],
             &mut window.view,
-            command_history,
             &key.target,
             |s| s.process_input(),
         );
@@ -2027,7 +2066,8 @@ impl App {
             self.sessions[index].restore_update_session(snapshot);
             self.sessions[index].input_text.clear();
             let conn = self.sessions[index].id;
-            self.pending_inputs.push((conn, input));
+            let target = self.sessions[index].current_channel.clone();
+            self.pending_inputs.push((conn, target, input));
         }
         // The active session's window is the one to come back to.
         if let Some(session) = self.sessions.get(position) {
@@ -2174,14 +2214,13 @@ fn switchbar_label(session: &Session, target: Option<&str>) -> RichText {
 pub(crate) fn with_window_view<R>(
     session: &mut Session,
     view: &mut TargetView,
-    history: &mut Vec<String>,
     target: &Option<String>,
     f: impl FnOnce(&mut Session) -> R,
 ) -> (Option<Option<String>>, R) {
     let saved_current = std::mem::replace(&mut session.current_channel, target.clone());
-    swap_view(session, view, history);
+    swap_view(session, view);
     let result = f(session);
-    swap_view(session, view, history);
+    swap_view(session, view);
     let after = session.current_channel.clone();
     let exists = |session: &Session, target: &Option<String>| {
         target
@@ -2205,8 +2244,11 @@ pub(crate) fn with_window_view<R>(
     }
 }
 
-fn swap_view(session: &mut Session, view: &mut TargetView, history: &mut Vec<String>) {
+fn swap_view(session: &mut Session, view: &mut TargetView) {
     std::mem::swap(&mut session.input_text, &mut view.input_text);
+    // The sent-line history travels with the input line: each window
+    // recalls only what was sent from that window.
+    std::mem::swap(&mut session.command_history, &mut view.command_history);
     std::mem::swap(&mut session.history_index, &mut view.history_index);
     std::mem::swap(&mut session.history_temp, &mut view.history_temp);
     std::mem::swap(&mut session.tab_completion, &mut view.tab_completion);
@@ -2216,7 +2258,6 @@ fn swap_view(session: &mut Session, view: &mut TargetView, history: &mut Vec<Str
         &mut view.input_focus_request,
     );
     std::mem::swap(&mut session.input_had_focus, &mut view.input_had_focus);
-    std::mem::swap(&mut session.command_history, history);
 }
 
 /// The same floors the Settings dialog enforces, applied to values loaded
@@ -2250,6 +2291,21 @@ mod tests {
         let mut app = App::with_settings(test_settings(), LayoutFile::default());
         app.start(None);
         app
+    }
+
+    #[test]
+    fn sync_windows_reconciles_a_replaced_window_manager() {
+        // The manager can be swapped wholesale (startup layout restore);
+        // the next sync must still reconcile it even though the sessions'
+        // window set did not change in between.
+        let mut app = test_app();
+        app.sync_windows();
+        let before = app.windows.windows.len();
+        assert!(before > 0);
+        app.windows = WindowManager::from_layout(LayoutFile::default());
+        assert_eq!(app.windows.windows.len(), 0);
+        app.sync_windows();
+        assert_eq!(app.windows.windows.len(), before);
     }
 
     /// Make session `index` look registered, capturing what it sends.
@@ -2391,6 +2447,121 @@ mod tests {
             "draft two"
         );
         assert!(app.sessions[0].input_text.is_empty() && app.sessions[1].input_text.is_empty());
+    }
+
+    /// Recall the input line in one window the way the Up key does,
+    /// returning what the user would see (and could send) there.
+    fn recall_in(app: &mut App, key: &WindowKey) -> String {
+        let index = app.session_index(key.conn).unwrap();
+        let window = app.windows.get_mut(key).unwrap();
+        with_window_view(
+            &mut app.sessions[index],
+            &mut window.view,
+            &key.target,
+            |s| {
+                s.history_up();
+                s.input_text.clone()
+            },
+        )
+        .1
+    }
+
+    #[test]
+    fn drafts_sends_and_history_stay_in_their_window_and_network() {
+        let (mut app, mut rx_a, mut rx_b) = two_networks();
+        // The same channel name on both networks: only the connection key
+        // tells the two #same windows apart.
+        feed(&mut app, 0, ":me!u@h JOIN #same");
+        feed(&mut app, 1, ":me!u@h JOIN #same");
+        app.sync_windows();
+        let a_rust = WindowKey::new(app.sessions[0].id, Some("#rust".into()));
+        let a_same = WindowKey::new(app.sessions[0].id, Some("#same".into()));
+        let b_same = WindowKey::new(app.sessions[1].id, Some("#same".into()));
+        let b_debian = WindowKey::new(app.sessions[1].id, Some("#debian".into()));
+        let draft = |app: &App, key: &WindowKey| {
+            app.windows.get(key).unwrap().view.input_text.clone()
+        };
+        app.windows.get_mut(&a_rust).unwrap().view.input_text = "for rust only".into();
+        app.windows.get_mut(&a_same).unwrap().view.input_text = "net A same draft".into();
+        app.windows.get_mut(&b_same).unwrap().view.input_text = "net B same draft".into();
+        app.windows.get_mut(&b_debian).unwrap().view.input_text = "for debian only".into();
+
+        // A real frame draws every window; no draft moves.
+        let ctx = egui::Context::default();
+        frame(&mut app, &ctx);
+        assert_eq!(draft(&app, &a_rust), "for rust only");
+        assert_eq!(draft(&app, &a_same), "net A same draft");
+        assert_eq!(draft(&app, &b_same), "net B same draft");
+        assert_eq!(draft(&app, &b_debian), "for debian only");
+
+        // Submitting net B's #same (while net A's window is the active one)
+        // puts the text on net B's wire, addressed to net B's #same only.
+        app.activate(a_rust.clone());
+        app.submit_window_input(&b_same);
+        assert!(drain(&mut rx_a).is_empty());
+        assert_eq!(drain(&mut rx_b), ["PRIVMSG #same :net B same draft"]);
+        assert_eq!(draft(&app, &b_same), "");
+        assert_eq!(draft(&app, &a_same), "net A same draft");
+
+        // Net A's #same sends on net A's wire only.
+        app.submit_window_input(&a_same);
+        assert_eq!(drain(&mut rx_a), ["PRIVMSG #same :net A same draft"]);
+        assert!(drain(&mut rx_b).is_empty());
+
+        // History is per window: net B's #same recalls its own sent line,
+        // net A's #same recalls its own, and windows that sent nothing
+        // recall nothing from anywhere else.
+        app.windows.get_mut(&b_same).unwrap().view.input_text = "b typing".into();
+        assert_eq!(recall_in(&mut app, &b_same), "net B same draft");
+        app.windows.get_mut(&a_same).unwrap().view.input_text = "a typing".into();
+        assert_eq!(recall_in(&mut app, &a_same), "net A same draft");
+        assert_eq!(recall_in(&mut app, &b_debian), "for debian only");
+        assert_eq!(recall_in(&mut app, &a_rust), "for rust only");
+        // Recalling never sends anything by itself.
+        assert!(drain(&mut rx_a).is_empty() && drain(&mut rx_b).is_empty());
+
+        // A detached window on net B is its own OS window: its draft still
+        // belongs to it alone through real frames, and submitting it still
+        // goes only to net B's #debian.
+        app.toggle_detached(&b_debian);
+        app.windows.get_mut(&b_debian).unwrap().view.input_text = "detached draft".into();
+        frame(&mut app, &ctx);
+        assert_eq!(draft(&app, &b_debian), "detached draft");
+        assert_eq!(draft(&app, &a_rust), "for rust only");
+        app.submit_window_input(&b_debian);
+        assert!(drain(&mut rx_a).is_empty());
+        assert_eq!(drain(&mut rx_b), ["PRIVMSG #debian :detached draft"]);
+    }
+
+    #[test]
+    fn restored_draft_lands_in_its_own_window_even_if_selection_moved() {
+        let (mut app, _rx_a, _rx_b) = two_networks();
+        app.sessions[0].apply_unprofiled_endpoint("a.example", "6697", true);
+        assert!(app.sessions[0].start_session_from_form());
+        app.sessions[1].apply_unprofiled_endpoint("b.example", "6697", true);
+        assert!(app.sessions[1].start_session_from_form());
+        for index in 0..2 {
+            app.sessions[index].connected = true;
+            app.sessions[index].connecting = false;
+        }
+        let debian = WindowKey::new(app.sessions[1].id, Some("#debian".into()));
+        app.activate(debian.clone());
+        app.windows.get_mut(&debian).unwrap().view.input_text = "unsent".into();
+        let json = serde_json::to_string(&app.update_session()).unwrap();
+        let snapshot: UpdateSession = serde_json::from_str(&json).unwrap();
+
+        let mut restored = App::with_settings(test_settings(), LayoutFile::default());
+        restored.start(Some(snapshot));
+        // The session's selection moved before the first window sync.
+        restored.sessions[1].current_channel = None;
+        restored.sync_windows();
+        let key = WindowKey::new(restored.sessions[1].id, Some("#debian".into()));
+        assert_eq!(
+            restored.windows.get(&key).unwrap().view.input_text,
+            "unsent"
+        );
+        let status = WindowKey::new(restored.sessions[1].id, None);
+        assert_eq!(restored.windows.get(&status).unwrap().view.input_text, "");
     }
 
     #[test]

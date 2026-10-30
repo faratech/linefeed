@@ -146,6 +146,12 @@ impl Session {
 
             run_worker_runtime(rt, async {
                 let mut client = IrcClient::new(config.clone());
+                // Wake the UI as each server message lands so it is painted
+                // on arrival, not at the next idle poll (up to 500 ms).
+                let wake_ctx = ctx.clone();
+                client.set_wake_callback(std::sync::Arc::new(move || {
+                    wake_ctx.request_repaint();
+                }));
                 match client.connect(msg_tx.clone(), cmd_rx).await {
                     Ok(_) => tracing::info!("Connection closed"),
                     Err(e) => {
@@ -406,6 +412,69 @@ pub(crate) mod tests {
             l.server_messages
                 .iter()
                 .any(|message| message.content.contains("Connection failed"))
+        });
+    }
+
+    #[test]
+    fn a_server_push_requests_an_immediate_repaint() {
+        use std::io::{BufRead, Write};
+        // Registration, then one post-registration push.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                .unwrap();
+            let mut writer = stream.try_clone().unwrap();
+            let mut reader = std::io::BufReader::new(stream);
+            let mut line = String::new();
+            while reader.read_line(&mut line).unwrap_or(0) > 0 {
+                let text = line.trim_end().to_string();
+                line.clear();
+                match text.as_str() {
+                    "CAP LS 302" => writer.write_all(b":srv CAP * LS :multi-prefix\r\n"),
+                    "CAP REQ :multi-prefix" => {
+                        writer.write_all(b":srv CAP * ACK :multi-prefix\r\n")
+                    }
+                    "CAP END" => writer.write_all(
+                        b":srv 001 tester :Welcome\r\n:alice!a@h PRIVMSG tester :hello\r\n",
+                    ),
+                    _ => Ok(()),
+                }
+                .unwrap();
+            }
+        });
+
+        let (delay_tx, delay_rx) = std::sync::mpsc::channel();
+        let ctx = egui::Context::default();
+        ctx.set_request_repaint_callback(move |info| {
+            let _ = delay_tx.send(info.delay);
+        });
+        let mut app = app_for_port(port);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            app.background_tick(&ctx);
+            let pushed = app
+                .channels
+                .get("alice")
+                .is_some_and(|ch| ch.messages.iter().any(|m| m.content == "hello"));
+            if pushed {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline, "push never arrived");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let delays: Vec<_> = std::iter::from_fn(|| delay_rx.try_recv().ok()).collect();
+        assert!(
+            delays.iter().any(|delay| delay.is_zero()),
+            "no immediate repaint was requested for the push: {delays:?}"
+        );
+
+        // Cleanup: disconnect so the worker ends instead of lingering.
+        app.request_manual_disconnect(None);
+        tick_until(&mut app, "worker to exit after disconnect", |l| {
+            l.worker.is_none()
         });
     }
 

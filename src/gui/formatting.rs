@@ -1100,5 +1100,40 @@ mod tests {
         assert!(urls_in("awww.so cute").is_empty());
         assert!(urls_in("Seehttps://a.test").is_empty());
     }
+
+    #[test]
+    fn strip_and_layout_preserve_the_visible_text() {
+        // Deterministic pseudo-random formatting soup: the stripped text must
+        // always equal the concatenation of the parsed spans' visible text.
+        let alphabet: Vec<char> = vec![
+            'a', 'b', '1', '2', ',', ' ', '\x03', '\x04', '\x02', '\x0F', '\x1D', '\x1F', '\x16',
+            '\x1E', '\x11', 'F', 'x',
+        ];
+        let mut state: u64 = 0x1234_5678_9abc_def0;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for case in 0..20000 {
+            let len = (next() % 24) as usize;
+            let input: String = (0..len)
+                .map(|_| alphabet[(next() as usize) % alphabet.len()])
+                .collect();
+            let stripped = strip_irc_formatting(&input);
+            let visible: String = parse_irc_colors(&input)
+                .iter()
+                .map(|span| span.text.as_str())
+                .collect();
+            assert_eq!(stripped, visible, "case {case} input {input:?}");
+            // Layout must preserve every visible character exactly once.
+            let laid: String = layout_irc_text(&input)
+                .iter()
+                .map(|segment| segment.text.as_str())
+                .collect();
+            assert_eq!(laid, visible, "layout case {case} input {input:?}");
+        }
+    }
 }
 

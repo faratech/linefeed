@@ -623,6 +623,31 @@ impl CaseMapping {
         value.chars().map(|c| self.fold_char(c)).collect()
     }
 
+    /// Ordering equivalent to comparing the two `canonicalize` outputs,
+    /// without allocating in the ASCII-based mappings: folding is per
+    /// character and independent, so comparing folded character streams
+    /// gives the same order as comparing the folded strings. Used to sort
+    /// tab and user lists that are rebuilt every frame.
+    pub fn cmp_canonical(self, left: &str, right: &str) -> std::cmp::Ordering {
+        use std::cmp::Ordering;
+        if self == CaseMapping::Utf8Rfc8265 {
+            return self.canonicalize(left).cmp(&self.canonicalize(right));
+        }
+        let mut left_chars = left.chars().map(|c| self.fold_char(c));
+        let mut right_chars = right.chars().map(|c| self.fold_char(c));
+        loop {
+            match (left_chars.next(), right_chars.next()) {
+                (None, None) => return Ordering::Equal,
+                (None, Some(_)) => return Ordering::Less,
+                (Some(_), None) => return Ordering::Greater,
+                (Some(a), Some(b)) => match a.cmp(&b) {
+                    Ordering::Equal => continue,
+                    other => return other,
+                },
+            }
+        }
+    }
+
     /// Compare two identifiers without building canonical keys: the ASCII
     /// mappings fold on the fly, so a comparison allocates nothing.
     pub fn eq(self, left: &str, right: &str) -> bool {
@@ -740,6 +765,16 @@ impl NetworkSupport {
             return format!("{first}{}", self.case_mapping.canonicalize(rest));
         }
         self.case_mapping.canonicalize(value)
+    }
+
+    /// `canonicalize` ordering without the allocation, for sorting. The
+    /// UTF-8 mapping keeps the allocating comparison because of its
+    /// channel-prefix preservation (see `canonicalize`).
+    pub fn cmp_canonical(&self, left: &str, right: &str) -> std::cmp::Ordering {
+        if self.case_mapping == CaseMapping::Utf8Rfc8265 {
+            return self.canonicalize(left).cmp(&self.canonicalize(right));
+        }
+        self.case_mapping.cmp_canonical(left, right)
     }
 
     pub fn identifiers_equal(&self, left: &str, right: &str) -> bool {
@@ -2041,6 +2076,42 @@ mod tests {
         }
     }
 
+    #[test]
+    fn cmp_canonical_agrees_with_canonical_key_order() {
+        let samples = [
+            "", "a", "A", "alice", "ALICE", "Alice[1]", "alice{1}", "a\\b", "a|b", "n^ick",
+            "n~ick", "Ünï", "ÜNÏ", "#Chan", "#chan", "##", "#a", "z", "Z}", "éclair", "Éclair",
+        ];
+        for mapping in [
+            CaseMapping::Ascii,
+            CaseMapping::StrictRfc1459,
+            CaseMapping::Rfc1459,
+            CaseMapping::Utf8Rfc8265,
+        ] {
+            let support = NetworkSupport {
+                case_mapping: mapping,
+                ..NetworkSupport::default()
+            };
+            for left in samples {
+                for right in samples {
+                    let expected = support
+                        .canonicalize(left)
+                        .cmp(&support.canonicalize(right));
+                    assert_eq!(
+                        support.cmp_canonical(left, right),
+                        expected,
+                        "{mapping:?}: {left:?} vs {right:?}"
+                    );
+                    assert_eq!(
+                        mapping.cmp_canonical(left, right),
+                        mapping.canonicalize(left).cmp(&mapping.canonicalize(right)),
+                        "{mapping:?}: {left:?} vs {right:?}"
+                    );
+                }
+            }
+        }
+    }
+
     /// The visible list must stay sorted by (rank, case-mapped nick) and every
     /// member must be reachable through the case-insensitive lookup.
     fn assert_users_sorted_and_findable(ch: &Channel) {
@@ -2130,6 +2201,61 @@ mod tests {
         assert!(ch.has_user("nick[1]"));
         assert!(!ch.has_user("nick{1}"));
         assert_users_sorted_and_findable(&ch);
+    }
+
+    #[test]
+    fn random_membership_ops_keep_the_index_consistent() {
+        let nicks = [
+            "alpha", "Bravo", "charlie", "Delta", "echo", "Foxtrot", "golf", "Hotel", "Nick[1]",
+            "nick{1}", "Zulu", "yankee",
+        ];
+        let modes = [
+            UserMode::Normal,
+            UserMode::Voice,
+            UserMode::HalfOp,
+            UserMode::Op,
+            UserMode::Admin,
+            UserMode::Owner,
+        ];
+        let mut state: u64 = 0x0bad_5eed_0bad_5eed;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let mut ch = Channel::new();
+        for step in 0..3000 {
+            let nick = nicks[(next() as usize) % nicks.len()];
+            match next() % 8 {
+                0 => ch.add_user(nick, modes[(next() as usize) % modes.len()]),
+                1 => ch.remove_user(nick),
+                2 => {
+                    let new_nick = nicks[(next() as usize) % nicks.len()];
+                    ch.rename_user(nick, new_nick);
+                }
+                3 => ch.add_user_status_mode(nick, ['q', 'a', 'o', 'h', 'v'][(next() as usize) % 5]),
+                4 => {
+                    ch.remove_user_status_mode(nick, ['q', 'a', 'o', 'h', 'v'][(next() as usize) % 5])
+                }
+                5 => {
+                    ch.begin_user_burst();
+                    for _ in 0..3 {
+                        let n = nicks[(next() as usize) % nicks.len()];
+                        ch.add_user_burst_modes(n, &[modes[(next() as usize) % modes.len()]]);
+                    }
+                    ch.finish_user_burst();
+                }
+                6 => ch.set_case_mapping(match next() % 3 {
+                    0 => CaseMapping::Ascii,
+                    1 => CaseMapping::StrictRfc1459,
+                    _ => CaseMapping::Rfc1459,
+                }),
+                _ => ch.clear_users(),
+            }
+            assert_users_sorted_and_findable(&ch);
+            let _ = step;
+        }
     }
 
     #[test]

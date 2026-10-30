@@ -1273,6 +1273,41 @@ mod tests {
     }
 
     #[test]
+    fn parser_never_panics_on_hostile_input() {
+        let alphabet: Vec<char> = vec![
+            '@', ':', ';', '=', '\\', ' ', 'P', 'R', 'I', 'V', 'M', 'S', 'G', '0', '1', '#',
+            'a', '\r', '\n', '\t', 'é', '\u{1}', '*', '!', '.', '-', 'Z', 'T',
+        ];
+        let mut state: u64 = 0xfeed_face_1234_5678;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for _case in 0..50000 {
+            let len = (next() % 40) as usize;
+            let input: String = (0..len)
+                .map(|_| alphabet[(next() as usize) % alphabet.len()])
+                .collect();
+            if let Some(msg) = IrcMessage::parse(&input) {
+                let _ = msg.get_sender_nick();
+                let _ = msg.get_tag("time");
+                let _ = msg.get_tag("account");
+                let _ = msg.get_server_time();
+                let _ = msg.get_msgid();
+                // Re-parsing the raw form and the Display form must not panic.
+                let _ = IrcMessage::parse(&msg.raw);
+                let _ = msg.command.to_wire_line();
+                if let Some(wire) = msg.command.to_wire_line() {
+                    let _ = IrcMessage::parse(&wire);
+                }
+            }
+            let _ = parse_iso8601_utc(&input);
+        }
+    }
+
+    #[test]
     fn pass_is_sent_as_a_trailing_parameter() {
         // #231: a space or a leading ':' in the password must survive intact.
         assert_eq!(

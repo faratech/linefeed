@@ -6,6 +6,9 @@ use crate::irc::IrcCommand;
 
 impl Session {
     pub fn process_command(&mut self, input: &str) {
+        if input.is_empty() {
+            return;
+        }
         // "//text" is an escaped slash: it sends the literal message "/text"
         // instead of running a command (the same as "/say /text", #263).
         if input.starts_with("//") {
@@ -30,7 +33,11 @@ impl Session {
         // Whitespace separator (not just ' '): the credential filter splits
         // on any whitespace, so the command token must too — a tab after the
         // command word would otherwise become an unknown command (#148).
-        let parts: Vec<&str> = input[1..].splitn(2, char::is_whitespace).collect();
+        // Strip the slash by prefix, not by byte index: a caller handing us
+        // a bare word (or a multi-byte first character) must not lose its
+        // first character or panic on a non-boundary index.
+        let command_line = input.strip_prefix('/').unwrap_or(input);
+        let parts: Vec<&str> = command_line.splitn(2, char::is_whitespace).collect();
         let word = parts[0];
         // ASCII only: full Unicode upper-casing maps the dotless i and the
         // long s to I and S, so "/ıdentify pw" would dispatch as the raw
@@ -1985,7 +1992,9 @@ impl Session {
                                 })
                                 .take(50)
                                 .map(|msg| {
-                                    format!("[{}] <{}> {}", msg.timestamp, msg.sender, msg.content)
+                                    // The stored timestamp already carries
+                                    // its brackets ("[16:59]").
+                                    format!("{} <{}> {}", msg.timestamp, msg.sender, msg.content)
                                 })
                                 .collect()
                         } else {
@@ -3138,6 +3147,30 @@ mod tests {
             ("+".into(), Some("alice,bob".into()))
         );
         assert_eq!(monitor_args("+a\t"), ("+".into(), Some("a".into())));
+    }
+
+    #[test]
+    fn lastlog_results_show_the_stored_timestamp_once() {
+        let (mut app, _rx) = connected_command_app();
+        let mut channel = Channel::new();
+        let stored = ChatMessage::new_fmt("alice", "hello world", "short");
+        let expected = format!("{} <alice> hello world", stored.timestamp);
+        channel.messages.push_back(stored);
+        app.channels.insert("#room".to_string(), channel);
+        app.current_channel = Some("#room".to_string());
+
+        app.process_command("/lastlog hello");
+
+        let contents: Vec<&str> = app.channels["#room"]
+            .messages
+            .iter()
+            .map(|message| message.content.as_str())
+            .collect();
+        assert!(contents.contains(&expected.as_str()), "{contents:?}");
+        assert!(
+            !contents.iter().any(|line| line.contains("[[")),
+            "timestamp brackets doubled: {contents:?}"
+        );
     }
 
     #[test]
@@ -5126,6 +5159,58 @@ mod tests {
         }
         assert_eq!(parse_server_port("1"), Ok(1));
         assert_eq!(parse_server_port("65535"), Ok(65535));
+    }
+
+    #[test]
+    fn command_dispatch_never_panics_on_hostile_input() {
+        let (mut app, _rx) = connected_command_app();
+        // Degenerate inputs: no slash, an empty line, a lone slash and a
+        // multi-byte first character (a byte-index slash strip panicked).
+        app.process_command("");
+        app.process_command("/");
+        app.process_command("é");
+        app.process_command("bareword");
+        app.set_session_nick("me".into(), true);
+        let mut room = Channel::new();
+        room.joined = true;
+        room.add_user("alice", crate::gui::UserMode::Op);
+        room.add_user("bob", crate::gui::UserMode::Normal);
+        app.channels.insert("#room".into(), room);
+        app.current_channel = Some("#room".into());
+        let tokens = [
+            "/join", "/part", "/kick", "/ban", "/unban", "/kickban", "/mode", "/msg",
+            "/notice", "/query", "/me", "/say", "/topic", "/away", "/nick", "/whois",
+            "/monitor", "/silence", "/ignore", "/unignore", "/list", "/names", "/invite",
+            "/quit", "/raw", "/quote", "/perform", "/server", "/umode", "/op", "/deop",
+            "/voice", "/halfop", "/ctcp", "/lastlog", "/clear", "/help", "/window",
+            "/hop", "/cycle", "#room", "alice", "bob", "me", "+o", "-b", "key", "*!*@h",
+            "https://x.test", "\u{1}", "", "  ", "\t", "999999999999999999999999",
+        ];
+        let mut state: u64 = 0xc0ff_ee00_1234_5678;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for _case in 0..6000 {
+            let count = 1 + (next() % 4) as usize;
+            let line = (0..count)
+                .map(|_| tokens[(next() as usize) % tokens.len()])
+                .collect::<Vec<_>>()
+                .join(" ");
+            app.process_command(&line);
+            // Commands may legitimately switch or close the current tab.
+            if app.current_channel.is_none() {
+                app.current_channel = Some("#room".into());
+                if !app.channels.contains_key("#room") {
+                    let mut room = Channel::new();
+                    room.joined = true;
+                    app.channels.insert("#room".into(), room);
+                }
+            }
+        }
+        app.process_command("/say still alive");
     }
 
     #[test]

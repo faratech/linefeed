@@ -807,6 +807,92 @@ mod tests {
     }
 
     #[test]
+    fn log_lines_round_trip_edge_cases() {
+        for (sender, content, system, action) in [
+            ("alice", "* starred", false, false),
+            ("alice", "-!- forged", false, false),
+            ("alice", "", false, false),
+            ("carol", "waves", false, true),
+            ("carol", "", false, true),
+            ("*", "sys * tem", true, false),
+            ("bob", "<not-a-nick> hi", false, false),
+        ] {
+            let p = round_trip(&msg("[09:30]", sender, content, system, action));
+            assert_eq!(p.sender, sender, "sender for {content:?}");
+            assert_eq!(p.content, content, "content for {sender:?}");
+            assert_eq!(p.is_system, system);
+            assert_eq!(p.is_action, action);
+        }
+    }
+
+    #[test]
+    fn read_last_n_lines_matches_a_naive_tail() {
+        use std::io::Write as _;
+        let (_manager, dir) = test_manager("tailprobe");
+        let mut state: u64 = 0xabcd_ef01_2345_6789;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for case in 0..60 {
+            // Random content: short and chunk-crossing lines, optional
+            // trailing newline, optional empty lines.
+            let line_count = (next() % 40) as usize;
+            let mut content = String::new();
+            for i in 0..line_count {
+                let len = match next() % 4 {
+                    0 => (next() % 20) as usize,
+                    1 => 8190 + (next() % 10) as usize,
+                    2 => 20000 + (next() % 100) as usize,
+                    _ => (next() % 200) as usize,
+                };
+                content.push_str(&format!("line{i}-"));
+                content.push_str(&"x".repeat(len));
+                content.push('\n');
+            }
+            if next().is_multiple_of(3) && content.ends_with('\n') {
+                content.pop();
+            }
+            let path = dir.join(format!("case{case}.log"));
+            let mut file = fs::File::create(&path).unwrap();
+            file.write_all(content.as_bytes()).unwrap();
+            drop(file);
+            let size = fs::metadata(&path).unwrap().len();
+            let mut file = fs::File::open(&path).unwrap();
+            for max_lines in [1usize, 3, 10, 100] {
+                let got = read_last_n_lines(&mut file, size, max_lines);
+                let all: Vec<String> = content.lines().map(str::to_string).collect();
+                let start = all.len().saturating_sub(max_lines);
+                assert_eq!(got, all[start..], "case {case} max {max_lines}");
+            }
+        }
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn session_marker_datetime_matches_an_oracle() {
+        // Generated with Python datetime (ctime-style, day space-padded).
+        for (epoch, offset, expected) in [
+            (0u64, 0i64, "Thu Jan  1 00:00:00 1970"),
+            (1766950200, 0, "Sun Dec 28 19:30:00 2025"),
+            (1766950200, 3600, "Sun Dec 28 20:30:00 2025"),
+            (1766950200, -18000, "Sun Dec 28 14:30:00 2025"),
+            (951782400, 0, "Tue Feb 29 00:00:00 2000"),
+            (4102444800, 0, "Fri Jan  1 00:00:00 2100"),
+            (86399, 0, "Thu Jan  1 23:59:59 1970"),
+            (86400, 0, "Fri Jan  2 00:00:00 1970"),
+        ] {
+            assert_eq!(
+                datetime_string_at(epoch, offset),
+                expected,
+                "epoch {epoch} offset {offset}"
+            );
+        }
+    }
+
+    #[test]
     fn sanitize_filename_blocks_traversal() {
         assert_eq!(sanitize_filename(".."), "_");
         assert_eq!(sanitize_filename("."), "_");
