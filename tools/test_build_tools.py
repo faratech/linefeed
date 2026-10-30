@@ -134,6 +134,76 @@ class DependencyVersionAndParsingTests(unittest.TestCase):
             self.assertEqual(deps["multi"]["current"], "4")
             self.assertEqual(deps["targetdep"]["current"], "5")
 
+    def test_dependency_table_form_versions_are_rewritten(self):
+        # [dependencies.<name>] tables are parsed as dependencies, so the
+        # writer must rewrite their `version = "..."` line too (#325).
+        u = self.updater
+        with tempfile.TemporaryDirectory() as tmp:
+            manifest = Path(tmp) / "Cargo.toml"
+            manifest.write_text(
+                "[package]\n"
+                'name = "demo"\n'
+                'version = "0.1.0"\n'
+                "\n"
+                "[dependencies]\n"
+                'plain = "1"\n'
+                'dotted.version = "9"\n'
+                "\n"
+                "[dependencies.serde]\n"
+                'version = "1"\n'
+                'features = ["derive"]\n'
+                "\n"
+                "[target.'cfg(unix)'.dependencies.nix]\n"
+                'version = "0.5"\n'
+                "\n"
+                "[dependencies.other]\n"
+                'version = "7"\n'
+            )
+            u.CARGO_TOML = manifest
+            self.assertEqual(u.get_outdated_deps()["serde"]["current"], "1")
+            u.update_cargo_toml(
+                {"serde": "2", "plain": "3", "nix": "0.6", "dotted": "10"}
+            )
+            self.assertEqual(
+                manifest.read_text(),
+                "[package]\n"
+                'name = "demo"\n'
+                'version = "0.1.0"\n'
+                "\n"
+                "[dependencies]\n"
+                'plain = "3"\n'
+                'dotted.version = "10"\n'
+                "\n"
+                "[dependencies.serde]\n"
+                'version = "2"\n'
+                'features = ["derive"]\n'
+                "\n"
+                "[target.'cfg(unix)'.dependencies.nix]\n"
+                'version = "0.6"\n'
+                "\n"
+                "[dependencies.other]\n"
+                'version = "7"\n',
+            )
+
+    def test_unrewritable_dependency_spec_fails_loudly_and_rolls_back(self):
+        # A spec the writer cannot rewrite must not be reported as a
+        # successful update (#325): the whole operation rolls back.
+        u = self.updater
+        original = "[dependencies]\nserde = { version = '1' }\n"
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            manifest, lock = root / "Cargo.toml", root / "Cargo.lock"
+            manifest.write_text(original)
+            lock.write_text("orig\n")
+            u.CARGO_TOML, u.CARGO_LOCK = manifest, lock
+            ok = subprocess.CompletedProcess(["cargo"], 0, stdout="ok", stderr="")
+            with mock.patch.object(u, "run_cmd", return_value=ok):
+                self.assertFalse(u.update_manifest_and_lock({"serde": "2"}))
+            self.assertEqual(manifest.read_text(), original)
+            self.assertEqual(lock.read_text(), "orig\n")
+            with self.assertRaises(RuntimeError):
+                u.update_cargo_toml({"serde": "2"}, dry_run=True)
+
     def test_search_failure_is_fatal_not_not_found(self):
         u = self.updater
         failed = subprocess.CompletedProcess(

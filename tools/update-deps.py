@@ -282,23 +282,75 @@ def is_prerelease(version: str) -> bool:
     return "-" in version
 
 
+def _rewrite_crate_versions(
+    content: str, crate_name: str, new_version: str
+) -> tuple[str, int]:
+    """Rewrite every version spec of one crate; return (content, specs rewritten).
+
+    Handles every form the parsers accept: ``crate = "1"``,
+    ``crate = { version = "1", ... }``, ``crate.version = "1"`` and
+    ``[dependencies.crate]`` tables with a ``version = "1"`` line.
+    """
+    name = re.escape(crate_name)
+    count = 0
+
+    def sub(pattern: str, text: str) -> str:
+        nonlocal count
+        text, n = re.subn(
+            pattern, lambda m: f'{m.group(1)}{m.group(2)}"{new_version}"', text
+        )
+        count += n
+        return text
+
+    # Use word boundary (^|\n) to avoid matching 'rustls' in 'tokio-rustls'
+    # Simple: crate = "1.0" (also indented / quoted-key forms)
+    content = sub(rf'(^|\n)([ \t]*["\']?{name}["\']?\s*=\s*)"[^"]+"', content)
+    # Complex: crate = { version = "1.0", ... } (may span lines)
+    content = sub(
+        rf'(^|\n)([ \t]*["\']?{name}["\']?\s*=\s*\{{[^}}]*?version\s*=\s*)"[^"]+"',
+        content,
+    )
+    # Dotted key: crate.version = "1.0"
+    content = sub(
+        rf'(^|\n)([ \t]*["\']?{name}["\']?[ \t]*\.[ \t]*version[ \t]*=[ \t]*)"[^"]+"',
+        content,
+    )
+
+    # Table form: [dependencies.crate] / [target.'cfg'.dependencies.crate]
+    header = re.compile(
+        r"[ \t]*\[(?:[^\]\n]*\.)?"
+        r"(?:dependencies|dev-dependencies|build-dependencies)"
+        rf"\.(?:\"{name}\"|'{name}'|{name})[ \t]*\]"
+    )
+    version_line = re.compile(r'([ \t]*version[ \t]*=[ \t]*)"[^"]+"')
+    lines = content.splitlines(keepends=True)
+    in_table = False
+    for idx, line in enumerate(lines):
+        if re.match(r"[ \t]*\[", line):
+            in_table = header.match(line) is not None
+        elif in_table:
+            m = version_line.match(line)
+            if m:
+                lines[idx] = f'{m.group(1)}"{new_version}"' + line[m.end():]
+                count += 1
+    return "".join(lines), count
+
+
 def update_cargo_toml(updates: dict[str, str], dry_run: bool = False) -> None:
-    """Update Cargo.toml with new versions."""
+    """Update Cargo.toml with new versions.
+
+    Raises RuntimeError when a crate's version spec cannot be located in a
+    form the writer understands, so callers never report a silent no-op.
+    """
     content = CARGO_TOML.read_text()
 
     for crate_name, new_version in updates.items():
-        # Match both simple and complex dependency formats
-        # Use word boundary (^|[\s\[]) to avoid matching 'rustls' in 'tokio-rustls'
-        # Simple: crate = "1.0" (also indented / quoted-key forms)
-        pattern1 = rf'(^|\n)([ \t]*["\']?{re.escape(crate_name)}["\']?\s*=\s*)"[^"]+"'
-        replacement1 = rf'\1\2"{new_version}"'
-
-        # Complex: crate = { version = "1.0", ... } (may span lines)
-        pattern2 = rf'(^|\n)([ \t]*["\']?{re.escape(crate_name)}["\']?\s*=\s*\{{[^}}]*?version\s*=\s*)"[^"]+"'
-        replacement2 = rf'\1\2"{new_version}"'
-
-        content = re.sub(pattern1, replacement1, content)
-        content = re.sub(pattern2, replacement2, content)
+        content, rewritten = _rewrite_crate_versions(content, crate_name, new_version)
+        if rewritten == 0:
+            raise RuntimeError(
+                f"could not rewrite the version spec of '{crate_name}' in "
+                f"{CARGO_TOML.name}: unsupported dependency form"
+            )
 
     if dry_run:
         print("\n[Dry run] Would update Cargo.toml with:")
@@ -429,7 +481,11 @@ def main():
         sys.exit(1)
 
     if args.dry_run:
-        update_cargo_toml(updates, dry_run=True)
+        try:
+            update_cargo_toml(updates, dry_run=True)
+        except RuntimeError as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            sys.exit(1)
     else:
         if not update_manifest_and_lock(updates, pin=args.pin):
             sys.exit(1)
