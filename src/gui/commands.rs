@@ -1580,7 +1580,7 @@ impl IrcApp {
                     self.send_command(IrcCommand::Part(ch.clone(), Some("Cycling".to_string())));
                     // The own-PART handler drops the tab, so the key must
                     // travel with this JOIN to reach the replacement tab (#250).
-                    self.send_join(ch, key);
+                    self.send_rejoin(ch, key);
                 }
             }
 

@@ -5286,9 +5286,17 @@ impl IrcApp {
     }
 
     fn handle_numeric(&mut self, num: u16, params: &[String]) {
+        // 470 ERR_LINKCHANNEL <client> <#old> <#new>: the JOIN was forwarded.
+        const ERR_LINKCHANNEL: u16 = 470;
+        if num == ERR_LINKCHANNEL
+            && let (Some(from), Some(to)) = (params.get(1), params.get(2))
+        {
+            self.redirect_join_focus_request(from, to);
+        }
         // A refused JOIN ends the attempt the key was sent for. Left in the
         // map, the key would attach to the tab of whatever later JOIN of that
         // channel (keyless, from an invite or a bouncer) the server confirms.
+        // The same goes for the user's request to focus the channel (#290).
         if matches!(
             num,
             ERR_NOSUCHCHANNEL
@@ -5303,6 +5311,7 @@ impl IrcApp {
         {
             self.pending_channel_keys
                 .remove(&self.network_support.canonicalize(channel));
+            self.take_join_focus_request(channel);
         }
         match num {
             RPL_SAVENICK => {
@@ -6937,15 +6946,64 @@ impl IrcApp {
     /// entries and rejoins on a kicked tab keep the key (#250).
     pub(crate) fn send_join(&mut self, channel: String, key: Option<String>) -> bool {
         let sent = self.send_join_in_background(channel.clone(), key);
-        // The user asked for this tab: its own-JOIN echo may take focus.
         if sent {
-            const MAX_JOIN_FOCUS_REQUESTS: usize = 64;
+            self.request_join_focus(&channel, false);
+        }
+        sent
+    }
+
+    /// The JOIN that follows a PART in /cycle. The tab still reads as joined
+    /// until the PART echo arrives, but the JOIN echo will recreate it, so the
+    /// focus request must be recorded even then.
+    pub(crate) fn send_rejoin(&mut self, channel: String, key: Option<String>) -> bool {
+        let sent = self.send_join_in_background(channel.clone(), key);
+        if sent {
+            self.request_join_focus(&channel, true);
+        }
+        sent
+    }
+
+    /// The user asked to join `channels` (a comma list is several requests):
+    /// each channel's own-JOIN echo may take focus. A channel the user is
+    /// already in produces no echo to wait for, so it is focused right away
+    /// instead of leaving a request that a later unsolicited JOIN would
+    /// consume (#290).
+    fn request_join_focus(&mut self, channels: &str, rejoining: bool) {
+        const MAX_JOIN_FOCUS_REQUESTS: usize = 64;
+        for name in channels
+            .split(',')
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+        {
+            let joined_tab = self
+                .channel_key(name)
+                .filter(|key| self.channels.get(key).is_some_and(|channel| channel.joined));
+            if let Some(key) = joined_tab
+                && !rejoining
+            {
+                self.select_tab(Some(key));
+                continue;
+            }
+            if self
+                .join_focus_requests
+                .iter()
+                .any(|requested| self.identifiers_equal(requested, name))
+            {
+                continue;
+            }
             if self.join_focus_requests.len() >= MAX_JOIN_FOCUS_REQUESTS {
                 self.join_focus_requests.remove(0);
             }
-            self.join_focus_requests.push(channel);
+            self.join_focus_requests.push(name.to_string());
         }
-        sent
+    }
+
+    /// 470: the server forwarded the JOIN of `from` to `to`, so the request
+    /// follows the redirect.
+    fn redirect_join_focus_request(&mut self, from: &str, to: &str) {
+        if self.take_join_focus_request(from) {
+            self.request_join_focus(to, false);
+        }
     }
 
     /// JOIN on the client's own initiative (the auto-join list): same key
@@ -13548,5 +13606,102 @@ mod tests {
                 .iter()
                 .any(|row| row.content == "chatter")
         );
+    }
+
+    /// A connected app reading a query, with its outgoing commands drained.
+    fn app_reading_a_query() -> (IrcApp, mpsc::UnboundedReceiver<IrcCommand>) {
+        let (mut app, rx) = test_app_connected();
+        app.set_session_nick("me".to_string(), true);
+        app.add_message_to_channel("alice", ChatMessage::new_fmt("alice", "hi", "short"));
+        app.current_channel = Some("alice".to_string());
+        (app, rx)
+    }
+
+    #[test]
+    fn join_with_a_channel_list_focuses_each_channel_as_it_is_confirmed() {
+        let (mut app, _rx) = app_reading_a_query();
+
+        app.process_command("/join #a,#b");
+        app.handle_incoming_message(IrcMessage::parse(":me!u@h JOIN #a").unwrap());
+        assert_eq!(app.current_channel.as_deref(), Some("#a"), "#290");
+        app.handle_incoming_message(IrcMessage::parse(":me!u@h JOIN #b").unwrap());
+        assert_eq!(app.current_channel.as_deref(), Some("#b"));
+        assert!(app.join_focus_requests.is_empty());
+    }
+
+    #[test]
+    fn a_refused_join_does_not_leave_a_request_to_steal_focus_later() {
+        let (mut app, _rx) = app_reading_a_query();
+
+        app.process_command("/join #locked");
+        app.handle_numeric(
+            ERR_BANNEDFROMCHAN,
+            &[
+                "me".to_string(),
+                "#locked".to_string(),
+                "Cannot join channel (+b)".to_string(),
+            ],
+        );
+        assert!(app.join_focus_requests.is_empty(), "#290: stale request");
+
+        // Later the server joins us there unasked (an invite, a bouncer).
+        app.handle_incoming_message(IrcMessage::parse(":me!u@h JOIN #locked").unwrap());
+        assert_eq!(app.current_channel.as_deref(), Some("alice"));
+    }
+
+    #[test]
+    fn a_forwarded_join_focuses_the_channel_it_was_forwarded_to() {
+        let (mut app, _rx) = app_reading_a_query();
+
+        app.process_command("/join #old");
+        // 470 <me> <#old> <#new> :Forwarding to another channel
+        app.handle_numeric(
+            470,
+            &[
+                "me".to_string(),
+                "#old".to_string(),
+                "#new".to_string(),
+                "Forwarding to another channel".to_string(),
+            ],
+        );
+        app.handle_incoming_message(IrcMessage::parse(":me!u@h JOIN #new").unwrap());
+
+        assert_eq!(app.current_channel.as_deref(), Some("#new"));
+        assert!(app.join_focus_requests.is_empty());
+    }
+
+    #[test]
+    fn joining_an_already_joined_channel_focuses_it_without_leaving_a_request() {
+        let (mut app, mut rx) = app_reading_a_query();
+        let mut room = Channel::new();
+        room.joined = true;
+        app.channels.insert("#room".to_string(), room);
+
+        app.process_command("/join #ROOM");
+
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(IrcCommand::Join(channel, _, _, _)) if channel == "#ROOM"
+        ));
+        assert_eq!(app.current_channel.as_deref(), Some("#room"));
+        assert!(
+            app.join_focus_requests.is_empty(),
+            "no JOIN echo will consume the request"
+        );
+    }
+
+    #[test]
+    fn cycling_the_current_channel_brings_the_user_back_to_it() {
+        let (mut app, _rx) = app_reading_a_query();
+        let mut room = Channel::new();
+        room.joined = true;
+        app.channels.insert("#room".to_string(), room);
+        app.current_channel = Some("#room".to_string());
+
+        app.process_command("/cycle");
+        app.handle_incoming_message(IrcMessage::parse(":me!u@h PART #room :Cycling").unwrap());
+        app.handle_incoming_message(IrcMessage::parse(":me!u@h JOIN #room").unwrap());
+
+        assert_eq!(app.current_channel.as_deref(), Some("#room"));
     }
 }
