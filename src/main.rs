@@ -16,16 +16,13 @@ use eframe::egui;
 use std::sync::Arc;
 #[cfg(windows)]
 use std::sync::OnceLock;
-use tokio::sync::mpsc;
 
-use gui::ConnectionIntent;
-use gui::{ChatMessage, IrcApp};
-use irc::{IrcClient, IrcCommand, IrcMessage};
+use gui::App;
 
 #[cfg(windows)]
 static SINGLE_INSTANCE_MUTEX: OnceLock<isize> = OnceLock::new();
 
-fn load_icon() -> egui::IconData {
+pub(crate) fn load_icon() -> egui::IconData {
     egui::IconData {
         rgba: icon_data::ICON_RGBA.to_vec(),
         width: icon_data::ICON_WIDTH,
@@ -312,7 +309,7 @@ fn main() -> eframe::Result<()> {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1024.0, 768.0])
             .with_min_inner_size([640.0, 480.0])
-            .with_title("Linefeed")
+            .with_title(gui::MAIN_WINDOW_TITLE)
             .with_icon(Arc::new(load_icon())),
         ..Default::default()
     };
@@ -329,21 +326,19 @@ fn main() -> eframe::Result<()> {
                 opts.reduce_texture_memory = true;
             });
 
-            let mut app = IrcApp::new(cc);
-            if let Some(snapshot) = snapshot {
-                app.restore_update_session(snapshot);
-            }
+            let mut app = App::load();
+            app.start(snapshot);
             app.updater.install_reason = update_error;
+            let automatic_updates = app.automatic_updates();
             app.updater
-                .start(paths, cc.egui_ctx.clone(), app.automatic_updates);
+                .start(paths, cc.egui_ctx.clone(), automatic_updates);
             let mut style = (*cc.egui_ctx.global_style()).clone();
             style.spacing.item_spacing = egui::vec2(8.0, 4.0);
             cc.egui_ctx.set_global_style(style);
-            gui::apply_font_size(&cc.egui_ctx, app.font_size);
+            gui::apply_font_size(&cc.egui_ctx, app.font_size());
 
             Ok(Box::new(LinefeedApp {
                 app,
-                connection_thread: None,
                 last_message_time: std::time::Instant::now(),
                 window_size_ok: false,
                 list_loading_since: None,
@@ -361,11 +356,45 @@ fn main() -> eframe::Result<()> {
     result
 }
 
+impl LinefeedApp {
+    /// While the main window is minimized or occluded, eframe runs no ui
+    /// pass at all, only `App::logic`. Keep every connection drained and its timers,
+    /// reconnects and lag pings running then, or the incoming buffers fill
+    /// and connections time out. When a ui pass follows, it does this work.
+    fn hidden_logic(&mut self, ctx: &egui::Context) {
+        let hidden = ctx.input(|i| i.viewport().visible() == Some(false));
+        if !hidden {
+            return;
+        }
+        self.app.updater.poll();
+        // Minimize-to-tray: a minimized main window gets no ui pass, so the
+        // intercept in `ui` never sees the minimize. Hide it from here.
+        #[cfg(windows)]
+        if self.app.minimize_to_tray()
+            && systray::is_active()
+            && !systray::is_window_hidden()
+            && !systray::restore_pending()
+            && ctx.input(|i| i.viewport().minimized == Some(true))
+        {
+            // Posted, not sent: this runs inside eframe's event-loop
+            // callback, where a synchronous ShowWindow deadlocks.
+            systray::hide_window_async();
+            self.app.tray_hidden = true;
+        }
+        // Detached windows minimize with the main window. Never force a ui
+        // pass instead: it would paint the minimized main window, and a
+        // present on a minimized window can block on Windows.
+        self.app.hide_detached_windows(ctx);
+        self.app.background_tick(ctx);
+        // Nothing else wakes a hidden window: keep `logic` coming.
+        ctx.request_repaint_after(std::time::Duration::from_millis(250));
+    }
+}
+
 struct LinefeedApp {
     startup_ack: Option<updater::install::Transaction>,
     shutdown: Arc<std::sync::Mutex<Option<updater::install::Armed>>>,
-    app: IrcApp,
-    connection_thread: Option<std::thread::JoinHandle<()>>,
+    app: App,
     /// Track when we last received messages (for adaptive repaint intervals)
     last_message_time: std::time::Instant,
     /// Set once the window has been confirmed at a sane size; guards the
@@ -377,7 +406,11 @@ struct LinefeedApp {
 }
 
 impl eframe::App for LinefeedApp {
-    fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
+    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.hidden_logic(ctx);
+    }
+
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         let ctx = &ctx;
         self.app.updater.poll();
@@ -423,9 +456,13 @@ impl eframe::App for LinefeedApp {
             // the tray (handled above); resync if something else re-showed
             // the window, e.g. a second instance's activate racing this frame.
             if systray::is_window_hidden() {
-                self.background_tick(ctx);
+                // Detached windows hide with the main window and are
+                // recreated from their saved geometry on restore.
+                self.app.tray_hidden = true;
+                self.app.background_tick(ctx);
                 if systray::is_window_visible() {
                     systray::clear_hidden();
+                    self.app.tray_hidden = false;
                     if ctx.input(|i| i.viewport().minimized.unwrap_or(false)) {
                         ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
                     }
@@ -442,7 +479,7 @@ impl eframe::App for LinefeedApp {
             // applies viewport commands after the frame, and a minimized
             // window is a *visible* window on Windows, so it would undo the
             // hide and leave a taskbar button behind.
-            if self.app.minimize_to_tray && systray::is_active() && !restoring {
+            if self.app.minimize_to_tray() && systray::is_active() && !restoring {
                 let close_requested = ctx.input(|i| i.viewport().close_requested());
                 let minimized = ctx.input(|i| i.viewport().minimized.unwrap_or(false));
                 if close_requested || minimized {
@@ -450,7 +487,8 @@ impl eframe::App for LinefeedApp {
                         ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
                     }
                     systray::hide_window();
-                    self.background_tick(ctx);
+                    self.app.tray_hidden = true;
+                    self.app.background_tick(ctx);
                     ctx.request_repaint_after(std::time::Duration::from_millis(250));
                     return;
                 }
@@ -460,12 +498,11 @@ impl eframe::App for LinefeedApp {
         // Check if window is minimized (cross-platform, including Linux)
         let is_minimized = ctx.input(|i| i.viewport().minimized.unwrap_or(false));
         if is_minimized {
-            // Process messages to prevent buffer overflow, but skip rendering.
-            self.background_tick(ctx);
-            // Drain reasonably often while minimized: update_minimal() empties the
-            // channel each call, so polling ~4x/second keeps the message-loss window
-            // small without the cost of full-rate rendering.
-            ctx.request_repaint_after(std::time::Duration::from_millis(250));
+            // `logic` already ticked every connection this frame (it runs
+            // before `ui`, and alone while the window is minimized). The
+            // detached windows are not drawn, so egui closes them; they
+            // reopen where they were when the window is restored.
+            self.app.forget_detached_windows();
             return;
         }
 
@@ -485,10 +522,9 @@ impl eframe::App for LinefeedApp {
             }
         }
 
-        self.process_connection_lifecycle(ctx);
-
         // Main UI update
-        self.app.ui(ui, frame);
+        self.app.tray_hidden = false;
+        self.app.ui(ui);
 
         // Hyperlink clicks queue OpenUrl commands that eframe's native
         // backends ignore (only its web backend acts on them), so open them
@@ -515,14 +551,12 @@ impl eframe::App for LinefeedApp {
         }
 
         // Adaptive repaint interval based on activity level
-        if self.app.connected
-            || self.app.connecting
-            // While waiting out the reconnect backoff nothing else wakes the
-            // event loop: without a scheduled repaint the frame would never
-            // re-run to observe the retry deadline passing.
-            || self.app.awaiting_reconnect()
-        {
-            let interval = if self.app.channel_list_loading {
+        // While any session is connected, connecting or waiting out a
+        // reconnect backoff, nothing else wakes the event loop: without a
+        // scheduled repaint the frame would never observe new messages or
+        // the retry deadline passing.
+        if self.app.wants_polling() {
+            let interval = if self.app.channel_list_loading() {
                 // High-traffic mode during /list - fast polling for UI
                 // responsiveness. A broken or hostile server that never sends
                 // RPL_LISTEND (323) must not pin this rate forever.
@@ -557,17 +591,12 @@ impl eframe::App for LinefeedApp {
     // eframe passes a glow context only on Linux; other targets use wgpu.
     fn on_exit(&mut self, #[cfg(target_os = "linux")] _gl: Option<&eframe::glow::Context>) {
         self.app.prepare_update_shutdown();
+        // One deadline for all sessions: every worker flushes its QUIT
+        // concurrently.
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-        if let Some(thread) = self.connection_thread.take() {
-            while !thread.is_finished() && std::time::Instant::now() < deadline {
-                std::thread::sleep(std::time::Duration::from_millis(10));
-            }
-            if thread.is_finished() {
-                let _ = thread.join();
-            }
-        }
-        self.app.msg_rx = None;
-        if let Some(armed) = self.app.updater.arm_on_exit(self.app.automatic_updates)
+        self.app.join_workers(deadline);
+        let automatic_updates = self.app.automatic_updates();
+        if let Some(armed) = self.app.updater.arm_on_exit(automatic_updates)
             && let Ok(mut shutdown) = self.shutdown.lock()
         {
             *shutdown = Some(armed);
@@ -578,165 +607,111 @@ impl eframe::App for LinefeedApp {
     }
 }
 
-impl LinefeedApp {
-    fn background_tick(&mut self, ctx: &egui::Context) {
-        self.app.update_minimal();
-        self.process_connection_lifecycle(ctx);
-    }
-
-    fn process_connection_lifecycle(&mut self, ctx: &egui::Context) {
-        if self
-            .connection_thread
-            .as_ref()
-            .is_some_and(|handle| handle.is_finished())
-        {
-            self.connection_thread = None;
-            match self.app.connection_intent {
-                ConnectionIntent::ReconnectAfterClose => {
-                    self.app.connection_intent = ConnectionIntent::None;
-                    // An explicit endpoint switch is staged while the old
-                    // socket closes. Promote it only now so late messages from
-                    // the old server cannot be relabelled as the new session.
-                    self.app.promote_pending_session();
-                    self.app.connecting = true;
-                    self.app.connected = false;
-                    self.app
-                        .add_server_message(ChatMessage::system("Previous connection closed"));
-                }
-                ConnectionIntent::ManualDisconnect => {
-                    self.app.connection_intent = ConnectionIntent::None;
-                    // request_manual_disconnect already cleared `connecting`,
-                    // so a set flag here is a connect requested while this
-                    // worker was still exiting: keep it so it starts below.
-                    self.app.connected = false;
-                }
-                ConnectionIntent::None => {
-                    if self.app.connected {
-                        // Connection was lost unexpectedly after registering.
-                        self.app.mark_connection_lost();
-                        self.app
-                            .add_server_message(ChatMessage::system("Connection lost"));
-                        tracing::warn!("Connection lost, will attempt reconnect");
-                    } else if self.app.connecting {
-                        // The connection thread exited before we ever registered.
-                        self.app.connecting = false;
-                        self.app.mark_connection_lost();
-                        self.app
-                            .add_server_message(ChatMessage::system("Connection failed"));
-                        tracing::warn!("Initial connection failed, will attempt reconnect");
-                    }
-                }
-            }
-        }
-
-        self.app
-            .release_closing_connection(self.connection_thread.is_none());
-
-        // A worker told to close is still exiting. Nothing else schedules a
-        // frame to observe it finish (its own repaint request can land before
-        // the thread is joinable), and the next connect waits for it, so poll.
-        if self.connection_thread.is_some() && !self.app.connected && !self.app.connecting {
-            ctx.request_repaint_after(std::time::Duration::from_millis(100));
-        }
-
-        // Auto-reconnect if enabled and connection was lost.
-        if self.app.should_reconnect() {
-            self.app.start_reconnect();
-        }
-
-        // Start connection if requested.
-        if self.app.connecting && self.connection_thread.is_none() {
-            if !self.app.ensure_active_session() {
-                return;
-            }
-            self.start_connection(ctx.clone());
-        }
-    }
-
-    fn start_connection(&mut self, ctx: egui::Context) {
-        let Some(config) = self.app.active_server_config() else {
-            self.app.connecting = false;
-            self.app.show_connect_dialog = true;
-            self.app.add_server_message(ChatMessage::system(
-                "Cannot connect without a validated server endpoint",
-            ));
-            return;
-        };
-        tracing::info!("Connecting to {}:{}", config.host, config.port);
-
-        let (msg_tx, msg_rx) = mpsc::channel::<IrcMessage>(1000);
-        let (cmd_tx, cmd_rx) = mpsc::unbounded_channel::<IrcCommand>();
-
-        // The previous worker is gone (connection_thread was None), so nothing
-        // it negotiated or left half-received may leak into this socket.
-        self.app.begin_connection_attempt();
-        self.app.msg_rx = Some(msg_rx);
-        self.app.cmd_tx = Some(cmd_tx);
-
-        self.connection_thread = Some(std::thread::spawn(move || {
-            let rt = match tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-            {
-                Ok(rt) => rt,
-                Err(e) => {
-                    // Surface the failure instead of panicking the worker thread.
-                    // The thread then finishes, and update() resolves the stuck
-                    // "connecting" state (and triggers reconnect) on the next frame.
-                    tracing::error!("Failed to build tokio runtime: {}", e);
-                    let _ = msg_tx.blocking_send(IrcMessage {
-                        tags: None,
-                        prefix: None,
-                        command: IrcCommand::Notice(
-                            "*".to_string(),
-                            format!("Failed to start connection runtime: {}", e),
-                        ),
-                        raw: String::new(),
-                    });
-                    return;
-                }
-            };
-
-            run_worker_runtime(rt, async {
-                let mut client = IrcClient::new(config.clone());
-                match client.connect(msg_tx.clone(), cmd_rx).await {
-                    Ok(_) => tracing::info!("Connection closed"),
-                    Err(e) => {
-                        tracing::error!("Connection error: {}", e);
-                        let _ = msg_tx
-                            .send(IrcMessage {
-                                tags: None,
-                                prefix: None,
-                                command: IrcCommand::Notice(
-                                    "*".to_string(),
-                                    format!("Connection error: {}", e),
-                                ),
-                                raw: String::new(),
-                            })
-                            .await;
-                    }
-                }
-            });
-            // The thread is done: wake the UI so the lifecycle observes it.
-            ctx.request_repaint();
-        }));
-    }
-}
-
-/// Run a connection worker's future to completion, then tear its runtime
-/// down. Dropping a tokio `Runtime` waits indefinitely for `spawn_blocking`
-/// work, and connecting resolves the host through one (`getaddrinfo`): with a
-/// stuck resolver the thread would never finish, and `connection_thread`
-/// being set blocks every later connect (#245).
-fn run_worker_runtime<F: std::future::Future>(rt: tokio::runtime::Runtime, future: F) -> F::Output {
-    let output = rt.block_on(future);
-    rt.shutdown_background();
-    output
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn hermetic_linefeed() -> LinefeedApp {
+        let mut app = App::with_settings(
+            gui::Settings {
+                logging_enabled: false,
+                ..gui::Settings::default()
+            },
+            Default::default(),
+        );
+        app.start(None);
+        LinefeedApp {
+            startup_ack: None,
+            shutdown: Arc::new(std::sync::Mutex::new(None)),
+            app,
+            last_message_time: std::time::Instant::now(),
+            window_size_ok: true,
+            list_loading_since: None,
+        }
+    }
+
+    fn run_hidden(linefeed: &mut LinefeedApp, minimized: bool) -> Vec<egui::ViewportCommand> {
+        let ctx = egui::Context::default();
+        let mut input = egui::RawInput::default();
+        input.viewports.insert(
+            egui::ViewportId::ROOT,
+            egui::ViewportInfo {
+                minimized: Some(minimized),
+                occluded: Some(false),
+                ..Default::default()
+            },
+        );
+        let mut output = ctx.run_ui(input, |ui| linefeed.hidden_logic(ui.ctx()));
+        output.textures_delta.clear();
+        output
+            .viewport_output
+            .remove(&egui::ViewportId::ROOT)
+            .map(|o| o.commands)
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn connections_keep_draining_while_the_window_is_minimized() {
+        let mut linefeed = hermetic_linefeed();
+        let (tx, rx) = tokio::sync::mpsc::channel(4);
+        linefeed.app.sessions[0].msg_rx = Some(rx);
+        tx.try_send(irc::IrcMessage::parse(":srv NOTICE * :while minimized").unwrap())
+            .unwrap();
+
+        // Visible: the ui pass does this work, `logic` must not.
+        run_hidden(&mut linefeed, false);
+        assert!(!tx.is_closed() && tx.capacity() == 3, "drained by logic while visible");
+
+        let commands = run_hidden(&mut linefeed, true);
+        assert!(
+            linefeed.app.sessions[0]
+                .server_messages
+                .iter()
+                .any(|m| m.content.contains("while minimized"))
+        );
+        // No detached window: no ui pass is needed.
+        assert!(!commands.contains(&egui::ViewportCommand::RequestPaintWhileHidden));
+    }
+
+    #[test]
+    fn detached_windows_hide_with_a_minimized_window_without_forcing_a_paint() {
+        let mut linefeed = hermetic_linefeed();
+        linefeed.app.detach_status_window_for_tests();
+        let (tx, rx) = tokio::sync::mpsc::channel(4);
+        linefeed.app.sessions[0].msg_rx = Some(rx);
+        tx.try_send(irc::IrcMessage::parse(":srv NOTICE * :still live").unwrap())
+            .unwrap();
+        let ctx = egui::Context::default();
+        // A normal frame first: the detached window's viewport exists.
+        ctx.run_ui(egui::RawInput::default(), |ui| linefeed.app.ui(ui))
+            .textures_delta
+            .clear();
+        let mut input = egui::RawInput::default();
+        input.viewports.insert(
+            egui::ViewportId::ROOT,
+            egui::ViewportInfo {
+                minimized: Some(true),
+                ..Default::default()
+            },
+        );
+        let mut output = ctx.run_ui(input, |ui| linefeed.hidden_logic(ui.ctx()));
+        output.textures_delta.clear();
+        // Connections still tick...
+        assert!(
+            linefeed.app.sessions[0]
+                .server_messages
+                .iter()
+                .any(|m| m.content.contains("still live"))
+        );
+        // ...the detached window is hidden (a bare egui context embeds
+        // viewports, so the command itself is only visible under eframe)...
+        assert!(linefeed.app.detached_windows_hidden());
+        // ...and no paint of the minimized main window is forced.
+        let root = output.viewport_output.get(&egui::ViewportId::ROOT);
+        assert!(root.is_none_or(|o| !o
+            .commands
+            .contains(&egui::ViewportCommand::RequestPaintWhileHidden)));
+    }
 
     #[test]
     fn single_instance_gate_runs_before_recovery_except_when_supervised() {
@@ -744,396 +719,5 @@ mod tests {
         // update launches defer the gate until after recovery (issue #199).
         assert!(single_instance_allows_startup(false));
         assert!(single_instance_allows_startup(true));
-    }
-
-    #[test]
-    fn background_tick_observes_finished_connection_threads() {
-        let handle = std::thread::spawn(|| {});
-        while !handle.is_finished() {
-            std::thread::yield_now();
-        }
-
-        let mut app = IrcApp::default();
-        app.connected = true;
-        let mut linefeed = LinefeedApp {
-            startup_ack: None,
-            shutdown: Arc::new(std::sync::Mutex::new(None)),
-            app,
-            connection_thread: Some(handle),
-            last_message_time: std::time::Instant::now(),
-            window_size_ok: true,
-            list_loading_since: None,
-        };
-        linefeed.background_tick(&egui::Context::default());
-
-        assert!(linefeed.connection_thread.is_none());
-        assert!(linefeed.app.connection_lost);
-        assert!(!linefeed.app.connected);
-    }
-
-    /// A plaintext IRC server that completes registration, then records every
-    /// line until the client closes the socket (or goes silent).
-    fn scripted_server() -> (u16, std::sync::mpsc::Receiver<Vec<String>>) {
-        use std::io::{BufRead, Write};
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = listener.local_addr().unwrap().port();
-        let (done_tx, done_rx) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
-            let (stream, _) = listener.accept().unwrap();
-            stream
-                .set_read_timeout(Some(std::time::Duration::from_secs(5)))
-                .unwrap();
-            let mut writer = stream.try_clone().unwrap();
-            let mut reader = std::io::BufReader::new(stream);
-            let mut lines = Vec::new();
-            let mut line = String::new();
-            while reader.read_line(&mut line).unwrap_or(0) > 0 {
-                let text = line.trim_end().to_string();
-                line.clear();
-                match text.as_str() {
-                    "CAP LS 302" => writer.write_all(b":srv CAP * LS :multi-prefix\r\n"),
-                    "CAP REQ :multi-prefix" => {
-                        writer.write_all(b":srv CAP * ACK :multi-prefix\r\n")
-                    }
-                    "CAP END" => writer.write_all(b":srv 001 tester :Welcome\r\n"),
-                    _ => Ok(()),
-                }
-                .unwrap();
-                lines.push(text);
-            }
-            let _ = done_tx.send(lines);
-        });
-        (port, done_rx)
-    }
-
-    fn linefeed_for_port(port: u16) -> LinefeedApp {
-        let mut app = IrcApp::with_settings(gui::Settings {
-            server_host: "127.0.0.1".to_string(),
-            server_port: port.to_string(),
-            use_tls: false,
-            nickname: "tester".to_string(),
-            logging_enabled: false,
-            ..gui::Settings::default()
-        });
-        app.connecting = true;
-        LinefeedApp {
-            startup_ack: None,
-            shutdown: Arc::new(std::sync::Mutex::new(None)),
-            app,
-            connection_thread: None,
-            last_message_time: std::time::Instant::now(),
-            window_size_ok: true,
-            list_loading_since: None,
-        }
-    }
-
-    /// Drive the lifecycle the way the frame loop does until `done` holds.
-    fn tick_until(linefeed: &mut LinefeedApp, what: &str, done: impl Fn(&LinefeedApp) -> bool) {
-        let ctx = egui::Context::default();
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while !done(linefeed) {
-            assert!(
-                std::time::Instant::now() < deadline,
-                "timed out: {what}; connecting={} connected={} intent={:?} thread={} messages={:?}",
-                linefeed.app.connecting,
-                linefeed.app.connected,
-                linefeed.app.connection_intent,
-                linefeed.connection_thread.is_some(),
-                linefeed
-                    .app
-                    .server_messages
-                    .iter()
-                    .map(|m| m.content.clone())
-                    .collect::<Vec<_>>()
-            );
-            linefeed.background_tick(&ctx);
-            std::thread::sleep(std::time::Duration::from_millis(5));
-        }
-    }
-
-    /// A stand-in for a live connection worker: alive until `release` is
-    /// dropped or sent to, like a real thread still winding its socket down.
-    fn parked_worker(
-        channel_ends: impl Send + 'static,
-    ) -> (std::thread::JoinHandle<()>, std::sync::mpsc::Sender<()>) {
-        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
-        let handle = std::thread::spawn(move || {
-            let _channel_ends = channel_ends;
-            let _ = release_rx.recv();
-        });
-        (handle, release_tx)
-    }
-
-    /// Release the parked worker, wait for it to be observably finished, then
-    /// run one lifecycle pass, as the frame loop would.
-    fn finish_worker_and_tick(linefeed: &mut LinefeedApp, release: std::sync::mpsc::Sender<()>) {
-        release.send(()).unwrap();
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while !linefeed
-            .connection_thread
-            .as_ref()
-            .is_some_and(|handle| handle.is_finished())
-        {
-            assert!(std::time::Instant::now() < deadline, "worker never exited");
-            std::thread::yield_now();
-        }
-        linefeed.background_tick(&egui::Context::default());
-    }
-
-    /// An app that looks connected through a parked worker. The configured
-    /// endpoint is an unused loopback port: the tests that follow only
-    /// observe whether the lifecycle started another worker, never its result.
-    fn linefeed_with_live_worker() -> (LinefeedApp, std::sync::mpsc::Sender<()>) {
-        let mut linefeed = linefeed_for_port(1);
-        assert!(linefeed.app.start_session_from_form());
-        let (cmd_tx, cmd_rx) = mpsc::unbounded_channel::<IrcCommand>();
-        let (msg_tx, msg_rx) = mpsc::channel::<IrcMessage>(8);
-        // The parked worker owns the far ends so the channels stay open.
-        let (handle, release) = parked_worker((cmd_rx, msg_tx));
-        linefeed.connection_thread = Some(handle);
-        linefeed.app.cmd_tx = Some(cmd_tx);
-        linefeed.app.msg_rx = Some(msg_rx);
-        linefeed.app.connecting = false;
-        linefeed.app.connected = true;
-        (linefeed, release)
-    }
-
-    #[test]
-    fn late_welcome_from_the_closing_connection_does_not_cancel_a_server_switch() {
-        let (mut linefeed, release) = linefeed_with_live_worker();
-        linefeed.app.connected = false;
-        linefeed.app.connecting = true;
-        linefeed
-            .app
-            .apply_unprofiled_endpoint("127.0.0.1", "2", false);
-        assert!(linefeed.app.switch_session_from_form("Changing servers"));
-
-        // Registration finished on the old socket after QUIT was queued.
-        linefeed.app.handle_incoming_message(
-            IrcMessage::parse(":old.example 001 tester :Welcome").unwrap(),
-        );
-        assert!(!linefeed.app.connected);
-        assert_eq!(
-            linefeed.app.connection_intent,
-            ConnectionIntent::ReconnectAfterClose
-        );
-
-        finish_worker_and_tick(&mut linefeed, release);
-
-        // The staged endpoint was promoted and connected to, instead of the
-        // old one being declared lost and auto-reconnected.
-        assert_eq!(linefeed.app.active_server_config().unwrap().port, 2);
-        assert!(linefeed.connection_thread.is_some());
-        assert!(
-            !linefeed
-                .app
-                .server_messages
-                .iter()
-                .any(|message| message.content.contains("Connection lost"))
-        );
-    }
-
-    #[test]
-    fn connect_right_after_a_manual_disconnect_survives_the_old_workers_exit() {
-        let (mut linefeed, release) = linefeed_with_live_worker();
-        linefeed.app.request_manual_disconnect(Some("bye".into()));
-        assert!(linefeed.app.start_session_from_form());
-
-        finish_worker_and_tick(&mut linefeed, release);
-
-        assert!(
-            linefeed.connection_thread.is_some(),
-            "the connect request was silently dropped"
-        );
-        assert_eq!(linefeed.app.connection_intent, ConnectionIntent::None);
-    }
-
-    #[test]
-    fn reconnect_right_after_a_manual_disconnect_is_not_reported_as_a_failure() {
-        let (mut linefeed, release) = linefeed_with_live_worker();
-        linefeed.app.request_manual_disconnect(Some("bye".into()));
-        linefeed.app.request_reconnect_after_close("Reconnecting");
-
-        finish_worker_and_tick(&mut linefeed, release);
-
-        assert!(linefeed.connection_thread.is_some());
-        assert!(
-            !linefeed
-                .app
-                .server_messages
-                .iter()
-                .any(|message| message.content.contains("Connection failed"))
-        );
-    }
-
-    #[test]
-    fn a_stale_manual_disconnect_does_not_hide_the_next_connections_failure() {
-        // A server that hangs up on every connection, so the worker fails fast.
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = listener.local_addr().unwrap().port();
-        std::thread::spawn(move || {
-            for stream in listener.incoming() {
-                drop(stream);
-            }
-        });
-
-        // Disconnect with no worker left to consume the intent...
-        let mut linefeed = linefeed_for_port(port);
-        linefeed.app.connecting = false;
-        linefeed.app.request_manual_disconnect(None);
-        assert_eq!(
-            linefeed.app.connection_intent,
-            ConnectionIntent::ManualDisconnect
-        );
-
-        // ...then connect: the new worker owns a fresh intent, so its failure
-        // is reported and retried like any other.
-        assert!(linefeed.app.start_session_from_form());
-        linefeed.background_tick(&egui::Context::default());
-        assert_eq!(linefeed.app.connection_intent, ConnectionIntent::None);
-        tick_until(&mut linefeed, "refused connection to be reported", |l| {
-            l.app
-                .server_messages
-                .iter()
-                .any(|message| message.content.contains("Connection failed"))
-        });
-    }
-
-    #[test]
-    fn an_exiting_worker_is_polled_until_the_lifecycle_observes_it_finish() {
-        let (mut linefeed, release) = linefeed_with_live_worker();
-        linefeed.app.request_manual_disconnect(Some("bye".into()));
-        let (delay_tx, delay_rx) = std::sync::mpsc::channel();
-        let ctx = egui::Context::default();
-        ctx.set_request_repaint_callback(move |info| {
-            let _ = delay_tx.send(info.delay);
-        });
-
-        // Disconnected and not connecting, but the worker has not exited yet:
-        // no other repaint source exists, so the lifecycle must ask for one.
-        linefeed.process_connection_lifecycle(&ctx);
-        assert!(
-            delay_rx
-                .try_recv()
-                .is_ok_and(|delay| delay <= std::time::Duration::from_millis(100)),
-            "no repaint was scheduled for the exiting worker"
-        );
-
-        // Once the worker is gone nothing keeps the idle window repainting.
-        finish_worker_and_tick(&mut linefeed, release);
-        while delay_rx.try_recv().is_ok() {}
-        linefeed.process_connection_lifecycle(&ctx);
-        assert!(delay_rx.try_recv().is_err());
-    }
-
-    #[test]
-    fn worker_exit_does_not_wait_for_stuck_blocking_work() {
-        // Stands in for a getaddrinfo that never returns.
-        let (stuck_tx, stuck_rx) = std::sync::mpsc::channel::<()>();
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        let worker = std::thread::spawn(move || {
-            run_worker_runtime(rt, async move {
-                tokio::task::spawn_blocking(move || {
-                    let _ = stuck_rx.recv();
-                });
-                // Give the blocking task time to start.
-                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-            });
-        });
-
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-        while !worker.is_finished() && std::time::Instant::now() < deadline {
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
-        let finished = worker.is_finished();
-        // Release the stuck task either way so a failure does not hang the run.
-        drop(stuck_tx);
-        assert!(finished, "worker thread blocked on the runtime drop");
-    }
-
-    #[test]
-    fn manual_disconnect_cancels_a_connection_that_never_registers() {
-        // Reads the client's opening line and then says nothing, like a wedged
-        // server. Waiting for that line puts the worker in the registration
-        // phase, where the QUIT is consumed, not an earlier connect phase.
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = listener.local_addr().unwrap().port();
-        let (accepted_tx, accepted_rx) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
-            use std::io::BufRead;
-            let (stream, _) = listener.accept().unwrap();
-            stream
-                .set_read_timeout(Some(std::time::Duration::from_secs(5)))
-                .unwrap();
-            let mut reader = std::io::BufReader::new(stream);
-            let mut line = String::new();
-            if reader.read_line(&mut line).unwrap_or(0) > 0 {
-                let _ = accepted_tx.send(());
-            }
-            std::thread::sleep(std::time::Duration::from_secs(30));
-        });
-        let mut linefeed = linefeed_for_port(port);
-        tick_until(&mut linefeed, "registration to start", |_| {
-            accepted_rx.try_recv().is_ok()
-        });
-
-        // The retired receiver stays open, so cancellation has to come from the
-        // queued QUIT alone, long before the registration deadline.
-        linefeed.app.request_manual_disconnect(None);
-        assert!(linefeed.app.closing_rx.is_some());
-        // Wait for the worker without running the lifecycle: its pass drops the
-        // retired receiver once the grace period is over, and closing that
-        // receiver cancels the worker by itself, which would let this test
-        // pass even with QUIT-based cancellation broken.
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while !linefeed
-            .connection_thread
-            .as_ref()
-            .is_some_and(|handle| handle.is_finished())
-        {
-            assert!(
-                std::time::Instant::now() < deadline,
-                "the queued QUIT did not cancel the wedged worker"
-            );
-            std::thread::sleep(std::time::Duration::from_millis(5));
-        }
-        assert!(
-            linefeed.app.closing_rx.is_some(),
-            "the worker only exited once its receiver was dropped"
-        );
-
-        // The lifecycle then observes the exit as an ordinary disconnect.
-        tick_until(&mut linefeed, "worker exit to be observed", |l| {
-            l.connection_thread.is_none()
-        });
-        assert!(!linefeed.app.connecting && !linefeed.app.connected);
-        assert!(linefeed.app.closing_rx.is_none());
-    }
-
-    #[test]
-    fn manual_disconnect_delivers_quit_before_closing_the_socket() {
-        let (port, lines_rx) = scripted_server();
-        let mut linefeed = linefeed_for_port(port);
-        tick_until(&mut linefeed, "registration", |l| l.app.connected);
-
-        linefeed
-            .app
-            .request_manual_disconnect(Some("bye now".into()));
-        tick_until(&mut linefeed, "worker exit", |l| {
-            l.connection_thread.is_none()
-        });
-
-        let lines = lines_rx
-            .recv_timeout(std::time::Duration::from_secs(5))
-            .expect("server never saw the connection close");
-        assert!(
-            lines.iter().any(|line| line == "QUIT :bye now"),
-            "QUIT was lost on manual disconnect: {lines:?}"
-        );
-        assert!(!linefeed.app.connected && !linefeed.app.connecting);
-        assert!(linefeed.app.msg_rx.is_none());
     }
 }

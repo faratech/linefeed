@@ -1,7 +1,7 @@
 //! Custom Windows system tray implementation using Win32 APIs directly.
 //! Replaces the tray-icon crate for full control over behavior.
 
-use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, Ordering};
 
 use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, POINT, WPARAM};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
@@ -13,12 +13,12 @@ use windows::Win32::UI::Shell::{
 use windows::Win32::UI::WindowsAndMessaging::{
     CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, CreatePopupMenu, CreateWindowExW, DefWindowProcW,
     DestroyMenu, DispatchMessageW, EnumWindows, GetClassNameW, GetCursorPos, GetMessageW,
-    GetWindowTextW, GetWindowThreadProcessId, HICON, InsertMenuW, IsIconic, IsWindowVisible,
-    MF_BYPOSITION, MF_SEPARATOR, MF_STRING, MSG, PostMessageW, PostQuitMessage, RegisterClassExW,
-    RegisterWindowMessageW, SW_HIDE, SW_RESTORE, SW_SHOW, SetForegroundWindow, SetMenuDefaultItem,
-    ShowWindow, TPM_BOTTOMALIGN, TPM_LEFTALIGN, TPM_RIGHTBUTTON, TrackPopupMenu, TranslateMessage,
-    WINDOW_EX_STYLE, WM_COMMAND, WM_DESTROY, WM_LBUTTONDBLCLK, WM_NULL, WM_RBUTTONUP, WM_USER,
-    WNDCLASSEXW, WS_OVERLAPPEDWINDOW,
+    GetWindowTextW, GetWindowThreadProcessId, HICON, InsertMenuW, InternalGetWindowText, IsIconic,
+    IsWindowVisible, MF_BYPOSITION, MF_SEPARATOR, MF_STRING, MSG, PostMessageW, PostQuitMessage,
+    RegisterClassExW, RegisterWindowMessageW, SW_HIDE, SW_RESTORE, SW_SHOW, SetForegroundWindow,
+    SetMenuDefaultItem, ShowWindow, ShowWindowAsync, TPM_BOTTOMALIGN, TPM_LEFTALIGN,
+    TPM_RIGHTBUTTON, TrackPopupMenu, TranslateMessage, WINDOW_EX_STYLE, WM_COMMAND, WM_DESTROY,
+    WM_LBUTTONDBLCLK, WM_NULL, WM_RBUTTONUP, WM_USER, WNDCLASSEXW, WS_OVERLAPPEDWINDOW,
 };
 use windows::core::{BOOL, PCWSTR, w};
 
@@ -33,6 +33,9 @@ static TRAY_ACTIVE: AtomicBool = AtomicBool::new(false);
 static EXIT_REQUESTED: AtomicBool = AtomicBool::new(false);
 static WINDOW_HIDDEN: AtomicBool = AtomicBool::new(false);
 static RESTORE_REQUESTED: AtomicBool = AtomicBool::new(false);
+/// When a posted (asynchronous) hide was requested, in milliseconds since
+/// the Unix epoch; 0 when none is in flight.
+static HIDE_POSTED_AT: AtomicU64 = AtomicU64::new(0);
 static MSG_HWND: AtomicPtr<std::ffi::c_void> = AtomicPtr::new(std::ptr::null_mut());
 static TRAY_ICON_ADDED: AtomicBool = AtomicBool::new(false);
 
@@ -62,8 +65,12 @@ unsafe extern "system" fn enum_find_main_window(hwnd: HWND, lparam: LPARAM) -> B
     if String::from_utf16_lossy(&class_buf[..class_len]) == "Linefeed_TrayClass" {
         return BOOL(1);
     }
+    // InternalGetWindowText reads the caption without sending WM_GETTEXT:
+    // GetWindowTextW on one of our own windows dispatches that message
+    // synchronously into the window procedure, which can deadlock when the
+    // lookup runs inside the event loop's own callbacks.
     let mut title_buf = [0u16; 64];
-    let title_len = unsafe { GetWindowTextW(hwnd, &mut title_buf) }.max(0) as usize;
+    let title_len = unsafe { InternalGetWindowText(hwnd, &mut title_buf) }.max(0) as usize;
     if String::from_utf16_lossy(&title_buf[..title_len]) == "Linefeed" {
         state.found = hwnd;
         return BOOL(0); // stop enumerating
@@ -95,6 +102,7 @@ fn find_main_window() -> Option<HWND> {
 
 pub fn show_window() {
     WINDOW_HIDDEN.store(false, Ordering::SeqCst);
+    HIDE_POSTED_AT.store(0, Ordering::SeqCst);
     RESTORE_REQUESTED.store(true, Ordering::SeqCst);
     if let Some(hwnd) = find_main_window() {
         unsafe {
@@ -123,6 +131,20 @@ pub fn hide_window() {
     }
 }
 
+/// `hide_window` for callers inside the event loop's own callbacks (the app's
+/// `logic` while minimized): the hide is posted instead of dispatched
+/// synchronously into the window procedure, which deadlocks there.
+pub fn hide_window_async() {
+    WINDOW_HIDDEN.store(true, Ordering::SeqCst);
+    HIDE_POSTED_AT.store(now_millis(), Ordering::SeqCst);
+    if let Some(hwnd) = find_main_window() {
+        unsafe {
+            let _ = ShowWindowAsync(hwnd, SW_HIDE);
+        }
+        tracing::info!("Window hidden to tray");
+    }
+}
+
 pub fn is_window_hidden() -> bool {
     WINDOW_HIDDEN.load(Ordering::SeqCst)
 }
@@ -132,7 +154,31 @@ pub fn is_window_hidden() -> bool {
 /// we believe the window is hidden in the tray - so the GUI can resync
 /// instead of presenting a live window that never repaints.
 pub fn is_window_visible() -> bool {
-    find_main_window().is_some_and(|hwnd| unsafe { IsWindowVisible(hwnd) }.as_bool())
+    let visible = find_main_window().is_some_and(|hwnd| unsafe { IsWindowVisible(hwnd) }.as_bool());
+    let posted = HIDE_POSTED_AT.load(Ordering::SeqCst);
+    if posted != 0 {
+        if !visible {
+            // The posted hide has landed.
+            HIDE_POSTED_AT.store(0, Ordering::SeqCst);
+        } else if now_millis().saturating_sub(posted) < HIDE_LANDING_GRACE_MS {
+            // Still visible only because the posted hide has not been
+            // processed yet: not a re-show.
+            return false;
+        }
+    }
+    visible
+}
+
+/// How long a posted hide may take to land before a still-visible window
+/// counts as re-shown.
+const HIDE_LANDING_GRACE_MS: u64 = 2000;
+
+fn now_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or_default()
+        .max(1)
 }
 
 pub fn clear_hidden() {
@@ -141,6 +187,13 @@ pub fn clear_hidden() {
 
 pub fn take_restore_request() -> bool {
     RESTORE_REQUESTED.swap(false, Ordering::SeqCst)
+}
+
+/// Whether a restore from the tray is pending, without consuming it: the
+/// window can still read as minimized until the restore lands, and nothing
+/// may hide it again meanwhile.
+pub fn restore_pending() -> bool {
+    RESTORE_REQUESTED.load(Ordering::SeqCst)
 }
 
 pub fn is_active() -> bool {

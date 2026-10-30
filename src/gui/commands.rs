@@ -1,10 +1,10 @@
 //! IRC command processing and help system
 
 use super::helpers::{is_extended_ban, mask_matches, nick_to_mask};
-use super::{ChatMessage, IrcApp};
+use super::{ChatMessage, Session, SessionEvent, WindowCommand};
 use crate::irc::IrcCommand;
 
-impl IrcApp {
+impl Session {
     pub fn process_command(&mut self, input: &str) {
         // "//text" is an escaped slash: it sends the literal message "/text"
         // instead of running a command (the same as "/say /text", #263).
@@ -1784,6 +1784,48 @@ impl IrcApp {
             }
 
             // === Connection Commands ===
+            "SERVER" if new_window_server_args(args).is_some() => {
+                // `/server -m host [port]`: a new status window, keeping this
+                // connection. Like /server it is unprofiled: the new session
+                // starts from the endpoint alone, never from this form's
+                // secrets.
+                let rest = new_window_server_args(args).unwrap_or_default();
+                if rest.is_empty() {
+                    self.add_message_to_current(ChatMessage::system(
+                        "Usage: /server -m <host> [port]",
+                    ));
+                    return;
+                }
+                let ServerArg { host, port, tls } = match parse_server_arg(rest) {
+                    Ok(endpoint) => endpoint,
+                    Err(error) => {
+                        self.add_server_message(ChatMessage::system_fmt(
+                            &error,
+                            &self.timestamp_format,
+                        ));
+                        return;
+                    }
+                };
+                if host.trim().is_empty() {
+                    self.add_server_message(ChatMessage::system_fmt(
+                        "Server host cannot be empty",
+                        &self.timestamp_format,
+                    ));
+                    return;
+                }
+                let port = port.unwrap_or_else(|| self.server_port.clone());
+                if let Err(error) = parse_server_port(&port) {
+                    self.add_server_message(ChatMessage::system_fmt(&error, &self.timestamp_format));
+                    return;
+                }
+                let use_tls = tls.unwrap_or(self.use_tls);
+                self.events.push(SessionEvent::NewServer {
+                    host,
+                    port,
+                    use_tls,
+                });
+            }
+
             "SERVER" => {
                 if !args.is_empty() {
                     // Handles "host", "host [+]port", "host:[+]port",
@@ -1902,8 +1944,7 @@ impl IrcApp {
                     }
                 } else {
                     if self.add_ignore_masks(args) {
-                        let ignored = self.ignore_list.clone();
-                        self.save_setting(|settings| settings.ignore_list = ignored);
+                        self.save_config();
                     }
                 }
             }
@@ -1914,8 +1955,7 @@ impl IrcApp {
                         "Usage: /unignore <nick|mask>",
                     ));
                 } else if self.remove_ignore_masks(args) {
-                    let ignored = self.ignore_list.clone();
-                    self.save_setting(|settings| settings.ignore_list = ignored);
+                    self.save_config();
                 }
             }
 
@@ -2014,8 +2054,7 @@ impl IrcApp {
                     }
                 } else if args.eq_ignore_ascii_case("clear") {
                     self.auto_perform.clear();
-                    let perform = self.auto_perform.clone();
-                    self.save_setting(|settings| settings.auto_perform = perform);
+                    self.save_auto_perform();
                     self.add_message_to_current(ChatMessage::system(
                         "Auto-perform commands cleared.",
                     ));
@@ -2025,16 +2064,28 @@ impl IrcApp {
                         self.auto_perform.push('\n');
                     }
                     self.auto_perform.push_str(args);
-                    let perform = self.auto_perform.clone();
-                    self.save_setting(|settings| settings.auto_perform = perform);
+                    self.save_auto_perform();
                     self.add_message_to_current(
                         ChatMessage::system("Added command to auto-perform.").without_logging(),
                     );
                 }
             }
 
+            "WINDOW" => {
+                let action = args.trim().to_ascii_lowercase();
+                match WindowCommand::parse(&action) {
+                    Some(command) => self.events.push(SessionEvent::Window {
+                        command,
+                        target: self.current_channel.clone(),
+                    }),
+                    None => self.add_message_to_current(ChatMessage::system(
+                        "Usage: /window tile|cascade|max|restore|detach|attach|close|new",
+                    )),
+                }
+            }
+
             "SETTINGS" => {
-                self.show_settings = true;
+                self.events.push(SessionEvent::OpenSettings);
             }
 
             "CPRIVMSG" | "CNOTICE" => {
@@ -2378,6 +2429,8 @@ impl IrcApp {
         self.persistence_profile.clear();
         self.pending_auto_perform = None;
         self.accept_invalid_certs = false;
+        // Without its credentials the form no longer describes the profile.
+        self.form_profile = None;
     }
 
     /// Snapshot the connection-form fields that make up the saved network
@@ -2399,6 +2452,7 @@ impl IrcApp {
             auto_perform: self.auto_perform.clone(),
             pre_away_message: self.pre_away_message.clone(),
             persistence_profile: self.persistence_profile.clone(),
+            form_profile: self.form_profile.clone(),
         }
     }
 
@@ -2418,6 +2472,7 @@ impl IrcApp {
         self.auto_perform = form.auto_perform;
         self.pre_away_message = form.pre_away_message;
         self.persistence_profile = form.persistence_profile;
+        self.form_profile = form.form_profile;
     }
 
     pub fn show_help(&mut self) {
@@ -2496,6 +2551,7 @@ impl IrcApp {
                     "/server <host> [[+]port] - Connect to a server (saved settings unchanged)",
                     "  Port 6697 or +port (e.g. +7000) uses TLS, ports 6660-6669 plain text;",
                     "  any other port (or no port) keeps the current TLS setting",
+                    "/server -m <host> [[+]port] - Connect to another server in a new status window",
                     "/disconnect         - Disconnect",
                     "/reconnect          - Reconnect",
                     "/away [message]     - Set away message",
@@ -2567,10 +2623,22 @@ impl IrcApp {
                 ],
             ),
             (
+                "=== Windows ===",
+                vec![
+                    "/window tile|cascade - Arrange the windows side by side or stacked",
+                    "/window max|restore  - One window at a time, or all side by side",
+                    "/window detach|attach - Move this window into its own OS window and back",
+                    "/window close       - Close this window (parts a channel)",
+                    "/window new         - Open a status window for another server",
+                ],
+            ),
+            (
                 "=== Shortcuts ===",
                 vec![
-                    "Alt+1-9             - Switch tabs",
-                    "Ctrl+W              - Close tab",
+                    "Alt+1-9             - Switch windows",
+                    "Ctrl+Tab            - Next window (Ctrl+Shift+Tab: previous)",
+                    "Ctrl+M              - Maximize / restore the windows",
+                    "Ctrl+W              - Close window",
                     "Up/Down             - Command history",
                     "Tab                 - Nick completion",
                 ],
@@ -2902,6 +2970,7 @@ struct EndpointForm {
     auto_perform: String,
     pre_away_message: String,
     persistence_profile: String,
+    form_profile: Option<String>,
 }
 
 /// The standard TLS port: a `/server` that names it connects with TLS.
@@ -2966,6 +3035,7 @@ fn parse_server_arg_port(value: &str) -> Result<(u16, Option<bool>), String> {
 /// host that is not a single (optionally `+`) port. Such a line must not be
 /// echoed or kept in history (#226).
 pub(super) fn server_args_carry_secret(args: &str) -> bool {
+    let args = new_window_server_args(args).unwrap_or(args);
     let mut parts = args.split_whitespace();
     parts.next();
     match (parts.next(), parts.next()) {
@@ -2973,6 +3043,13 @@ pub(super) fn server_args_carry_secret(args: &str) -> bool {
         (Some(port), None) => parse_server_arg_port(port).is_err(),
         (Some(_), Some(_)) => true,
     }
+}
+
+/// The arguments after a leading `-m` flag (`/server -m host [port]`, which
+/// opens a new status window), or `None` without the flag.
+fn new_window_server_args(args: &str) -> Option<&str> {
+    let rest = args.trim_start().strip_prefix("-m")?;
+    (rest.is_empty() || rest.starts_with(char::is_whitespace)).then(|| rest.trim())
 }
 
 /// Parse the /server argument: "host", "host [+]port", "host:[+]port",
@@ -3031,10 +3108,10 @@ mod tests {
     use crate::gui::types::Channel;
     use tokio::sync::mpsc;
 
-    fn connected_command_app() -> (IrcApp, mpsc::UnboundedReceiver<IrcCommand>) {
+    fn connected_command_app() -> (Session, mpsc::UnboundedReceiver<IrcCommand>) {
         // Logging off: query tabs opened by a test must not write chat logs
         // under the real config directory.
-        let mut app = IrcApp::with_settings(crate::gui::Settings {
+        let mut app = Session::with_settings(crate::gui::Settings {
             logging_enabled: false,
             ..crate::gui::Settings::default()
         });
@@ -3217,7 +3294,7 @@ mod tests {
     }
 
     /// An app in `#chan` with `alice` (`~alice@host.example`) present.
-    fn ban_command_app() -> (IrcApp, mpsc::UnboundedReceiver<IrcCommand>) {
+    fn ban_command_app() -> (Session, mpsc::UnboundedReceiver<IrcCommand>) {
         let (mut app, rx) = connected_command_app();
         let mut channel = Channel::new();
         channel.joined = true;
@@ -3299,7 +3376,7 @@ mod tests {
         expect_mode(&mut rx, "-b", "bob!*@host");
     }
 
-    fn set_bans(app: &mut IrcApp, masks: &[&str]) {
+    fn set_bans(app: &mut Session, masks: &[&str]) {
         let channel = app.channels.get_mut("#chan").unwrap();
         channel.bans.clear();
         for mask in masks {
@@ -3307,7 +3384,7 @@ mod tests {
         }
     }
 
-    fn last_note(app: &IrcApp) -> String {
+    fn last_note(app: &Session) -> String {
         app.channels["#chan"]
             .messages
             .back()
@@ -3766,11 +3843,11 @@ mod tests {
         // also persist the list and so cannot run against the real config
         // directory from a test. "alice bob" used to become one mask with a
         // space in it that matched nobody (#315).
-        let mut app = IrcApp::with_settings(crate::gui::Settings {
+        let mut app = Session::with_settings(crate::gui::Settings {
             logging_enabled: false,
             ..crate::gui::Settings::default()
         });
-        let last = |app: &IrcApp| {
+        let last = |app: &Session| {
             app.server_messages
                 .back()
                 .map(|row| row.content.clone())
@@ -4038,7 +4115,7 @@ mod tests {
     fn monitor_changes_local_state_only_when_the_command_was_sent() {
         // Disconnected: no MONITOR reaches the wire, so nothing is tracked
         // (#313), and the user is told why.
-        let mut app = IrcApp::with_settings(crate::gui::Settings {
+        let mut app = Session::with_settings(crate::gui::Settings {
             logging_enabled: false,
             ..crate::gui::Settings::default()
         });
@@ -4121,7 +4198,7 @@ mod tests {
 
     #[test]
     fn raw_command_reports_usage_and_disconnect_feedback() {
-        let mut app = IrcApp::with_settings(crate::gui::Settings::default());
+        let mut app = Session::with_settings(crate::gui::Settings::default());
         app.process_command("/raw");
         assert!(
             app.server_messages
@@ -4138,7 +4215,7 @@ mod tests {
 
     #[test]
     fn history_subcommand_does_not_switch_tabs_when_the_request_cannot_be_sent() {
-        let mut app = IrcApp::with_settings(crate::gui::Settings::default());
+        let mut app = Session::with_settings(crate::gui::Settings::default());
         app.handle_cap_message("ACK", &["draft/chathistory".into()]);
         app.process_command("/history before #chan *");
         assert!(
@@ -4190,7 +4267,7 @@ mod tests {
 
     #[test]
     fn disconnected_commands_never_claim_they_were_sent() {
-        let mut app = IrcApp::with_settings(crate::gui::Settings::default());
+        let mut app = Session::with_settings(crate::gui::Settings::default());
         app.process_command("/ctcp bob VERSION");
         app.process_command("/invite bob #room");
         app.process_command("/knock #room");
@@ -4690,12 +4767,12 @@ mod tests {
 
     #[test]
     fn perform_listing_redacts_targetless_credential_lines() {
-        // Hermetic by construction: IrcApp::default() reads the real user's
+        // Hermetic by construction: Session::default() reads the real user's
         // settings.json (and would rename a torn file), which is what #152
         // was about. Set auto_perform directly — the PERFORM add branch also
         // calls get_settings().save() and so cannot run against the real
         // config from a test.
-        let mut app = IrcApp::with_settings(crate::gui::Settings::default());
+        let mut app = Session::with_settings(crate::gui::Settings::default());
         app.auto_perform = "/me IDENTIFY hunter11".into();
         app.process_command("/perform");
         let shown: Vec<&str> = app
@@ -4770,7 +4847,7 @@ mod tests {
 
     #[test]
     fn unprofiled_endpoint_changes_clear_server_scoped_secrets() {
-        let mut app = IrcApp {
+        let mut app = Session {
             password: "server-pass".into(),
             sasl_username: "account".into(),
             sasl_password: "sasl-pass".into(),
@@ -4778,7 +4855,7 @@ mod tests {
             auto_perform: "/ns identify nickserv-pass".into(),
             pending_auto_perform: Some(vec!["/ns identify nickserv-pass".into()]),
             accept_invalid_certs: true,
-            ..IrcApp::with_settings(crate::gui::Settings::default())
+            ..Session::with_settings(crate::gui::Settings::default())
         };
 
         app.clear_endpoint_credentials();
@@ -4792,8 +4869,8 @@ mod tests {
         assert!(!app.accept_invalid_certs);
     }
 
-    fn saved_libera_profile_app() -> IrcApp {
-        IrcApp {
+    fn saved_libera_profile_app() -> Session {
+        Session {
             server_host: "irc.libera.chat".into(),
             server_port: "6697".into(),
             use_tls: true,
@@ -4803,7 +4880,7 @@ mod tests {
             auto_join_channels: "#private key".into(),
             auto_perform: "/ns identify nickserv-pass".into(),
             accept_invalid_certs: true,
-            ..IrcApp::with_settings(crate::gui::Settings {
+            ..Session::with_settings(crate::gui::Settings {
                 logging_enabled: false,
                 ..crate::gui::Settings::default()
             })
@@ -4928,14 +5005,14 @@ mod tests {
 
     #[test]
     fn server_command_validates_before_mutation_and_never_inherits_a_profile() {
-        let mut app = IrcApp {
+        let mut app = Session {
             password: "server-pass".into(),
             sasl_username: "account".into(),
             sasl_password: "sasl-pass".into(),
             auto_join_channels: "#private key".into(),
             auto_perform: "/ns identify nickserv-pass".into(),
             accept_invalid_certs: true,
-            ..IrcApp::with_settings(crate::gui::Settings::default())
+            ..Session::with_settings(crate::gui::Settings::default())
         };
         let original_host = app.server_host.clone();
         app.process_command("/server new.example 0");
@@ -4968,7 +5045,7 @@ mod tests {
 
     #[test]
     fn empty_nickname_is_rejected_by_the_connection_form() {
-        let mut app = IrcApp::with_settings(crate::gui::Settings::default());
+        let mut app = Session::with_settings(crate::gui::Settings::default());
         app.nickname = "  ".into();
         app.server_host = "irc.example".into();
         app.server_port = "6697".into();

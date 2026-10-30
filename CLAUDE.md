@@ -114,14 +114,20 @@ upstream MIT license (the project itself is CC BY 4.0).
 
 ```
 src/
-├── main.rs              # Entry point, LinefeedApp (eframe::App), connection thread spawn
+├── main.rs              # Entry point, LinefeedApp (eframe::App): tray/minimized paths, repaint policy, exit
 ├── systray.rs           # Windows system tray via direct Win32 APIs (show/hide, flash, notify, single-instance)
 ├── icon_data.rs         # Generated: embedded icon as raw RGBA bytes
+├── opener.rs            # Opening hyperlinks in the browser
+├── updater/             # Automatic updates: check, download, install on exit, recovery
 ├── gui/
-│   ├── mod.rs           # IrcApp: UI state, message routing, numeric handlers, lifecycle (~5000 lines)
+│   ├── app.rs           # App: sessions, settings, notifications, toolbar/switchbar, windows, detached viewports (~2600 lines)
+│   ├── mod.rs           # Session: one connection's state, message routing, numeric handlers (~12700 lines)
+│   ├── connection.rs    # Per-session connection worker lifecycle (thread, intent, reconnect)
+│   ├── windows.rs       # WindowManager: placement, tile/cascade, layout.json
+│   ├── view.rs          # Drawing one window: topic, user list, scrollback, input line
 │   ├── types.rs         # Settings, ChatMessage, Channel, NetworkSupport, UserMode, BanEntry, TabCompletion
-│   ├── commands.rs      # process_command() - all /slash commands (~2000 lines)
-│   ├── dialogs.rs       # Connect, Settings (tabbed), Channel List, Channel Info windows
+│   ├── commands.rs      # process_command() - all /slash commands (~5100 lines)
+│   ├── dialogs.rs       # Connect (per session), Settings (App), Channel List, Channel Info windows
 │   ├── formatting.rs    # IRC formatting parsing, nick colors, text rendering
 │   ├── helpers.rs       # is_channel(), nick_to_mask(), current_time_formatted(), days_to_ymd()
 │   └── logging.rs       # LogManager: persistent chat history in irssi format
@@ -133,8 +139,10 @@ src/
 ```
 
 **Key types:**
-- `LinefeedApp` (main.rs): eframe::App wrapper, owns IrcApp and connection thread
-- `IrcApp` (gui/mod.rs): UI state, channel data, settings, message processing; `SessionConfig` snapshots the active connection's endpoint/credentials so dialog edits cannot contaminate a live session
+- `LinefeedApp` (main.rs): eframe::App wrapper around `App`, tray/minimized handling
+- `App` (gui/app.rs): owns every `Session` plus everything global: canonical `Settings` (only a validated connect form is ever adopted into them), favorites/network profiles, updater, desktop-notification policy, the `WindowManager`; draws the toolbar, switchbar, windows and detached OS windows. Sessions talk to it through `SessionEvent`s
+- `Session` (gui/mod.rs): one connection (its status window, channels, queries), its own connect form, mirrored behaviour settings (`apply_config`/`export_config`), its worker thread; `SessionConfig` snapshots the live connection's endpoint/credentials so form edits cannot contaminate it
+- `WindowManager` (gui/windows.rs): which window is active, maximized vs floating, per-window placement and input line (`TargetView`, swapped into the session while the window draws)
 - `IrcClient` (irc/client.rs): Async connection, TLS, SASL negotiation
 - `IrcCommand` (irc/message.rs): Enum for all IRC commands, implements Display for wire format
 - `IrcMessage` (irc/message.rs): Parsed message with IRCv3 tags, prefix, command
@@ -144,16 +152,19 @@ src/
 - `LogManager` (gui/logging.rs): Chat history at `~/.config/linefeed/logs/<network>/<target>.log`, endpoint-scoped paths, credential filtering at write time
 
 **Threading model:**
-1. Main thread runs egui event loop via `LinefeedApp::update()`
-2. Connection thread spawns with single-threaded tokio runtime
-3. Two mpsc channels bridge threads: `cmd_tx` (GUI→IRC), `msg_rx` (IRC→GUI)
+1. Main thread runs egui event loop via `LinefeedApp::ui()`; detached windows are immediate viewports on the same thread
+2. Each `Session` spawns its own connection thread with a single-threaded tokio runtime
+3. Two mpsc channels per session bridge threads: `cmd_tx` (GUI→IRC), `msg_rx` (IRC→GUI)
 4. IrcClient auto-handles PING/PONG; all messages forwarded to GUI
 
 ## Module Responsibilities
 
-- **main.rs**: App lifecycle, connection management, background tick while tray-hidden/minimized
-- **systray.rs**: Windows-only tray icon, minimize-to-tray, taskbar flash, balloon notifications, single-instance activation
-- **gui/mod.rs**: `handle_incoming_message()` routes by IrcCommand type, `handle_numeric()` for server replies, connection lifecycle, lag meter, auto-away
+- **main.rs**: eframe entry, tray/minimized paths (detached windows keep running while the main window is minimized and hide with it in the tray), repaint policy, exit
+- **systray.rs**: Windows-only tray icon, minimize-to-tray, taskbar flash, balloon notifications, single-instance activation (finds the main window by its exact title, which no detached window may use)
+- **gui/app.rs**: multi-session frame (pump, timers, lifecycles, `SessionEvent`s), window activation and close semantics, switchbar/shortcuts, floating and detached windows, settings persistence, notifications, update-restart snapshot of every session
+- **gui/mod.rs**: `handle_incoming_message()` routes by IrcCommand type, `handle_numeric()` for server replies, lag meter, auto-away
+- **gui/connection.rs**: per-session worker thread, `ConnectionIntent` handling, auto-reconnect
+- **gui/windows.rs**: window set derived from the sessions, placement memory, tile/cascade geometry, layout.json (kept apart from settings.json)
 - **commands.rs**: All /slash commands including service shortcuts (/ns, /cs), /monitor, /slap
 - **dialogs.rs**: Modal windows with tabbed Settings (Connection, Display, Automation, Behavior, About)
 - **formatting.rs**: `parse_irc_colors()` for IRC formatting controls, `render_irc_text()` with egui
@@ -169,7 +180,11 @@ credentials must never reach chat logs or input history (logging.rs and
 commands.rs filter them), switching servers must not leak PASS/SASL/
 auto-perform secrets to the new endpoint, and CAP negotiation enforces
 byte/token/line budgets against hostile servers. Preserve these invariants
-when touching connection, logging, or command-history code.
+when touching connection, logging, or command-history code. With several
+sessions: a new session (`/server -m`, "New connection") never inherits
+another's credentials, and settings saves never persist an unvalidated or
+scratch connect form (`SaveSettings` vs `SaveConfig`/`SaveAutoPerform`,
+#316).
 
 ## Features
 
@@ -181,7 +196,8 @@ when touching connection, logging, or command-history code.
 - **Away**: Manual /away, /back, auto-away on idle with configurable timeout
 - **Privacy**: CTCP reply toggle, ignore list with wildcard masks
 - **UI**: Tab completion, command history, lag meter, desktop notifications
-- **Connection**: Safe reconnect/server switching, auto-reconnect with exponential backoff, configurable delay/max attempts
+- **Connection**: Several servers at once, safe reconnect/server switching, auto-reconnect with exponential backoff, configurable delay/max attempts, auto-connect network profiles
+- **Windows**: mIRC-style maximized or floating (tile/cascade) windows, switchbar grouped by network, detach any window into its own OS window, layout persisted in layout.json
 - **Platform**: System tray on Windows (minimize to tray, taskbar flash on notification), desktop notifications on supported platforms
 
 **build.rs:** Compiles Windows resources (icon, version info) using llvm-mingw windres.
