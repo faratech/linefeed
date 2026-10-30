@@ -366,7 +366,10 @@ pub struct IrcApp {
     // Channel list popup
     pub channel_list: Vec<ChannelListEntry>,
     pub channel_list_loading: bool,
-    pub(crate) channel_list_apply_min_filter: bool,
+    /// Minimum user count applied to each incoming 322 row, frozen when the
+    /// LIST was requested so the Min control cannot change the rule midway
+    /// through one response. 0 means no client-side filtering (#317).
+    pub(crate) channel_list_min_users: u32,
     pub show_channel_list: bool,
     pub channel_list_filter: String,
     pub channel_list_selected: Option<String>,
@@ -615,7 +618,7 @@ impl IrcApp {
 
             channel_list: Vec::new(),
             channel_list_loading: false,
-            channel_list_apply_min_filter: false,
+            channel_list_min_users: 0,
             show_channel_list: false,
             channel_list_filter: String::new(),
             channel_list_selected: None,
@@ -5648,9 +5651,7 @@ impl IrcApp {
 
                 match parsed {
                     Some((name, user_count, topic)) => {
-                        if self.channel_list_apply_min_filter
-                            && user_count < self.list_min_users as usize
-                        {
+                        if user_count < self.channel_list_min_users as usize {
                             return;
                         }
                         self.channel_list

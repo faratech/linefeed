@@ -963,13 +963,18 @@ impl IrcApp {
 
             "LIST" => {
                 self.show_channel_list = true;
-                self.channel_list_apply_min_filter = args.is_empty()
-                    && self.list_min_users >= 1
+                // Freeze the threshold for this response (#317).
+                self.channel_list_min_users = if args.is_empty()
                     && !self
                         .network_support
                         .elist
                         .to_ascii_uppercase()
-                        .contains('U');
+                        .contains('U')
+                {
+                    self.list_min_users
+                } else {
+                    0
+                };
 
                 // Use configurable min users filter to avoid flooding on large networks
                 // Users can override with /list * or /list <filter>

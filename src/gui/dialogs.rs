@@ -90,6 +90,32 @@ impl IrcApp {
         self.save_setting(|settings| settings.automatic_updates = enabled);
     }
 
+    /// Request a fresh channel list from the Channel List window.
+    fn refresh_channel_list(&mut self) {
+        // Mirror /list: server-side >N only with ELIST=U, otherwise plain
+        // LIST plus the client-side filter. Assigning the threshold on every
+        // refresh also clears a stale one left by an earlier /list (#205),
+        // and freezes it for the whole response: the Min control and the
+        // shared Settings value may change while 322 rows stream in (#317).
+        let (request, apply_client_filter) =
+            channel_list_refresh_request(self.list_min_users, &self.network_support.elist);
+        self.channel_list_min_users = if apply_client_filter {
+            self.list_min_users
+        } else {
+            0
+        };
+        let sent = self.send_command(request);
+        if sent {
+            self.channel_list.clear();
+            self.channel_list_dirty = true;
+            self.channel_list_selected = None;
+            self.channel_list_loading = true;
+        } else {
+            self.channel_list_loading = false;
+            self.report_send_failure(sent, "Not connected - channel list was not refreshed");
+        }
+    }
+
     fn save_list_min_users(&mut self) {
         let min_users = self.list_min_users;
         self.save_setting(|settings| settings.list_min_users = min_users);
@@ -1276,28 +1302,7 @@ impl IrcApp {
                     self.list_min_users = min_users.max(0) as u32;
 
                     if ui.button("Refresh").clicked() {
-                        // Mirror /list: server-side >N only with ELIST=U,
-                        // otherwise plain LIST plus the client-side filter.
-                        // Assigning the flag on every refresh also clears a
-                        // stale `true` left by an earlier /list (#205).
-                        let (request, apply_client_filter) = channel_list_refresh_request(
-                            self.list_min_users,
-                            &self.network_support.elist,
-                        );
-                        self.channel_list_apply_min_filter = apply_client_filter;
-                        let sent = self.send_command(request);
-                        if sent {
-                            self.channel_list.clear();
-                            self.channel_list_dirty = true;
-                            self.channel_list_selected = None;
-                            self.channel_list_loading = true;
-                        } else {
-                            self.channel_list_loading = false;
-                            self.report_send_failure(
-                                sent,
-                                "Not connected - channel list was not refreshed",
-                            );
-                        }
+                        self.refresh_channel_list();
                     }
                     if ui.button("Close").clicked() {
                         close = true;
@@ -1904,5 +1909,64 @@ mod tests {
         assert!(app.close_settings_window(), "{:?}", app.connection_error());
 
         assert_eq!(app.load_persisted_settings().server_port, "6667");
+    }
+
+
+    fn list_row(app: &mut IrcApp, channel: &str, users: &str) {
+        app.handle_numeric(
+            crate::irc::numerics::RPL_LIST,
+            &[
+                "me".to_string(),
+                channel.to_string(),
+                users.to_string(),
+                "topic".to_string(),
+            ],
+        );
+    }
+
+    #[test]
+    fn min_users_filter_is_fixed_for_a_whole_streaming_list_response() {
+        let mut app = IrcApp::with_settings(Settings::default());
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        app.cmd_tx = Some(tx);
+        app.connected = true;
+        app.list_min_users = 5;
+
+        app.refresh_channel_list();
+        app.handle_numeric(
+            crate::irc::numerics::RPL_LISTSTART,
+            &["me".to_string(), "Channel".to_string(), "Users".to_string()],
+        );
+        list_row(&mut app, "#tiny", "3");
+        list_row(&mut app, "#first", "10");
+        // The user drags Min (or changes it in Settings -> Behavior) while
+        // the 322 replies are still streaming in (#317).
+        app.list_min_users = 50;
+        list_row(&mut app, "#second", "10");
+        list_row(&mut app, "#tiny2", "4");
+        app.handle_numeric(
+            crate::irc::numerics::RPL_LISTEND,
+            &["me".to_string(), "End".to_string()],
+        );
+
+        let names: Vec<&str> = app.channel_list.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, ["#first", "#second"]);
+    }
+
+    #[test]
+    fn slash_list_snapshots_the_min_users_filter_for_its_response() {
+        let mut app = IrcApp::with_settings(Settings::default());
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        app.cmd_tx = Some(tx);
+        app.connected = true;
+        app.list_min_users = 5;
+
+        app.process_command("/list");
+        app.list_min_users = 50;
+        list_row(&mut app, "#kept", "10");
+        list_row(&mut app, "#dropped", "4");
+
+        let names: Vec<&str> = app.channel_list.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, ["#kept"]);
     }
 }
