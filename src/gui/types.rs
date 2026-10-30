@@ -553,6 +553,13 @@ pub enum CaseMapping {
     Utf8Rfc8265,
 }
 
+#[cfg(test)]
+thread_local! {
+    /// PRECIS enforcement is the costly fold; tests count it to keep list
+    /// maintenance linear.
+    static PRECIS_CANONICALIZATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 impl CaseMapping {
     /// Fold one character under the ASCII-based IRC mappings. Shared by
     /// `canonicalize` and `eq` so the two can never disagree.
@@ -572,6 +579,8 @@ impl CaseMapping {
     /// must not acquire locale- or Unicode-dependent equivalences.
     pub fn canonicalize(self, value: &str) -> String {
         if self == CaseMapping::Utf8Rfc8265 {
+            #[cfg(test)]
+            PRECIS_CANONICALIZATIONS.with(|calls| calls.set(calls.get() + 1));
             // Invalid PRECIS input must remain distinct instead of being folded
             // into another identifier. Servers should not emit it, but ASCII
             // folding is a deterministic and conservative fallback.
@@ -784,6 +793,31 @@ pub struct BanEntry {
     pub mask: String,
     pub set_by: String,
     pub set_time: u64,
+    /// `mask` folded under the channel's CASEMAPPING, so matching entries is a
+    /// plain comparison (PRECIS folding is too costly to repeat per entry).
+    key: String,
+}
+
+/// Refresh the entry with the same canonical `key`, or append a new one.
+fn upsert_keyed_entry(
+    entries: &mut Vec<BanEntry>,
+    key: String,
+    mask: String,
+    set_by: String,
+    set_time: u64,
+) {
+    match entries.iter_mut().find(|entry| entry.key == key) {
+        Some(entry) => {
+            entry.set_by = set_by;
+            entry.set_time = set_time;
+        }
+        None => entries.push(BanEntry {
+            mask,
+            set_by,
+            set_time,
+            key,
+        }),
+    }
 }
 
 /// A user in a channel with mode and away status
@@ -977,6 +1011,7 @@ impl Channel {
         // Sort order and both lookup indexes are derived from the mapping.
         self.sort_users();
         self.rebuild_names_index();
+        self.rekey_mode_lists();
     }
 
     /// Replace the topic together with its attribution so a stale setter or
@@ -1014,31 +1049,6 @@ impl Channel {
         self.sort_users();
     }
 
-    pub fn upsert_mode_list_entry(
-        &mut self,
-        mode: char,
-        mask: String,
-        set_by: String,
-        set_time: u64,
-    ) {
-        let mapping = self.case_mapping;
-        let entries = self.mode_lists.entry(mode).or_default();
-        match entries
-            .iter()
-            .position(|entry| mapping.eq(&entry.mask, &mask))
-        {
-            Some(slot) => {
-                entries[slot].set_by = set_by;
-                entries[slot].set_time = set_time;
-            }
-            None => entries.push(BanEntry {
-                mask,
-                set_by,
-                set_time,
-            }),
-        }
-    }
-
     /// Record one entry of a server list reply (367, 346, 348, 728). The first
     /// entry of a listing replaces whatever an earlier listing left behind, so
     /// an entry another op removed while we were away does not linger; the
@@ -1053,27 +1063,33 @@ impl Channel {
         if self.mode_lists_receiving.insert(mode) {
             self.clear_mode_list(mode);
         }
+        // The mask is folded once and shared by both stored lists.
+        let key = self.case_mapping.canonicalize(&mask);
         if mode == 'b' {
             // Overlapping requests can list the same mask twice; a re-listed
             // ban replaces its earlier entry instead of duplicating it.
-            let mapping = self.case_mapping;
-            match self
-                .bans
-                .iter()
-                .position(|entry| mapping.eq(&entry.mask, &mask))
-            {
-                Some(slot) => {
-                    self.bans[slot].set_by = set_by.clone();
-                    self.bans[slot].set_time = set_time;
-                }
-                None => self.bans.push(BanEntry {
-                    mask: mask.clone(),
-                    set_by: set_by.clone(),
-                    set_time,
-                }),
-            }
+            upsert_keyed_entry(
+                &mut self.bans,
+                key.clone(),
+                mask.clone(),
+                set_by.clone(),
+                set_time,
+            );
         }
-        self.upsert_mode_list_entry(mode, mask, set_by, set_time);
+        let entries = self.mode_lists.entry(mode).or_default();
+        upsert_keyed_entry(entries, key, mask, set_by, set_time);
+    }
+
+    /// Re-fold the stored masks after the network's CASEMAPPING changed.
+    fn rekey_mode_lists(&mut self) {
+        let mapping = self.case_mapping;
+        for entry in self
+            .bans
+            .iter_mut()
+            .chain(self.mode_lists.values_mut().flatten())
+        {
+            entry.key = mapping.canonicalize(&entry.mask);
+        }
     }
 
     /// Mark a list fully received. An end marker with no entries before it is
@@ -1100,22 +1116,30 @@ impl Channel {
 
     pub fn apply_mode_list_change(&mut self, sign: char, mode: char, mask: &str, setter: &str) {
         // Masks match under the network's CASEMAPPING, like nicks and channels.
-        let mapping = self.case_mapping;
+        let key = self.case_mapping.canonicalize(mask);
         if sign == '+' {
-            self.upsert_mode_list_entry(mode, mask.to_string(), setter.to_string(), 0);
-            if mode == 'b' && !self.bans.iter().any(|entry| mapping.eq(&entry.mask, mask)) {
+            let entries = self.mode_lists.entry(mode).or_default();
+            upsert_keyed_entry(
+                entries,
+                key.clone(),
+                mask.to_string(),
+                setter.to_string(),
+                0,
+            );
+            if mode == 'b' && !self.bans.iter().any(|entry| entry.key == key) {
                 self.bans.push(BanEntry {
                     mask: mask.to_string(),
                     set_by: setter.to_string(),
                     set_time: 0,
+                    key,
                 });
             }
         } else {
             if let Some(entries) = self.mode_lists.get_mut(&mode) {
-                entries.retain(|entry| !mapping.eq(&entry.mask, mask));
+                entries.retain(|entry| entry.key != key);
             }
             if mode == 'b' {
-                self.bans.retain(|entry| !mapping.eq(&entry.mask, mask));
+                self.bans.retain(|entry| entry.key != key);
             }
         }
     }
@@ -1878,6 +1902,45 @@ mod tests {
         assert_eq!(masks(&ch), ["[troll]!*@*", "{troll}!*@*"]);
         ch.apply_mode_list_change('-', 'b', "{TROLL}!*@*", "op");
         assert_eq!(masks(&ch), ["[troll]!*@*"]);
+
+        // A CASEMAPPING announced after masks were stored re-folds them.
+        let mut ch = Channel::new();
+        ch.apply_mode_list_change('+', 'b', "[troll]!*@*", "op");
+        ch.set_case_mapping(CaseMapping::Ascii);
+        ch.apply_mode_list_change('-', 'b', "{troll}!*@*", "op");
+        assert_eq!(masks(&ch), ["[troll]!*@*"]);
+        assert_eq!(list_masks(&ch), ["[troll]!*@*"]);
+        ch.set_case_mapping(CaseMapping::Rfc1459);
+        ch.apply_mode_list_change('-', 'b', "{TROLL}!*@*", "op");
+        assert!(masks(&ch).is_empty());
+    }
+
+    #[test]
+    fn large_utf8_mapped_mode_lists_fold_each_mask_a_bounded_number_of_times() {
+        const ENTRIES: usize = 500;
+        let mut ch = Channel::new();
+        ch.set_case_mapping(CaseMapping::Utf8Rfc8265);
+        PRECIS_CANONICALIZATIONS.with(|calls| calls.set(0));
+
+        for i in 0..ENTRIES {
+            ch.record_mode_list_reply('b', format!("Nick{i}!*@host{i}"), "op".into(), 1);
+        }
+        // Re-listed masks, spelled differently, still merge.
+        ch.record_mode_list_reply('b', "NICK7!*@HOST7".into(), "other".into(), 2);
+        ch.apply_mode_list_change('+', 'b', "nick8!*@host8", "op");
+        ch.apply_mode_list_change('-', 'b', "NICK9!*@HOST9", "op");
+        ch.complete_mode_list('b');
+
+        assert_eq!(ch.bans.len(), ENTRIES - 1);
+        assert_eq!(ch.mode_lists[&'b'].len(), ENTRIES - 1);
+        assert_eq!(ch.bans[7].set_by, "other");
+        let folds = PRECIS_CANONICALIZATIONS.with(|calls| calls.get());
+        // One fold per incoming mask (shared by both stored lists), not one per
+        // stored entry: 500 entries once cost over half a second.
+        assert!(
+            folds <= 2 * ENTRIES,
+            "{folds} PRECIS foldings for {ENTRIES} masks"
+        );
     }
 
     #[test]
