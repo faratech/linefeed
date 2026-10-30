@@ -506,6 +506,34 @@ fn server_error_reason(msg: &IrcMessage) -> Option<&str> {
         .then(|| params.strip_prefix(':').unwrap_or(params))
 }
 
+/// Write one STS probe line within the probe's overall `deadline`, racing the
+/// same cancellation signals as the probe's connect and reads. `Ok(false)`
+/// means the write failed or ran out of time, so the probe has no verdict;
+/// only cancellation is an error (#300).
+async fn probe_write<W>(
+    writer: &mut W,
+    line: &[u8],
+    deadline: tokio::time::Instant,
+    incoming_tx: &mpsc::Sender<IrcMessage>,
+    outgoing_rx: &mut mpsc::UnboundedReceiver<IrcCommand>,
+    pending_commands: &mut VecDeque<IrcCommand>,
+) -> Result<bool, Box<dyn std::error::Error + Send + Sync>>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    tokio::select! {
+        biased;
+        _ = incoming_tx.closed() => Err("Connection cancelled during STS probe".into()),
+        _ = wait_for_disconnect(outgoing_rx, pending_commands) => {
+            Err("Connection cancelled during STS probe".into())
+        }
+        result = tokio::time::timeout_at(deadline, async {
+            writer.write_all(line).await?;
+            writer.flush().await
+        }) => Ok(matches!(result, Ok(Ok(())))),
+    }
+}
+
 /// Read the next protocol message of interest during the registration
 /// handshake (see `handle_handshake_line`). Returns `None` when the per-step
 /// budget expires with nothing received.
@@ -1218,27 +1246,55 @@ impl IrcClient {
         pending_commands: &mut VecDeque<IrcCommand>,
         probe_timeout: Duration,
     ) -> Result<Option<u16>, Box<dyn std::error::Error + Send + Sync>> {
+        // One overall deadline for the whole probe, TCP connect included: a
+        // drip-feeding endpoint must not re-arm the budget per line (#189),
+        // nor may a slow connect hand the conversation a fresh one (#300).
+        let deadline = tokio::time::Instant::now() + probe_timeout;
         let stream = tokio::select! {
             biased;
             _ = incoming_tx.closed() => return Err("Connection cancelled during STS probe".into()),
             _ = wait_for_disconnect(outgoing_rx, pending_commands) => {
                 return Err("Connection cancelled during STS probe".into());
             }
-            result = timeout(probe_timeout, TcpStream::connect((host, port))) => {
+            result = tokio::time::timeout_at(deadline, TcpStream::connect((host, port))) => {
                 match result {
                     Ok(Ok(stream)) => stream,
                     _ => return Ok(None),
                 }
             }
         };
+        Self::probe_sts_over(stream, deadline, incoming_tx, outgoing_rx, pending_commands).await
+    }
+
+    /// The conversation half of the STS probe, over an already-connected
+    /// stream: ask for `CAP LS 302` and read until a verdict or `deadline`.
+    async fn probe_sts_over<S>(
+        stream: S,
+        deadline: tokio::time::Instant,
+        incoming_tx: &mpsc::Sender<IrcMessage>,
+        outgoing_rx: &mut mpsc::UnboundedReceiver<IrcCommand>,
+        pending_commands: &mut VecDeque<IrcCommand>,
+    ) -> Result<Option<u16>, Box<dyn std::error::Error + Send + Sync>>
+    where
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    {
         let (reader, mut writer) = tokio::io::split(stream);
         let mut reader = BufReader::new(reader);
-        writer.write_all(b"CAP LS 302\r\n").await?;
-        writer.flush().await?;
+        // Like every read-side failure, a probe write that fails or runs out
+        // of time just means "no STS": it must not abort the connection.
+        if !probe_write(
+            &mut writer,
+            b"CAP LS 302\r\n",
+            deadline,
+            incoming_tx,
+            outgoing_rx,
+            pending_commands,
+        )
+        .await?
+        {
+            return Ok(None);
+        }
         let mut buf = Vec::with_capacity(512);
-        // One overall deadline for the whole probe: a drip-feeding endpoint
-        // must not re-arm the budget per line (#189).
-        let deadline = tokio::time::Instant::now() + probe_timeout;
         for _ in 0..MAX_CAP_LINES {
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
             if remaining.is_zero() {
@@ -1274,8 +1330,18 @@ impl IrcClient {
                 continue;
             };
             if let IrcCommand::Ping(token) = message.command {
-                writer.write_all(pong_line(&token).as_bytes()).await?;
-                writer.flush().await?;
+                if !probe_write(
+                    &mut writer,
+                    pong_line(&token).as_bytes(),
+                    deadline,
+                    incoming_tx,
+                    outgoing_rx,
+                    pending_commands,
+                )
+                .await?
+                {
+                    return Ok(None);
+                }
                 continue;
             }
             if let IrcCommand::Cap(_, subcommand, params) = message.command
@@ -3206,6 +3272,114 @@ mod tests {
             .unwrap();
             assert_eq!(port, Some(6697));
             assert_eq!(server.await.unwrap(), SANITIZED_PONG);
+        });
+    }
+
+    fn sts_probe_deadline(timeout: Duration) -> tokio::time::Instant {
+        tokio::time::Instant::now() + timeout
+    }
+
+    #[test]
+    fn sts_probe_write_failure_falls_back_to_plaintext() {
+        test_runtime().block_on(async {
+            // #300: every read-side probe failure maps to "no STS"; a write
+            // failure (peer reset before CAP LS went out) used to abort the
+            // whole connect with `?`.
+            let (client_io, server_io) = tokio::io::duplex(1024);
+            drop(server_io);
+            let (incoming_tx, _incoming_rx) = mpsc::channel(1);
+            let (_outgoing_tx, mut outgoing_rx) = mpsc::unbounded_channel();
+            let mut pending = VecDeque::new();
+            let port = IrcClient::probe_sts_over(
+                client_io,
+                sts_probe_deadline(Duration::from_secs(1)),
+                &incoming_tx,
+                &mut outgoing_rx,
+                &mut pending,
+            )
+            .await
+            .expect("a failed probe write must not abort the connection");
+            assert_eq!(port, None);
+        });
+    }
+
+    #[test]
+    fn sts_probe_pong_write_failure_falls_back_to_plaintext() {
+        test_runtime().block_on(async {
+            let (client_io, server_io) = tokio::io::duplex(1024);
+            let (server_read, mut server_write) = tokio::io::split(server_io);
+            let server = tokio::spawn(async move {
+                let mut reader = BufReader::new(server_read);
+                assert_eq!(read_wire_line(&mut reader).await, "CAP LS 302");
+                server_write.write_all(b":srv PING :x\r\n").await.unwrap();
+                // Both halves drop here: the client's PONG hits a dead peer.
+            });
+            let (incoming_tx, _incoming_rx) = mpsc::channel(1);
+            let (_outgoing_tx, mut outgoing_rx) = mpsc::unbounded_channel();
+            let mut pending = VecDeque::new();
+            let port = IrcClient::probe_sts_over(
+                client_io,
+                sts_probe_deadline(Duration::from_secs(1)),
+                &incoming_tx,
+                &mut outgoing_rx,
+                &mut pending,
+            )
+            .await
+            .expect("a failed probe PONG must not abort the connection");
+            assert_eq!(port, None);
+            server.await.unwrap();
+        });
+    }
+
+    #[test]
+    fn sts_probe_write_that_never_completes_is_bounded_by_the_deadline() {
+        test_runtime().block_on(async {
+            // A one-byte pipe nobody drains: CAP LS can never be fully
+            // written. The write used to sit outside every deadline.
+            let (client_io, _server_io) = tokio::io::duplex(1);
+            let (incoming_tx, _incoming_rx) = mpsc::channel(1);
+            let (_outgoing_tx, mut outgoing_rx) = mpsc::unbounded_channel();
+            let mut pending = VecDeque::new();
+            let started = tokio::time::Instant::now();
+            let port = timeout(
+                Duration::from_secs(3),
+                IrcClient::probe_sts_over(
+                    client_io,
+                    sts_probe_deadline(Duration::from_millis(200)),
+                    &incoming_tx,
+                    &mut outgoing_rx,
+                    &mut pending,
+                ),
+            )
+            .await
+            .expect("probe write ignored the probe deadline")
+            .unwrap();
+            assert_eq!(port, None);
+            assert!(started.elapsed() < Duration::from_secs(2));
+        });
+    }
+
+    #[test]
+    fn dropping_the_gui_receiver_cancels_a_blocked_sts_probe_write() {
+        test_runtime().block_on(async {
+            let (client_io, _server_io) = tokio::io::duplex(1);
+            let (incoming_tx, incoming_rx) = mpsc::channel(1);
+            let (_outgoing_tx, mut outgoing_rx) = mpsc::unbounded_channel();
+            let mut pending = VecDeque::new();
+            drop(incoming_rx);
+            let result = timeout(
+                Duration::from_secs(2),
+                IrcClient::probe_sts_over(
+                    client_io,
+                    sts_probe_deadline(Duration::from_secs(30)),
+                    &incoming_tx,
+                    &mut outgoing_rx,
+                    &mut pending,
+                ),
+            )
+            .await
+            .expect("blocked probe write was not cancelled");
+            assert!(result.is_err());
         });
     }
 
