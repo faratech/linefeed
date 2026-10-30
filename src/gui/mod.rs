@@ -4661,6 +4661,7 @@ impl IrcApp {
         let previous_case_mapping = self.network_support.case_mapping;
         let previous_prefix_modes = self.network_support.prefix_modes.clone();
         let previous_prefixes = self.network_support.user_prefixes.clone();
+        let previous_history_limit = self.network_support.history_limit;
 
         for token in params.iter().skip(1) {
             if token.starts_with(':') {
@@ -4778,7 +4779,12 @@ impl IrcApp {
         support.utf8_only = support.has_isupport("UTF8ONLY");
         support.account_required = support.has_isupport("DRAFT/ACCOUNTREQUIRED");
 
-        self.chathistory_limit = support.history_limit;
+        // The page limit may also come from the draft/chathistory capability
+        // value, and most servers never send a CHATHISTORY token; only a token
+        // that is present (or one that was withdrawn) changes what CAP set.
+        if support.history_limit.is_some() || previous_history_limit.is_some() {
+            self.chathistory_limit = support.history_limit;
+        }
         self.network_support = support;
         if self.network_support.case_mapping != previous_case_mapping {
             self.refresh_case_mapping_state();
@@ -11553,6 +11559,30 @@ mod tests {
             IrcMessage::parse(":srv CAP me LS :draft/chathistory=37").unwrap(),
         );
         assert_eq!(app.chathistory_limit, Some(37));
+    }
+
+    #[test]
+    fn cap_negotiated_history_limit_survives_isupport_without_a_chathistory_token() {
+        let (mut app, _rx) = test_app_connected();
+        app.handle_incoming_message(
+            IrcMessage::parse(":srv CAP me LS :draft/chathistory=37").unwrap(),
+        );
+        app.handle_incoming_message(
+            IrcMessage::parse(":srv 005 me CHANTYPES=# NETWORK=Net :are supported").unwrap(),
+        );
+        assert_eq!(app.chathistory_limit, Some(37));
+        assert_eq!(app.history_page_limit(100), 37);
+
+        // A limit the server states through ISUPPORT is the later and more
+        // specific word; withdrawing it falls back to the protocol default.
+        app.handle_incoming_message(
+            IrcMessage::parse(":srv 005 me CHATHISTORY=50 :are supported").unwrap(),
+        );
+        assert_eq!(app.chathistory_limit, Some(50));
+        app.handle_incoming_message(
+            IrcMessage::parse(":srv 005 me -CHATHISTORY :are supported").unwrap(),
+        );
+        assert_eq!(app.chathistory_limit, None);
     }
 
     #[test]
