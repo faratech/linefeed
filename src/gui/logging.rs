@@ -1308,15 +1308,23 @@ mod tests {
     #[test]
     fn flush_failure_evicts_the_cached_writer() {
         let (manager, dir) = test_manager("flush-failure");
-        let full = PathBuf::from("/dev/full");
-        manager.with_writer(full.clone(), |writer| {
-            writeln!(writer.writer, "buffered line")
-        });
-        assert!(manager.writers.borrow().contains_key(&full));
+        let path = dir.join("flush.log");
+        manager.with_writer(path.clone(), |_| Ok(()));
+        // Inject a real failing sink after opening a normal private log. Using
+        // with_writer on /dev/full would try to chmod /dev and the device,
+        // which fails for unprivileged users and can change a root test host.
+        let sink = OpenOptions::new().write(true).open("/dev/full").unwrap();
+        {
+            let mut writers = manager.writers.borrow_mut();
+            let cached = writers.get_mut(&path).unwrap();
+            cached.writer = std::io::BufWriter::new(sink);
+            writeln!(cached.writer, "buffered line").unwrap();
+        }
+        assert!(manager.writers.borrow().contains_key(&path));
 
         manager.flush_all();
 
-        assert!(!manager.writers.borrow().contains_key(&full));
+        assert!(!manager.writers.borrow().contains_key(&path));
         fs::remove_dir_all(dir).expect("remove temporary log directory");
     }
 
