@@ -390,7 +390,9 @@ impl Session {
                 history_down = Self::consume_plain_composer_key(ui, egui::Key::ArrowDown);
             }
         }
-        let line_height = ui.text_style_height(&egui::TextStyle::Body);
+        let input_font = egui::TextStyle::Monospace.resolve(ui.style());
+        let line_height = ui.fonts_mut(|fonts| fonts.row_height(&input_font))
+            + ui.spacing().extra_text_line_spacing;
         let max_height = line_height * 4.0 + 8.0;
         let output = ui
             .scope_builder(
@@ -434,6 +436,7 @@ impl Session {
                                 .show(ui, |ui| {
                                     TextEdit::multiline(&mut self.input_text)
                                         .id(input_id)
+                                        .font(input_font.clone())
                                         .hint_text("Type a message…")
                                         .align(egui::Align2::LEFT_TOP)
                                         .desired_rows(1)
