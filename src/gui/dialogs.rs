@@ -1,8 +1,8 @@
 //! Dialog windows for connect, settings, and channel list
 
-use super::helpers::format_timestamp;
 use super::app::FavoritesUi;
-use super::{App, ChatMessage, Session, ServerFavorite, Settings};
+use super::helpers::format_timestamp;
+use super::{App, ChatMessage, ServerFavorite, Session, Settings};
 use crate::irc::IrcCommand;
 use crate::irc::client::SaslMechanism;
 use egui::{Color32, RichText, ScrollArea, TextEdit, Vec2};
@@ -1128,8 +1128,8 @@ impl Session {
     }
 
     pub fn show_channel_info_window(&mut self, ctx: &egui::Context) {
-        let channel_name = match &self.channel_info_target {
-            Some(name) => name.clone(),
+        let channel_name = match self.channel_info_target.and_then(|id| self.target_name(id)) {
+            Some(name) => name.to_string(),
             None => return,
         };
         let list_modes: Vec<char> = self.network_support.chanmodes_a.chars().collect();
@@ -1150,7 +1150,7 @@ impl Session {
             .resizable(true)
             .default_size([500.0, 400.0])
             .show(ctx, |ui| {
-                if let Some(ch) = self.channels.get(&channel_name) {
+                if let Some(ch) = self.conversations.get(&channel_name) {
                     // Channel name and modes
                     ui.horizontal(|ui| {
                         ui.label(RichText::new(&channel_name).strong().size(16.0));
@@ -1373,7 +1373,7 @@ impl Session {
                 lists_sent &= sent;
             }
             if modes_sent && lists_sent {
-                if let Some(ch) = self.channels.get_mut(&channel_name) {
+                if let Some(ch) = self.conversations.get_mut(&channel_name) {
                     ch.bans.clear();
                     ch.ban_list_complete = false;
                     ch.mode_lists.clear();
@@ -1534,11 +1534,15 @@ impl App {
             .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
-                    for (index, label) in ["Connection", "Display", "Automation", "Behavior", "About"]
-                        .into_iter()
-                        .enumerate()
+                    for (index, label) in
+                        ["Connection", "Display", "Automation", "Behavior", "About"]
+                            .into_iter()
+                            .enumerate()
                     {
-                        if ui.selectable_label(self.settings_tab == index, label).clicked() {
+                        if ui
+                            .selectable_label(self.settings_tab == index, label)
+                            .clicked()
+                        {
                             self.settings_tab = index;
                         }
                     }
@@ -1728,7 +1732,6 @@ impl App {
             );
         });
     }
-
 }
 
 #[cfg(test)]
@@ -1929,8 +1932,7 @@ mod tests {
         let mut app = app_with_dirty_connection_form();
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         let session = &mut app.sessions[0];
-        session.cmd_tx = Some(tx);
-        session.connected = true;
+        session.test_set_registered(tx);
         session.show_channel_list = true;
         session.list_min_users = 3;
 
@@ -1981,8 +1983,7 @@ mod tests {
     fn min_users_filter_is_fixed_for_a_whole_streaming_list_response() {
         let mut app = Session::with_settings(Settings::default());
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
-        app.cmd_tx = Some(tx);
-        app.connected = true;
+        app.test_set_registered(tx);
         app.list_min_users = 5;
 
         app.refresh_channel_list();
@@ -2010,8 +2011,7 @@ mod tests {
     fn slash_list_snapshots_the_min_users_filter_for_its_response() {
         let mut app = Session::with_settings(Settings::default());
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
-        app.cmd_tx = Some(tx);
-        app.connected = true;
+        app.test_set_registered(tx);
         app.list_min_users = 5;
 
         app.process_command("/list");
@@ -2037,7 +2037,10 @@ mod tests {
         assert_eq!(saved.server_favorites.len(), 3);
         let favorite = saved.server_favorites.last().unwrap();
         assert_eq!(favorite.name, "mine");
-        assert_eq!(favorite.password, "scratch-pass", "favorites keep credentials");
+        assert_eq!(
+            favorite.password, "scratch-pass",
+            "favorites keep credentials"
+        );
     }
 
     #[test]

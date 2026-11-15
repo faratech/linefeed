@@ -618,7 +618,8 @@ fn parse_log_line(line: &str) -> Option<ChatMessage> {
         // Regular message: "<nick> message"
         if let Some(end) = rest.find('>') {
             let nick = &rest[1..end];
-            let content = rest[end + 1..].trim_start();
+            let after_nick = &rest[end + 1..];
+            let content = after_nick.strip_prefix(' ').unwrap_or(after_nick);
             Some(ChatMessage {
                 timestamp,
                 server_time: None,
@@ -823,6 +824,40 @@ mod tests {
             assert_eq!(p.is_system, system);
             assert_eq!(p.is_action, action);
         }
+    }
+
+    #[test]
+    fn log_lines_preserve_payload_whitespace_in_every_timestamp_format() {
+        for timestamp in ["[09:30]", "[09:30:15]", "[06-14 09:30]"] {
+            for content in [
+                "  indented code",
+                "\t\tindented code",
+                " \t mixed \t ",
+                "   ",
+                "",
+            ] {
+                for (sender, system, action) in [
+                    ("alice", false, false),
+                    ("alice", false, true),
+                    ("*", true, false),
+                ] {
+                    let parsed = round_trip(&msg(timestamp, sender, content, system, action));
+                    assert_eq!(parsed.timestamp, timestamp);
+                    assert_eq!(parsed.content, content);
+                    assert_eq!(parsed.sender, sender);
+                    assert_eq!(parsed.is_system, system);
+                    assert_eq!(parsed.is_action, action);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn legacy_log_lines_without_a_separator_keep_the_payload() {
+        let parsed = parse_log_line("09:30 <alice>hello").unwrap();
+        assert_eq!(parsed.content, "hello");
+        let parsed = parse_log_line("09:30 <alice>\thello").unwrap();
+        assert_eq!(parsed.content, "\thello");
     }
 
     #[test]

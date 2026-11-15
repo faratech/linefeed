@@ -261,7 +261,12 @@ impl Controller {
         }
     }
     pub fn prepare_restart(&mut self, snapshot: crate::gui::UpdateSession) {
+        self.restart_requested = false;
         if self.staged.is_some() && !self.busy() {
+            if let Err(error) = install::validate_snapshot(&snapshot) {
+                self.status = Status::Error(error.to_string());
+                return;
+            }
             self.status = Status::Applying;
             self.send(Command::Prepare(Box::new(snapshot)));
         }
@@ -1028,7 +1033,10 @@ mod tests {
     }
     /// A valid Staged transaction on disk beside a stand-in executable.
     fn staged_fixture(version: &str) -> (std::path::PathBuf, Paths, Transaction) {
-        let root = std::env::temp_dir().join(format!("linefeed-updater-test-{}", install::nonce().unwrap()));
+        let root = std::env::temp_dir().join(format!(
+            "linefeed-updater-test-{}",
+            install::nonce().unwrap()
+        ));
         platform::private_dir(&root).unwrap();
         let paths = Paths {
             target: root.join("app"),
@@ -1053,6 +1061,47 @@ mod tests {
         tx.save().unwrap();
         (root, paths, tx)
     }
+
+    #[test]
+    fn oversized_restart_keeps_the_gui_running_and_can_be_retried() {
+        let (root, paths, staged) = staged_fixture("0.0.10");
+        let original_journal = fs::read(paths.journal()).unwrap();
+        let (sender, commands) = mpsc::channel();
+        let mut controller = Controller::default();
+        controller.status = Status::Ready;
+        controller.staged = Some(staged.clone());
+        controller.sender = Some(sender);
+        controller.restart_requested = true;
+        let mut snapshot = crate::gui::UpdateSession::default();
+        snapshot.set_input("x".repeat(install::MAX_JSON_STATE));
+        controller.prepare_restart(snapshot);
+
+        assert!(matches!(
+            &controller.status,
+            Status::Error(message) if message.contains("Save your unsent drafts")
+        ));
+        assert!(!controller.busy());
+        assert!(!controller.closing);
+        assert!(!controller.restart_requested);
+        assert!(controller.armed.is_none());
+        assert!(!controller.canceled.load(Ordering::Relaxed));
+        assert_eq!(controller.staged.as_ref().unwrap().attempt, staged.attempt);
+        assert!(matches!(
+            commands.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+        assert_eq!(fs::read(paths.journal()).unwrap(), original_journal);
+        assert!(!staged.snapshot().exists());
+
+        controller.prepare_restart(crate::gui::UpdateSession::default());
+        assert!(matches!(controller.status, Status::Applying));
+        assert!(matches!(commands.try_recv(), Ok(Command::Prepare(_))));
+        assert!(!controller.closing);
+        assert!(controller.armed.is_none());
+        drop(controller);
+        fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn a_staged_older_update_does_not_block_downloading_a_newer_offer() {
         // With automatic updates off, a staged 0.0.10 persists across launches;
@@ -1362,7 +1411,13 @@ mod tests {
         assert!(!controller.reset_available());
         assert!(!matches!(controller.status, Status::Error(_)));
         // The updater stays off until a restart re-reads the (now clean) state.
-        assert!(controller.install_reason.as_deref().unwrap().contains("Restart"));
+        assert!(
+            controller
+                .install_reason
+                .as_deref()
+                .unwrap()
+                .contains("Restart")
+        );
         drop(controller);
         let _ = fs::remove_dir_all(root);
     }
@@ -1393,13 +1448,18 @@ mod tests {
             while reader.read_line(&mut line).is_ok_and(|n| n > 0) && line != "\r\n" {
                 line.clear();
             }
-            let head = format!("HTTP/1.1 200 OK\r\nContent-Length: {parts}\r\nConnection: close\r\n\r\n");
+            let head =
+                format!("HTTP/1.1 200 OK\r\nContent-Length: {parts}\r\nConnection: close\r\n\r\n");
             if stream.write_all(head.as_bytes()).is_err() {
                 return;
             }
             for _ in 0..parts {
                 std::thread::sleep(pause);
-                if stream.write_all(b"x").and_then(|()| stream.flush()).is_err() {
+                if stream
+                    .write_all(b"x")
+                    .and_then(|()| stream.flush())
+                    .is_err()
+                {
                     return;
                 }
             }
@@ -1425,7 +1485,11 @@ mod tests {
                 }
                 for piece in pieces {
                     let piece = piece.replace("{base}", &host);
-                    if stream.write_all(piece.as_bytes()).and_then(|()| stream.flush()).is_err() {
+                    if stream
+                        .write_all(piece.as_bytes())
+                        .and_then(|()| stream.flush())
+                        .is_err()
+                    {
                         return;
                     }
                     std::thread::sleep(Duration::from_millis(100));
@@ -1447,19 +1511,19 @@ mod tests {
                 "Content-Type: text/html\r\nSet-Cookie: a=b\r\n\r\n0\r\n\r\n".to_owned(),
             ]
         };
-        let asset = vec!["HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nasset".to_owned()];
-        let base = scripted_server(vec![
-            redirect("{base}/hop"),
-            redirect("/asset"),
-            asset,
-        ]);
+        let asset = vec![
+            "HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nasset".to_owned(),
+        ];
+        let base = scripted_server(vec![redirect("{base}/hop"), redirect("/asset"), asset]);
         let agent = build_agent(None, false);
         let body = limited_body(response(&agent, &format!("{base}/download")).unwrap(), 1024);
         assert_eq!(body.unwrap(), b"asset");
     }
     #[test]
     fn redirects_are_bounded_and_require_a_location() {
-        let hop = || vec!["HTTP/1.1 302 Found\r\nContent-Length: 0\r\nLocation: /again\r\n\r\n".to_owned()];
+        let hop = || {
+            vec!["HTTP/1.1 302 Found\r\nContent-Length: 0\r\nLocation: /again\r\n\r\n".to_owned()]
+        };
         let base = scripted_server((0..7).map(|_| hop()).collect());
         let agent = build_agent(None, false);
         assert!(response(&agent, &format!("{base}/start")).is_err());
@@ -1470,16 +1534,25 @@ mod tests {
     }
     #[test]
     fn redirect_targets_resolve_against_the_current_url() {
-        let current: ureq::http::Uri = "https://github.com/o/r/releases/download/v1/a".parse().unwrap();
+        let current: ureq::http::Uri = "https://github.com/o/r/releases/download/v1/a"
+            .parse()
+            .unwrap();
         let header = |v: &str| ureq::http::HeaderValue::from_str(v).unwrap();
         assert_eq!(
-            redirect_target(&current, Some(&header("https://release-assets.githubusercontent.com/x?y=1")))
-                .unwrap()
-                .to_string(),
+            redirect_target(
+                &current,
+                Some(&header(
+                    "https://release-assets.githubusercontent.com/x?y=1"
+                ))
+            )
+            .unwrap()
+            .to_string(),
             "https://release-assets.githubusercontent.com/x?y=1"
         );
         assert_eq!(
-            redirect_target(&current, Some(&header("/elsewhere?q"))).unwrap().to_string(),
+            redirect_target(&current, Some(&header("/elsewhere?q")))
+                .unwrap()
+                .to_string(),
             "https://github.com/elsewhere?q"
         );
         assert!(redirect_target(&current, Some(&header("relative/path"))).is_none());

@@ -171,15 +171,15 @@ fn at_top_edge(area: Rect, pointer: Pos2) -> bool {
 }
 
 pub(crate) fn maximize_button_id(key: &WindowKey) -> Id {
-    Id::unique(("linefeed_snap_maximize", key.conn, key.target.clone()))
+    Id::unique(("linefeed_snap_maximize", key.conn, key.conversation))
 }
 
 pub(crate) fn close_button_id(key: &WindowKey) -> Id {
-    Id::unique(("linefeed_snap_close", key.conn, key.target.clone()))
+    Id::unique(("linefeed_snap_close", key.conn, key.conversation))
 }
 
 pub(crate) fn caption_id(key: &WindowKey) -> Id {
-    Id::unique(("linefeed_snap_caption", key.conn, key.target.clone()))
+    Id::unique(("linefeed_snap_caption", key.conn, key.conversation))
 }
 
 pub(crate) fn flyout_id() -> Id {
@@ -197,7 +197,7 @@ pub(crate) fn zone_id(grid: Id, layout: usize, zone: usize) -> Id {
 
 /// A window offered for a free zone by Snap Assist.
 pub(crate) fn assist_choice_id(zone: usize, key: &WindowKey) -> Id {
-    Id::unique(("linefeed_snap_assist", zone, key.conn, key.target.clone()))
+    Id::unique(("linefeed_snap_assist", zone, key.conn, key.conversation))
 }
 
 /// What the user did with a floating window's caption.
@@ -235,6 +235,60 @@ pub(crate) struct SnapUi {
     /// The layout bar a window was dragged to; `Rect::NOTHING` until drawn.
     pub(crate) bar: Option<Rect>,
     pub(crate) assist: Option<Assist>,
+}
+
+impl SnapUi {
+    pub(crate) fn merge_window(&mut self, survivor: WindowKey, retired: WindowKey) {
+        if let Some(drag) = &mut self.drag
+            && drag.key == retired
+        {
+            drag.key = survivor;
+        }
+        if let Some((key, _)) = &mut self.hover
+            && *key == retired
+        {
+            *key = survivor;
+        }
+        if self.dismissed == Some(retired) {
+            self.dismissed = Some(survivor);
+        }
+        if let Some((key, _)) = &mut self.flyout
+            && *key == retired
+        {
+            *key = survivor;
+        }
+        if let Some(assist) = &mut self.assist {
+            for key in &mut assist.placed {
+                if *key == retired {
+                    *key = survivor;
+                }
+            }
+            let mut seen = std::collections::HashSet::new();
+            assist.placed.retain(|key| seen.insert(*key));
+        }
+    }
+
+    pub(crate) fn forget_connection(&mut self, conn: super::windows::ConnId) {
+        if self.drag.as_ref().is_some_and(|drag| drag.key.conn == conn) {
+            self.drag = None;
+        }
+        if self.hover.as_ref().is_some_and(|(key, _)| key.conn == conn) {
+            self.hover = None;
+        }
+        if self.dismissed.is_some_and(|key| key.conn == conn) {
+            self.dismissed = None;
+        }
+        if self
+            .flyout
+            .as_ref()
+            .is_some_and(|(key, _)| key.conn == conn)
+        {
+            self.flyout = None;
+        }
+        if let Some(assist) = &mut self.assist {
+            assist.placed.retain(|key| key.conn != conn);
+        }
+    }
 }
 
 /// A zone of a layout grid the pointer is on, and one that was clicked, as
@@ -379,7 +433,7 @@ impl App {
             && let Some(window) = self.windows.get(key).and_then(|w| w.child_rect)
         {
             self.snap.drag = Some(Drag {
-                key: key.clone(),
+                key: *key,
                 grab: origin - window.min,
             });
             self.snap.flyout = None;
@@ -416,7 +470,7 @@ impl App {
         if let Some((key, _)) = self.snap.flyout.take() {
             self.snap.dismissed = Some(key);
         } else if let Some((key, _)) = &self.snap.hover {
-            self.snap.dismissed = Some(key.clone());
+            self.snap.dismissed = Some(*key);
         }
         self.snap.hover = None;
     }
@@ -449,13 +503,13 @@ impl App {
             Some((k, since)) if k == key => {
                 let waited = now - since;
                 if waited >= FLYOUT_DELAY {
-                    self.snap.flyout = Some((key.clone(), button.rect));
+                    self.snap.flyout = Some((*key, button.rect));
                 } else {
                     ctx.request_repaint_after(Duration::from_secs_f64(FLYOUT_DELAY - waited));
                 }
             }
             _ => {
-                self.snap.hover = Some((key.clone(), now));
+                self.snap.hover = Some((*key, now));
                 ctx.request_repaint_after(Duration::from_secs_f64(FLYOUT_DELAY));
             }
         }
@@ -471,11 +525,11 @@ impl App {
     pub(crate) fn snap_window(&mut self, key: &WindowKey, target: SnapTarget) {
         self.windows.mode = LayoutMode::Floating;
         self.windows.place(key, target.rect());
-        self.user_activate(key.clone());
+        self.user_activate(*key);
         let rest = target.rest();
         self.snap.assist = (!rest.is_empty()).then(|| Assist {
             zones: rest,
-            placed: vec![key.clone()],
+            placed: vec![*key],
         });
     }
 
@@ -496,7 +550,7 @@ impl App {
         let pointer = ctx.input(|i| i.pointer.latest_pos());
         let mut preview = None;
 
-        if let Some(key) = self.snap.drag.as_ref().map(|d| d.key.clone()) {
+        if let Some(key) = self.snap.drag.as_ref().map(|d| d.key) {
             let mut target = None;
             if let Some(p) = pointer {
                 let near_bar = self
@@ -532,7 +586,7 @@ impl App {
             }
         }
 
-        if let Some((key, anchor)) = self.snap.flyout.clone() {
+        if let Some((key, anchor)) = self.snap.flyout {
             if self.windows.get(&key).is_none_or(|w| w.detached) {
                 self.snap.flyout = None;
             } else {
@@ -679,7 +733,7 @@ impl App {
                                         visuals.text_color(),
                                     );
                                     if response.clicked() {
-                                        pick = Some((index, key.clone()));
+                                        pick = Some((index, key));
                                     }
                                 }
                             });
@@ -688,11 +742,11 @@ impl App {
         }
         if let Some((index, key)) = pick {
             // As on Windows, the window picked comes forward with focus.
-            self.windows.place(&key, zones[index]);
-            self.user_activate(key.clone());
+            self.windows.place(key, zones[index]);
+            self.user_activate(*key);
             if let Some(assist) = &mut self.snap.assist {
                 assist.zones.remove(index);
-                assist.placed.push(key);
+                assist.placed.push(*key);
             }
             return;
         }

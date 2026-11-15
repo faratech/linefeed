@@ -1,6 +1,7 @@
 mod app;
 mod commands;
 mod connection;
+mod conversations;
 mod dialogs;
 mod formatting;
 mod helpers;
@@ -10,13 +11,20 @@ mod types;
 mod view;
 mod windows;
 
+use connection::{ConnectionLifecycle, RecoveryPolicy};
+
 use egui::{Color32, RichText, ScrollArea};
 use std::collections::{HashMap, VecDeque};
+#[cfg(test)]
 use tokio::sync::mpsc;
 
 use crate::irc::client::{DESIRED_CAPS, SaslMechanism, ServerConfig};
 use crate::irc::numerics::*;
 use crate::irc::{IrcCommand, IrcMessage};
+pub use app::App;
+pub(crate) use app::MAIN_WINDOW_TITLE;
+pub(crate) use conversations::ConversationId;
+use conversations::ConversationStore;
 use formatting::{nick_color, render_segments};
 use helpers::{epoch_time_formatted, format_timestamp, mask_matches, truncate_chars};
 pub use types::{
@@ -25,8 +33,6 @@ pub use types::{
     UserMode,
 };
 use types::{CtcpReplyDecision, CtcpReplyLimiter};
-pub use app::App;
-pub(crate) use app::MAIN_WINDOW_TITLE;
 
 /// `/window` subcommands.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -81,8 +87,21 @@ pub(crate) enum SessionEvent {
     /// `/window ...`, typed in the window showing `target`.
     Window {
         command: WindowCommand,
-        target: Option<String>,
+        conversation: Option<ConversationId>,
     },
+    /// Mutable target metadata; runtime identity is unchanged.
+    ConversationRenamed {
+        id: ConversationId,
+        old: String,
+        new: String,
+    },
+    /// Redirect references once, then permanently invalidate the retired ID.
+    ConversationMerged {
+        survivor: ConversationId,
+        retired: ConversationId,
+    },
+    /// A new endpoint retires old target and status editing state.
+    EndpointChanged,
     /// A worker was not started because another session is live on the
     /// same endpoint.
     DuplicateEndpoint,
@@ -92,13 +111,6 @@ pub(crate) enum SessionEvent {
         port: String,
         use_tls: bool,
     },
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ConnectionIntent {
-    None,
-    ManualDisconnect,
-    ReconnectAfterClose,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -140,9 +152,14 @@ struct SessionConfig {
 pub struct UpdateSession {
     session: Option<SessionConfig>,
     reconnect: bool,
+    /// Initial connections and switches to another endpoint start their own
+    /// configured joins rather than restoring an established membership set.
+    fresh_connect: bool,
     tabs: Vec<(String, Option<String>, bool)>,
     selected: Option<String>,
     input: String,
+    /// Per-window drafts. Absent in older snapshots, which only carried input.
+    drafts: Option<Vec<(Option<String>, String)>>,
     away: Option<String>,
     /// Every other session, each a snapshot of the same shape (with no
     /// `others` of its own). Older binaries ignore this and restore only
@@ -160,6 +177,14 @@ impl UpdateSession {
 
     pub(crate) fn set_input(&mut self, input: String) {
         self.input = input;
+    }
+
+    pub(crate) fn set_drafts(&mut self, drafts: Vec<(Option<String>, String)>) {
+        self.drafts = Some(drafts);
+    }
+
+    pub(crate) fn take_drafts(&mut self) -> Option<Vec<(Option<String>, String)>> {
+        self.drafts.take()
     }
 
     pub(crate) fn set_others(&mut self, others: Vec<UpdateSession>) {
@@ -296,6 +321,14 @@ impl SessionConfig {
     }
 }
 
+/// Logical payloads that were queued successfully; deliberately not Debug:
+/// service messages may contain credentials.
+#[derive(Default)]
+struct TextSendOutcome {
+    complete: bool,
+    payloads: Vec<String>,
+}
+
 const IRC_MAX_LINE_BYTES: usize = 510;
 pub(crate) const PROJECT_SOURCE_URL: &str = "https://github.com/faratech/linefeed";
 const COMMAND_COMPLETIONS: &[&str] = &[
@@ -424,14 +457,19 @@ pub(crate) fn apply_font_size(ctx: &egui::Context, font_size: f32) {
 }
 
 pub struct Session {
-    update_rejoins: Option<Vec<(String, Option<String>)>>,
+    /// Outstanding memberships to recover on this endpoint. Some(empty)
+    /// deliberately suppresses configured auto-join after a registered loss.
+    pending_rejoins: RecoveryPolicy,
+    /// Successfully queued PARTs that the current server has not confirmed.
+    /// They must not become recovery JOINs if that transport disappears.
+    pending_parts: Vec<String>,
+    /// Deliberate PART/JOIN cycles retain their conversation identity.
+    pending_cycles: std::collections::HashSet<ConversationId>,
     update_selected: Option<String>,
     update_join_targets: Vec<String>,
-    // Connection state
-    pub connected: bool,
-    pub connecting: bool,
+    // The phase owns the worker, transport and any replacement connection.
+    connection: ConnectionLifecycle,
     pub my_nick: String,
-    pub connection_intent: ConnectionIntent,
 
     // Server config
     pub server_host: String,
@@ -443,15 +481,14 @@ pub struct Session {
     pub realname: String,
     pub password: String,
 
-    // Immutable active/pending connection snapshots. `pending_session` is used
-    // while an old socket closes so its final messages retain the old identity.
+    // Immutable identity of the currently displayed endpoint. A replacement
+    // belongs to the Closing phase until the old worker has exited.
     active_session: Option<SessionConfig>,
-    pending_session: Option<SessionConfig>,
     connection_error: Option<String>,
 
     // Channels and messages
-    pub channels: HashMap<String, Channel>,
-    pub current_channel: Option<String>,
+    conversations: ConversationStore,
+    pub(crate) current_conversation: Option<ConversationId>,
     pub server_messages: VecDeque<ChatMessage>,
     pub server_unread: usize,
 
@@ -459,16 +496,6 @@ pub struct Session {
     pub input_text: String,
     pub join_channel: String,
 
-    // Communication channels
-    pub cmd_tx: Option<mpsc::UnboundedSender<IrcCommand>>,
-    pub msg_rx: Option<mpsc::Receiver<IrcMessage>>,
-    // Receiver of a connection that was told to QUIT, kept (unread) until its
-    // worker has flushed the QUIT and exited, so the worker is not cancelled
-    // before the QUIT reaches the wire. See request_manual_disconnect.
-    pub(crate) closing_rx: Option<(mpsc::Receiver<IrcMessage>, std::time::Instant)>,
-    /// This session's connection worker thread, if one is running or has
-    /// exited without being observed yet (see `connection.rs`).
-    pub(crate) worker: Option<std::thread::JoinHandle<()>>,
     /// Identifies this session to the window manager; never reused.
     pub(crate) id: windows::ConnId,
     /// The network profile (server favorite) this session was started from.
@@ -536,14 +563,8 @@ pub struct Session {
     // Window focus tracking (for notifications)
     pub window_focused: bool,
 
-    // Auto-reconnect state
-    pub reconnect_attempts: u32,
-    pub last_disconnect_time: Option<std::time::Instant>,
-    pub connection_lost: bool,
-
     // Ignore list
     pub ignore_list: Vec<String>,
-
 
     // Auto-perform commands (newline-separated)
     pub auto_perform: String,
@@ -552,7 +573,6 @@ pub struct Session {
 
     // Pending auto-perform (to execute after connect)
     pub pending_auto_perform: Option<Vec<String>>,
-
 
     // Pending channel keys (for storing key when joining +k channels)
     pub pending_channel_keys: HashMap<String, String>,
@@ -637,8 +657,7 @@ pub struct Session {
 
     // Channel info dialog
     pub show_channel_info: bool,
-    pub channel_info_target: Option<String>,
-
+    pub(crate) channel_info_target: Option<ConversationId>,
 
     // Lag meter
     pub lag_ms: Option<u32>,
@@ -651,7 +670,6 @@ pub struct Session {
 
     // CPU optimization state
     pub had_messages_this_frame: bool,
-
 
     nick_retry_attempts: u8,
     /// Nicks this client has held this session (newest first, capped). Own
@@ -670,7 +688,7 @@ pub struct Session {
     /// Memoized switchbar tab order with the fingerprint it was sorted
     /// under: the order is rebuilt every frame, but the tab set (and the
     /// casemapping that orders it) rarely changes.
-    tab_order_cache: std::cell::RefCell<Option<(u64, Vec<Option<String>>)>>,
+    tab_order_cache: std::cell::RefCell<Option<(u64, Vec<Option<ConversationId>>)>>,
 }
 
 impl Default for Session {
@@ -692,13 +710,13 @@ impl Session {
         let self_nick_keys = vec![my_nick_lower.clone()];
 
         Self {
-            update_rejoins: None,
+            pending_rejoins: RecoveryPolicy::ConfiguredAutoJoin,
+            pending_parts: Vec::new(),
+            pending_cycles: std::collections::HashSet::new(),
             update_selected: None,
             update_join_targets: Vec::new(),
-            connected: false,
-            connecting: false,
+            connection: ConnectionLifecycle::default(),
             my_nick: nickname.clone(),
-            connection_intent: ConnectionIntent::None,
 
             server_host: settings.server_host,
             server_port: settings.server_port,
@@ -709,21 +727,16 @@ impl Session {
             realname: settings.realname,
             password: settings.password,
             active_session: None,
-            pending_session: None,
             connection_error: None,
 
-            channels: HashMap::new(),
-            current_channel: None,
+            conversations: ConversationStore::default(),
+            current_conversation: None,
             server_messages: VecDeque::new(),
             server_unread: 0,
 
             input_text: String::new(),
             join_channel: String::new(),
 
-            cmd_tx: None,
-            msg_rx: None,
-            closing_rx: None,
-            worker: None,
             id: 0,
             profile_id: None,
             form_profile: None,
@@ -764,10 +777,6 @@ impl Session {
 
             window_focused: true,
 
-            reconnect_attempts: 0,
-            last_disconnect_time: None,
-            connection_lost: false,
-
             // Cached lowercase versions (computed before moving owned values)
             my_nick_lower,
             ignore_list_lower: settings
@@ -787,7 +796,6 @@ impl Session {
             pre_away_message: settings.pre_away_message,
             persistence_profile: settings.persistence_profile,
             pending_auto_perform: None,
-
 
             pending_channel_keys: HashMap::new(),
             join_focus_requests: Vec::new(),
@@ -853,7 +861,6 @@ impl Session {
 
             show_channel_info: false,
             channel_info_target: None,
-
 
             // Lag meter
             lag_ms: None,
@@ -985,80 +992,47 @@ impl Session {
         false
     }
 
-    /// Calculate reconnect delay with exponential backoff (1s, 2s, 4s, 8s, max 60s)
+    /// Exponential reconnect delay, preserving the configured base and 120s cap.
     pub fn get_reconnect_delay(&self) -> std::time::Duration {
-        let base_delay = self.reconnect_delay_secs as u64;
-        let max_delay = 120u64;
-        // Exponential backoff: delay * 2^attempt, capped at max_delay
-        let delay = base_delay.saturating_mul(2u64.saturating_pow(self.reconnect_attempts.min(6)));
-        std::time::Duration::from_secs(delay.min(max_delay))
+        let delay = u64::from(self.reconnect_delay_secs)
+            .saturating_mul(2u64.saturating_pow(self.connection.attempts().min(6)));
+        std::time::Duration::from_secs(delay.min(120))
     }
 
-    /// Check if we should attempt reconnection now
     pub fn should_reconnect(&self) -> bool {
-        if !self.awaiting_reconnect() {
-            return false;
-        }
-
-        if let Some(disconnect_time) = self.last_disconnect_time {
-            let elapsed = disconnect_time.elapsed();
-            let delay = self.get_reconnect_delay();
-            elapsed >= delay
-        } else {
-            true
-        }
+        self.awaiting_reconnect()
+            && self
+                .connection
+                .failed_at()
+                .is_none_or(|failed| failed.elapsed() >= self.get_reconnect_delay())
     }
 
-    /// Whether an auto-reconnect retry is still pending (regardless of whether
-    /// its backoff deadline has passed). The event loop must keep polling while
-    /// this is true: on an idle visible window nothing else wakes the frame to
-    /// observe the deadline.
     pub fn awaiting_reconnect(&self) -> bool {
         self.auto_reconnect
-            && self.connection_lost
-            && !self.connecting
-            && self.reconnect_attempts < self.max_reconnect_attempts
+            && self.connection.connection_lost()
+            && self.connection.attempts() < self.max_reconnect_attempts
     }
 
-    /// Reset reconnection state (called on successful connect)
-    pub fn reset_reconnect_state(&mut self) {
-        self.reconnect_attempts = 0;
-        self.last_disconnect_time = None;
-        self.connection_lost = false;
-    }
-
-    /// Mark connection as lost (called on disconnect)
     pub fn mark_connection_lost(&mut self) {
-        // Drain any still-buffered incoming messages before dropping the receiver,
-        // so the last lines the server sent before the disconnect are not lost.
-        if let Some(mut rx) = self.msg_rx.take() {
-            while let Ok(msg) = rx.try_recv() {
-                self.handle_incoming_message(msg);
-            }
+        if self.connection.is_closing() {
+            return;
         }
-        self.connected = false;
-        self.connection_lost = true;
-        self.last_disconnect_time = Some(std::time::Instant::now());
-        self.cmd_tx = None;
-        self.msg_rx = None;
+        self.pump(None);
+        self.capture_rejoin_memberships();
+        self.connection
+            .enter_retry_wait(Some(std::time::Instant::now()));
         self.lag_ms = None;
         self.ping_sent_time = None;
         self.mark_channel_tabs_unjoined();
     }
 
-    /// Prepare for reconnection attempt
     pub fn start_reconnect(&mut self) {
-        self.reconnect_attempts += 1;
-        // Every fresh registration gets a fresh 433 walkaway budget; the
-        // auto-reconnect path never re-enters activate_session, so the
-        // reset cannot live only there (#173).
+        let attempts = self.connection.attempts().saturating_add(1);
         self.nick_retry_attempts = 0;
-        self.connecting = true;
-        self.connection_lost = false;
+        self.queue_current_connection(attempts);
         let delay = self.get_reconnect_delay();
         self.add_server_message(ChatMessage::system(&format!(
-            "Reconnecting... (attempt {}, next retry in {:?})",
-            self.reconnect_attempts, delay
+            "Reconnecting... (attempt {attempts}, next retry in {delay:?})"
         )));
     }
 
@@ -1079,20 +1053,12 @@ impl Session {
     /// whether more were left queued. Logged lines are flushed once per call
     /// instead of once per message.
     pub(crate) fn pump(&mut self, limit: Option<usize>) -> bool {
-        let messages: Vec<_> = match &mut self.msg_rx {
-            Some(rx) => {
-                let incoming = std::iter::from_fn(|| rx.try_recv().ok());
-                match limit {
-                    // One extra detects that more are pending.
-                    Some(limit) => incoming.take(limit + 1).collect(),
-                    None => incoming.collect(),
-                }
-            }
-            None => Vec::new(),
-        };
-        let has_more = limit.is_some_and(|limit| messages.len() > limit);
+        let (generation, messages, has_more) = self.connection.take_messages(limit);
         self.had_messages_this_frame = !messages.is_empty();
         for msg in messages {
+            if !generation.is_some_and(|generation| self.connection.can_dispatch(generation)) {
+                break;
+            }
             self.handle_incoming_message(msg);
         }
         self.log_manager.flush_all();
@@ -1127,7 +1093,7 @@ impl Session {
     /// The user is looking at the selected tab (or the server buffer): clear
     /// its unread badge and report it read.
     fn mark_selected_tab_seen(&mut self) {
-        match self.current_channel.clone() {
+        match self.current_target_name().map(str::to_owned) {
             Some(target) => {
                 if let Some(channel) = self.channel_mut(&target) {
                     channel.unread = 0;
@@ -1163,7 +1129,7 @@ impl Session {
         }
 
         // Check for idle timeout and set auto-away
-        if self.connected && self.away_status.is_none() && self.auto_away_enabled {
+        if self.is_connected() && self.away_status.is_none() && self.auto_away_enabled {
             let idle_duration = self.last_activity.elapsed();
             let timeout = std::time::Duration::from_secs(self.auto_away_minutes as u64 * 60);
             if idle_duration >= timeout {
@@ -1176,7 +1142,7 @@ impl Session {
         }
 
         // Lag meter - send PING every 30 seconds when connected
-        if self.connected && self.last_lag_check.elapsed().as_secs() >= 30 {
+        if self.is_connected() && self.last_lag_check.elapsed().as_secs() >= 30 {
             self.last_lag_check = std::time::Instant::now();
             self.ping_sent_time = Some(std::time::Instant::now());
             self.send_command(IrcCommand::Ping("LAG".to_string()));
@@ -1245,22 +1211,86 @@ impl Session {
         self.events.push(SessionEvent::SaveConfig);
     }
 
+    pub(crate) fn update_changes_endpoint(&self) -> bool {
+        self.connection.staged_config().is_some_and(|pending| {
+            self.active_session
+                .as_ref()
+                .is_none_or(|active| active.endpoint_key() != pending.endpoint_key())
+        })
+    }
+
     pub fn update_session(&self) -> UpdateSession {
-        let mut session = self.active_session.clone();
-        if let Some(session) = &mut session {
+        let staged = self.connection.staged_config();
+        let changes_endpoint = self.update_changes_endpoint();
+        let changes_identity = staged.is_some_and(|pending| {
+            self.active_session.as_ref().is_some_and(|active| {
+                active.services_identity_key() != pending.services_identity_key()
+            })
+        });
+        let mut session = staged.cloned().or_else(|| self.active_session.clone());
+        if staged.is_none()
+            && let Some(session) = &mut session
+        {
             session.server.nick = self.my_nick.clone();
+        }
+        let mut tabs: Vec<_> = self
+            .conversations
+            .iter()
+            .map(|(name, channel)| {
+                let pending = self.pending_rejoins.as_ref().and_then(|rejoins| {
+                    rejoins
+                        .iter()
+                        .find(|(target, _)| self.identifiers_equal(target, name))
+                });
+                let key = if channel.joined {
+                    channel.key.clone()
+                } else {
+                    pending.map_or_else(|| channel.key.clone(), |(_, key)| key.clone())
+                };
+                (
+                    name.clone(),
+                    key,
+                    !self.is_parting(name) && (channel.joined || pending.is_some()),
+                )
+            })
+            .collect();
+        if let Some(rejoins) = self.pending_rejoins.as_ref() {
+            for (name, key) in rejoins.iter().filter(|(name, _)| !self.is_parting(name)) {
+                if !tabs
+                    .iter()
+                    .any(|(target, _, _)| self.identifiers_equal(target, name))
+                {
+                    tabs.push((name.clone(), key.clone(), true));
+                }
+            }
+        }
+        if changes_endpoint {
+            tabs.clear();
         }
         UpdateSession {
             session,
-            reconnect: self.connected || self.connecting || self.awaiting_reconnect(),
-            tabs: self
-                .channels
-                .iter()
-                .map(|(name, channel)| (name.clone(), channel.key.clone(), channel.joined))
-                .collect(),
-            selected: self.current_channel.clone(),
-            input: self.input_text.clone(),
-            away: self.away_status.clone(),
+            reconnect: self.is_connected()
+                || self.has_pending_connect()
+                || self.awaiting_reconnect(),
+            fresh_connect: changes_endpoint
+                || (!self.is_connected()
+                    && self.pending_rejoins.is_none()
+                    && self.conversations.values().all(|channel| !channel.joined)),
+            tabs,
+            selected: (!changes_endpoint)
+                .then(|| self.current_target_name().map(str::to_owned))
+                .flatten(),
+            input: if changes_endpoint {
+                String::new()
+            } else {
+                self.input_text.clone()
+            },
+            drafts: None,
+            away: if changes_endpoint || changes_identity {
+                None
+            } else {
+                self.away_status.clone()
+            },
             others: Vec::new(),
             active_position: 0,
         }
@@ -1295,34 +1325,30 @@ impl Session {
                     ));
                 channel.history_loaded = !channel.messages.is_empty();
             }
-            self.channels.insert(name, channel);
+            self.conversations.insert(name, channel);
         }
         self.update_join_targets = rejoins.iter().map(|(name, _)| name.clone()).collect();
-        self.update_rejoins = Some(rejoins);
-        self.current_channel = snapshot.selected.clone();
+        self.pending_rejoins = if snapshot.fresh_connect {
+            RecoveryPolicy::ConfiguredAutoJoin
+        } else {
+            RecoveryPolicy::ExactMemberships(rejoins)
+        };
+        self.current_conversation = snapshot
+            .selected
+            .as_deref()
+            .and_then(|target| self.id_for_target(target));
         self.update_selected = snapshot.selected;
         self.input_text = snapshot.input;
         self.away_status = snapshot.away;
-        self.connecting = snapshot.reconnect && self.active_session.is_some();
+        if snapshot.reconnect && self.active_session.is_some() {
+            self.queue_current_connection(0);
+        }
         self.show_connect_dialog = false;
     }
 
     pub fn prepare_update_shutdown(&mut self) {
-        // The App saves settings; this only winds the connection down.
         self.log_manager.flush_all();
-        self.connection_intent = ConnectionIntent::ManualDisconnect;
-        self.pending_session = None;
-        if self.cmd_tx.is_some() {
-            self.send_command(IrcCommand::Quit(Self::clamp_quit_reason(Some(
-                self.quit_message.clone(),
-            ))));
-        }
-        self.cmd_tx = None;
-        // Keep the incoming receiver alive until the connection thread has
-        // flushed QUIT. Dropping it here could cancel the writer first.
-        self.connected = false;
-        self.connecting = false;
-        self.connection_lost = false;
+        self.close_connection(Some(self.quit_message.clone()), false);
     }
 
     /// Update cached lowercase versions of strings for efficient comparison
@@ -1444,22 +1470,101 @@ impl Session {
     /// Return the display-preserving key already used for an IRC target.
     /// `HashMap<String, _>` itself is byte-sensitive, so every lookup must pass
     /// through negotiated CASEMAPPING to avoid duplicate channel/query tabs.
+    pub(crate) fn id_for_target(&self, name: &str) -> Option<ConversationId> {
+        self.conversations
+            .lookup(name)
+            .filter(|id| {
+                self.target_name(*id)
+                    .is_some_and(|target| self.identifiers_equal(target, name))
+            })
+            .or_else(|| {
+                self.conversations.ids().find(|id| {
+                    self.target_name(*id)
+                        .is_some_and(|target| self.identifiers_equal(target, name))
+                })
+            })
+    }
+
+    pub(crate) fn target_name(&self, id: ConversationId) -> Option<&str> {
+        self.conversations.target(id)
+    }
+
+    pub(crate) fn conversation_channel(&self, id: ConversationId) -> Option<&Channel> {
+        self.conversations.channel(id)
+    }
+
+    pub(crate) fn conversation_channel_mut(&mut self, id: ConversationId) -> Option<&mut Channel> {
+        self.conversations.channel_mut(id)
+    }
+
+    pub(crate) fn conversation_ids(&self) -> Vec<ConversationId> {
+        self.conversations.ids().collect()
+    }
+
+    pub(crate) fn current_target_name(&self) -> Option<&str> {
+        self.current_conversation
+            .and_then(|id| self.target_name(id))
+    }
+
+    pub(crate) fn current_target(&self) -> Option<&str> {
+        self.current_target_name()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn ensure_target(&mut self, name: &str) -> ConversationId {
+        if let Some(id) = self.id_for_target(name) {
+            return id;
+        }
+        let mut channel = Channel::new();
+        channel.set_case_mapping(self.network_support.case_mapping);
+        channel.set_prefix_schema(
+            &self.network_support.prefix_modes,
+            &self.network_support.user_prefixes,
+        );
+        self.conversations.insert(name.to_owned(), channel);
+        self.id_for_target(name).unwrap()
+    }
+
+    pub(crate) fn select_target(&mut self, name: &str) -> bool {
+        let Some(id) = self.id_for_target(name) else {
+            return false;
+        };
+        self.current_conversation = Some(id);
+        true
+    }
+
+    pub(crate) fn select_conversation(&mut self, id: Option<ConversationId>) -> bool {
+        if id.is_some_and(|id| self.target_name(id).is_none()) {
+            return false;
+        }
+        self.current_conversation = id;
+        true
+    }
+
     fn channel_key(&self, name: &str) -> Option<String> {
-        let wanted = self.network_support.canonicalize(name);
-        self.channels
-            .keys()
-            .find(|key| self.network_support.canonicalize(key) == wanted)
-            .cloned()
+        self.id_for_target(name)
+            .and_then(|id| self.target_name(id))
+            .map(str::to_owned)
     }
 
     fn channel_mut(&mut self, name: &str) -> Option<&mut Channel> {
         let key = self.channel_key(name)?;
-        self.channels.get_mut(&key)
+        self.conversations.get_mut(&key)
     }
 
     fn remove_channel(&mut self, name: &str) -> Option<Channel> {
+        self.forget_rejoin_membership(name);
         let key = self.channel_key(name)?;
-        let removed = self.channels.remove(&key);
+        let id = self.id_for_target(&key)?;
+        let removed = self.conversations.remove(&key);
+        self.pending_cycles.remove(&id);
+        if self.current_conversation == Some(id) {
+            self.current_conversation = self.conversations.ids().next();
+        }
+        if self.channel_info_target == Some(id) {
+            self.channel_info_target = None;
+            self.show_channel_info = false;
+        }
         self.prune_known_users();
         removed
     }
@@ -1471,7 +1576,7 @@ impl Session {
     fn prune_known_users(&mut self) {
         let mut referenced = self.monitored_users.clone();
         referenced.insert(self.network_support.canonicalize(&self.my_nick));
-        for (name, channel) in &self.channels {
+        for (name, channel) in &self.conversations {
             // A query tab is named after its partner.
             referenced.insert(self.network_support.canonicalize(name));
             referenced.extend(
@@ -1492,7 +1597,7 @@ impl Session {
             return false;
         }
         if let Some(existing) = self.channel_key(target) {
-            self.current_channel = Some(existing);
+            self.select_target(&existing);
             return true;
         }
 
@@ -1504,7 +1609,7 @@ impl Session {
             ),
         );
         if let Some(created) = self.channel_key(target) {
-            self.current_channel = Some(created);
+            self.select_target(&created);
             true
         } else {
             false
@@ -1512,41 +1617,94 @@ impl Session {
     }
 
     fn current_target_is(&self, target: &str) -> bool {
-        self.current_channel
-            .as_deref()
+        self.current_target_name()
             .is_some_and(|current| self.identifiers_equal(current, target))
     }
 
     fn mark_target_read(&mut self, target: &str) {
-        if !self.connected || !self.enabled_caps.contains("draft/read-marker") {
+        if !self.is_connected() || !self.enabled_caps.contains("draft/read-marker") {
             return;
         }
         let Some(key) = self.channel_key(target) else {
             return;
         };
-        let timestamp = self.channels.get(&key).and_then(|channel| {
+        let timestamp = self.conversations.get(&key).and_then(|channel| {
             channel
                 .messages
                 .iter()
-                .rev()
-                .find_map(|message| message.server_time.clone())
+                .filter_map(|message| message.server_time.as_ref())
+                .max()
+                .cloned()
         });
         let Some(timestamp) = timestamp else {
             return;
         };
-        let marker = format!("timestamp={timestamp}");
-        if self.channels[&key].read_marker.as_deref() == Some(marker.as_str()) {
+        // A server marker can be newer than the rows retained locally (for
+        // example after loading an older page or redacting the newest row).
+        // Automatic marking must never move that known read position back.
+        if self.conversations[&key]
+            .read_marker
+            .as_deref()
+            .and_then(|marker| marker.strip_prefix("timestamp="))
+            .is_some_and(|previous| previous >= timestamp.as_str())
+        {
             return;
         }
+        let marker = format!("timestamp={timestamp}");
         if self.send_command(IrcCommand::Markread(key.clone(), Some(marker.clone())))
-            && let Some(channel) = self.channels.get_mut(&key)
+            && let Some(channel) = self.conversations.get_mut(&key)
         {
             channel.read_marker = Some(marker);
         }
     }
 
+    /// Remember actual memberships before a registered transport is retired.
+    /// Preserve unconfirmed recovery JOINs when another retry fails early.
+    fn capture_rejoin_memberships(&mut self) {
+        if !self.is_connected()
+            && self.pending_rejoins.is_none()
+            && !self.conversations.values().any(|channel| channel.joined)
+        {
+            return;
+        }
+        let mut rejoins = self.pending_rejoins.take().unwrap_or_default();
+        for (name, channel) in &self.conversations {
+            if !channel.joined || self.is_parting(name) {
+                continue;
+            }
+            if let Some(existing) = rejoins
+                .iter_mut()
+                .find(|(target, _)| self.network_support.identifiers_equal(target, name))
+            {
+                existing.clone_from(&(name.clone(), channel.key.clone()));
+            } else {
+                rejoins.push((name.clone(), channel.key.clone()));
+            }
+        }
+        self.pending_rejoins = RecoveryPolicy::ExactMemberships(rejoins);
+    }
+
+    fn forget_rejoin_membership(&mut self, name: &str) {
+        if let Some(rejoins) = self.pending_rejoins.as_mut() {
+            let support = &self.network_support;
+            rejoins.retain(|(target, _)| !support.identifiers_equal(target, name));
+        }
+    }
+
+    fn is_parting(&self, name: &str) -> bool {
+        self.pending_parts
+            .iter()
+            .any(|target| self.identifiers_equal(target, name))
+    }
+
+    fn forget_part_intent(&mut self, name: &str) {
+        let support = &self.network_support;
+        self.pending_parts
+            .retain(|target| !support.identifiers_equal(target, name));
+    }
+
     fn mark_channel_tabs_unjoined(&mut self) {
-        for channel in self.channels.values_mut() {
+        for channel in self.conversations.values_mut() {
             channel.joined = false;
             channel.abandon_user_burst();
             channel.abandon_mode_list_bursts();
@@ -1559,7 +1717,7 @@ impl Session {
             return true;
         }
         self.channel_key(target)
-            .and_then(|key| self.channels.get(&key))
+            .and_then(|key| self.conversations.get(&key))
             // An explicit target without an open tab may be a channel that
             // permits external messages. Only a retained, known-stale tab is
             // blocked locally.
@@ -1568,8 +1726,14 @@ impl Session {
 
     fn refresh_case_mapping_state(&mut self) {
         let mapping = self.network_support.case_mapping;
-        for channel in self.channels.values_mut() {
+        self.conversations
+            .provisional_support(&self.network_support);
+        for channel in self.conversations.values_mut() {
             channel.set_case_mapping(mapping);
+        }
+        for (survivor, retired, channel) in self.conversations.set_mapping(mapping) {
+            self.merge_conversation_payload(survivor, channel);
+            self.redirect_conversation(survivor, retired);
         }
         self.my_nick_lower = self.network_support.canonicalize(&self.my_nick);
         self.refresh_self_nick_keys();
@@ -1586,6 +1750,8 @@ impl Session {
 
     fn reset_connection_support(&mut self) {
         self.network_support = NetworkSupport::default();
+        self.conversations
+            .provisional_support(&self.network_support);
         // The ignore/highlight keys were folded under the old network's
         // CASEMAPPING; a new network that advertises the default never
         // triggers refresh_case_mapping_state, so rebuild them here (#249).
@@ -1603,6 +1769,11 @@ impl Session {
     /// the next batch for that target, and leaked batches eventually stop new
     /// history from being collected (#248).
     fn reset_per_connection_state(&mut self) {
+        self.pending_cycles.clear();
+        // Recovery membership was captured before retiring the old socket,
+        // excluding its unconfirmed PARTs. Its acknowledgments cannot arrive
+        // on this socket, and no retained tab is still marked joined.
+        self.pending_parts.clear();
         self.enabled_caps.clear();
         self.chathistory_enabled = false;
         self.chathistory_limit = None;
@@ -1616,9 +1787,14 @@ impl Session {
         self.next_whox_token = 1;
         self.ctcp_reply_limiter = CtcpReplyLimiter::default();
         // A NAMES burst or mode-list reply the old socket never finished.
-        for channel in self.channels.values_mut() {
+        for channel in self.conversations.values_mut() {
             channel.abandon_user_burst();
             channel.abandon_mode_list_bursts();
+            // Only the transport that queued a local row can confirm it.
+            // A new socket's identical send must acquire its own identity.
+            for message in &mut channel.messages {
+                message.pending_echo = false;
+            }
         }
         // Keys of JOINs the old socket never confirmed: the new connection's
         // JOINs carry their own.
@@ -1632,7 +1808,6 @@ impl Session {
         // The previous worker has exited, so any intent still recorded is
         // stale (e.g. a disconnect issued while no worker was left to consume
         // it) and must not be applied to this worker's exit (#247).
-        self.connection_intent = ConnectionIntent::None;
         self.reset_per_connection_state();
     }
 
@@ -1826,7 +2001,7 @@ impl Session {
         let limit = self.history_page_limit(total);
         let reference = if placement == HistoryPlacement::Append {
             self.channel_key(target)
-                .and_then(|key| self.channels.get(&key))
+                .and_then(|key| self.conversations.get(&key))
                 .and_then(|channel| {
                     channel
                         .messages
@@ -1874,17 +2049,17 @@ impl Session {
                 &self.network_support.prefix_modes,
                 &self.network_support.user_prefixes,
             );
-            self.channels.insert(target.to_string(), channel);
+            self.conversations.insert(target.to_string(), channel);
             target.to_string()
         };
-        self.current_channel = Some(key);
+        self.select_target(&key);
     }
 
     fn load_local_history_fallback(&mut self, target: &str) -> Option<VecDeque<ChatMessage>> {
         if !self.logging_load_history
             || self
                 .channel_key(target)
-                .and_then(|key| self.channels.get(&key))
+                .and_then(|key| self.conversations.get(&key))
                 .is_some_and(|channel| channel.history_loaded)
         {
             return None;
@@ -1934,7 +2109,7 @@ impl Session {
         );
         history.extend(local);
         if let Some(key) = self.channel_key(target)
-            && let Some(channel) = self.channels.get_mut(&key)
+            && let Some(channel) = self.conversations.get_mut(&key)
         {
             channel.history_loaded = true;
         }
@@ -2068,6 +2243,15 @@ impl Session {
         if self.is_ignored(&batch.sender, batch.sender_prefix.as_deref()) {
             return;
         }
+        // Notices have explicit local confirmation rows, just like the
+        // non-multiline NOTICE handler. Historical notices still replay.
+        if batch.is_notice
+            && batch.parent_history.is_none()
+            && self.enabled_caps.contains("echo-message")
+            && self.identifiers_equal(&batch.sender, &self.my_nick)
+        {
+            return;
+        }
         let is_action = batch.content.starts_with("\x01ACTION ") && batch.content.ends_with('\x01');
         let content = if is_action {
             batch
@@ -2146,26 +2330,20 @@ impl Session {
             return false;
         };
         // Echoes arrive in send order, so pair with the oldest unconfirmed
-        // matching row inside the recent window; searching newest-first would
+        // matching retained row; searching newest-first would
         // swap msgid/time between identical consecutive sends. Only rows this
         // session sent are candidates: rows loaded from the local log also
         // lack a msgid and server-time, and stamping one of those would
         // leave the new row unconfirmed.
-        let window_start = channel.messages.len().saturating_sub(32);
-        let Some(local) = channel
-            .messages
-            .iter_mut()
-            .skip(window_start)
-            .find(|candidate| {
-                candidate.pending_echo
-                    && !candidate.is_system
-                    && candidate.msgid.is_none()
-                    && candidate.server_time.is_none()
-                    && candidate.sender.eq_ignore_ascii_case(&echoed.sender)
-                    && candidate.content == echoed.content
-                    && candidate.is_action == echoed.is_action
-            })
-        else {
+        let Some(local) = channel.messages.iter_mut().find(|candidate| {
+            candidate.pending_echo
+                && !candidate.is_system
+                && candidate.msgid.is_none()
+                && candidate.server_time.is_none()
+                && candidate.sender.eq_ignore_ascii_case(&echoed.sender)
+                && candidate.content == echoed.content
+                && candidate.is_action == echoed.is_action
+        }) else {
             return false;
         };
         local.pending_echo = false;
@@ -2262,6 +2440,84 @@ impl Session {
         )
     }
 
+    /// Sort only timestamped slots. Comparing an untagged row as Equal to
+    /// every tagged row is not a total order, and also fails to keep those
+    /// untagged rows at stable positions within a history page.
+    fn order_history_page(messages: Vec<ChatMessage>) -> Vec<ChatMessage> {
+        let mut slots = Vec::with_capacity(messages.len());
+        let mut timed = Vec::new();
+        for message in messages {
+            if message.server_time.is_some() {
+                timed.push(message);
+                slots.push(None);
+            } else {
+                slots.push(Some(message));
+            }
+        }
+        // All entries have a canonical, validated server-time. Stable sort
+        // retains wire order for messages sharing the same millisecond.
+        timed.sort_by(|left, right| left.server_time.cmp(&right.server_time));
+        let mut timed = timed.into_iter();
+        slots
+            .into_iter()
+            .map(|slot| slot.unwrap_or_else(|| timed.next().expect("one row per timestamped slot")))
+            .collect()
+    }
+
+    /// Catch-up pages and live traffic may interleave on the wire. Merge
+    /// their timestamped rows instead of placing an older page after newer
+    /// live rows. Untagged rows keep their stream order and stay with the
+    /// preceding timestamp; leading history banners travel with its first row.
+    fn merge_catch_up_history(
+        existing: &mut VecDeque<ChatMessage>,
+        history: VecDeque<ChatMessage>,
+    ) {
+        // Echo reconciliation can stamp an earlier optimistic row with a
+        // later time than its following peer row. Repair such inversions
+        // before the linear merge while leaving untagged slots anchored.
+        let mut previous = None;
+        let out_of_order = existing
+            .iter()
+            .filter_map(|row| row.server_time.as_ref())
+            .any(|time| {
+                let inverted = previous.is_some_and(|old: &String| old > time);
+                previous = Some(time);
+                inverted
+            });
+        if out_of_order {
+            *existing = Self::order_history_page(existing.drain(..).collect()).into();
+        }
+        let mut merged = VecDeque::with_capacity(existing.len().saturating_add(history.len()));
+        let mut leading = VecDeque::new();
+        let mut has_timestamp = false;
+        for message in history {
+            if let Some(timestamp) = message.server_time.as_deref() {
+                while existing.front().is_some_and(|row| {
+                    row.server_time
+                        .as_deref()
+                        .is_none_or(|existing_time| existing_time <= timestamp)
+                }) {
+                    merged.push_back(existing.pop_front().unwrap());
+                }
+                merged.append(&mut leading);
+                merged.push_back(message);
+                has_timestamp = true;
+            } else if has_timestamp {
+                merged.push_back(message);
+            } else {
+                leading.push_back(message);
+            }
+        }
+        if !has_timestamp {
+            // An empty result's status banner, or an entirely untagged page,
+            // has no chronological reference; retain its existing placement.
+            existing.append(&mut leading);
+        } else {
+            merged.append(existing);
+            *existing = merged;
+        }
+    }
+
     fn finish_chathistory_batch(&mut self, batch_id: &str) {
         let Some(batch) = self.chathistory_batches.remove(batch_id) else {
             return;
@@ -2275,20 +2531,10 @@ impl Session {
                 &self.network_support.prefix_modes,
                 &self.network_support.user_prefixes,
             );
-            self.channels.insert(batch.target.clone(), channel);
+            self.conversations.insert(batch.target.clone(), channel);
             batch.target.clone()
         };
-        let mut messages = batch.messages;
-        // CHATHISTORY delivery order is not consistent across server
-        // implementations. Server-time is canonical RFC3339, so lexical order
-        // produces a stable oldest-to-newest page while leaving untagged
-        // messages in their arrival positions.
-        messages.sort_by(
-            |left, right| match (&left.server_time, &right.server_time) {
-                (Some(left), Some(right)) => left.cmp(right),
-                _ => std::cmp::Ordering::Equal,
-            },
-        );
+        let mut messages = Self::order_history_page(batch.messages);
         let page_count = messages.len();
         let remaining = batch.request.remaining.saturating_sub(page_count);
         let loaded = batch.request.loaded.saturating_add(page_count);
@@ -2297,7 +2543,7 @@ impl Session {
             HistoryDirection::Before => messages.first().and_then(Self::message_reference),
             HistoryDirection::After => messages.last().and_then(Self::message_reference),
         };
-        let existing_ids: std::collections::HashSet<String> = self.channels[&key]
+        let existing_ids: std::collections::HashSet<String> = self.conversations[&key]
             .messages
             .iter()
             .filter_map(|message| message.msgid.clone())
@@ -2309,7 +2555,10 @@ impl Session {
                 .is_none_or(|msgid| !existing_ids.contains(msgid))
         });
         if batch.request.placement == HistoryPlacement::Append {
-            Self::drop_rows_shown_without_identity(&mut messages, &self.channels[&key].messages);
+            Self::drop_rows_shown_without_identity(
+                &mut messages,
+                &self.conversations[&key].messages,
+            );
         }
         // Own-notice replays whose local confirmation row ("-> -target- text")
         // is already in the tab are display duplicates, and own-credential
@@ -2327,7 +2576,7 @@ impl Session {
             // suppress a replay (#157). The stored target is the spelling the
             // user typed, so it is compared after stripping status prefixes.
             let confirmations: Vec<(String, String)> = self
-                .channels
+                .conversations
                 .get(&key)
                 .map(|channel| {
                     channel
@@ -2440,7 +2689,7 @@ impl Session {
                 {
                     local_history_loaded = true;
                     local.pop_front(); // Replace the local-only status below.
-                    if let Some(channel) = self.channels.get(&key) {
+                    if let Some(channel) = self.conversations.get(&key) {
                         local.retain(|row| {
                             !messages
                                 .iter()
@@ -2484,7 +2733,7 @@ impl Session {
                 history.push_front(
                     ChatMessage::system_fmt(&status, &self.timestamp_format).without_logging(),
                 );
-                if let Some(channel) = self.channels.get_mut(&key) {
+                if let Some(channel) = self.conversations.get_mut(&key) {
                     channel.history_loaded = true;
                 }
                 if !local_history_loaded && let Some((network, _, _)) = self.active_log_context() {
@@ -2513,12 +2762,12 @@ impl Session {
         };
         history.extend(messages.drain(..));
 
-        if let Some(channel) = self.channels.get_mut(&key) {
+        if let Some(channel) = self.conversations.get_mut(&key) {
             if batch.request.placement == HistoryPlacement::Prepend {
                 history.append(&mut channel.messages);
                 channel.messages = history;
             } else {
-                channel.messages.append(&mut history);
+                Self::merge_catch_up_history(&mut channel.messages, history);
             }
             while channel.messages.len() > self.max_scrollback {
                 channel.messages.pop_front();
@@ -2526,7 +2775,7 @@ impl Session {
         }
         if !arrivals.is_empty() {
             if !(self.window_focused && self.current_target_is(&batch.target))
-                && let Some(channel) = self.channels.get_mut(&key)
+                && let Some(channel) = self.conversations.get_mut(&key)
             {
                 channel.unread = channel.unread.saturating_add(arrivals.len());
             }
@@ -2586,82 +2835,17 @@ impl Session {
     }
 
     pub fn request_manual_disconnect(&mut self, reason: Option<String>) {
-        // A /reconnect or /server still closing the connection has already
-        // queued its own QUIT (and dropped the sender this call would queue
-        // another through): that QUIT is just as much in need of flushing.
-        let quit_in_flight = self.connection_intent == ConnectionIntent::ReconnectAfterClose;
-        self.connection_intent = ConnectionIntent::ManualDisconnect;
-        // A manual disconnect cancels an in-flight explicit server switch. If
-        // the old worker exits later it must not unexpectedly activate the
-        // staged endpoint.
-        self.pending_session = None;
-        // Disconnecting also cancels an update restore that has not run yet.
         self.clear_update_restore();
-        let quit_queued = self.cmd_tx.is_some()
-            && self.send_command(IrcCommand::Quit(Self::clamp_quit_reason(reason)));
-        self.connected = false;
-        self.connecting = false;
-        self.connection_lost = false;
-        self.cmd_tx = None;
-        // Dropping the receiver signals the connection thread (the handshake and
-        // read loop both watch for a closed channel), so a wedged connect attempt
-        // can be aborted instead of blocking future reconnects. But the same
-        // signal also aborts the writer, which on the worker's single-threaded
-        // runtime has usually not yet run, so a QUIT queued just above would be
-        // lost (#243). When one is on its way, retire the receiver instead: the
-        // worker exits on its own once QUIT is flushed (or, before the writer
-        // exists, on seeing the queued QUIT), and release_closing_connection
-        // drops the receiver then. Nothing read from it is processed. The
-        // same goes for a QUIT queued by an earlier reconnect or server
-        // switch that this disconnect interrupts.
-        if let Some(rx) = self.msg_rx.take()
-            && (quit_queued || quit_in_flight)
-        {
-            self.closing_rx = Some((rx, std::time::Instant::now()));
-        }
-        self.lag_ms = None;
-        self.ping_sent_time = None;
-        self.mark_channel_tabs_unjoined();
+        self.close_connection(reason, false);
     }
 
-    /// Drop the retired receiver of a QUIT-ed connection once its worker has
-    /// exited. A worker that cannot flush QUIT (a server that stopped
-    /// reading) is cancelled the old way after a grace period, so it can never
-    /// block the next connection.
+    #[cfg(test)]
     pub(crate) fn release_closing_connection(&mut self, worker_exited: bool) {
-        const QUIT_FLUSH_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
-        if let Some((_, retired_at)) = &self.closing_rx
-            && (worker_exited || retired_at.elapsed() >= QUIT_FLUSH_GRACE)
-        {
-            self.closing_rx = None;
-        }
+        self.connection.release_closing_receiver(worker_exited);
     }
 
     pub fn request_reconnect_after_close(&mut self, reason: &str) {
-        // An explicit reconnect starts over, even after auto-reconnect gave up.
-        self.reset_reconnect_state();
-        if self.cmd_tx.is_some() {
-            self.connection_intent = ConnectionIntent::ReconnectAfterClose;
-            let _ = self.send_command(IrcCommand::Quit(Self::clamp_quit_reason(Some(
-                reason.to_string(),
-            ))));
-            self.connected = false;
-            self.connecting = false;
-            self.connection_lost = false;
-            self.cmd_tx = None;
-        } else {
-            // No live transport to close. The intent is deliberately left
-            // alone: a worker still winding down from an earlier disconnect or
-            // switch keeps the intent that describes it, so its exit is not
-            // mistaken for this attempt failing (#247). A stale intent with no
-            // worker is cleared when the next worker starts.
-            self.connected = false;
-            self.connecting = true;
-            self.connection_lost = false;
-        }
-        self.lag_ms = None;
-        self.ping_sent_time = None;
-        self.mark_channel_tabs_unjoined();
+        self.close_connection(Some(reason.to_string()), true);
     }
 
     fn fail_registration(&mut self, message: String) {
@@ -2669,7 +2853,7 @@ impl Session {
         // A connection already being closed on purpose (disconnect, /server,
         // /reconnect) can still deliver a late registration error. It must
         // not turn a staged switch into a manual disconnect (#246).
-        if self.connection_intent != ConnectionIntent::None {
+        if self.connection.is_closing() {
             return;
         }
         self.request_manual_disconnect(Some("Registration failed".to_string()));
@@ -2681,15 +2865,25 @@ impl Session {
     /// endpoint (or a disconnect that cancels the restore) must never see
     /// them: B's 001 would otherwise JOIN A's channels with A's keys.
     fn clear_update_restore(&mut self) {
-        self.update_rejoins = None;
+        self.pending_rejoins = RecoveryPolicy::ConfiguredAutoJoin;
+        self.pending_parts.clear();
         self.update_join_targets.clear();
         self.update_selected = None;
     }
 
     fn reset_session_state(&mut self) {
         self.clear_update_restore();
-        self.channels.clear();
-        self.current_channel = None;
+        self.events.push(SessionEvent::EndpointChanged);
+        self.pending_cycles.clear();
+        self.conversations.clear();
+        self.current_conversation = None;
+        self.input_text.clear();
+        self.command_history.clear();
+        self.history_index = None;
+        self.history_temp.clear();
+        self.tab_completion = None;
+        self.channel_info_target = None;
+        self.show_channel_info = false;
         self.server_messages.clear();
         self.server_unread = 0;
         self.selected_user = None;
@@ -2759,21 +2953,21 @@ mod update_session_tests {
         };
         let mut before = Session::with_settings(settings.clone());
         assert!(before.start_session_from_form());
-        before.connected = true;
-        before.connecting = false;
+        before.test_set_connected(true);
+        before.test_set_connecting_flag(false);
         before.server_host = "edited.example".into();
         let mut live = Channel::new();
         live.joined = true;
         live.key = Some("private-key".into());
         let mut kicked = Channel::new();
         kicked.joined = false;
-        before.channels.insert("#live".into(), live);
+        before.conversations.insert("#live".into(), live);
         let mut custom = Channel::new();
         custom.joined = true;
-        before.channels.insert("!custom".into(), custom);
-        before.channels.insert("#kicked".into(), kicked);
-        before.channels.insert("alice".into(), Channel::new());
-        before.current_channel = Some("alice".into());
+        before.conversations.insert("!custom".into(), custom);
+        before.conversations.insert("#kicked".into(), kicked);
+        before.conversations.insert("alice".into(), Channel::new());
+        before.select_target("alice");
         before.input_text = "unsent draft".into();
         let snapshot = before.update_session();
         let encoded = serde_json::to_vec(&snapshot).unwrap();
@@ -2781,12 +2975,12 @@ mod update_session_tests {
         let mut after = Session::with_settings(settings);
         after.restore_update_session(snapshot);
         assert_eq!(after.active_server_config().unwrap().host, "active.example");
-        assert!(after.connecting);
+        assert!(after.is_connecting());
         assert_eq!(after.input_text, "unsent draft");
-        assert_eq!(after.current_channel.as_deref(), Some("alice"));
-        assert!(after.channels.contains_key("#kicked"));
+        assert_eq!(after.current_target_name(), Some("alice"));
+        assert!(after.conversations.contains_key("#kicked"));
         let (tx, mut rx) = mpsc::unbounded_channel();
-        after.cmd_tx = Some(tx);
+        after.test_set_sender(tx);
         after.handle_numeric(RPL_WELCOME, &["me".into(), "Welcome".into()]);
         let sent: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
         assert!(sent.iter().any(|cmd| matches!(cmd, IrcCommand::Join(name, Some(key), _, _) if name == "#live" && key == "private-key")));
@@ -2796,7 +2990,7 @@ mod update_session_tests {
         );
         assert!(!sent.iter().any(|cmd| matches!(cmd, IrcCommand::Join(name, _, _, _) if name == "#kicked" || name == "#configured")));
         after.handle_incoming_message(IrcMessage::parse(":me!u@h JOIN #live").unwrap());
-        assert_eq!(after.current_channel.as_deref(), Some("alice"));
+        assert_eq!(after.current_target_name(), Some("alice"));
         after.handle_incoming_message(IrcMessage::parse(":me!u@h JOIN !custom").unwrap());
         assert!(after.update_selected.is_none());
     }
@@ -2816,12 +3010,12 @@ mod update_session_tests {
         let mut secret = Channel::new();
         secret.joined = true;
         secret.key = Some("a-channel-key".into());
-        before.channels.insert("#secret".into(), secret);
-        before.current_channel = Some("#secret".into());
+        before.conversations.insert("#secret".into(), secret);
+        before.select_target("#secret");
         let mut after = Session::with_settings(settings);
         after.restore_update_session(before.update_session());
-        assert!(after.connecting);
-        assert!(after.update_rejoins.is_some());
+        assert!(after.is_connecting());
+        assert!(after.pending_rejoins.is_some());
         assert_eq!(after.update_join_targets, ["#secret"]);
         assert_eq!(after.update_selected.as_deref(), Some("#secret"));
         after
@@ -2835,12 +3029,12 @@ mod update_session_tests {
         after.server_host = "b.example".into();
         after.auto_join_channels = "#b-chan".into();
         assert!(after.switch_session_from_form("Changing servers"));
-        assert!(after.update_rejoins.is_none());
+        assert!(after.pending_rejoins.is_none());
         assert!(after.update_join_targets.is_empty());
         assert!(after.update_selected.is_none());
 
         let (tx, mut rx) = mpsc::unbounded_channel();
-        after.cmd_tx = Some(tx);
+        after.test_set_sender(tx);
         after.handle_numeric(RPL_WELCOME, &["me".into(), "Welcome".into()]);
         let sent: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
         // A's channels and keys never reach B, and B's own auto-join runs.
@@ -2862,7 +3056,7 @@ mod update_session_tests {
 
         after.request_manual_disconnect(None);
 
-        assert!(after.update_rejoins.is_none());
+        assert!(after.pending_rejoins.is_none());
         assert!(after.update_join_targets.is_empty());
         assert!(after.update_selected.is_none());
     }
@@ -2882,8 +3076,8 @@ mod update_session_tests {
         assert_eq!(server.host, "old.example");
         assert_eq!(server.sasl_mechanism, SaslMechanism::Auto);
         assert!(server.sasl_password.is_none());
-        assert!(app.connecting);
-        assert!(app.channels.contains_key("#a"));
+        assert!(app.is_connecting());
+        assert!(app.conversations.contains_key("#a"));
         assert!(app.input_text.is_empty());
         assert!(app.away_status.is_none());
         // An empty object (a snapshot with nothing to restore) also parses.
@@ -2930,8 +3124,8 @@ mod update_session_tests {
         let before = Session::with_settings(settings.clone());
         let mut after = Session::with_settings(settings);
         after.restore_update_session(before.update_session());
-        assert!(!after.connecting);
-        assert!(!after.connected);
+        assert!(!after.is_connecting());
+        assert!(!after.is_connected());
     }
 }
 
@@ -2974,9 +3168,9 @@ mod connection_lifecycle_tests {
             let mut app = lifecycle_app();
             let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel();
             let (msg_tx, msg_rx) = mpsc::channel(4);
-            app.cmd_tx = Some(cmd_tx);
-            app.msg_rx = Some(msg_rx);
-            app.connected = true;
+            app.test_set_sender(cmd_tx);
+            app.test_set_incoming(msg_rx);
+            app.test_set_connected(true);
 
             // /reconnect and /server queue the old connection's QUIT and keep
             // its receiver open until the worker exits...
@@ -2998,9 +3192,9 @@ mod connection_lifecycle_tests {
                 !msg_tx.is_closed(),
                 "switch_server={switch_server}: the receiver was dropped with a QUIT in flight"
             );
-            assert!(app.msg_rx.is_none());
-            assert!(app.closing_rx.is_some());
-            assert!(app.pending_session.is_none());
+            assert!(!app.test_has_incoming());
+            assert!(app.test_has_closing_receiver());
+            assert!(app.connection.staged_config().is_none());
 
             app.release_closing_connection(true);
             assert!(msg_tx.is_closed());
@@ -3012,9 +3206,9 @@ mod connection_lifecycle_tests {
         let mut app = lifecycle_app();
         let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel();
         let (msg_tx, msg_rx) = mpsc::channel(4);
-        app.cmd_tx = Some(cmd_tx);
-        app.msg_rx = Some(msg_rx);
-        app.connected = true;
+        app.test_set_sender(cmd_tx);
+        app.test_set_incoming(msg_rx);
+        app.test_set_connected(true);
 
         app.request_manual_disconnect(Some("bye".to_string()));
 
@@ -3022,7 +3216,7 @@ mod connection_lifecycle_tests {
         // The worker still sees an open channel, so it flushes QUIT instead of
         // being cancelled; whatever it reads meanwhile is never processed.
         assert!(!msg_tx.is_closed());
-        assert!(app.msg_rx.is_none());
+        assert!(!app.test_has_incoming());
         msg_tx
             .try_send(IrcMessage::parse(":srv NOTICE * :late").unwrap())
             .unwrap();
@@ -3043,10 +3237,10 @@ mod connection_lifecycle_tests {
         // ...or, for a worker that cannot flush QUIT, after the grace period.
         let (cmd_tx, _cmd_rx) = mpsc::unbounded_channel();
         let (msg_tx, msg_rx) = mpsc::channel(4);
-        app.cmd_tx = Some(cmd_tx);
-        app.msg_rx = Some(msg_rx);
+        app.test_set_sender(cmd_tx);
+        app.test_set_incoming(msg_rx);
         app.request_manual_disconnect(None);
-        app.closing_rx.as_mut().unwrap().1 -= std::time::Duration::from_secs(5);
+        app.test_age_closing_grace(std::time::Duration::from_secs(5));
         app.release_closing_connection(false);
         assert!(msg_tx.is_closed());
     }
@@ -3055,12 +3249,12 @@ mod connection_lifecycle_tests {
     fn manual_disconnect_without_a_queued_quit_cancels_the_worker_at_once() {
         let mut app = lifecycle_app();
         let (msg_tx, msg_rx) = mpsc::channel::<IrcMessage>(4);
-        app.msg_rx = Some(msg_rx);
+        app.test_set_incoming(msg_rx);
 
         app.request_manual_disconnect(None);
 
         assert!(msg_tx.is_closed());
-        assert!(app.closing_rx.is_none());
+        assert!(!app.test_has_closing_receiver());
     }
 
     #[test]
@@ -3068,10 +3262,10 @@ mod connection_lifecycle_tests {
         let mut app = lifecycle_app();
         assert!(app.start_session_from_form());
         let (tx, _rx) = mpsc::unbounded_channel();
-        app.cmd_tx = Some(tx);
+        app.test_set_sender(tx);
         app.apply_unprofiled_endpoint("other.example", "7000", false);
         assert!(app.switch_session_from_form("Changing servers"));
-        assert_eq!(app.connection_intent, ConnectionIntent::ReconnectAfterClose);
+        assert!(app.is_closing() && app.has_pending_connect());
 
         app.handle_numeric(
             ERR_PASSWDMISMATCH,
@@ -3079,8 +3273,8 @@ mod connection_lifecycle_tests {
         );
 
         // The error is shown, but the switch the user asked for still happens.
-        assert_eq!(app.connection_intent, ConnectionIntent::ReconnectAfterClose);
-        assert!(app.pending_session.is_some());
+        assert!(app.is_closing() && app.has_pending_connect());
+        assert!(app.connection.staged_config().is_some());
     }
 
     #[test]
@@ -3089,33 +3283,33 @@ mod connection_lifecycle_tests {
         app.auto_reconnect = true;
         app.max_reconnect_attempts = 3;
         // Auto-reconnect gave up: the budget is spent and a retry is stale.
-        app.reconnect_attempts = 3;
-        app.connection_lost = true;
-        app.last_disconnect_time = Some(std::time::Instant::now());
+        app.test_set_attempts(3);
+        app.test_set_lost(true);
+        app.test_set_failed_at(Some(std::time::Instant::now()));
         assert!(!app.awaiting_reconnect());
 
         assert!(app.start_session_from_form());
-        assert_eq!(app.reconnect_attempts, 0);
-        assert!(app.last_disconnect_time.is_none());
+        assert_eq!(app.reconnect_attempts(), 0);
+        assert!(app.connection.failed_at().is_none());
 
         // The same holds for /reconnect and /server.
-        app.reconnect_attempts = 3;
-        app.connecting = false;
+        app.test_set_attempts(3);
+        app.test_set_connecting_flag(false);
         app.request_reconnect_after_close("Reconnecting");
-        assert_eq!(app.reconnect_attempts, 0);
-        app.reconnect_attempts = 3;
-        app.connecting = false;
+        assert_eq!(app.reconnect_attempts(), 0);
+        app.test_set_attempts(3);
+        app.test_set_connecting_flag(false);
         app.apply_unprofiled_endpoint("other.example", "7000", false);
         assert!(app.switch_session_from_form("Changing servers"));
-        assert_eq!(app.reconnect_attempts, 0);
+        assert_eq!(app.reconnect_attempts(), 0);
     }
 
     #[test]
     fn background_tick_runs_the_time_based_work_and_marks_the_window_unfocused() {
         let mut app = lifecycle_app();
         let (tx, mut rx) = mpsc::unbounded_channel();
-        app.cmd_tx = Some(tx);
-        app.connected = true;
+        app.test_set_sender(tx);
+        app.test_set_connected(true);
         // Focus as last seen by a drawn frame, before the window went away.
         app.window_focused = true;
         app.auto_away_enabled = true;
@@ -3143,8 +3337,8 @@ mod connection_lifecycle_tests {
     fn background_tick_does_not_flap_away_when_the_user_is_active() {
         let mut app = lifecycle_app();
         let (tx, mut rx) = mpsc::unbounded_channel();
-        app.cmd_tx = Some(tx);
-        app.connected = true;
+        app.test_set_sender(tx);
+        app.test_set_connected(true);
         app.auto_away_enabled = true;
         app.auto_away_minutes = 5;
 
@@ -3170,8 +3364,8 @@ mod connection_lifecycle_tests {
     fn new_connection_drops_state_that_belonged_to_the_previous_socket() {
         let mut app = lifecycle_app();
         let (tx, _rx) = mpsc::unbounded_channel();
-        app.cmd_tx = Some(tx);
-        app.connected = true;
+        app.test_set_sender(tx);
+        app.test_set_connected(true);
         app.handle_cap_message("ACK", &["draft/chathistory batch".to_string()]);
         assert!(app.chathistory_enabled);
         // Dropped mid-CHATHISTORY: one request unanswered, one batch (and a
@@ -3233,7 +3427,7 @@ mod connection_lifecycle_tests {
             app.set_session_nick("me".into(), true);
             let mut channel = Channel::new();
             channel.joined = true;
-            app.channels.insert("#chan".to_string(), channel);
+            app.conversations.insert("#chan".to_string(), channel);
 
             // The connection dies after a 353 but before its 366.
             app.handle_numeric(
@@ -3255,7 +3449,7 @@ mod connection_lifecycle_tests {
             );
             app.handle_numeric(RPL_ENDOFNAMES, &["me".into(), "#chan".into()]);
 
-            let nicks: Vec<&str> = app.channels["#chan"]
+            let nicks: Vec<&str> = app.conversations["#chan"]
                 .users
                 .iter()
                 .map(|user| user.nick.as_str())
@@ -3268,8 +3462,8 @@ mod connection_lifecycle_tests {
     fn history_requested_after_a_reconnect_is_not_paired_with_a_dead_requests_placement() {
         let mut app = lifecycle_app();
         let (tx, _rx) = mpsc::unbounded_channel();
-        app.cmd_tx = Some(tx);
-        app.connected = true;
+        app.test_set_sender(tx);
+        app.test_set_connected(true);
         app.handle_cap_message("ACK", &["draft/chathistory".to_string()]);
         // The dead connection's unanswered live-catch-up request.
         app.pending_history_requests
@@ -3294,46 +3488,46 @@ mod connection_lifecycle_tests {
 /// setting, rate limiting) is the caller's (`App::notify`).
 #[cfg_attr(test, allow(dead_code))]
 pub(crate) fn show_desktop_notification(title: &str, body: &str) {
-        // Use notify-send on Linux/BSD (usually pre-installed on Linux desktops)
-        #[cfg(all(unix, not(target_os = "macos")))]
-        {
-            let title = title.to_string();
-            let body = body.to_string();
-            std::thread::spawn(move || {
-                let mut command = std::process::Command::new("notify-send");
-                command.args(notify_send_args(&title, &body));
-                match wait_for_notification_helper(&mut command) {
-                    Ok(status) if !status.success() => {
-                        tracing::warn!("notify-send exited with status {}", status)
-                    }
-                    Err(error) => tracing::warn!("Failed to run notify-send: {}", error),
-                    Ok(_) => {}
+    // Use notify-send on Linux/BSD (usually pre-installed on Linux desktops)
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        let title = title.to_string();
+        let body = body.to_string();
+        std::thread::spawn(move || {
+            let mut command = std::process::Command::new("notify-send");
+            command.args(notify_send_args(&title, &body));
+            match wait_for_notification_helper(&mut command) {
+                Ok(status) if !status.success() => {
+                    tracing::warn!("notify-send exited with status {}", status)
                 }
-            });
-        }
+                Err(error) => tracing::warn!("Failed to run notify-send: {}", error),
+                Ok(_) => {}
+            }
+        });
+    }
 
-        #[cfg(target_os = "macos")]
-        {
-            let script = applescript_notification(title, body);
-            std::thread::spawn(move || {
-                let mut command = std::process::Command::new("osascript");
-                command.args(["-e", &script]);
-                match wait_for_notification_helper(&mut command) {
-                    Ok(status) if !status.success() => {
-                        tracing::warn!("osascript exited with status {}", status)
-                    }
-                    Err(error) => tracing::warn!("Failed to run osascript: {}", error),
-                    Ok(_) => {}
+    #[cfg(target_os = "macos")]
+    {
+        let script = applescript_notification(title, body);
+        std::thread::spawn(move || {
+            let mut command = std::process::Command::new("osascript");
+            command.args(["-e", &script]);
+            match wait_for_notification_helper(&mut command) {
+                Ok(status) if !status.success() => {
+                    tracing::warn!("osascript exited with status {}", status)
                 }
-            });
-        }
+                Err(error) => tracing::warn!("Failed to run osascript: {}", error),
+                Ok(_) => {}
+            }
+        });
+    }
 
-        // On Windows, flash the taskbar - or, when hidden to the tray (no
-        // taskbar button to flash), show a tray balloon instead.
-        #[cfg(windows)]
-        {
-            crate::systray::notify(title, body);
-        }
+    // On Windows, flash the taskbar - or, when hidden to the tray (no
+    // taskbar button to flash), show a tray balloon instead.
+    #[cfg(windows)]
+    {
+        crate::systray::notify(title, body);
+    }
 }
 
 /// A random 16-hex-digit id for a network profile.
@@ -3345,7 +3539,10 @@ pub(crate) fn show_desktop_notification(title: &str, body: &str) {
 pub(crate) fn derived_profile_id(name: &str, host: &str, port: &str) -> String {
     use sha2::{Digest, Sha256};
     let digest = Sha256::digest(format!("linefeed-profile\0{name}\0{host}\0{port}"));
-    digest[..8].iter().map(|byte| format!("{byte:02x}")).collect()
+    digest[..8]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 pub(crate) fn new_profile_id() -> String {
@@ -3611,11 +3808,9 @@ impl Session {
     /// connection" whose Connect dialog was dismissed.
     pub(crate) fn is_pristine(&self) -> bool {
         self.active_session.is_none()
-            && self.pending_session.is_none()
-            && !self.connecting
-            && !self.connected
-            && self.worker.is_none()
-            && self.channels.is_empty()
+            && self.connection.staged_config().is_none()
+            && self.is_fully_stopped()
+            && self.conversations.is_empty()
     }
 
     fn session_from_form(&self) -> Result<SessionConfig, String> {
@@ -3738,8 +3933,7 @@ impl Session {
         if endpoint_changed {
             // Do not let buffered messages from the old socket recreate tabs or
             // logs after the new endpoint identity becomes active.
-            self.msg_rx = None;
-            self.cmd_tx = None;
+            self.connection.clear();
             self.reset_session_state();
         }
         // Session start. On an endpoint change the previous connection's
@@ -3773,25 +3967,17 @@ impl Session {
             self.nick_confirmed && self.identifiers_equal(&session.server.nick, &self.my_nick);
         self.set_session_nick(session.server.nick.clone(), accepted);
         self.active_session = Some(session);
-        self.pending_session = None;
         self.connection_error = None;
     }
 
     pub(crate) fn start_session_from_form(&mut self) -> bool {
         match self.session_from_form() {
             Ok(session) => {
-                self.activate_session(session);
-                // An explicit connect starts over, even after auto-reconnect
-                // gave up: a stale attempt count would deny it any retries.
-                self.reset_reconnect_state();
-                self.connected = false;
-                self.connecting = true;
-                self.connection_lost = false;
+                self.connect_validated_session(session, "Connecting");
                 true
             }
             Err(error) => {
                 self.connection_error = Some(error.clone());
-                self.connecting = false;
                 self.show_connect_dialog = true;
                 self.add_server_message(ChatMessage::system_fmt(&error, &self.timestamp_format));
                 false
@@ -3822,37 +4008,11 @@ impl Session {
             }
         };
 
-        // `connecting` can be set one UI frame before the lifecycle creates a
-        // worker/channel. In that state there is no old socket to close, so the
-        // fresh snapshot can be activated immediately. Staging is only needed
-        // while an actual transport (or registered connection) exists.
-        if self.connected || self.cmd_tx.is_some() || self.msg_rx.is_some() {
-            self.pending_session = Some(session);
-            self.request_reconnect_after_close(reason);
-        } else {
-            self.activate_session(session);
-            self.reset_reconnect_state();
-            self.connected = false;
-            self.connecting = true;
-            self.connection_lost = false;
-        }
+        self.connect_validated_session(session, reason);
         true
     }
 
-    pub(crate) fn promote_pending_session(&mut self) {
-        if let Some(session) = self.pending_session.take() {
-            self.activate_session(session);
-        }
-    }
-
-    pub(crate) fn ensure_active_session(&mut self) -> bool {
-        if self.active_session.is_some() {
-            true
-        } else {
-            self.start_session_from_form()
-        }
-    }
-
+    #[cfg(test)]
     pub(crate) fn active_server_config(&self) -> Option<ServerConfig> {
         self.active_session
             .as_ref()
@@ -3932,7 +4092,7 @@ impl Session {
     fn apply_nick_change(&mut self, old_nick: &str, new_nick: &str) {
         let sys_msg = ChatMessage::system(&format!("{} is now known as {}", old_nick, new_nick));
         let max = self.max_scrollback;
-        for channel in self.channels.values_mut() {
+        for channel in self.conversations.values_mut() {
             if channel.has_user(old_nick) {
                 channel.push_trimmed(sys_msg.clone(), max);
                 channel.rename_user(old_nick, new_nick);
@@ -3971,59 +4131,102 @@ impl Session {
             self.monitored_users
                 .insert(self.network_support.canonicalize(new_nick));
         }
-        // Re-key an open query (PM) window so the conversation follows
-        // the rename: otherwise new messages open a second tab under
-        // the new nick and replies in the stale tab go to the old nick.
-        let query_key = self
-            .channels
-            .keys()
-            .find(|k| !self.is_channel_name(k) && self.identifiers_equal(k, old_nick))
-            .cloned();
-        if let Some(key) = query_key {
-            let collision_key = self
-                .channels
-                .keys()
-                .find(|k| {
-                    self.identifiers_equal(k, new_nick) && !self.identifiers_equal(k, old_nick)
-                })
-                .cloned();
-            if let Some(existing_key) = collision_key {
-                // Merge the old query into the destination tab (#194),
-                // mirroring RENAME, instead of stranding the old tab.
-                if let Some(mut old_ch) = self.channels.remove(&key) {
-                    let was_current = self.current_channel.as_deref() == Some(key.as_str());
-                    let old_unread = old_ch.unread;
-                    if let Some(existing) = self.channels.get_mut(&existing_key) {
-                        while let Some(message) = old_ch.messages.pop_front() {
-                            let duplicate = message.msgid.as_ref().is_some_and(|msgid| {
-                                existing
-                                    .messages
-                                    .iter()
-                                    .any(|row| row.msgid.as_deref() == Some(msgid.as_str()))
-                            });
-                            if !duplicate {
-                                existing.messages.push_back(message);
-                            }
-                        }
-                        existing.unread = existing.unread.saturating_add(old_unread);
-                        existing.push_trimmed(sys_msg, max);
-                        while existing.messages.len() > max && max > 0 {
-                            existing.messages.pop_front();
-                        }
-                    }
-                    if was_current {
-                        self.current_channel = Some(existing_key);
-                    }
-                }
-            } else if let Some(mut ch) = self.channels.remove(&key) {
-                ch.push_trimmed(sys_msg, max);
-                let was_current = self.current_channel.as_deref() == Some(key.as_str());
-                self.channels.insert(new_nick.to_string(), ch);
-                if was_current {
-                    self.current_channel = Some(new_nick.to_string());
+        if let Some(id) = self.id_for_target(old_nick)
+            && self
+                .target_name(id)
+                .is_some_and(|name| !self.is_channel_name(name))
+        {
+            self.rename_conversation(id, new_nick);
+            if let Some(channel) = self.conversations.channel_mut(id) {
+                channel.push_trimmed(sys_msg, max);
+            }
+        }
+    }
+
+    /// Merge data without moving the surviving identity or its editing state.
+    fn merge_conversation_payload(&mut self, survivor: ConversationId, mut retired: Channel) {
+        let Some(channel) = self.conversations.channel_mut(survivor) else {
+            return;
+        };
+        while let Some(message) = retired.messages.pop_back() {
+            let duplicate = message.msgid.as_ref().is_some_and(|msgid| {
+                channel
+                    .messages
+                    .iter()
+                    .any(|row| row.msgid.as_ref() == Some(msgid))
+            });
+            if !duplicate {
+                channel.messages.push_front(message);
+            }
+        }
+        channel.unread = channel.unread.saturating_add(retired.unread);
+        channel.joined |= retired.joined;
+        channel.history_loaded |= retired.history_loaded;
+        channel.merge_metadata_from(&retired);
+        channel.merge_users(retired.users);
+        if self.max_scrollback > 0 {
+            while channel.messages.len() > self.max_scrollback {
+                channel.messages.pop_front();
+            }
+        }
+    }
+
+    fn redirect_conversation(&mut self, survivor: ConversationId, retired: ConversationId) {
+        if self.current_conversation == Some(retired) {
+            self.current_conversation = Some(survivor);
+        }
+        if self.channel_info_target == Some(retired) {
+            self.channel_info_target = Some(survivor);
+        }
+        if self.pending_cycles.remove(&retired) {
+            self.pending_cycles.insert(survivor);
+        }
+        self.events
+            .push(SessionEvent::ConversationMerged { survivor, retired });
+    }
+
+    fn rename_conversation(&mut self, id: ConversationId, new: &str) {
+        let Some(old) = self.target_name(id).map(str::to_owned) else {
+            return;
+        };
+        if let Some((retired, channel)) = self.conversations.rename(id, new) {
+            self.merge_conversation_payload(id, channel);
+            self.redirect_conversation(id, retired);
+        }
+        self.notify_target_rename(id, &old, new);
+    }
+
+    fn notify_target_rename(&mut self, id: ConversationId, old: &str, new: &str) {
+        let support = &self.network_support;
+        if self
+            .update_selected
+            .as_deref()
+            .is_some_and(|target| support.identifiers_equal(target, old))
+        {
+            self.update_selected = Some(new.to_string());
+        }
+        for target in &mut self.update_join_targets {
+            if support.identifiers_equal(target, old) {
+                *target = new.to_string();
+            }
+        }
+        if let Some(rejoins) = self.pending_rejoins.as_mut() {
+            for (target, _) in rejoins {
+                if support.identifiers_equal(target, old) {
+                    *target = new.to_string();
                 }
             }
         }
+        for target in &mut self.pending_parts {
+            if support.identifiers_equal(target, old) {
+                *target = new.to_string();
+            }
+        }
+        self.events.push(SessionEvent::ConversationRenamed {
+            id,
+            old: old.to_string(),
+            new: new.to_string(),
+        });
     }
 
     pub fn handle_incoming_message(&mut self, msg: IrcMessage) {
@@ -4239,7 +4442,7 @@ impl Session {
                     .is_none_or(|prefix| !prefix.contains('!') && !prefix.contains('@'));
                 let is_private = !self.is_channel_name(&routed_target)
                     && self.identifiers_equal(&routed_target, &self.my_nick);
-                if routed_target == "*" || !self.connected || (is_private && from_server) {
+                if routed_target == "*" || !self.is_connected() || (is_private && from_server) {
                     self.add_server_message(chat_msg);
                 } else {
                     // For private notices (target is our nick), route to sender's window
@@ -4361,7 +4564,7 @@ impl Session {
                     if failed_request.is_some_and(|req| req.placement == HistoryPlacement::Prepend)
                         && let Some(mut history) = self.load_local_history_fallback(target)
                         && let Some(key) = self.channel_key(target)
-                        && let Some(channel) = self.channels.get_mut(&key)
+                        && let Some(channel) = self.conversations.get_mut(&key)
                     {
                         history.append(&mut channel.messages);
                         channel.messages = history;
@@ -4379,7 +4582,7 @@ impl Session {
 
             IrcCommand::Markread(target, timestamp) => {
                 if let Some(key) = self.channel_key(target)
-                    && let Some(channel) = self.channels.get_mut(&key)
+                    && let Some(channel) = self.conversations.get_mut(&key)
                 {
                     channel.read_marker = timestamp.clone();
                 }
@@ -4387,7 +4590,7 @@ impl Session {
 
             IrcCommand::Redact(target, msgid, reason) => {
                 if let Some(key) = self.channel_key(target)
-                    && let Some(channel) = self.channels.get_mut(&key)
+                    && let Some(channel) = self.conversations.get_mut(&key)
                 {
                     let removed = channel.redact_message(msgid);
                     let reason = reason
@@ -4411,50 +4614,24 @@ impl Session {
             }
 
             IrcCommand::Rename(old, new, reason) => {
-                if let Some(old_key) = self.channel_key(old)
-                    && let Some(mut channel) = self.channels.remove(&old_key)
-                {
-                    let destination_was_current = self.current_target_is(new);
-                    if let Some(existing_key) = self.channel_key(new)
-                        && let Some(mut existing) = self.channels.remove(&existing_key)
-                    {
-                        // A public-history tab for the destination may already
-                        // exist. Preserve it and deduplicate any overlap before
-                        // turning the renamed live channel into that tab.
-                        while let Some(message) = existing.messages.pop_back() {
-                            let duplicate = message.msgid.as_ref().is_some_and(|msgid| {
-                                channel
-                                    .messages
-                                    .iter()
-                                    .any(|row| row.msgid.as_deref() == Some(msgid.as_str()))
-                            });
-                            if !duplicate {
-                                channel.messages.push_front(message);
-                            }
-                        }
-                        channel.unread = channel.unread.saturating_add(existing.unread);
-                        while channel.messages.len() > self.max_scrollback {
-                            channel.messages.pop_front();
-                        }
-                    }
-                    channel.push_trimmed(
-                        ChatMessage::system_fmt(
-                            &format!(
-                                "Channel renamed from {old} to {new}{}",
-                                reason
-                                    .as_deref()
-                                    .filter(|reason| !reason.is_empty())
-                                    .map(|reason| format!(": {reason}"))
-                                    .unwrap_or_default()
+                if let Some(id) = self.id_for_target(old) {
+                    self.rename_conversation(id, new);
+                    if let Some(channel) = self.conversations.channel_mut(id) {
+                        channel.push_trimmed(
+                            ChatMessage::system_fmt(
+                                &format!(
+                                    "Channel renamed from {old} to {new}{}",
+                                    reason
+                                        .as_deref()
+                                        .filter(|reason| !reason.is_empty())
+                                        .map(|reason| format!(": {reason}"))
+                                        .unwrap_or_default()
+                                ),
+                                &self.timestamp_format,
                             ),
-                            &self.timestamp_format,
-                        ),
-                        self.max_scrollback,
-                    );
-                    if self.current_target_is(&old_key) || destination_was_current {
-                        self.current_channel = Some(new.clone());
+                            self.max_scrollback,
+                        );
                     }
-                    self.channels.insert(new.clone(), channel);
                     let old_pending = self.network_support.canonicalize(old);
                     let new_pending = self.network_support.canonicalize(new);
                     if let Some(requests) = self.pending_history_requests.remove(&old_pending) {
@@ -4498,7 +4675,7 @@ impl Session {
                     &self.timestamp_format,
                 );
                 let max = self.max_scrollback;
-                for channel in self.channels.values_mut() {
+                for channel in self.conversations.values_mut() {
                     if channel.has_user(&sender) {
                         channel.set_user_realname(&sender, Some(realname.clone()));
                         channel.push_trimmed(notice.clone(), max);
@@ -4546,16 +4723,20 @@ impl Session {
                 let sender = msg.get_sender_nick().unwrap_or_default();
                 let (username, hostname) = Self::prefix_user_host(msg.prefix.as_deref());
                 if self.identifiers_equal(&sender, &self.my_nick) {
+                    self.forget_rejoin_membership(channel);
                     // We joined a channel
                     let existing_key = self.channel_key(channel);
-                    let is_new_channel = existing_key.is_none();
+                    let cycled = self
+                        .id_for_target(channel)
+                        .is_some_and(|id| self.pending_cycles.remove(&id));
+                    let is_new_channel = existing_key.is_none() || cycled;
                     // A key sent with our JOIN belongs to the tab whether it is
                     // new or retained (kicked/disconnected), so consume it
                     // here rather than only for new tabs (#250).
                     let pending_key = self
                         .pending_channel_keys
                         .remove(&self.network_support.canonicalize(channel));
-                    if existing_key.is_none() {
+                    if is_new_channel {
                         let mut new_channel = Channel::new();
                         new_channel.set_case_mapping(self.network_support.case_mapping);
                         new_channel.set_prefix_schema(
@@ -4597,7 +4778,7 @@ impl Session {
                                 &self.network_support.canonicalize(channel),
                             );
                         }
-                        self.channels.insert(channel.clone(), new_channel);
+                        self.conversations.insert(channel.clone(), new_channel);
                     }
                     if let Some(joined_channel) = self.channel_mut(channel) {
                         joined_channel.joined = true;
@@ -4614,20 +4795,22 @@ impl Session {
                         .position(|target| self.identifiers_equal(target, channel))
                     {
                         self.update_join_targets.remove(index);
-                        self.current_channel = self.update_selected.clone();
+                        self.current_conversation = self
+                            .update_selected
+                            .as_deref()
+                            .and_then(|target| self.id_for_target(target));
                         if self.update_join_targets.is_empty() {
                             self.update_selected = None;
                         }
                     } else if self.take_join_focus_request(channel)
-                        || self.current_channel.is_none()
+                        || self.current_conversation.is_none()
                     {
                         // The user asked for this channel - or has no tab
                         // selected at all, so landing on the first joined
                         // channel takes nothing away. Anything else (an
                         // auto-join or replayed JOIN) must not steal the tab
                         // being read (#290).
-                        self.current_channel =
-                            Some(existing_key.unwrap_or_else(|| channel.clone()));
+                        self.select_target(&existing_key.unwrap_or_else(|| channel.clone()));
                     }
                     // The banner is not news: it must not raise an unread
                     // badge on a tab joined in the background.
@@ -4695,9 +4878,39 @@ impl Session {
                 let sender = msg.get_sender_nick().unwrap_or_default();
                 let reason_str = reason.as_deref().unwrap_or("");
                 if self.identifiers_equal(&sender, &self.my_nick) {
-                    self.remove_channel(channel);
-                    if self.current_target_is(channel) {
-                        self.current_channel = self.channels.keys().next().cloned();
+                    // /cycle may already have queued a newer JOIN after this
+                    // PART. Its recovery intent belongs to that newer command.
+                    let rejoin = self.pending_rejoins.as_ref().and_then(|rejoins| {
+                        rejoins
+                            .iter()
+                            .find(|(target, _)| self.identifiers_equal(target, channel))
+                            .cloned()
+                    });
+                    if let Some(id) = self
+                        .id_for_target(channel)
+                        .filter(|id| self.pending_cycles.contains(id))
+                    {
+                        self.forget_rejoin_membership(channel);
+                        // Reset protocol/history data just as a fresh JOIN did,
+                        // while retaining the view and its immutable identity.
+                        let mut fresh = Channel::new();
+                        fresh.set_case_mapping(self.network_support.case_mapping);
+                        fresh.set_prefix_schema(
+                            &self.network_support.prefix_modes,
+                            &self.network_support.user_prefixes,
+                        );
+                        if let Some(tab) = self.conversations.channel_mut(id) {
+                            *tab = fresh;
+                        }
+                        self.prune_known_users();
+                    } else {
+                        self.remove_channel(channel);
+                    }
+                    self.forget_part_intent(channel);
+                    if let Some(rejoin) = rejoin {
+                        self.pending_rejoins
+                            .get_or_insert_with(Vec::new)
+                            .push(rejoin);
                     }
                 } else {
                     if !self.hide_join_part {
@@ -4719,6 +4932,7 @@ impl Session {
                 let reason_str = reason.as_deref().unwrap_or("");
                 let max = self.max_scrollback;
                 if self.identifiers_equal(kicked, &self.my_nick) {
+                    self.forget_rejoin_membership(channel);
                     // We were kicked: keep the tab visible with a notice, but clear
                     // membership state since the server has removed us.
                     if let Some(ch) = self.channel_mut(channel) {
@@ -4758,7 +4972,7 @@ impl Session {
 
                 // Remove user from all channels, optionally show quit message
                 let max = self.max_scrollback;
-                for channel in self.channels.values_mut() {
+                for channel in self.conversations.values_mut() {
                     if channel.has_user(&sender) {
                         if !self.hide_join_part {
                             let sys_msg = ChatMessage::system(&format!(
@@ -4904,7 +5118,7 @@ impl Session {
                     };
                     // Find first channel where user is present and show message there
                     let max = self.max_scrollback;
-                    for channel in self.channels.values_mut() {
+                    for channel in self.conversations.values_mut() {
                         if channel.has_user(&sender) {
                             channel.push_trimmed(sys_msg, max);
                             break;
@@ -4939,7 +5153,7 @@ impl Session {
                     };
                     // Show in channels where user is present
                     let max = self.max_scrollback;
-                    for channel in self.channels.values_mut() {
+                    for channel in self.conversations.values_mut() {
                         if channel.has_user(&sender) {
                             channel.push_trimmed(sys_msg.clone(), max);
                             break; // Only show once
@@ -4967,7 +5181,7 @@ impl Session {
                         sender, new_user, new_host
                     ));
                     let max = self.max_scrollback;
-                    for channel in self.channels.values_mut() {
+                    for channel in self.conversations.values_mut() {
                         if channel.has_user(&sender) {
                             channel.push_trimmed(sys_msg.clone(), max);
                             break; // Only show once
@@ -5236,15 +5450,21 @@ impl Session {
             self.chathistory_limit = support.history_limit;
         }
         self.network_support = support;
-        if self.network_support.case_mapping != previous_case_mapping {
+        if self.network_support.case_mapping != previous_case_mapping
+            || self.network_support.has_isupport("CASEMAPPING")
+            || self.network_support.has_isupport("UTF8MAPPING")
+        {
             self.refresh_case_mapping_state();
+        } else {
+            self.conversations
+                .provisional_support(&self.network_support);
         }
         if self.network_support.prefix_modes != previous_prefix_modes
             || self.network_support.user_prefixes != previous_prefixes
         {
             let modes = self.network_support.prefix_modes.clone();
             let prefixes = self.network_support.user_prefixes.clone();
-            for channel in self.channels.values_mut() {
+            for channel in self.conversations.values_mut() {
                 channel.set_prefix_schema(&modes, &prefixes);
             }
         }
@@ -5356,6 +5576,18 @@ impl Session {
             && let (Some(from), Some(to)) = (params.get(1), params.get(2))
         {
             self.redirect_join_focus_request(from, to);
+            let recovering = self.pending_rejoins.as_ref().is_some_and(|rejoins| {
+                rejoins
+                    .iter()
+                    .any(|(name, _)| self.identifiers_equal(name, from))
+            });
+            self.forget_rejoin_membership(from);
+            if recovering {
+                self.pending_rejoins
+                    .as_mut()
+                    .unwrap()
+                    .push((to.clone(), None));
+            }
         }
         // A refused JOIN ends the attempt the key was sent for. Left in the
         // map, the key would attach to the tab of whatever later JOIN of that
@@ -5373,9 +5605,13 @@ impl Session {
                 | ERR_NEEDREGGEDNICK
         ) && let Some(channel) = params.get(1)
         {
+            if let Some(id) = self.id_for_target(channel) {
+                self.pending_cycles.remove(&id);
+            }
             self.pending_channel_keys
                 .remove(&self.network_support.canonicalize(channel));
             self.take_join_focus_request(channel);
+            self.forget_rejoin_membership(channel);
         }
         match num {
             RPL_SAVENICK => {
@@ -5401,12 +5637,12 @@ impl Session {
                 // being closed. It must neither mark the session connected nor
                 // wipe the intent the lifecycle needs to finish the switch
                 // once that worker exits (#246).
-                if self.connection_intent != ConnectionIntent::None {
+                if self.connection.is_closing() {
                     return;
                 }
-                self.connected = true;
-                self.connecting = false;
-                self.reset_reconnect_state(); // Reset reconnect attempts on successful connection
+                if !self.connection.accept_registration() {
+                    return;
+                }
                 self.nick_retry_attempts = 0;
                 // Clear any lag reading left over from a previous connection.
                 self.lag_ms = None;
@@ -5439,13 +5675,9 @@ impl Session {
                 }
 
                 // Restore actual memberships, including keys, through JOIN.
-                if let Some(rejoins) = self.update_rejoins.take() {
+                if let Some(rejoins) = self.pending_rejoins.as_ref().cloned() {
                     for (name, key) in rejoins {
-                        if let Some(key) = &key {
-                            self.pending_channel_keys
-                                .insert(self.network_support.canonicalize(&name), key.clone());
-                        }
-                        self.send_command(IrcCommand::Join(name, key, None, None));
+                        self.send_join_in_background(name, key);
                     }
                 } else if !auto_join.is_empty() {
                     for chan in auto_join.split(',') {
@@ -5479,7 +5711,7 @@ impl Session {
                 // JOIN event, so request their missed messages here.
                 if self.chathistory_enabled && self.logging_load_history {
                     let query_targets: Vec<String> = self
-                        .channels
+                        .conversations
                         .iter()
                         .filter(|(target, channel)| {
                             !self.is_channel_name(target)
@@ -5742,7 +5974,7 @@ impl Session {
                 // After registration this is a failed /nick attempt: report it and
                 // keep our current nick. Auto-retrying here would silently rename
                 // the user to "<current>_" and desync my_nick from the server.
-                if self.connected {
+                if self.is_connected() {
                     let rejected = params.get(1).cloned().unwrap_or_default();
                     let text = params
                         .last()
@@ -5787,7 +6019,7 @@ impl Session {
                 // rows must stay attributed (#169). A pre-registration
                 // walkaway from the configured nick records nothing (#166).
                 self.set_session_nick(new_nick.clone(), false);
-                if let Some(tx) = &self.cmd_tx {
+                if let Some(tx) = self.connection.sender() {
                     let _ = tx.send(IrcCommand::Nick(new_nick));
                 }
                 self.add_server_message(ChatMessage::system(
@@ -5801,7 +6033,7 @@ impl Session {
                     .last()
                     .cloned()
                     .unwrap_or_else(|| format!("registration error {}", num));
-                if !self.connected {
+                if !self.is_connected() {
                     self.fail_registration(format!("Registration failed: {}", text));
                 } else {
                     self.add_server_message(ChatMessage::system_fmt(
@@ -6471,7 +6703,7 @@ impl Session {
             if !self.is_channel_name(channel) {
                 const MAX_QUERY_WINDOWS: usize = 200;
                 let query_count = self
-                    .channels
+                    .conversations
                     .keys()
                     .filter(|k| !self.is_channel_name(k))
                     .count();
@@ -6484,7 +6716,7 @@ impl Session {
                 // cap unjoined channel tabs the same way (#193).
                 const MAX_UNJOINED_CHANNEL_WINDOWS: usize = 200;
                 let unjoined_count = self
-                    .channels
+                    .conversations
                     .iter()
                     .filter(|(k, ch)| self.is_channel_name(k) && !ch.joined)
                     .count();
@@ -6523,10 +6755,10 @@ impl Session {
                 }
                 self.log_manager.log_session_start(&network, &log_key);
             }
-            self.channels.insert(key.clone(), new_channel);
+            self.conversations.insert(key.clone(), new_channel);
         }
         if msg.msgid.as_ref().is_some_and(|msgid| {
-            self.channels.get(&key).is_some_and(|channel| {
+            self.conversations.get(&key).is_some_and(|channel| {
                 channel
                     .messages
                     .iter()
@@ -6552,7 +6784,7 @@ impl Session {
         // window in front) accrues its badge and read marker is held back
         // until focus returns (#305).
         let seen = self.window_focused && self.current_target_is(&key);
-        if let Some(ch) = self.channels.get_mut(&key) {
+        if let Some(ch) = self.conversations.get_mut(&key) {
             ch.push_trimmed(msg, self.max_scrollback);
             if !seen {
                 ch.unread += 1;
@@ -6570,7 +6802,7 @@ impl Session {
             self.server_messages.pop_front();
         }
         // Unread unless the server buffer is shown in a focused window
-        if self.current_channel.is_some() || !self.window_focused {
+        if self.current_conversation.is_some() || !self.window_focused {
             self.server_unread += 1;
         }
     }
@@ -6581,7 +6813,11 @@ impl Session {
         if self.monitored_users.contains(&key) {
             return;
         }
-        if self.channels.values().any(|channel| channel.has_user(nick)) {
+        if self
+            .conversations
+            .values()
+            .any(|channel| channel.has_user(nick))
+        {
             return;
         }
         self.known_users.remove(&key);
@@ -6635,7 +6871,7 @@ impl Session {
             identity.online = value;
         }
         let identity = identity.clone();
-        for channel in self.channels.values_mut() {
+        for channel in self.conversations.values_mut() {
             channel.apply_user_identity(&identity);
         }
     }
@@ -6680,7 +6916,7 @@ impl Session {
 
     /// Add a message to the current window (channel or server buffer)
     fn add_message_to_current(&mut self, msg: ChatMessage) {
-        if let Some(channel_name) = &self.current_channel.clone() {
+        if let Some(channel_name) = &self.current_target_name().map(str::to_owned) {
             self.add_message_to_channel(channel_name, msg);
         } else {
             self.add_server_message(msg);
@@ -6809,6 +7045,51 @@ impl Session {
         Some(chunks)
     }
 
+    fn send_text_parts(
+        &mut self,
+        command: &str,
+        target: &str,
+        chunks: Vec<String>,
+        sensitive: bool,
+    ) -> TextSendOutcome {
+        // A fragmented service command is not a valid authentication command,
+        // and its continuation would evade keyword-based credential filtering.
+        if sensitive && chunks.len() > 1 {
+            self.add_message_to_current(
+                ChatMessage::system_fmt(
+                    "Credential command not sent - it must fit in one IRC message",
+                    &self.timestamp_format,
+                )
+                .without_logging(),
+            );
+            return TextSendOutcome::default();
+        }
+        let make_command = |chunk: String| match command {
+            "NOTICE" => IrcCommand::Notice(target.to_string(), chunk),
+            _ => IrcCommand::Privmsg(target.to_string(), chunk),
+        };
+        // Validate every part before queueing any of them (for example, a NUL
+        // in the last pasted line must not send the preceding lines).
+        if !chunks
+            .iter()
+            .all(|chunk| self.validate_command(&make_command(chunk.clone())))
+        {
+            return TextSendOutcome::default();
+        }
+        let mut outcome = TextSendOutcome {
+            complete: true,
+            payloads: Vec::new(),
+        };
+        for chunk in chunks {
+            if !self.send_command(make_command(chunk.clone())) {
+                outcome.complete = false;
+                break;
+            }
+            outcome.payloads.push(chunk);
+        }
+        outcome
+    }
+
     fn send_text_command(
         &mut self,
         command: &str,
@@ -6816,12 +7097,16 @@ impl Session {
         text: &str,
         wrapper_prefix: &str,
         wrapper_suffix: &str,
-    ) -> bool {
+    ) -> TextSendOutcome {
         let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
+        let sensitive = commands::service_message_contains_credentials(target, &normalized)
+            || normalized
+                .split('\n')
+                .any(|line| commands::service_message_contains_credentials(target, line));
         let line_limit = self
             .network_support
             .line_len
-            .unwrap_or(IRC_MAX_LINE_BYTES.saturating_add(2))
+            .unwrap_or(IRC_MAX_LINE_BYTES + 2)
             .saturating_sub(2)
             .max(IRC_MAX_LINE_BYTES);
         let mut chunks = Vec::new();
@@ -6841,11 +7126,10 @@ impl Session {
                     )
                     .without_logging(),
                 );
-                return false;
+                return TextSendOutcome::default();
             };
             chunks.append(&mut line_chunks);
         }
-
         let full_text = format!("{wrapper_prefix}{normalized}{wrapper_suffix}");
         let use_multiline = self.enabled_caps.contains("draft/multiline")
             && (normalized.contains('\n') || chunks.len() > 1)
@@ -6854,10 +7138,7 @@ impl Session {
                 .multiline_max_bytes
                 .is_none_or(|max| full_text.len() <= max);
         if !use_multiline {
-            return chunks.into_iter().all(|chunk| match command {
-                "NOTICE" => self.send_command(IrcCommand::Notice(target.to_string(), chunk)),
-                _ => self.send_command(IrcCommand::Privmsg(target.to_string(), chunk)),
-            });
+            return self.send_text_parts(command, target, chunks, sensitive);
         }
 
         use std::sync::atomic::{AtomicU64, Ordering};
@@ -6866,7 +7147,7 @@ impl Session {
         let concat_overhead =
             format!("@batch={batch_id};draft/multiline-concat {command} {target} :").len();
         if concat_overhead >= IRC_MAX_LINE_BYTES {
-            return false;
+            return TextSendOutcome::default();
         }
         let max_payload = IRC_MAX_LINE_BYTES - concat_overhead;
         let mut lines: Vec<(String, bool)> = Vec::new();
@@ -6883,7 +7164,7 @@ impl Session {
                     end -= 1;
                 }
                 if end == 0 {
-                    return false;
+                    return TextSendOutcome::default();
                 }
                 lines.push((rest[..end].to_string(), !first));
                 first = false;
@@ -6895,53 +7176,117 @@ impl Session {
             .multiline_max_lines
             .is_some_and(|max| lines.len() > max)
         {
-            return chunks.into_iter().all(|chunk| match command {
-                "NOTICE" => self.send_command(IrcCommand::Notice(target.to_string(), chunk)),
-                _ => self.send_command(IrcCommand::Privmsg(target.to_string(), chunk)),
-            });
+            return self.send_text_parts(command, target, chunks, sensitive);
         }
-
-        if !self.send_command(IrcCommand::Batch(
+        let mut wire = vec![IrcCommand::Batch(
             format!("+{batch_id}"),
             Some("draft/multiline".to_string()),
             Some(target.to_string()),
-        )) {
-            return false;
-        }
-        let mut success = true;
+        )];
         for (line, concat) in lines {
             let concat_tag = if concat {
                 ";draft/multiline-concat"
             } else {
                 ""
             };
-            success &= self.send_command(IrcCommand::Raw(format!(
+            wire.push(IrcCommand::Raw(format!(
                 "@batch={batch_id}{concat_tag} {command} {target} :{line}"
             )));
         }
-        success &= self.send_command(IrcCommand::Batch(format!("-{batch_id}"), None, None));
-        success
+        wire.push(IrcCommand::Batch(format!("-{batch_id}"), None, None));
+        if !wire.iter().all(|command| self.validate_command(command)) {
+            return TextSendOutcome::default();
+        }
+        if !wire.into_iter().all(|command| self.send_command(command)) {
+            return TextSendOutcome::default();
+        }
+        TextSendOutcome {
+            complete: true,
+            payloads: vec![full_text],
+        }
     }
 
-    pub fn send_privmsg_text(&mut self, target: &str, text: &str) -> bool {
+    fn send_privmsg_text(&mut self, target: &str, text: &str) -> TextSendOutcome {
         if !self.can_send_to_target(target) {
-            return false;
+            return TextSendOutcome::default();
         }
         self.send_text_command("PRIVMSG", target, text, "", "")
     }
 
-    pub fn send_notice_text(&mut self, target: &str, text: &str) -> bool {
+    fn send_notice_text(&mut self, target: &str, text: &str) -> TextSendOutcome {
         if !self.can_send_to_target(target) {
-            return false;
+            return TextSendOutcome::default();
         }
         self.send_text_command("NOTICE", target, text, "", "")
     }
 
-    pub fn send_action_text(&mut self, target: &str, text: &str) -> bool {
+    fn send_action_text(&mut self, target: &str, text: &str) -> TextSendOutcome {
         if !self.can_send_to_target(target) {
-            return false;
+            return TextSendOutcome::default();
         }
         self.send_text_command("PRIVMSG", target, text, "\x01ACTION ", "\x01")
+    }
+
+    /// Local rows describe exactly what was queued, so each echo can acquire
+    /// the server's identity without duplicating an unsplit optimistic row.
+    fn send_chat_text(&mut self, target: &str, text: &str, action: bool) -> bool {
+        let outcome = if action {
+            self.send_action_text(target, text)
+        } else {
+            self.send_privmsg_text(target, text)
+        };
+        let sensitive = commands::service_message_contains_credentials(target, text);
+        for payload in outcome.payloads {
+            let content = if action {
+                payload
+                    .strip_prefix("\x01ACTION ")
+                    .and_then(|text| text.strip_suffix('\x01'))
+                    .unwrap_or(&payload)
+            } else {
+                &payload
+            };
+            let row =
+                if sensitive || commands::service_message_contains_credentials(target, content) {
+                    ChatMessage::new_fmt(
+                        &self.my_nick,
+                        "<credential command sent>",
+                        &self.timestamp_format,
+                    )
+                    .without_logging()
+                } else if action {
+                    ChatMessage::action_fmt(&self.my_nick, content, &self.timestamp_format)
+                        .with_pending_echo()
+                } else {
+                    commands::outgoing_local_echo(
+                        target,
+                        &self.my_nick,
+                        content,
+                        &self.timestamp_format,
+                    )
+                };
+            self.add_message_to_channel(target, row);
+        }
+        outcome.complete
+    }
+
+    fn send_notice_with_confirmation(&mut self, target: &str, text: &str) -> bool {
+        let outcome = self.send_notice_text(target, text);
+        let sensitive = commands::service_message_contains_credentials(target, text);
+        for payload in outcome.payloads {
+            let row = if sensitive
+                || commands::service_message_contains_credentials(target, &payload)
+            {
+                ChatMessage::system_fmt(
+                    &format!("-> -{target}- <credential command sent>"),
+                    &self.timestamp_format,
+                )
+                .without_logging()
+            } else {
+                ChatMessage::system_fmt(&format!("-> -{target}- {payload}"), &self.timestamp_format)
+            };
+            self.add_message_to_current(row);
+        }
+        outcome.complete
     }
 
     /// Feedback for a failed send. While the connection channel is gone the
@@ -6951,7 +7296,7 @@ impl Session {
     /// contradict it (also wrong during negotiation, where connected is
     /// still false; #161).
     fn report_send_failure(&mut self, sent: bool, message: &str) {
-        if !sent && self.cmd_tx.is_none() {
+        if !sent && !self.has_transport() {
             // without_logging: connection-scope client state does not belong
             // in a channel's on-disk history, which add_message_to_channel
             // would otherwise write (#166).
@@ -6959,17 +7304,17 @@ impl Session {
         }
     }
 
-    pub fn send_command(&mut self, cmd: IrcCommand) -> bool {
+    fn validate_command(&mut self, cmd: &IrcCommand) -> bool {
         let base_limit = self
             .network_support
             .line_len
             .unwrap_or(IRC_MAX_LINE_BYTES.saturating_add(2))
             .saturating_sub(2)
             .max(IRC_MAX_LINE_BYTES);
-        if !Self::command_fits_limits(&cmd, base_limit) {
+        if !Self::command_fits_limits(cmd, base_limit) {
             tracing::warn!(
                 "Outgoing command not sent (line too long): {}",
-                Self::command_log_summary(&cmd)
+                Self::command_log_summary(cmd)
             );
             self.add_message_to_current(
                 ChatMessage::system_fmt(
@@ -6980,7 +7325,7 @@ impl Session {
             );
             return false;
         }
-        if let Some(tag) = self.client_tag_is_denied(&cmd) {
+        if let Some(tag) = self.client_tag_is_denied(cmd) {
             self.add_message_to_current(
                 ChatMessage::system_fmt(
                     &format!("Command not sent - server blocks client tag +{tag}"),
@@ -6990,7 +7335,26 @@ impl Session {
             );
             return false;
         }
-        if let Some(tx) = &self.cmd_tx {
+        true
+    }
+
+    pub fn send_command(&mut self, cmd: IrcCommand) -> bool {
+        if !self.validate_command(&cmd) {
+            return false;
+        }
+        // Track intent only after the command really entered the transport.
+        // Raw/tagged forms share the same leave/rejoin semantics.
+        let parsed = if let IrcCommand::Raw(line) = &cmd {
+            IrcMessage::parse(line)
+        } else {
+            None
+        };
+        let membership = match parsed.as_ref().map_or(&cmd, |message| &message.command) {
+            IrcCommand::Part(target, _) => Some((target.clone(), None, false)),
+            IrcCommand::Join(target, key, _, _) => Some((target.clone(), key.clone(), true)),
+            _ => None,
+        };
+        if let Some(tx) = self.connection.sender() {
             if let Err(e) = tx.send(cmd) {
                 tracing::warn!(
                     "Outgoing command not sent (disconnected): {}",
@@ -6998,9 +7362,79 @@ impl Session {
                 );
                 return false;
             }
+            if let Some((targets, keys, joining)) = membership {
+                self.note_membership_intent(&targets, keys.as_deref(), joining);
+            }
             true
         } else {
             false
+        }
+    }
+
+    fn note_membership_intent(&mut self, targets: &str, keys: Option<&str>, joining: bool) {
+        if joining && targets == "0" {
+            // JOIN 0 is the protocol spelling for leaving every channel.
+            let mut names: Vec<_> = self
+                .conversations
+                .keys()
+                .filter(|name| self.is_channel_name(name))
+                .cloned()
+                .collect();
+            if let Some(rejoins) = self.pending_rejoins.as_ref() {
+                names.extend(rejoins.iter().map(|(name, _)| name.clone()));
+            }
+            for name in names {
+                self.note_membership_intent(&name, None, false);
+            }
+            return;
+        }
+        let mut keys = keys.unwrap_or("").split(',');
+        for name in targets
+            .split(',')
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+        {
+            let key = keys
+                .next()
+                .filter(|key| !key.is_empty())
+                .map(str::to_string);
+            if !joining {
+                let known = self.channel_key(name).is_some()
+                    || self.pending_rejoins.as_ref().is_some_and(|rejoins| {
+                        rejoins
+                            .iter()
+                            .any(|(target, _)| self.identifiers_equal(target, name))
+                    });
+                self.forget_rejoin_membership(name);
+                self.pending_channel_keys
+                    .remove(&self.network_support.canonicalize(name));
+                self.take_join_focus_request(name);
+                if known && !self.is_parting(name) {
+                    self.pending_parts.push(name.to_string());
+                }
+                continue;
+            }
+            let was_parting = self.is_parting(name);
+            self.forget_part_intent(name);
+            let already_joined = self
+                .channel_key(name)
+                .and_then(|key| self.conversations.get(&key))
+                .is_some_and(|channel| channel.joined);
+            if (!self.is_connected() && self.pending_rejoins.is_none())
+                || (already_joined && !was_parting)
+            {
+                continue;
+            }
+            let support = &self.network_support;
+            let rejoins = self.pending_rejoins.get_or_insert_with(Vec::new);
+            if let Some(existing) = rejoins
+                .iter_mut()
+                .find(|(target, _)| support.identifiers_equal(target, name))
+            {
+                *existing = (name.to_string(), key);
+            } else {
+                rejoins.push((name.to_string(), key));
+            }
         }
     }
 
@@ -7027,6 +7461,30 @@ impl Session {
         sent
     }
 
+    pub(crate) fn cycle_conversation(&mut self, id: ConversationId) -> bool {
+        if self.pending_cycles.contains(&id) {
+            return false;
+        }
+        let Some(target) = self.target_name(id).map(str::to_owned) else {
+            return false;
+        };
+        let key = self
+            .conversations
+            .channel(id)
+            .and_then(|channel| channel.key.clone());
+        if !self.send_command(IrcCommand::Part(target.clone(), Some("Cycling".into()))) {
+            return false;
+        }
+        // The accepted PART must retain the view even if the following JOIN
+        // cannot be queued. Another cycle waits for its outcome instead of
+        // sharing one pending bit across several PART/JOIN pairs.
+        self.pending_cycles.insert(id);
+        if !self.send_rejoin(target, key) {
+            return false;
+        }
+        true
+    }
+
     /// The user asked to join `channels` (a comma list is several requests):
     /// each channel's own-JOIN echo may take focus. A channel the user is
     /// already in produces no echo to wait for, so it is focused right away
@@ -7039,13 +7497,15 @@ impl Session {
             .map(str::trim)
             .filter(|name| !name.is_empty())
         {
-            let joined_tab = self
-                .channel_key(name)
-                .filter(|key| self.channels.get(key).is_some_and(|channel| channel.joined));
+            let joined_tab = self.channel_key(name).filter(|key| {
+                self.conversations
+                    .get(key)
+                    .is_some_and(|channel| channel.joined)
+            });
             if let Some(key) = joined_tab
                 && !rejoining
             {
-                self.select_tab(Some(key));
+                self.select_tab(self.id_for_target(&key));
                 continue;
             }
             if self
@@ -7121,7 +7581,7 @@ impl Session {
         // explicit /msg and /query forms, account for ordinary input and /say
         // while the active query is NickServ/AuthServ.
         let contains_credentials = commands::command_line_contains_credentials(&input)
-            || self.current_channel.as_deref().is_some_and(|target| {
+            || self.current_target_name().is_some_and(|target| {
                 let candidate = if let Some(command_line) = input.strip_prefix('/') {
                     let mut parts = command_line.splitn(2, char::is_whitespace);
                     let command = parts.next().unwrap_or("");
@@ -7155,10 +7615,10 @@ impl Session {
 
         if input.starts_with('/') {
             self.process_command(&input);
-        } else if let Some(channel) = &self.current_channel.clone() {
+        } else if let Some(channel) = &self.current_target_name().map(str::to_owned) {
             // Don't echo a message we can't actually send: without a live
             // connection the command channel is gone and the line would be lost.
-            if !self.connected || self.cmd_tx.is_none() {
+            if !self.is_connected() || !self.has_transport() {
                 self.add_message_to_current(
                     ChatMessage::system("Not connected - message not sent").without_logging(),
                 );
@@ -7190,11 +7650,7 @@ impl Session {
             }
 
             // Send message to current channel
-            if self.send_privmsg_text(channel, &input) {
-                let msg = ChatMessage::new_fmt(&self.my_nick, &input, &self.timestamp_format)
-                    .with_pending_echo();
-                self.add_message_to_channel(channel, msg);
-            } else {
+            if !self.send_chat_text(channel, &input, false) {
                 self.add_message_to_current(
                     ChatMessage::system_fmt("Message not sent", &self.timestamp_format)
                         .without_logging(),
@@ -7238,8 +7694,8 @@ impl Session {
     }
 
     fn find_nick_completions(&self, prefix: &str) -> Vec<String> {
-        if let Some(channel_name) = &self.current_channel
-            && let Some(channel) = self.channels.get(channel_name)
+        if let Some(channel_name) = self.current_target_name()
+            && let Some(channel) = self.conversations.get(channel_name)
         {
             let prefix_key = self.network_support.canonicalize(prefix);
             let mut matches: Vec<String> = channel
@@ -7336,8 +7792,8 @@ impl Session {
     /// and drawing therefore cannot disagree, which keeps cumulative offsets,
     /// the scrollbar range, and stick-to-bottom exact.
     pub fn draw_scrollback(&self, ui: &mut egui::Ui, available_height: f32) -> ScrollbackStats {
-        let messages = if let Some(channel_name) = &self.current_channel {
-            self.channels.get(channel_name).map(|c| &c.messages)
+        let messages = if let Some(channel_name) = self.current_target_name() {
+            self.conversations.get(channel_name).map(|c| &c.messages)
         } else {
             Some(&self.server_messages)
         };
@@ -7358,7 +7814,7 @@ impl Session {
 
         let mut painted_offset = 0.0;
         let output = ScrollArea::vertical()
-            .id_salt(("chat_scrollback", self.id, &self.current_channel))
+            .id_salt(("chat_scrollback", self.id, self.current_conversation))
             .auto_shrink([false; 2])
             .max_height(available_height)
             .stick_to_bottom(stick)
@@ -7465,17 +7921,17 @@ impl Session {
         stats
     }
 
-    fn ordered_tabs(&self) -> Vec<Option<String>> {
+    pub(crate) fn ordered_tabs(&self) -> Vec<Option<ConversationId>> {
         let fingerprint = self.tab_order_fingerprint();
         if let Some((cached, tabs)) = &*self.tab_order_cache.borrow()
             && *cached == fingerprint
         {
             return tabs.clone();
         }
-        let tabs: Vec<Option<String>> = self
+        let tabs: Vec<Option<ConversationId>> = self
             .ordered_tab_names()
             .into_iter()
-            .map(|name| name.map(str::to_string))
+            .map(|name| name.and_then(|name| self.id_for_target(name)))
             .collect();
         *self.tab_order_cache.borrow_mut() = Some((fingerprint, tabs.clone()));
         tabs
@@ -7485,17 +7941,26 @@ impl Session {
     /// on: the tab names and the casemapping that orders them (including
     /// the channel types its UTF-8 form preserves). Order-independent,
     /// since channel iteration order is not stable.
+    #[cfg(test)]
+    fn ordered_target_names(&self) -> Vec<Option<String>> {
+        self.ordered_tabs()
+            .into_iter()
+            .map(|id| id.and_then(|id| self.target_name(id).map(str::to_owned)))
+            .collect()
+    }
+
     fn tab_order_fingerprint(&self) -> u64 {
         fn fnv(hash: u64, bytes: &[u8]) -> u64 {
             bytes.iter().fold(hash, |hash, byte| {
                 (hash ^ u64::from(*byte)).wrapping_mul(0x0000_0100_0000_01b3)
             })
         }
-        let mut session_hash = fnv(0xcbf2_9ce4_8422_2325, &self.channels.len().to_le_bytes());
-        session_hash = fnv(
-            session_hash,
-            self.network_support.channel_types.as_bytes(),
+        let mut session_hash = fnv(
+            0xcbf2_9ce4_8422_2325,
+            &self.conversations.revision().to_le_bytes(),
         );
+        session_hash = fnv(session_hash, &self.conversations.len().to_le_bytes());
+        session_hash = fnv(session_hash, self.network_support.channel_types.as_bytes());
         let mapping = match self.network_support.case_mapping {
             CaseMapping::Ascii => 0u8,
             CaseMapping::StrictRfc1459 => 1,
@@ -7504,7 +7969,7 @@ impl Session {
         };
         session_hash = fnv(session_hash, &[mapping]);
         let mut total = session_hash;
-        for name in self.channels.keys() {
+        for name in self.conversations.keys() {
             total = total.wrapping_add(fnv(session_hash, name.as_bytes()).rotate_left(17));
         }
         total
@@ -7515,26 +7980,28 @@ impl Session {
     /// canonical key per name just to compare them.
     fn ordered_tab_names(&self) -> Vec<Option<&str>> {
         let mut tabs = vec![None];
-        let mut names: Vec<&str> = self.channels.keys().map(String::as_str).collect();
+        let mut names: Vec<&str> = self.conversations.keys().map(String::as_str).collect();
         names.sort_by(|a, b| self.network_support.cmp_canonical(a, b));
         tabs.extend(names.into_iter().map(Some));
         tabs
     }
 
-    fn select_tab(&mut self, target: Option<String>) {
-        self.current_channel = target;
+    fn select_tab(&mut self, conversation: Option<ConversationId>) {
+        if !self.select_conversation(conversation) {
+            return;
+        }
         self.selected_user = None;
         // Completion matches belong to the previous tab's users, and the
         // input text (which normally invalidates them) may be unchanged (#266).
         self.reset_tab_completion();
-        if let Some(channel_name) = &self.current_channel {
-            if let Some(channel) = self.channels.get_mut(channel_name) {
+        if let Some(id) = self.current_conversation {
+            if let Some(channel) = self.conversations.channel_mut(id) {
                 channel.unread = 0;
             }
         } else {
             self.server_unread = 0;
         }
-        if let Some(target) = self.current_channel.clone() {
+        if let Some(target) = self.current_target_name().map(str::to_owned) {
             self.mark_target_read(&target);
         }
     }
@@ -7547,20 +8014,14 @@ impl Session {
         }
         let current = tabs
             .iter()
-            .position(
-                |tab| match (tab.as_deref(), self.current_channel.as_deref()) {
-                    (None, None) => true,
-                    (Some(left), Some(right)) => self.identifiers_equal(left, right),
-                    _ => false,
-                },
-            )
+            .position(|tab| *tab == self.current_conversation)
             .unwrap_or(0);
         let next = if reverse {
             current.checked_sub(1).unwrap_or(tabs.len() - 1)
         } else {
             (current + 1) % tabs.len()
         };
-        self.select_tab(tabs[next].clone());
+        self.select_tab(tabs[next]);
     }
 
     /// Whether closing this tab has to PART first. Only a joined channel does;
@@ -7569,12 +8030,12 @@ impl Session {
         self.is_channel_name(name)
             && self
                 .channel_key(name)
-                .and_then(|key| self.channels.get(&key))
+                .and_then(|key| self.conversations.get(&key))
                 .is_some_and(|channel| channel.joined)
     }
 
     pub(crate) fn close_current_tab(&mut self) {
-        if let Some(channel_name) = self.current_channel.clone() {
+        if let Some(channel_name) = self.current_target_name().map(str::to_owned) {
             self.close_tab(&channel_name);
         }
     }
@@ -7590,7 +8051,7 @@ impl Session {
         let was_current = self.current_target_is(name);
         self.remove_channel(name);
         if was_current {
-            self.current_channel = self.channels.keys().next().cloned();
+            self.current_conversation = self.conversations.ids().next();
         }
     }
 
@@ -7763,9 +8224,15 @@ pub(crate) mod tests {
     fn test_app_connected() -> (Session, mpsc::UnboundedReceiver<IrcCommand>) {
         let mut app = test_app();
         let (tx, rx) = mpsc::unbounded_channel();
-        app.cmd_tx = Some(tx);
-        app.connected = true;
+        app.test_set_sender(tx);
+        app.test_set_connected(true);
         (app, rx)
+    }
+
+    fn test_registration_transport(app: &mut Session) -> mpsc::UnboundedReceiver<IrcCommand> {
+        let (tx, rx) = mpsc::unbounded_channel();
+        app.test_set_connecting(tx, None);
+        rx
     }
 
     /// Run `f` under a TRACE-level subscriber and return everything it logged.
@@ -7931,7 +8398,7 @@ pub(crate) mod tests {
     fn minimal_update_drains_and_processes_background_messages() {
         let mut app = test_app();
         let (tx, rx) = mpsc::channel(2);
-        app.msg_rx = Some(rx);
+        app.test_set_incoming(rx);
         tx.try_send(IrcMessage::parse(":server NOTICE * :background").unwrap())
             .unwrap();
 
@@ -7951,24 +8418,24 @@ pub(crate) mod tests {
         let mut channel = Channel::new();
         channel.joined = true;
         channel.add_user("me", UserMode::Normal);
-        app.channels.insert("#chan".to_string(), channel);
-        app.current_channel = Some("#chan".to_string());
+        app.conversations.insert("#chan".to_string(), channel);
+        app.select_target("#chan");
 
         app.handle_incoming_message(IrcMessage::parse(":oper!u@h KICK #chan me :bye").unwrap());
-        assert!(!app.channels["#chan"].joined);
+        assert!(!app.conversations["#chan"].joined);
 
         app.input_text = "hello".to_string();
         app.process_input();
         app.process_command("/amsg broadcast");
         assert!(rx.try_recv().is_err());
         assert!(
-            !app.channels["#chan"]
+            !app.conversations["#chan"]
                 .messages
                 .iter()
                 .any(|message| message.sender == "me" && message.content == "hello")
         );
         assert!(
-            app.channels["#chan"]
+            app.conversations["#chan"]
                 .messages
                 .iter()
                 .any(|message| { message.content.contains("not joined") })
@@ -7981,8 +8448,8 @@ pub(crate) mod tests {
         let mut channel = Channel::new();
         channel.add_user("Alina", UserMode::Normal);
         channel.add_user("Alice", UserMode::Normal);
-        app.channels.insert("#chan".to_string(), channel);
-        app.current_channel = Some("#chan".to_string());
+        app.conversations.insert("#chan".to_string(), channel);
+        app.select_target("#chan");
 
         app.input_text = "Al".to_string();
         app.handle_tab_completion();
@@ -8004,9 +8471,9 @@ pub(crate) mod tests {
         let mut first = Channel::new();
         first.add_user("Alina", UserMode::Normal);
         first.add_user("Alice", UserMode::Normal);
-        app.channels.insert("#one".to_string(), first);
-        app.channels.insert("#two".to_string(), Channel::new());
-        app.current_channel = Some("#one".to_string());
+        app.conversations.insert("#one".to_string(), first);
+        app.conversations.insert("#two".to_string(), Channel::new());
+        app.select_target("#one");
 
         app.input_text = "Al".to_string();
         app.handle_tab_completion();
@@ -8014,13 +8481,13 @@ pub(crate) mod tests {
 
         // The input is untouched by the switch, so only the tab change can
         // invalidate the first channel's matches (#266).
-        app.select_tab(Some("#two".to_string()));
+        app.select_tab(app.id_for_target("#two"));
         assert!(app.tab_completion.is_none());
         app.handle_tab_completion();
         assert_eq!(app.input_text, "Alice: ", "no stale nick cycling");
 
         // Selecting the server buffer is a tab change too.
-        app.select_tab(Some("#one".to_string()));
+        app.select_tab(app.id_for_target("#one"));
         app.input_text = "Al".to_string();
         app.handle_tab_completion();
         assert!(app.tab_completion.is_some());
@@ -8033,8 +8500,8 @@ pub(crate) mod tests {
         let mut app = test_app();
         let mut channel = Channel::new();
         channel.add_user("Alice", UserMode::Normal);
-        app.channels.insert("#chan".to_string(), channel);
-        app.current_channel = Some("#chan".to_string());
+        app.conversations.insert("#chan".to_string(), channel);
+        app.select_target("#chan");
 
         // A multi-byte whitespace char before the word must not panic on
         // byte-offset slicing (rfind returns the char's start offset).
@@ -8058,13 +8525,13 @@ pub(crate) mod tests {
                 "short",
             ));
         }
-        app.channels.insert("#history".into(), channel);
-        app.current_channel = Some("#history".into());
+        app.conversations.insert("#history".into(), channel);
+        app.select_target("#history");
         let ctx = egui::Context::default();
         let mut positions = Vec::new();
         for frame in 0..30 {
             if frame >= 20 && frame % 2 == 0 {
-                app.channels
+                app.conversations
                     .get_mut("#history")
                     .unwrap()
                     .messages
@@ -8117,7 +8584,7 @@ pub(crate) mod tests {
     fn cached_tab_order_tracks_tabs_and_casemapping() {
         let mut app = test_app();
         for name in ["#delta", "#Alpha", "#charlie"] {
-            app.channels.insert(name.to_string(), Channel::new());
+            app.conversations.insert(name.to_string(), Channel::new());
         }
         let expected: Vec<Option<String>> = vec![
             None,
@@ -8125,14 +8592,15 @@ pub(crate) mod tests {
             Some("#charlie".into()),
             Some("#delta".into()),
         ];
-        assert_eq!(app.ordered_tabs(), expected);
+        assert_eq!(app.ordered_target_names(), expected);
         // Second call is the memoized path and must agree.
-        assert_eq!(app.ordered_tabs(), expected);
+        assert_eq!(app.ordered_target_names(), expected);
 
-        app.channels.insert("#bravo".to_string(), Channel::new());
-        app.channels.remove("#charlie");
+        app.conversations
+            .insert("#bravo".to_string(), Channel::new());
+        app.conversations.remove("#charlie");
         assert_eq!(
-            app.ordered_tabs(),
+            app.ordered_target_names(),
             vec![
                 None,
                 Some("#Alpha".into()),
@@ -8143,16 +8611,16 @@ pub(crate) mod tests {
 
         // Casemapping changes the order: under RFC1459 "#Z" folds to "#z"
         // and sorts before "#[a" (folded "#{a"); ASCII keeps '[' first.
-        app.channels.clear();
-        app.channels.insert("#[a".to_string(), Channel::new());
-        app.channels.insert("#Z".to_string(), Channel::new());
+        app.conversations.clear();
+        app.conversations.insert("#[a".to_string(), Channel::new());
+        app.conversations.insert("#Z".to_string(), Channel::new());
         assert_eq!(
-            app.ordered_tabs(),
+            app.ordered_target_names(),
             vec![None, Some("#Z".into()), Some("#[a".into())]
         );
         app.network_support.case_mapping = CaseMapping::Ascii;
         assert_eq!(
-            app.ordered_tabs(),
+            app.ordered_target_names(),
             vec![None, Some("#[a".into()), Some("#Z".into())]
         );
     }
@@ -8166,8 +8634,8 @@ pub(crate) mod tests {
                 "message {i}: some channel chatter"
             )));
         }
-        app.channels.insert("#chan".to_string(), channel);
-        app.current_channel = Some("#chan".to_string());
+        app.conversations.insert("#chan".to_string(), channel);
+        app.select_target("#chan");
 
         // Headless egui pass: no renderer needed, real layout runs.
         let ctx = egui::Context::default();
@@ -8288,15 +8756,15 @@ pub(crate) mod tests {
                 .messages
                 .push_back(ChatMessage::system(&format!("row {i} of history")));
         }
-        app.channels.insert("#chan".to_string(), channel);
-        app.current_channel = Some("#chan".to_string());
+        app.conversations.insert("#chan".to_string(), channel);
+        app.select_target("#chan");
 
         let ctx = egui::Context::default();
         for frame in 0..6 {
             if frame > 0 {
                 // Simulate a newly arrived message: its row has no cached
                 // height yet, forcing a measurement this frame.
-                let chan = app.channels.get_mut("#chan").unwrap();
+                let chan = app.conversations.get_mut("#chan").unwrap();
                 chan.messages
                     .push_back(ChatMessage::system(&format!("fresh {frame}")));
             }
@@ -8328,20 +8796,20 @@ pub(crate) mod tests {
     #[test]
     fn ctrl_tab_navigation_wraps_in_both_directions() {
         let mut app = test_app();
-        app.channels.insert("#b".to_string(), Channel::new());
+        app.conversations.insert("#b".to_string(), Channel::new());
         let mut a = Channel::new();
         a.unread = 2;
-        app.channels.insert("#a".to_string(), a);
+        app.conversations.insert("#a".to_string(), a);
 
         app.cycle_tab(false);
-        assert_eq!(app.current_channel.as_deref(), Some("#a"));
-        assert_eq!(app.channels["#a"].unread, 0);
+        assert_eq!(app.current_target_name(), Some("#a"));
+        assert_eq!(app.conversations["#a"].unread, 0);
         app.cycle_tab(false);
-        assert_eq!(app.current_channel.as_deref(), Some("#b"));
+        assert_eq!(app.current_target_name(), Some("#b"));
         app.cycle_tab(false);
-        assert!(app.current_channel.is_none());
+        assert!(app.current_conversation.is_none());
         app.cycle_tab(true);
-        assert_eq!(app.current_channel.as_deref(), Some("#b"));
+        assert_eq!(app.current_target_name(), Some("#b"));
     }
 
     fn drain_commands(rx: &mut mpsc::UnboundedReceiver<IrcCommand>) -> Vec<IrcCommand> {
@@ -8365,8 +8833,8 @@ pub(crate) mod tests {
         // The server confirms each channel with its own JOIN echo.
         app.handle_incoming_message(IrcMessage::parse(":me!u@h JOIN #a").unwrap());
         app.handle_incoming_message(IrcMessage::parse(":me!u@h JOIN #b").unwrap());
-        assert_eq!(app.channels["#a"].key.as_deref(), Some("keya"));
-        assert_eq!(app.channels["#b"].key.as_deref(), Some("keyb"));
+        assert_eq!(app.conversations["#a"].key.as_deref(), Some("keya"));
+        assert_eq!(app.conversations["#b"].key.as_deref(), Some("keyb"));
         assert!(
             app.pending_channel_keys.is_empty(),
             "no stale pending key for the list as a whole is left behind"
@@ -8379,13 +8847,14 @@ pub(crate) mod tests {
         app.set_session_nick("me".to_string(), true);
         app.process_command("/join #sec hunter2");
         app.handle_incoming_message(IrcMessage::parse(":me!u@h JOIN #sec").unwrap());
-        assert_eq!(app.channels["#sec"].key.as_deref(), Some("hunter2"));
+        assert_eq!(app.conversations["#sec"].key.as_deref(), Some("hunter2"));
         drain_commands(&mut rx);
 
-        // The own-PART handler drops the tab, so each cycle must carry the
-        // key through the pending map to the new tab (#250).
+        // The retained conversation resets its protocol data on PART; the
+        // pending JOIN key must survive each round (#250).
+        let original = app.id_for_target("#sec").unwrap();
         for round in 0..2 {
-            app.current_channel = Some("#sec".to_string());
+            app.select_target("#sec");
             app.process_command("/cycle");
             assert_eq!(
                 drain_commands(&mut rx),
@@ -8396,10 +8865,11 @@ pub(crate) mod tests {
                 "round {round}"
             );
             app.handle_incoming_message(IrcMessage::parse(":me!u@h PART #sec :Cycling").unwrap());
-            assert!(!app.channels.contains_key("#sec"));
+            assert_eq!(app.id_for_target("#sec"), Some(original));
+            assert!(!app.conversations["#sec"].joined);
             app.handle_incoming_message(IrcMessage::parse(":me!u@h JOIN #sec").unwrap());
             assert_eq!(
-                app.channels["#sec"].key.as_deref(),
+                app.conversations["#sec"].key.as_deref(),
                 Some("hunter2"),
                 "round {round}"
             );
@@ -8434,7 +8904,7 @@ pub(crate) mod tests {
             // The channel is later joined without a key (an invite, a
             // bouncer, a keyless auto-join): it must not inherit the old one.
             app.handle_incoming_message(IrcMessage::parse(":me!u@h JOIN #sec").unwrap());
-            assert_eq!(app.channels["#sec"].key, None, "{refusal}");
+            assert_eq!(app.conversations["#sec"].key, None, "{refusal}");
         }
     }
 
@@ -8458,7 +8928,7 @@ pub(crate) mod tests {
         app.set_session_nick("me".to_string(), true);
         let mut kicked = Channel::new();
         kicked.key = Some("old-key".into());
-        app.channels.insert("#sec".to_string(), kicked);
+        app.conversations.insert("#sec".to_string(), kicked);
 
         app.process_command("/join #sec new-key");
         assert_eq!(
@@ -8472,8 +8942,8 @@ pub(crate) mod tests {
         );
         app.handle_incoming_message(IrcMessage::parse(":me!u@h JOIN #sec").unwrap());
 
-        assert!(app.channels["#sec"].joined);
-        assert_eq!(app.channels["#sec"].key.as_deref(), Some("new-key"));
+        assert!(app.conversations["#sec"].joined);
+        assert_eq!(app.conversations["#sec"].key.as_deref(), Some("new-key"));
         assert!(
             app.pending_channel_keys.is_empty(),
             "no stale pending key is left behind"
@@ -8509,10 +8979,17 @@ pub(crate) mod tests {
         );
 
         app.handle_incoming_message(IrcMessage::parse(":me!u@h JOIN #sec").unwrap());
-        assert_eq!(app.channels["#sec"].key.as_deref(), Some("hunter2"));
+        assert_eq!(app.conversations["#sec"].key.as_deref(), Some("hunter2"));
+        // #plain is still awaiting its JOIN echo, and must survive an
+        // update/reconnect during the initial auto-join burst as well.
+        let mut tabs = app.update_session().tabs;
+        tabs.sort();
         assert_eq!(
-            app.update_session().tabs,
-            vec![("#sec".to_string(), Some("hunter2".to_string()), true)]
+            tabs,
+            vec![
+                ("#plain".to_string(), None, true),
+                ("#sec".to_string(), Some("hunter2".to_string()), true),
+            ]
         );
     }
 
@@ -8522,12 +8999,12 @@ pub(crate) mod tests {
         app.set_session_nick("me".to_string(), true);
         app.process_command("/join #sec oldkey");
         app.handle_incoming_message(IrcMessage::parse(":me!u@h JOIN #sec").unwrap());
-        assert_eq!(app.channels["#sec"].key.as_deref(), Some("oldkey"));
+        assert_eq!(app.conversations["#sec"].key.as_deref(), Some("oldkey"));
 
         app.handle_incoming_message(IrcMessage::parse(":op!u@h MODE #sec +k newkey").unwrap());
-        assert_eq!(app.channels["#sec"].key.as_deref(), Some("newkey"));
+        assert_eq!(app.conversations["#sec"].key.as_deref(), Some("newkey"));
         drain_commands(&mut rx);
-        app.current_channel = Some("#sec".to_string());
+        app.select_target("#sec");
         app.process_command("/cycle");
         assert_eq!(
             drain_commands(&mut rx),
@@ -8543,10 +9020,10 @@ pub(crate) mod tests {
 
         // Removal names the old key on most servers; the stored key goes too.
         app.handle_incoming_message(IrcMessage::parse(":op!u@h MODE #sec -k newkey").unwrap());
-        assert_eq!(app.channels["#sec"].key, None);
+        assert_eq!(app.conversations["#sec"].key, None);
         app.handle_incoming_message(IrcMessage::parse(":op!u@h MODE #sec +k again").unwrap());
         app.handle_incoming_message(IrcMessage::parse(":op!u@h MODE #sec -k *").unwrap());
-        assert_eq!(app.channels["#sec"].key, None);
+        assert_eq!(app.conversations["#sec"].key, None);
     }
 
     #[test]
@@ -8557,7 +9034,7 @@ pub(crate) mod tests {
         app.handle_incoming_message(IrcMessage::parse(":me!u@h JOIN #sec").unwrap());
 
         app.handle_incoming_message(IrcMessage::parse(":srv 324 me #sec +ntk rotated").unwrap());
-        assert_eq!(app.channels["#sec"].key.as_deref(), Some("rotated"));
+        assert_eq!(app.conversations["#sec"].key.as_deref(), Some("rotated"));
 
         // Servers that hide the key from the reply show a placeholder; it is
         // not a key and must not replace the real one.
@@ -8566,7 +9043,7 @@ pub(crate) mod tests {
                 IrcMessage::parse(&format!(":srv 324 me #sec +ntk {placeholder}")).unwrap(),
             );
             assert_eq!(
-                app.channels["#sec"].key.as_deref(),
+                app.conversations["#sec"].key.as_deref(),
                 Some("rotated"),
                 "{placeholder}"
             );
@@ -8579,20 +9056,20 @@ pub(crate) mod tests {
         app.set_session_nick("me".to_string(), true);
         app.process_command("/join #sec oldkey");
         app.handle_incoming_message(IrcMessage::parse(":me!u@h JOIN #sec").unwrap());
-        assert_eq!(app.channels["#sec"].key.as_deref(), Some("oldkey"));
+        assert_eq!(app.conversations["#sec"].key.as_deref(), Some("oldkey"));
 
         // The key was removed while we were away; we come back without one.
         app.handle_incoming_message(IrcMessage::parse(":op!u@h KICK #sec me :bye").unwrap());
-        assert!(!app.channels["#sec"].joined);
+        assert!(!app.conversations["#sec"].joined);
         app.process_command("/join #sec");
         app.handle_incoming_message(IrcMessage::parse(":me!u@h JOIN #sec").unwrap());
-        assert!(app.channels["#sec"].joined);
-        assert_eq!(app.channels["#sec"].key.as_deref(), Some("oldkey"));
+        assert!(app.conversations["#sec"].joined);
+        assert_eq!(app.conversations["#sec"].key.as_deref(), Some("oldkey"));
 
         app.handle_incoming_message(IrcMessage::parse(":srv 324 me #sec +nt").unwrap());
-        assert_eq!(app.channels["#sec"].key, None);
+        assert_eq!(app.conversations["#sec"].key, None);
         drain_commands(&mut rx);
-        app.current_channel = Some("#sec".to_string());
+        app.select_target("#sec");
         app.process_command("/cycle");
         assert_eq!(
             drain_commands(&mut rx),
@@ -8612,19 +9089,21 @@ pub(crate) mod tests {
         let (mut connected, mut rx) = test_app_connected();
         let mut live = Channel::new();
         live.joined = true;
-        connected.channels.insert("#live".to_string(), live);
-        connected.current_channel = Some("#live".to_string());
+        connected.conversations.insert("#live".to_string(), live);
+        connected.select_target("#live");
         connected.close_current_tab();
-        assert!(connected.channels.contains_key("#live"));
+        assert!(connected.conversations.contains_key("#live"));
         assert!(matches!(rx.try_recv(), Ok(IrcCommand::Part(channel, None)) if channel == "#live"));
 
         let mut disconnected = test_app();
         let mut stale = Channel::new();
         stale.joined = true;
-        disconnected.channels.insert("#stale".to_string(), stale);
-        disconnected.current_channel = Some("#stale".to_string());
+        disconnected
+            .conversations
+            .insert("#stale".to_string(), stale);
+        disconnected.select_target("#stale");
         disconnected.close_current_tab();
-        assert!(!disconnected.channels.contains_key("#stale"));
+        assert!(!disconnected.conversations.contains_key("#stale"));
     }
 
     #[test]
@@ -8632,10 +9111,12 @@ pub(crate) mod tests {
         let (mut app, mut rx) = test_app_connected();
         let mut live = Channel::new();
         live.joined = true;
-        app.channels.insert("#live".to_string(), live);
-        app.channels.insert("#kicked".to_string(), Channel::new());
-        app.channels.insert("alice".to_string(), Channel::new());
-        app.current_channel = Some("#live".to_string());
+        app.conversations.insert("#live".to_string(), live);
+        app.conversations
+            .insert("#kicked".to_string(), Channel::new());
+        app.conversations
+            .insert("alice".to_string(), Channel::new());
+        app.select_target("#live");
 
         // The tab menu offers Close (not Part Channel) exactly when no PART
         // is needed: kicked/disconnected channels and queries (#256).
@@ -8646,21 +9127,22 @@ pub(crate) mod tests {
         app.close_tab("#kicked");
         app.close_tab("alice");
         assert!(rx.try_recv().is_err(), "unjoined tabs close locally");
-        assert!(!app.channels.contains_key("#kicked"));
-        assert!(!app.channels.contains_key("alice"));
-        assert_eq!(app.current_channel.as_deref(), Some("#live"));
+        assert!(!app.conversations.contains_key("#kicked"));
+        assert!(!app.conversations.contains_key("alice"));
+        assert_eq!(app.current_target_name(), Some("#live"));
 
         // A live channel is parted and kept until the server confirms.
         app.close_tab("#live");
         assert!(matches!(rx.try_recv(), Ok(IrcCommand::Part(channel, None)) if channel == "#live"));
-        assert!(app.channels.contains_key("#live"));
+        assert!(app.conversations.contains_key("#live"));
 
         // Closing the selected stale tab moves the selection off it.
-        app.channels.insert("#kicked".to_string(), Channel::new());
-        app.current_channel = Some("#kicked".to_string());
+        app.conversations
+            .insert("#kicked".to_string(), Channel::new());
+        app.select_target("#kicked");
         app.close_tab("#kicked");
-        assert!(!app.channels.contains_key("#kicked"));
-        assert_eq!(app.current_channel.as_deref(), Some("#live"));
+        assert!(!app.conversations.contains_key("#kicked"));
+        assert_eq!(app.current_target_name(), Some("#live"));
     }
 
     #[test]
@@ -8668,17 +9150,17 @@ pub(crate) mod tests {
         let mut app = test_app();
         app.logging_load_history = false;
         assert!(app.open_query("Alice"));
-        assert_eq!(app.current_channel.as_deref(), Some("Alice"));
+        assert_eq!(app.current_target_name(), Some("Alice"));
         assert!(
-            app.channels["Alice"]
+            app.conversations["Alice"]
                 .messages
                 .iter()
                 .any(|message| message.content == "Conversation with Alice")
         );
 
         assert!(app.open_query("alice"));
-        assert_eq!(app.channels.len(), 1);
-        assert_eq!(app.current_channel.as_deref(), Some("Alice"));
+        assert_eq!(app.conversations.len(), 1);
+        assert_eq!(app.current_target_name(), Some("Alice"));
     }
 
     #[test]
@@ -8719,7 +9201,7 @@ pub(crate) mod tests {
         assert_eq!(active.sasl_password.as_deref(), Some("old-sasl-pass"));
 
         let (tx, mut rx) = mpsc::unbounded_channel();
-        app.cmd_tx = Some(tx);
+        app.test_set_sender(tx);
         app.handle_numeric(RPL_WELCOME, &["me".into(), "welcome".into()]);
         assert!(matches!(rx.try_recv(), Ok(IrcCommand::Mode(_, Some(mode), _)) if mode == "+i"));
         assert!(
@@ -8744,27 +9226,27 @@ pub(crate) mod tests {
         app.auto_join_channels = "#old".into();
         app.auto_perform = "/ns identify old-nickserv-pass".into();
         assert!(app.start_session_from_form());
-        app.channels.insert("#old".into(), Channel::new());
+        app.conversations.insert("#old".into(), Channel::new());
 
         let (tx, mut rx) = mpsc::unbounded_channel();
-        app.cmd_tx = Some(tx);
-        app.connected = true;
-        app.connecting = false;
+        app.test_set_sender(tx);
+        app.test_set_connected(true);
+        app.test_set_connecting_flag(false);
         app.apply_unprofiled_endpoint("new.example", "7000", false);
         assert!(app.switch_session_from_form("Changing servers"));
 
         // Until the old worker exits, display/log/reconnect identity remains A.
         assert_eq!(app.active_endpoint_label(), "old.example:6697");
         assert!(matches!(rx.try_recv(), Ok(IrcCommand::Quit(_))));
-        assert!(app.pending_session.is_some());
+        assert!(app.connection.staged_config().is_some());
 
-        app.promote_pending_session();
+        app.test_finish_close();
         assert_eq!(app.active_endpoint_label(), "new.example:7000");
         assert_eq!(
             app.active_log_context().map(|context| context.0),
             Some("plain://new.example:7000".into())
         );
-        assert!(app.channels.is_empty());
+        assert!(app.conversations.is_empty());
         assert!(app.pending_auto_perform.is_none());
         let session = app.active_session.as_ref().unwrap();
         assert!(session.server.password.is_none());
@@ -8783,15 +9265,15 @@ pub(crate) mod tests {
     fn manual_disconnect_cancels_a_staged_endpoint_switch() {
         let mut app = test_app();
         assert!(app.start_session_from_form());
-        app.connected = true;
+        app.test_set_connected(true);
         let (tx, _rx) = mpsc::unbounded_channel();
-        app.cmd_tx = Some(tx);
+        app.test_set_sender(tx);
         app.apply_unprofiled_endpoint("other.example", "6667", false);
         assert!(app.switch_session_from_form("Changing servers"));
-        assert!(app.pending_session.is_some());
+        assert!(app.connection.staged_config().is_some());
 
         app.request_manual_disconnect(None);
-        assert!(app.pending_session.is_none());
+        assert!(app.connection.staged_config().is_none());
     }
 
     #[test]
@@ -8817,7 +9299,7 @@ pub(crate) mod tests {
         app.show_connect_dialog = false;
         assert!(!app.start_session_from_form());
         assert!(app.show_connect_dialog);
-        assert!(!app.connecting);
+        assert!(!app.is_connecting());
         assert!(app.connection_error().is_some());
         assert!(
             app.server_messages
@@ -8884,7 +9366,10 @@ pub(crate) mod tests {
         );
         app.handle_incoming_message(IrcMessage::parse(":srv BATCH -replay").unwrap());
 
-        let chan = app.channels.get("#chan").expect("batch creates the tab");
+        let chan = app
+            .conversations
+            .get("#chan")
+            .expect("batch creates the tab");
         assert!(
             chan.messages
                 .iter()
@@ -8895,7 +9380,7 @@ pub(crate) mod tests {
         // A live (non-batch) own notice is still suppressed as an echo.
         app.handle_incoming_message(IrcMessage::parse(":me!u@h NOTICE #chan :live echo").unwrap());
         assert!(
-            !app.channels["#chan"]
+            !app.conversations["#chan"]
                 .messages
                 .iter()
                 .any(|message| message.content.contains("live echo"))
@@ -8922,7 +9407,7 @@ pub(crate) mod tests {
         while rx.try_recv().is_ok() {}
 
         assert!(app.command_history.is_empty());
-        let query = &app.channels["NickServ"];
+        let query = &app.conversations["NickServ"];
         for secret in ["hunter2", "hunter3", "hunter4", "hunter5", "hunter6"] {
             assert!(
                 query
@@ -8946,7 +9431,7 @@ pub(crate) mod tests {
         app.input_text = "/lastlog IDENTIFY".into();
         app.process_input();
         assert!(
-            app.channels["NickServ"]
+            app.conversations["NickServ"]
                 .messages
                 .iter()
                 .all(|message| !message.content.contains("hunter"))
@@ -8968,8 +9453,8 @@ pub(crate) mod tests {
         app.add_message_to_channel("#te{st", ChatMessage::new_fmt("bob", "second", "short"));
         app.log_manager.flush_all();
 
-        assert_eq!(app.channels.len(), 1);
-        assert!(app.channels.contains_key("#Te[st"));
+        assert_eq!(app.conversations.len(), 1);
+        assert!(app.conversations.contains_key("#Te[st"));
         // Log keys are casemapped (#142): both spellings hash to one file.
         let canonical = app.network_support.canonicalize("#Te[st");
         let path = app
@@ -9075,7 +9560,7 @@ pub(crate) mod tests {
         let mut channel = Channel::new();
         channel.add_user("alice", UserMode::Normal);
         channel.add_user("bob", UserMode::Normal);
-        app.channels.insert("#chan".to_string(), channel);
+        app.conversations.insert("#chan".to_string(), channel);
         app.pending_whox
             .push_back(("7".to_string(), "#chan".to_string()));
 
@@ -9096,7 +9581,7 @@ pub(crate) mod tests {
                 "Alice Real".into(),
             ],
         );
-        let alice = app.channels["#chan"].get_user("alice").unwrap();
+        let alice = app.conversations["#chan"].get_user("alice").unwrap();
         assert_eq!(alice.account.as_deref(), Some("acc"));
         assert!(alice.is_away(), "flags column G must mark away");
         assert_eq!(alice.realname.as_deref(), Some("Alice Real"));
@@ -9116,7 +9601,7 @@ pub(crate) mod tests {
                 "Bob".into(),
             ],
         );
-        let bob = app.channels["#chan"].get_user("bob").unwrap();
+        let bob = app.conversations["#chan"].get_user("bob").unwrap();
         assert_eq!(bob.account.as_deref(), None);
         assert!(!bob.is_away());
     }
@@ -9127,7 +9612,7 @@ pub(crate) mod tests {
         app.set_session_nick("me".into(), true);
         let mut channel = Channel::new();
         channel.add_user("carol", UserMode::Normal);
-        app.channels.insert("#chan".to_string(), channel);
+        app.conversations.insert("#chan".to_string(), channel);
         app.pending_whox
             .push_back(("9".to_string(), "#chan".to_string()));
 
@@ -9146,7 +9631,7 @@ pub(crate) mod tests {
                 "Carol".into(),
             ],
         );
-        let carol = app.channels["#chan"].get_user("carol").unwrap();
+        let carol = app.conversations["#chan"].get_user("carol").unwrap();
         assert_eq!(carol.account.as_deref(), Some("Guest42"));
         assert!(!carol.is_away(), "an account starting with G is not away");
     }
@@ -9159,7 +9644,7 @@ pub(crate) mod tests {
         let mut channel = Channel::new();
         channel.joined = true;
         channel.add_user("alice", UserMode::Normal);
-        app.channels.insert("#chan".to_string(), channel);
+        app.conversations.insert("#chan".to_string(), channel);
         let whox_reply = |token: &str, account: &str| {
             [
                 "me".to_string(),
@@ -9174,7 +9659,7 @@ pub(crate) mod tests {
             ]
         };
         let account = |app: &Session| {
-            app.channels["#chan"]
+            app.conversations["#chan"]
                 .get_user("alice")
                 .unwrap()
                 .account
@@ -9223,7 +9708,7 @@ pub(crate) mod tests {
         for name in ["#a", "#b"] {
             let mut channel = Channel::new();
             channel.joined = true;
-            app.channels.insert(name.to_string(), channel);
+            app.conversations.insert(name.to_string(), channel);
         }
         app.handle_numeric(
             RPL_NAMREPLY,
@@ -9253,7 +9738,7 @@ pub(crate) mod tests {
         app.handle_numeric(RPL_ENDOFNAMES, &["me".into(), "#b".into()]);
 
         for channel in ["#a", "#b"] {
-            let alice = app.channels[channel].get_user("alice").unwrap();
+            let alice = app.conversations[channel].get_user("alice").unwrap();
             assert_eq!(alice.username.as_deref(), Some("au"), "{channel}");
             assert_eq!(alice.hostname.as_deref(), Some("ahost"), "{channel}");
         }
@@ -9269,7 +9754,7 @@ pub(crate) mod tests {
             ],
         );
         app.handle_numeric(RPL_ENDOFNAMES, &["me".into(), "#b".into()]);
-        let alice = app.channels["#b"].get_user("alice").unwrap();
+        let alice = app.conversations["#b"].get_user("alice").unwrap();
         assert_eq!(alice.username.as_deref(), Some("newu"));
         assert_eq!(alice.hostname.as_deref(), Some("newhost"));
     }
@@ -9284,7 +9769,7 @@ pub(crate) mod tests {
         for name in ["#a", "#b"] {
             let mut channel = Channel::new();
             channel.joined = true;
-            app.channels.insert(name.to_string(), channel);
+            app.conversations.insert(name.to_string(), channel);
         }
         let nicks: Vec<String> = (0..USERS).map(|i| format!("user{i}")).collect();
 
@@ -9307,8 +9792,8 @@ pub(crate) mod tests {
             }
             app.handle_numeric(RPL_ENDOFNAMES, &["me".into(), name.into()]);
         }
-        assert_eq!(app.channels["#a"].users.len(), USERS);
-        assert_eq!(app.channels["#b"].users.len(), USERS);
+        assert_eq!(app.conversations["#a"].users.len(), USERS);
+        assert_eq!(app.conversations["#b"].users.len(), USERS);
 
         // 366 queued a WHOX for each channel; answer #a's for every member.
         let token = app
@@ -9336,7 +9821,7 @@ pub(crate) mod tests {
 
         // The reply for each member reached both channels they share.
         for channel in ["#a", "#b"] {
-            let user = app.channels[channel].get_user("USER7777").unwrap();
+            let user = app.conversations[channel].get_user("USER7777").unwrap();
             assert_eq!(user.account.as_deref(), Some("acct7777"), "{channel}");
             assert_eq!(user.username.as_deref(), Some("u7777"), "{channel}");
         }
@@ -9359,13 +9844,13 @@ pub(crate) mod tests {
         app.handle_cap_message("ACK", &["echo-message".into(), "draft/chathistory".into()]);
         let mut channel = Channel::new();
         channel.joined = true;
-        app.channels.insert("#chan".to_string(), channel);
-        app.current_channel = Some("#chan".to_string());
+        app.conversations.insert("#chan".to_string(), channel);
+        app.select_target("#chan");
 
         // The local confirmation row "-> -#chan- unique-notice-text" exists.
         app.process_command("/notice #chan unique-notice-text");
         assert!(
-            app.channels["#chan"]
+            app.conversations["#chan"]
                 .messages
                 .iter()
                 .any(|message| message.content == "-> -#chan- unique-notice-text"),
@@ -9380,7 +9865,7 @@ pub(crate) mod tests {
         );
         app.handle_incoming_message(IrcMessage::parse(":srv BATCH -r").unwrap());
 
-        let hits = app.channels["#chan"]
+        let hits = app.conversations["#chan"]
             .messages
             .iter()
             .filter(|message| message.content.contains("unique-notice-text"))
@@ -9395,8 +9880,8 @@ pub(crate) mod tests {
         app.handle_cap_message("ACK", &["draft/chathistory".into()]);
         let mut channel = Channel::new();
         channel.joined = true;
-        app.channels.insert("NickServ".to_string(), channel);
-        app.current_channel = Some("NickServ".to_string());
+        app.conversations.insert("NickServ".to_string(), channel);
+        app.select_target("NickServ");
 
         app.handle_incoming_message(
             IrcMessage::parse(":srv BATCH +r chathistory NickServ").unwrap(),
@@ -9408,7 +9893,7 @@ pub(crate) mod tests {
         app.handle_incoming_message(IrcMessage::parse(":srv BATCH -r").unwrap());
 
         assert!(
-            app.channels["NickServ"]
+            app.conversations["NickServ"]
                 .messages
                 .iter()
                 .all(|message| !message.content.contains("hunter12")),
@@ -9423,8 +9908,8 @@ pub(crate) mod tests {
         app.handle_cap_message("ACK", &["echo-message".into()]);
         let mut channel = Channel::new();
         channel.joined = true;
-        app.channels.insert("#chan".to_string(), channel);
-        app.current_channel = Some("#chan".to_string());
+        app.conversations.insert("#chan".to_string(), channel);
+        app.select_target("#chan");
 
         // Confirmation stores the target as typed: "-> -@#chan- op hello".
         app.process_command("/notice @#chan op hello");
@@ -9435,7 +9920,7 @@ pub(crate) mod tests {
         );
         app.handle_incoming_message(IrcMessage::parse(":srv BATCH -r").unwrap());
 
-        let hits = app.channels["#chan"]
+        let hits = app.conversations["#chan"]
             .messages
             .iter()
             .filter(|message| message.content.contains("op hello"))
@@ -9450,12 +9935,12 @@ pub(crate) mod tests {
         app.handle_cap_message("ACK", &["echo-message".into()]);
         let mut channel = Channel::new();
         channel.joined = true;
-        app.channels.insert("#chan".to_string(), channel);
-        app.current_channel = Some("#chan".to_string());
+        app.conversations.insert("#chan".to_string(), channel);
+        app.select_target("#chan");
 
         app.process_command("/say lol");
         app.process_command("/say lol");
-        assert_eq!(app.channels["#chan"].messages.len(), 2);
+        assert_eq!(app.conversations["#chan"].messages.len(), 2);
 
         // Echoes come back in send order; the first must confirm the first row.
         app.handle_incoming_message(
@@ -9471,7 +9956,7 @@ pub(crate) mod tests {
             .unwrap(),
         );
 
-        let msgids: Vec<_> = app.channels["#chan"]
+        let msgids: Vec<_> = app.conversations["#chan"]
             .messages
             .iter()
             .map(|message| message.msgid.as_deref())
@@ -9491,11 +9976,11 @@ pub(crate) mod tests {
         channel
             .messages
             .push_back(ChatMessage::new_fmt("me", "ok", "short"));
-        app.channels.insert("#chan".to_string(), channel);
-        app.current_channel = Some("#chan".to_string());
+        app.conversations.insert("#chan".to_string(), channel);
+        app.select_target("#chan");
 
         app.process_command("/say ok");
-        assert_eq!(app.channels["#chan"].messages.len(), 2);
+        assert_eq!(app.conversations["#chan"].messages.len(), 2);
         app.handle_incoming_message(
             IrcMessage::parse(
                 "@msgid=fresh;time=2026-10-25T12:00:00.000Z :me!u@h PRIVMSG #chan :ok",
@@ -9503,7 +9988,7 @@ pub(crate) mod tests {
             .unwrap(),
         );
 
-        let messages = &app.channels["#chan"].messages;
+        let messages = &app.conversations["#chan"].messages;
         assert_eq!(messages.len(), 2, "the echo must not add a third row");
         assert_eq!(
             messages[0].msgid, None,
@@ -9523,7 +10008,7 @@ pub(crate) mod tests {
             )
             .unwrap(),
         );
-        let messages = &app.channels["#chan"].messages;
+        let messages = &app.conversations["#chan"].messages;
         assert_eq!(messages[0].msgid, None);
         assert_eq!(messages[1].msgid.as_deref(), Some("fresh"));
     }
@@ -9535,8 +10020,8 @@ pub(crate) mod tests {
         app.handle_cap_message("ACK", &["echo-message".into()]);
         let mut channel = Channel::new();
         channel.joined = true;
-        app.channels.insert("#chan".to_string(), channel);
-        app.current_channel = Some("#chan".to_string());
+        app.conversations.insert("#chan".to_string(), channel);
+        app.select_target("#chan");
 
         // A peer types the literal confirmation shape: it must not suppress
         // a genuine replay of our own notice sent from another device.
@@ -9549,7 +10034,7 @@ pub(crate) mod tests {
         );
         app.handle_incoming_message(IrcMessage::parse(":srv BATCH -r").unwrap());
 
-        let hits = app.channels["#chan"]
+        let hits = app.conversations["#chan"]
             .messages
             .iter()
             .filter(|message| message.content.contains("hello"))
@@ -9567,8 +10052,8 @@ pub(crate) mod tests {
         app.handle_cap_message("ACK", &["echo-message".into()]);
         let mut channel = Channel::new();
         channel.joined = true;
-        app.channels.insert("NickServ".to_string(), channel);
-        app.current_channel = Some("NickServ".to_string());
+        app.conversations.insert("NickServ".to_string(), channel);
+        app.select_target("NickServ");
 
         // An own notice with auth-keyword text replayed from a service query
         // is dropped (over-redaction is the safe direction there); the
@@ -9588,7 +10073,7 @@ pub(crate) mod tests {
         );
         app.handle_incoming_message(IrcMessage::parse(":srv BATCH -r").unwrap());
 
-        let rows: Vec<&str> = app.channels["NickServ"]
+        let rows: Vec<&str> = app.conversations["NickServ"]
             .messages
             .iter()
             .map(|message| message.content.as_str())
@@ -9684,11 +10169,11 @@ pub(crate) mod tests {
     #[test]
     fn send_failure_rows_are_not_persisted_to_logs() {
         let mut app = Session::with_settings(crate::gui::Settings::default());
-        app.current_channel = Some("#chan".into());
-        app.channels.insert("#chan".into(), Channel::new());
+        app.select_target("#chan");
+        app.conversations.insert("#chan".into(), Channel::new());
         app.report_send_failure(false, "Not connected - away status not changed");
         assert!(
-            app.channels["#chan"]
+            app.conversations["#chan"]
                 .messages
                 .iter()
                 .all(|message| message.no_log)
@@ -9704,7 +10189,7 @@ pub(crate) mod tests {
             "NickServ",
             ChatMessage::new_fmt("Guest123", "IDENTIFY hunter16", "short"),
         );
-        let query = &app.channels["NickServ"];
+        let query = &app.conversations["NickServ"];
         assert!(
             query
                 .messages
@@ -9722,8 +10207,8 @@ pub(crate) mod tests {
         app.handle_cap_message("ACK", &["draft/chathistory".into()]);
         let mut channel = Channel::new();
         channel.joined = true;
-        app.channels.insert("NickServ".to_string(), channel);
-        app.current_channel = Some("NickServ".to_string());
+        app.conversations.insert("NickServ".to_string(), channel);
+        app.select_target("NickServ");
 
         // Own row to an auth service but NOT a credential command: replay
         // must keep it (#158 drops only the credential shape).
@@ -9736,7 +10221,7 @@ pub(crate) mod tests {
         app.handle_incoming_message(IrcMessage::parse(":srv BATCH -r").unwrap());
 
         assert!(
-            app.channels["NickServ"]
+            app.conversations["NickServ"]
                 .messages
                 .iter()
                 .any(|message| message.content == "INFO alice")
@@ -9751,8 +10236,8 @@ pub(crate) mod tests {
         app.handle_cap_message("ACK", &["draft/chathistory".into()]);
         let mut channel = Channel::new();
         channel.joined = true;
-        app.channels.insert("NickServ".to_string(), channel);
-        app.current_channel = Some("NickServ".to_string());
+        app.conversations.insert("NickServ".to_string(), channel);
+        app.select_target("NickServ");
 
         // The sending nick predates the GHOST/REGAIN: the keyword check still
         // runs for any own row replayed from a service query.
@@ -9776,7 +10261,7 @@ pub(crate) mod tests {
         );
         app.handle_incoming_message(IrcMessage::parse(":srv BATCH -r").unwrap());
 
-        let rows: Vec<&str> = app.channels["NickServ"]
+        let rows: Vec<&str> = app.conversations["NickServ"]
             .messages
             .iter()
             .map(|message| message.content.as_str())
@@ -9798,8 +10283,8 @@ pub(crate) mod tests {
         app.handle_cap_message("ACK", &["draft/chathistory".into()]);
         let mut channel = Channel::new();
         channel.joined = true;
-        app.channels.insert("#chan".to_string(), channel);
-        app.current_channel = Some("#chan".to_string());
+        app.conversations.insert("#chan".to_string(), channel);
+        app.select_target("#chan");
 
         app.handle_incoming_message(IrcMessage::parse(":srv BATCH +r chathistory #chan").unwrap());
         for (id, line) in [
@@ -9813,7 +10298,7 @@ pub(crate) mod tests {
         }
         app.handle_incoming_message(IrcMessage::parse(":srv BATCH -r").unwrap());
 
-        let rows: Vec<&str> = app.channels["#chan"]
+        let rows: Vec<&str> = app.conversations["#chan"]
             .messages
             .iter()
             .map(|message| message.content.as_str())
@@ -9837,6 +10322,7 @@ pub(crate) mod tests {
         app.use_tls = true;
         let session = app.session_from_form().unwrap();
         app.activate_session(session.clone());
+        let _registration = test_registration_transport(&mut app);
         // This connection's own 001 confirms the configured nick.
         app.handle_numeric(RPL_WELCOME, &["alice".into(), "welcome".into()]);
         assert!(app.nick_confirmed);
@@ -9846,6 +10332,7 @@ pub(crate) mod tests {
 
         // Reconnect to the SAME endpoint: bob was genuinely ours, and the
         // configured alice stays held (#168).
+        app.test_set_disconnected();
         app.activate_session(session);
         assert!(
             app.sender_is_self("bob"),
@@ -9862,10 +10349,12 @@ pub(crate) mod tests {
         app.use_tls = true;
         let session = app.session_from_form().unwrap();
         app.activate_session(session.clone());
+        let _registration = test_registration_transport(&mut app);
         app.handle_numeric(RPL_WELCOME, &["bob".into(), "welcome".into()]);
         // The connection drops; the auto-reconnect re-registers as "bob"
         // and the server 433s — bob was confirmed on this lineage.
         app.mark_connection_lost();
+        let _registration = test_registration_transport(&mut app);
 
         app.handle_numeric(
             ERR_NICKNAMEINUSE,
@@ -9881,6 +10370,7 @@ pub(crate) mod tests {
         app.nickname = "other".into();
         app.server_host = "other.example".into();
         let other = app.session_from_form().unwrap();
+        app.test_set_disconnected();
         app.activate_session(other);
         assert!(app.past_nicks.is_empty());
         assert!(!app.sender_is_self("bob_"));
@@ -9890,6 +10380,7 @@ pub(crate) mod tests {
     #[test]
     fn welcome_records_a_confirmed_replacement_but_adopts_speculative() {
         let mut app = test_app();
+        let _registration = test_registration_transport(&mut app);
         // Confirmed nick replaced by the server's 001 (bouncer rewrite):
         // the confirmed nick is recorded as held (#168).
         app.set_session_nick("bob".into(), true);
@@ -9900,6 +10391,7 @@ pub(crate) mod tests {
 
         // Speculative pre-registration nick replaced at 001: never held.
         let mut app2 = test_app();
+        let _registration2 = test_registration_transport(&mut app2);
         app2.handle_numeric(ERR_NICKNAMEINUSE, &["x".into(), "in use".into()]);
         app2.handle_numeric(RPL_WELCOME, &["x__".into(), "welcome".into()]);
         assert_eq!(app2.my_nick, "x__");
@@ -9914,8 +10406,8 @@ pub(crate) mod tests {
         app.handle_cap_message("ACK", &["echo-message".into()]);
         let mut channel = Channel::new();
         channel.joined = true;
-        app.channels.insert("#chan".to_string(), channel);
-        app.current_channel = Some("#chan".to_string());
+        app.conversations.insert("#chan".to_string(), channel);
+        app.select_target("#chan");
 
         // A peer took 'alice' and sends a channel NOTICE: the live
         // echo-suppression gate is current-nick-only (#168).
@@ -9923,7 +10415,7 @@ pub(crate) mod tests {
             IrcMessage::parse(":alice!u@h NOTICE #chan :maintenance at noon").unwrap(),
         );
         assert!(
-            app.channels["#chan"]
+            app.conversations["#chan"]
                 .messages
                 .iter()
                 .any(|message| message.content.contains("maintenance at noon")),
@@ -9942,6 +10434,7 @@ pub(crate) mod tests {
         app.sasl_password = "pw1".into();
         let session = app.session_from_form().unwrap();
         app.activate_session(session.clone());
+        let _registration = test_registration_transport(&mut app);
 
         // Pre-registration walkaway: nothing recorded, then 001 grants the
         // suffixed nick (confirmed, past_nicks empty).
@@ -9958,7 +10451,9 @@ pub(crate) mod tests {
         // nick differs from the confirmed one, so it is adopted unconfirmed
         // and a subsequent pre-registration 433 must NOT attribute the
         // stranger-held "alice" (#171).
+        app.test_set_disconnected();
         app.activate_session(session.clone());
+        let _registration = test_registration_transport(&mut app);
         assert!(!app.nick_confirmed);
         app.handle_numeric(
             ERR_NICKNAMEINUSE,
@@ -9971,7 +10466,9 @@ pub(crate) mod tests {
 
         // Re-applying the confirmed nick itself keeps confirmation (#170),
         // and the equal-case 001 records nothing (#169).
+        app.test_set_disconnected();
         app.activate_session(session.clone());
+        let _registration = test_registration_transport(&mut app);
         app.handle_numeric(RPL_WELCOME, &["alice_".into(), "welcome".into()]);
         assert_eq!(app.my_nick, "alice_");
         assert!(app.nick_confirmed);
@@ -9984,6 +10481,7 @@ pub(crate) mod tests {
         app.sasl_username = "other".into();
         app.sasl_password = "pw2".into();
         let other = app.session_from_form().unwrap();
+        app.test_set_disconnected();
         app.activate_session(other);
         assert!(app.past_nicks.is_empty());
         assert!(!app.sender_is_self("alice_"));
@@ -10090,9 +10588,9 @@ pub(crate) mod tests {
     fn auto_reconnect_resets_the_walkaway_budget() {
         let mut app = test_app();
         app.nick_retry_attempts = 3;
-        app.connection_lost = true;
+        app.test_set_lost(true);
         app.auto_reconnect = true;
-        app.last_disconnect_time = Some(std::time::Instant::now());
+        app.test_set_failed_at(Some(std::time::Instant::now()));
         app.start_reconnect();
         assert_eq!(
             app.nick_retry_attempts, 0,
@@ -10106,11 +10604,11 @@ pub(crate) mod tests {
         app.set_session_nick("mine".into(), true);
         let mut channel = Channel::new();
         channel.add_user("mine", crate::gui::UserMode::Normal);
-        app.channels.insert("#chan".into(), channel);
+        app.conversations.insert("#chan".into(), channel);
         app.handle_numeric(RPL_SAVENICK, &["me".into(), "forced2".into()]);
         assert_eq!(app.my_nick, "forced2");
         assert!(app.sender_is_self("mine"), "forced-away nick stays ours");
-        let chan = &app.channels["#chan"];
+        let chan = &app.conversations["#chan"];
         assert!(chan.get_user("forced2").is_some(), "user list renamed");
         assert!(
             chan.messages
@@ -10185,7 +10683,7 @@ pub(crate) mod tests {
 
         assert!(rx.try_recv().is_err(), "must not reply to ourselves");
         assert!(app.server_messages.is_empty(), "no CTCP request notice");
-        assert!(app.channels.is_empty(), "no query tab for the echo");
+        assert!(app.conversations.is_empty(), "no query tab for the echo");
 
         // A peer's request is still answered.
         app.handle_incoming_message(
@@ -10203,8 +10701,8 @@ pub(crate) mod tests {
         app.set_session_nick("me".into(), true);
         let mut channel = Channel::new();
         channel.joined = true;
-        app.channels.insert("#chan".to_string(), channel);
-        app.current_channel = Some("#chan".to_string());
+        app.conversations.insert("#chan".to_string(), channel);
+        app.select_target("#chan");
 
         // Fifty channel-wide requests, from one flooder and from fifty nicks.
         for i in 0..50 {
@@ -10226,14 +10724,14 @@ pub(crate) mod tests {
         );
         // The focused tab is told once that replies are being held back, not
         // once per request.
-        let rows = app.channels["#chan"]
+        let rows = app.conversations["#chan"]
             .messages
             .iter()
             .filter(|message| message.content.starts_with("[CTCP]"))
             .count();
         assert_eq!(rows, replies + 1);
         assert!(
-            app.channels["#chan"]
+            app.conversations["#chan"]
                 .messages
                 .iter()
                 .any(|message| message.content.contains("rate limit"))
@@ -10253,7 +10751,7 @@ pub(crate) mod tests {
 
         app.begin_connection_attempt();
         let (tx, mut rx) = mpsc::unbounded_channel();
-        app.cmd_tx = Some(tx);
+        app.test_set_sender(tx);
         app.handle_incoming_message(
             IrcMessage::parse(":peer!u@h PRIVMSG me :\x01VERSION\x01").unwrap(),
         );
@@ -10266,7 +10764,7 @@ pub(crate) mod tests {
         channel.topic = Some("old topic".to_string());
         channel.topic_set_by = Some("olduser".to_string());
         channel.topic_set_time = Some(1);
-        app.channels.insert("#chan".to_string(), channel);
+        app.conversations.insert("#chan".to_string(), channel);
     }
 
     #[test]
@@ -10278,7 +10776,7 @@ pub(crate) mod tests {
             IrcMessage::parse("@time=2026-10-25T12:00:00.000Z :alice!u@h TOPIC #chan :new topic")
                 .unwrap(),
         );
-        let ch = &app.channels["#chan"];
+        let ch = &app.conversations["#chan"];
         assert_eq!(ch.topic.as_deref(), Some("new topic"));
         assert_eq!(ch.topic_set_by.as_deref(), Some("alice"));
         assert_eq!(ch.topic_set_time, Some(1792929600));
@@ -10287,7 +10785,7 @@ pub(crate) mod tests {
         app.handle_incoming_message(
             IrcMessage::parse(":bob!u@h TOPIC #chan :newer topic").unwrap(),
         );
-        let ch = &app.channels["#chan"];
+        let ch = &app.conversations["#chan"];
         assert_eq!(ch.topic_set_by.as_deref(), Some("bob"));
         assert!(ch.topic_set_time.unwrap() > 1792929600);
     }
@@ -10299,7 +10797,7 @@ pub(crate) mod tests {
 
         app.handle_incoming_message(IrcMessage::parse(":alice!u@h TOPIC #chan :").unwrap());
 
-        let ch = &app.channels["#chan"];
+        let ch = &app.conversations["#chan"];
         assert_eq!(ch.topic, None);
         assert_eq!(ch.topic_set_by, None);
         assert_eq!(ch.topic_set_time, None);
@@ -10321,7 +10819,7 @@ pub(crate) mod tests {
             &["me".into(), "#chan".into(), "No topic is set".into()],
         );
 
-        let ch = &app.channels["#chan"];
+        let ch = &app.conversations["#chan"];
         assert_eq!(ch.topic, None);
         assert_eq!(ch.topic_set_by, None);
         assert_eq!(ch.topic_set_time, None);
@@ -10335,7 +10833,7 @@ pub(crate) mod tests {
         // 332 starts a fresh topic: the old setter must not linger if the
         // server omits 333.
         app.handle_numeric(RPL_TOPIC, &["me".into(), "#chan".into(), "fresh".into()]);
-        let ch = &app.channels["#chan"];
+        let ch = &app.conversations["#chan"];
         assert_eq!(ch.topic.as_deref(), Some("fresh"));
         assert_eq!(ch.topic_set_by, None);
         assert_eq!(ch.topic_set_time, None);
@@ -10349,13 +10847,13 @@ pub(crate) mod tests {
                 "1700000000".into(),
             ],
         );
-        let ch = &app.channels["#chan"];
+        let ch = &app.conversations["#chan"];
         assert_eq!(ch.topic_set_by.as_deref(), Some("carol"));
         assert_eq!(ch.topic_set_time, Some(1700000000));
 
         // An empty 332 is no topic, not an empty "Topic:" row.
         app.handle_numeric(RPL_TOPIC, &["me".into(), "#chan".into(), "".into()]);
-        assert_eq!(app.channels["#chan"].topic, None);
+        assert_eq!(app.conversations["#chan"].topic, None);
     }
 
     #[test]
@@ -10478,7 +10976,7 @@ pub(crate) mod tests {
             &app.network_support.prefix_modes,
             &app.network_support.user_prefixes,
         );
-        app.channels.insert("#room".into(), channel);
+        app.conversations.insert("#room".into(), channel);
         app.handle_numeric(
             RPL_NAMREPLY,
             &["nick".into(), "=".into(), "#room".into(), "!@Alice".into()],
@@ -10486,12 +10984,18 @@ pub(crate) mod tests {
         app.handle_numeric(RPL_ENDOFNAMES, &["nick".into(), "#room".into()]);
 
         assert_eq!(
-            app.channels["#room"].get_user("alice").unwrap().prefix(),
+            app.conversations["#room"]
+                .get_user("alice")
+                .unwrap()
+                .prefix(),
             "!"
         );
         app.handle_mode_message("oper", "#room", Some("-Y"), &["alice".into()]);
         assert_eq!(
-            app.channels["#room"].get_user("alice").unwrap().prefix(),
+            app.conversations["#room"]
+                .get_user("alice")
+                .unwrap()
+                .prefix(),
             "@"
         );
         assert_eq!(app.strip_status_prefix("@+#room"), "#room");
@@ -10501,7 +11005,7 @@ pub(crate) mod tests {
     #[test]
     fn common_channel_mode_lists_are_structured_and_updated_live() {
         let mut app = test_app();
-        app.channels.insert("#room".into(), Channel::new());
+        app.conversations.insert("#room".into(), Channel::new());
         app.handle_numeric(
             RPL_EXCEPTLIST,
             &[
@@ -10513,9 +11017,13 @@ pub(crate) mod tests {
             ],
         );
         app.handle_numeric(RPL_ENDOFEXCEPTLIST, &["me".into(), "#room".into()]);
-        let exceptions = &app.channels["#room"].mode_lists[&'e'];
+        let exceptions = &app.conversations["#room"].mode_lists[&'e'];
         assert_eq!(exceptions[0].mask, "*!*@trusted.example");
-        assert!(app.channels["#room"].mode_lists_complete.contains(&'e'));
+        assert!(
+            app.conversations["#room"]
+                .mode_lists_complete
+                .contains(&'e')
+        );
 
         app.handle_mode_message(
             "oper",
@@ -10523,7 +11031,10 @@ pub(crate) mod tests {
             Some("+I-b"),
             &["account:*".into(), "*!*@bad.example".into()],
         );
-        assert_eq!(app.channels["#room"].mode_lists[&'I'][0].mask, "account:*");
+        assert_eq!(
+            app.conversations["#room"].mode_lists[&'I'][0].mask,
+            "account:*"
+        );
     }
 
     #[test]
@@ -10537,9 +11048,9 @@ pub(crate) mod tests {
         ];
         for (entry, end, mode) in lists {
             let mut app = test_app();
-            app.channels.insert("#room".into(), Channel::new());
+            app.conversations.insert("#room".into(), Channel::new());
             let list = |app: &Session| -> Vec<String> {
-                let channel = &app.channels["#room"];
+                let channel = &app.conversations["#room"];
                 let masks: Vec<String> = channel
                     .mode_lists
                     .get(&mode)
@@ -10578,7 +11089,11 @@ pub(crate) mod tests {
             // An emptied list sends only the end marker.
             burst(&mut app, &[]);
             assert!(list(&app).is_empty(), "+{mode}");
-            assert!(app.channels["#room"].mode_lists_complete.contains(&mode));
+            assert!(
+                app.conversations["#room"]
+                    .mode_lists_complete
+                    .contains(&mode)
+            );
 
             // A listing cut off by a disconnect is not continued by the next.
             burst(&mut app, &["a!*@*"]);
@@ -10606,9 +11121,9 @@ pub(crate) mod tests {
         app.handle_incoming_message(
             IrcMessage::parse(":srv 005 me CHANMODES=eIbqZ,k,fl,imnt :are supported").unwrap(),
         );
-        app.channels.insert("#chan".into(), Channel::new());
+        app.conversations.insert("#chan".into(), Channel::new());
         let masks = |app: &Session, mode: char| -> Vec<String> {
-            app.channels["#chan"]
+            app.conversations["#chan"]
                 .mode_lists
                 .get(&mode)
                 .map(|entries| entries.iter().map(|entry| entry.mask.clone()).collect())
@@ -10630,8 +11145,16 @@ pub(crate) mod tests {
         burst(&mut app, "Z", &["z!*@*"]);
         assert_eq!(masks(&app, 'q'), ["a!*@*", "b!*@*"]);
         assert_eq!(masks(&app, 'Z'), ["z!*@*"]);
-        assert!(app.channels["#chan"].mode_lists_complete.contains(&'q'));
-        assert!(app.channels["#chan"].mode_lists_complete.contains(&'Z'));
+        assert!(
+            app.conversations["#chan"]
+                .mode_lists_complete
+                .contains(&'q')
+        );
+        assert!(
+            app.conversations["#chan"]
+                .mode_lists_complete
+                .contains(&'Z')
+        );
 
         // The end marker's mode letter decides which list it closes: a Z
         // listing in progress is not completed by (or merged into) q's.
@@ -10658,9 +11181,9 @@ pub(crate) mod tests {
         app.handle_incoming_message(
             IrcMessage::parse(":srv 005 me EXCEPTS=x INVEX=y :are supported").unwrap(),
         );
-        app.channels.insert("#chan".into(), Channel::new());
+        app.conversations.insert("#chan".into(), Channel::new());
         let masks = |app: &Session, mode: char| -> Vec<String> {
-            app.channels["#chan"]
+            app.conversations["#chan"]
                 .mode_lists
                 .get(&mode)
                 .map(|entries| entries.iter().map(|entry| entry.mask.clone()).collect())
@@ -10689,7 +11212,9 @@ pub(crate) mod tests {
             burst(&["a!*@*"]);
             assert_eq!(masks(&app, mode), ["a!*@*"], "+{mode}");
             assert!(
-                app.channels["#chan"].mode_lists_complete.contains(&mode),
+                app.conversations["#chan"]
+                    .mode_lists_complete
+                    .contains(&mode),
                 "+{mode}"
             );
         }
@@ -10707,10 +11232,10 @@ pub(crate) mod tests {
         let msg = IrcMessage::parse(":alice!u@h PRIVMSG me :hello").unwrap();
         app.handle_incoming_message(msg);
 
-        assert_eq!(app.channels.len(), 1);
-        assert!(app.channels.contains_key("Alice"));
+        assert_eq!(app.conversations.len(), 1);
+        assert!(app.conversations.contains_key("Alice"));
         assert!(
-            app.channels["Alice"]
+            app.conversations["Alice"]
                 .messages
                 .iter()
                 .any(|message| message.content == "hello")
@@ -10799,7 +11324,7 @@ pub(crate) mod tests {
         let mut channel = Channel::new();
         channel.add_user("alice", UserMode::Normal);
         channel.add_user("stale", UserMode::Op);
-        app.channels.insert("#chan".to_string(), channel);
+        app.conversations.insert("#chan".to_string(), channel);
 
         app.handle_numeric(
             RPL_NAMREPLY,
@@ -10811,13 +11336,13 @@ pub(crate) mod tests {
             ],
         );
         // The visible list is unchanged until the authoritative burst ends.
-        assert!(app.channels["#chan"].has_user("stale"));
+        assert!(app.conversations["#chan"].has_user("stale"));
         app.handle_numeric(
             RPL_ENDOFNAMES,
             &["me".to_string(), "#CHAN".to_string(), "end".to_string()],
         );
 
-        let channel = &app.channels["#chan"];
+        let channel = &app.conversations["#chan"];
         assert!(!channel.has_user("stale"));
         let alice = channel.get_user("alice").unwrap();
         assert!(alice.has_mode(UserMode::Op));
@@ -10828,7 +11353,7 @@ pub(crate) mod tests {
     #[test]
     fn userhost_in_names_keeps_only_the_membership_nickname() {
         let mut app = test_app();
-        app.channels.insert("#chan".into(), Channel::new());
+        app.conversations.insert("#chan".into(), Channel::new());
         app.handle_numeric(
             RPL_NAMREPLY,
             &[
@@ -10840,7 +11365,7 @@ pub(crate) mod tests {
         );
         app.handle_numeric(RPL_ENDOFNAMES, &["me".into(), "#chan".into()]);
 
-        let channel = &app.channels["#chan"];
+        let channel = &app.conversations["#chan"];
         assert!(channel.has_user("Alice"));
         assert!(channel.has_user("bob"));
         assert!(!channel.has_user("Alice!user@example.test"));
@@ -10850,12 +11375,12 @@ pub(crate) mod tests {
     fn extended_join_and_setname_retain_member_identity() {
         let mut app = test_app();
         app.set_session_nick("me".into(), true);
-        app.channels.insert("#room".into(), Channel::new());
+        app.conversations.insert("#room".into(), Channel::new());
 
         app.handle_incoming_message(
             IrcMessage::parse(":alice!u@h JOIN #room alice-account :Alice Example").unwrap(),
         );
-        let alice = app.channels["#room"].get_user("alice").unwrap();
+        let alice = app.conversations["#room"].get_user("alice").unwrap();
         assert_eq!(alice.account.as_deref(), Some("alice-account"));
         assert_eq!(alice.realname.as_deref(), Some("Alice Example"));
 
@@ -10863,7 +11388,7 @@ pub(crate) mod tests {
             IrcMessage::parse(":alice!u@h SETNAME :Alice Updated").unwrap(),
         );
         assert_eq!(
-            app.channels["#room"]
+            app.conversations["#room"]
                 .get_user("alice")
                 .unwrap()
                 .realname
@@ -10880,10 +11405,10 @@ pub(crate) mod tests {
             IrcMessage::parse("@+draft/react=👍;+reply=abc :alice!u@h TAGMSG me").unwrap(),
         );
 
-        assert!(app.channels.contains_key("alice"));
-        assert!(!app.channels.contains_key("me"));
+        assert!(app.conversations.contains_key("alice"));
+        assert!(!app.conversations.contains_key("me"));
         assert!(
-            app.channels["alice"].messages[0]
+            app.conversations["alice"].messages[0]
                 .content
                 .contains("reacted 👍 to abc")
         );
@@ -10921,7 +11446,7 @@ pub(crate) mod tests {
             .unwrap(),
         );
 
-        let channel = &app.channels["#room"];
+        let channel = &app.conversations["#room"];
         assert_eq!(channel.messages.len(), 1);
         assert_eq!(channel.messages[0].msgid.as_deref(), Some("abc"));
         assert_eq!(channel.messages[0].account.as_deref(), Some("acct"));
@@ -10932,8 +11457,8 @@ pub(crate) mod tests {
     fn selected_live_message_advances_the_server_read_marker() {
         let (mut app, mut rx) = test_app_connected();
         app.set_session_nick("me".into(), true);
-        app.current_channel = Some("#room".into());
-        app.channels.insert("#room".into(), Channel::new());
+        app.conversations.insert("#room".into(), Channel::new());
+        app.select_target("#room");
         app.handle_incoming_message(
             IrcMessage::parse(":srv CAP me ACK :draft/read-marker").unwrap(),
         );
@@ -10957,12 +11482,12 @@ pub(crate) mod tests {
     #[test]
     fn standard_reply_uses_its_channel_context() {
         let mut app = test_app();
-        app.channels.insert("#room".into(), Channel::new());
+        app.conversations.insert("#room".into(), Channel::new());
         app.handle_incoming_message(
             IrcMessage::parse(":srv FAIL CHATHISTORY INVALID_TARGET #room :No history").unwrap(),
         );
         assert!(
-            app.channels["#room"]
+            app.conversations["#room"]
                 .messages
                 .iter()
                 .any(|message| message.content.contains("INVALID_TARGET"))
@@ -10981,20 +11506,20 @@ pub(crate) mod tests {
                 None,
             ),
         );
-        app.channels.insert("#room".into(), channel);
+        app.conversations.insert("#room".into(), channel);
 
         app.handle_incoming_message(
             IrcMessage::parse(":alice!u@h REDACT #room gone :cleanup").unwrap(),
         );
 
         assert!(
-            app.channels["#room"]
+            app.conversations["#room"]
                 .messages
                 .iter()
                 .all(|message| message.msgid.as_deref() != Some("gone"))
         );
         assert!(
-            app.channels["#room"]
+            app.conversations["#room"]
                 .messages
                 .iter()
                 .any(|message| message.content == "A message was redacted: cleanup")
@@ -11039,14 +11564,14 @@ pub(crate) mod tests {
     #[test]
     fn fatal_registration_error_clears_connecting() {
         let mut app = test_app();
-        app.connecting = true;
+        app.test_set_connecting_flag(true);
         app.handle_numeric(
             ERR_PASSWDMISMATCH,
             &["nick".to_string(), "Password incorrect".to_string()],
         );
-        assert!(!app.connecting);
-        assert!(!app.connected);
-        assert_eq!(app.connection_intent, ConnectionIntent::ManualDisconnect);
+        assert!(!app.is_connecting());
+        assert!(!app.is_connected());
+        assert!(!app.has_pending_connect());
         assert!(
             app.server_messages
                 .back()
@@ -11059,11 +11584,11 @@ pub(crate) mod tests {
         let mut app = test_app();
         let mut channel = Channel::new();
         channel.add_user("alice", UserMode::Normal);
-        app.channels.insert("#chan".to_string(), channel);
+        app.conversations.insert("#chan".to_string(), channel);
 
         app.handle_mode_message("oper", "#chan", Some("+o"), &["alice".to_string()]);
 
-        let alice = app.channels["#chan"].get_user("alice").unwrap();
+        let alice = app.conversations["#chan"].get_user("alice").unwrap();
         assert_eq!(alice.mode, UserMode::Op);
     }
 
@@ -11072,15 +11597,15 @@ pub(crate) mod tests {
         let mut app = test_app();
         let mut channel = Channel::new();
         channel.add_user("alice", UserMode::Op);
-        app.channels.insert("#chan".to_string(), channel);
+        app.conversations.insert("#chan".to_string(), channel);
 
         app.handle_mode_message("oper", "#CHAN", Some("+v"), &["Alice".to_string()]);
-        let alice = app.channels["#chan"].get_user("alice").unwrap();
+        let alice = app.conversations["#chan"].get_user("alice").unwrap();
         assert_eq!(alice.mode, UserMode::Op);
         assert!(alice.has_mode(UserMode::Voice));
 
         app.handle_mode_message("oper", "#CHAN", Some("-v"), &["Alice".to_string()]);
-        let alice = app.channels["#chan"].get_user("alice").unwrap();
+        let alice = app.conversations["#chan"].get_user("alice").unwrap();
         assert_eq!(alice.mode, UserMode::Op);
         assert!(!alice.has_mode(UserMode::Voice));
     }
@@ -11088,7 +11613,8 @@ pub(crate) mod tests {
     #[test]
     fn live_channel_modes_update_parameter_values() {
         let mut app = test_app();
-        app.channels.insert("#chan".to_string(), Channel::new());
+        app.conversations
+            .insert("#chan".to_string(), Channel::new());
         app.handle_numeric(
             RPL_CHANNELMODEIS,
             &[
@@ -11105,12 +11631,12 @@ pub(crate) mod tests {
             Some("-k+l"),
             &["oldkey".into(), "50".into()],
         );
-        let channel = &app.channels["#chan"];
+        let channel = &app.conversations["#chan"];
         assert_eq!(channel.modes, "+ntl");
         assert_eq!(channel.mode_params, ["50"]);
 
         app.handle_mode_message("oper", "#chan", Some("-l"), &[]);
-        let channel = &app.channels["#chan"];
+        let channel = &app.conversations["#chan"];
         assert_eq!(channel.modes, "+nt");
         assert!(channel.mode_params.is_empty());
     }
@@ -11131,7 +11657,7 @@ pub(crate) mod tests {
         );
         let mut channel = Channel::new();
         channel.add_user("alice", UserMode::Normal);
-        app.channels.insert("#chan".to_string(), channel);
+        app.conversations.insert("#chan".to_string(), channel);
 
         // "+fo [4:5] alice": 'f' must consume "[4:5]" so 'o' reads "alice".
         app.handle_mode_message(
@@ -11140,15 +11666,15 @@ pub(crate) mod tests {
             Some("+fo"),
             &["[4:5]".to_string(), "alice".to_string()],
         );
-        let alice = app.channels["#chan"].get_user("alice").unwrap();
+        let alice = app.conversations["#chan"].get_user("alice").unwrap();
         assert_eq!(alice.mode, UserMode::Op);
 
         // Libera-style +q is a quiet LIST mode here, not owner: consuming the
         // mask must not create or promote any user.
         app.handle_mode_message("oper", "#chan", Some("+q"), &["*!*@spam".to_string()]);
-        assert!(!app.channels["#chan"].has_user("*!*@spam"));
+        assert!(!app.conversations["#chan"].has_user("*!*@spam"));
         assert_eq!(
-            app.channels["#chan"].get_user("alice").unwrap().mode,
+            app.conversations["#chan"].get_user("alice").unwrap().mode,
             UserMode::Op
         );
     }
@@ -11158,12 +11684,12 @@ pub(crate) mod tests {
         let mut app = test_app();
         let mut channel = Channel::new();
         channel.add_user("bob", UserMode::Normal);
-        app.channels.insert("#chan".to_string(), channel);
+        app.conversations.insert("#chan".to_string(), channel);
 
         let msg = IrcMessage::parse(":alice!a@h KICK #chan bob :spamming").unwrap();
         app.handle_incoming_message(msg);
 
-        let ch = &app.channels["#chan"];
+        let ch = &app.conversations["#chan"];
         assert!(!ch.has_user("bob"));
         assert!(ch.messages.iter().any(|m| {
             m.content
@@ -11178,13 +11704,13 @@ pub(crate) mod tests {
         let mut channel = Channel::new();
         channel.add_user("me", UserMode::Normal);
         channel.add_user("bob", UserMode::Normal);
-        app.channels.insert("#chan".to_string(), channel);
-        app.current_channel = Some("#chan".to_string());
+        app.conversations.insert("#chan".to_string(), channel);
+        app.select_target("#chan");
 
         let msg = IrcMessage::parse(":alice!a@h KICK #chan me :bye").unwrap();
         app.handle_incoming_message(msg);
 
-        let ch = &app.channels["#chan"];
+        let ch = &app.conversations["#chan"];
         assert!(ch.users.is_empty());
         assert!(ch.messages.iter().any(|m| {
             m.content
@@ -11196,7 +11722,7 @@ pub(crate) mod tests {
     fn nick_in_use_while_connected_reports_without_renaming() {
         let mut app = test_app();
         app.set_session_nick("mike".to_string(), true);
-        app.connected = true;
+        app.test_set_connected(true);
         app.handle_numeric(
             ERR_NICKNAMEINUSE,
             &[
@@ -11219,7 +11745,7 @@ pub(crate) mod tests {
         // Pre-registration: mike was configured but never confirmed here
         // (accepted=false — a state the connected test above cannot model).
         app.set_session_nick("mike".to_string(), false);
-        app.connected = false;
+        app.test_set_connected(false);
         app.handle_numeric(
             ERR_NICKNAMEINUSE,
             &[
@@ -11251,14 +11777,14 @@ pub(crate) mod tests {
     #[test]
     fn disconnect_command_stops_reconnect_loop_without_touching_setting() {
         let mut app = test_app();
-        app.connection_lost = true;
+        app.test_set_lost(true);
         app.auto_reconnect = true;
-        app.last_disconnect_time = None;
+        app.test_set_failed_at(None);
         app.channel_list_loading = true;
 
         app.process_command("/disconnect");
 
-        assert!(!app.connection_lost);
+        assert!(!app.connection_lost());
         assert!(!app.should_reconnect());
         assert!(!app.channel_list_loading);
         assert!(app.auto_reconnect, "persisted setting must not be flipped");
@@ -11267,13 +11793,13 @@ pub(crate) mod tests {
     #[test]
     fn unexpected_disconnect_stops_channel_list_loading() {
         let mut app = test_app();
-        app.connected = true;
+        app.test_set_connected(true);
         app.channel_list_loading = true;
 
         app.mark_connection_lost();
 
         assert!(!app.channel_list_loading);
-        assert!(app.connection_lost);
+        assert!(app.connection_lost());
     }
 
     #[test]
@@ -11289,14 +11815,14 @@ pub(crate) mod tests {
         assert!(app.awaiting_reconnect());
         assert!(!app.should_reconnect());
 
-        app.reconnect_attempts = app.max_reconnect_attempts;
+        app.test_set_attempts(app.max_reconnect_attempts);
         assert!(!app.awaiting_reconnect(), "attempts exhausted");
 
-        app.reconnect_attempts = 0;
-        app.connecting = true;
+        app.test_set_attempts(0);
+        app.test_set_connecting_flag(true);
         assert!(!app.awaiting_reconnect(), "a retry is already in flight");
 
-        app.connecting = false;
+        app.test_set_connecting_flag(false);
         app.auto_reconnect = false;
         assert!(!app.awaiting_reconnect(), "setting disabled");
     }
@@ -11312,14 +11838,18 @@ pub(crate) mod tests {
             }
             other => panic!("expected Privmsg, got {:?}", other),
         }
-        assert!(!app.channels.contains_key(""), "no phantom empty-name tab");
+        assert!(
+            !app.conversations.contains_key(""),
+            "no phantom empty-name tab"
+        );
     }
 
     #[test]
     fn kickban_with_hostmask_bans_mask_and_skips_kick() {
         let (mut app, mut rx) = test_app_connected();
-        app.channels.insert("#chan".to_string(), Channel::new());
-        app.current_channel = Some("#chan".to_string());
+        app.conversations
+            .insert("#chan".to_string(), Channel::new());
+        app.select_target("#chan");
 
         app.process_command("/kb *!*@spam.example.com flooding");
         match rx.try_recv() {
@@ -11367,11 +11897,12 @@ pub(crate) mod tests {
     fn bare_nick_presence_replies_keep_the_known_user_and_host() {
         let (mut app, _rx) = test_app_connected();
         app.set_session_nick("me".to_string(), true);
-        app.channels.insert("#chan".to_string(), Channel::new());
+        app.conversations
+            .insert("#chan".to_string(), Channel::new());
         app.handle_incoming_message(IrcMessage::parse(":alice!user@host JOIN #chan").unwrap());
         let identity = |app: &Session| {
             let known = &app.known_users["alice"];
-            let in_channel = app.channels["#chan"].get_user("alice").unwrap();
+            let in_channel = app.conversations["#chan"].get_user("alice").unwrap();
             assert_eq!(known.username, in_channel.username);
             assert_eq!(known.hostname, in_channel.hostname);
             (known.username.clone(), known.hostname.clone(), known.online)
@@ -11414,13 +11945,14 @@ pub(crate) mod tests {
     #[test]
     fn part_while_disconnected_closes_window_locally() {
         let mut app = test_app();
-        app.channels.insert("#stale".to_string(), Channel::new());
-        app.current_channel = Some("#stale".to_string());
+        app.conversations
+            .insert("#stale".to_string(), Channel::new());
+        app.select_target("#stale");
 
         app.process_command("/part");
 
-        assert!(!app.channels.contains_key("#stale"));
-        assert_ne!(app.current_channel.as_deref(), Some("#stale"));
+        assert!(!app.conversations.contains_key("#stale"));
+        assert_ne!(app.current_target_name(), Some("#stale"));
     }
 
     #[test]
@@ -11428,14 +11960,14 @@ pub(crate) mod tests {
         let mut app = test_app();
         let mut query = Channel::new();
         query.push_trimmed(ChatMessage::system("old talk"), 100);
-        app.channels.insert("alice".to_string(), query);
-        app.current_channel = Some("alice".to_string());
+        app.conversations.insert("alice".to_string(), query);
+        app.select_target("alice");
 
         let msg = IrcMessage::parse(":alice!u@h NICK :alice2").unwrap();
         app.handle_incoming_message(msg);
 
-        assert!(!app.channels.contains_key("alice"));
-        let renamed = app.channels.get("alice2").expect("window re-keyed");
+        assert!(!app.conversations.contains_key("alice"));
+        let renamed = app.conversations.get("alice2").expect("window re-keyed");
         assert!(
             renamed
                 .messages
@@ -11448,7 +11980,7 @@ pub(crate) mod tests {
                 .iter()
                 .any(|m| m.content.contains("alice is now known as alice2"))
         );
-        assert_eq!(app.current_channel.as_deref(), Some("alice2"));
+        assert_eq!(app.current_target_name(), Some("alice2"));
     }
 
     #[test]
@@ -11476,7 +12008,7 @@ pub(crate) mod tests {
         );
         app.handle_incoming_message(IrcMessage::parse(":alice BATCH -ml").unwrap());
         assert!(
-            !app.channels.contains_key("#room"),
+            !app.conversations.contains_key("#room"),
             "#191: oversized batch dropped"
         );
         // Line cap.
@@ -11493,7 +12025,7 @@ pub(crate) mod tests {
         );
         app.handle_incoming_message(IrcMessage::parse(":alice BATCH -m2").unwrap());
         assert!(
-            !app.channels.contains_key("#room"),
+            !app.conversations.contains_key("#room"),
             "#191: over-line batch dropped"
         );
     }
@@ -11511,7 +12043,7 @@ pub(crate) mod tests {
         );
         app.handle_incoming_message(IrcMessage::parse(":Troll BATCH -ml").unwrap());
         assert!(
-            !app.channels.contains_key("#room"),
+            !app.conversations.contains_key("#room"),
             "#192: ignored multiline dropped"
         );
     }
@@ -11524,7 +12056,7 @@ pub(crate) mod tests {
         app.update_cached_lowercase();
         let mut channel = Channel::new();
         channel.joined = true;
-        app.channels.insert("#room".to_string(), channel);
+        app.conversations.insert("#room".to_string(), channel);
 
         // INVITE to us: no pending invite, server-buffer line or notification.
         app.handle_incoming_message(IrcMessage::parse(":Troll!u@h INVITE me #elsewhere").unwrap());
@@ -11540,8 +12072,8 @@ pub(crate) mod tests {
 
         assert!(app.pending_invites.is_empty());
         assert!(app.server_messages.is_empty());
-        assert!(app.channels["#room"].messages.is_empty());
-        assert!(!app.channels.contains_key("#elsewhere"));
+        assert!(app.conversations["#room"].messages.is_empty());
+        assert!(!app.conversations.contains_key("#elsewhere"));
 
         // The same events from a peer are still shown.
         app.handle_incoming_message(IrcMessage::parse(":alice!u@h INVITE me #elsewhere").unwrap());
@@ -11552,7 +12084,7 @@ pub(crate) mod tests {
             IrcMessage::parse(":alice!u@h WALLCHOPS #room :ops only").unwrap(),
         );
         assert_eq!(app.pending_invites.len(), 1);
-        assert_eq!(app.channels["#room"].messages.len(), 2);
+        assert_eq!(app.conversations["#room"].messages.len(), 2);
     }
 
     #[test]
@@ -11567,7 +12099,10 @@ pub(crate) mod tests {
         // And one with no prefix at all.
         app.handle_incoming_message(IrcMessage::parse("NOTICE me :bare server notice").unwrap());
 
-        assert!(app.channels.is_empty(), "no query tab named after a server");
+        assert!(
+            app.conversations.is_empty(),
+            "no query tab named after a server"
+        );
         assert_eq!(app.server_messages.len(), 2);
         assert!(
             app.server_messages[0]
@@ -11580,7 +12115,7 @@ pub(crate) mod tests {
             IrcMessage::parse(":NickServ!NickServ@services.example.net NOTICE me :Welcome")
                 .unwrap(),
         );
-        assert!(app.channels.contains_key("NickServ"));
+        assert!(app.conversations.contains_key("NickServ"));
         assert_eq!(app.server_messages.len(), 2);
     }
 
@@ -11588,14 +12123,18 @@ pub(crate) mod tests {
     fn unjoined_channel_tabs_are_capped() {
         let mut app = test_app();
         for i in 0..200 {
-            app.channels.insert(format!("#spam{i}"), Channel::new());
+            app.conversations
+                .insert(format!("#spam{i}"), Channel::new());
         }
         app.handle_incoming_message(
             IrcMessage::parse(":alice!u@h PRIVMSG #spam200 :hello").unwrap(),
         );
-        assert!(!app.channels.contains_key("#spam200"), "#193: unjoined cap");
+        assert!(
+            !app.conversations.contains_key("#spam200"),
+            "#193: unjoined cap"
+        );
         assert_eq!(
-            app.channels
+            app.conversations
                 .keys()
                 .filter(|k| app.is_channel_name(k))
                 .count(),
@@ -11608,17 +12147,17 @@ pub(crate) mod tests {
         let mut app = test_app();
         let mut q1 = Channel::new();
         q1.push_trimmed(ChatMessage::system("old talk"), 100);
-        app.channels.insert("alice".to_string(), q1);
+        app.conversations.insert("alice".to_string(), q1);
         let mut q2 = Channel::new();
         q2.push_trimmed(ChatMessage::system("dest talk"), 100);
-        app.channels.insert("alice2".to_string(), q2);
-        app.current_channel = Some("alice".to_string());
+        app.conversations.insert("alice2".to_string(), q2);
+        app.select_target("alice");
         app.handle_incoming_message(IrcMessage::parse(":alice!u@h NICK :alice2").unwrap());
         assert!(
-            !app.channels.contains_key("alice"),
+            !app.conversations.contains_key("alice"),
             "#194: old tab merged away"
         );
-        let merged = &app.channels["alice2"];
+        let merged = &app.conversations["alice2"];
         assert!(
             merged
                 .messages
@@ -11637,7 +12176,7 @@ pub(crate) mod tests {
                 .iter()
                 .any(|m| m.content.contains("alice is now known as alice2"))
         );
-        assert_eq!(app.current_channel.as_deref(), Some("alice2"));
+        assert_eq!(app.current_target_name(), Some("alice2"));
     }
 
     #[test]
@@ -11694,11 +12233,11 @@ pub(crate) mod tests {
                 channel.add_user(user, UserMode::Normal);
                 know(&mut app, user);
             }
-            app.channels.insert(name.to_string(), channel);
+            app.conversations.insert(name.to_string(), channel);
         }
         // A query partner, a monitored friend, and a nick only seen in a
         // WHO reply: only the first two are referenced by anything.
-        app.channels.insert("erin".to_string(), Channel::new());
+        app.conversations.insert("erin".to_string(), Channel::new());
         know(&mut app, "erin");
         app.monitored_users
             .insert(app.network_support.canonicalize("frank"));
@@ -11717,7 +12256,7 @@ pub(crate) mod tests {
 
         // Being kicked from #c clears its users from the retained tab.
         app.handle_incoming_message(IrcMessage::parse(":op!u@h KICK #c me :bye").unwrap());
-        assert!(app.channels.contains_key("#c"));
+        assert!(app.conversations.contains_key("#c"));
         assert!(!is_known(&app, "gina"), "#257: self-kick evicts users");
 
         // Leaving #a keeps the monitored friend, drops everyone else there.
@@ -11739,8 +12278,8 @@ pub(crate) mod tests {
         let mut channel = Channel::new();
         channel.add_user("^Alice", UserMode::Normal);
         channel.add_user("[Bob]", UserMode::Normal);
-        app.channels.insert("#room".to_string(), channel);
-        app.current_channel = Some("#room".to_string());
+        app.conversations.insert("#room".to_string(), channel);
+        app.select_target("#room");
         assert_eq!(
             app.find_nick_completions("~a"),
             vec!["^Alice".to_string()],
@@ -11778,7 +12317,7 @@ pub(crate) mod tests {
             rx.try_recv().unwrap(),
             IrcCommand::ChathistoryLatest("#room".into(), "*".into(), 100)
         );
-        assert!(app.channels["#room"].joined);
+        assert!(app.conversations["#room"].joined);
     }
 
     #[test]
@@ -11796,7 +12335,7 @@ pub(crate) mod tests {
                 Some("alice".into()),
             ),
         );
-        app.channels.insert("#room".into(), channel);
+        app.conversations.insert("#room".into(), channel);
 
         app.handle_incoming_message(IrcMessage::parse(":me!u@h JOIN #room").unwrap());
 
@@ -11822,7 +12361,7 @@ pub(crate) mod tests {
                 None,
             ),
         );
-        app.channels.insert("alice".into(), query);
+        app.conversations.insert("alice".into(), query);
 
         app.handle_numeric(RPL_WELCOME, &["me".into(), "welcome".into()]);
 
@@ -11892,7 +12431,7 @@ pub(crate) mod tests {
         let mut app = test_app();
         app.max_scrollback = 20;
         app.prepare_history_target("#public");
-        app.channels
+        app.conversations
             .get_mut("#public")
             .unwrap()
             .messages
@@ -11908,11 +12447,11 @@ pub(crate) mod tests {
             )
             .unwrap(),
         );
-        assert_eq!(app.channels["#public"].messages.len(), 1);
+        assert_eq!(app.conversations["#public"].messages.len(), 1);
 
         app.handle_incoming_message(IrcMessage::parse(":srv BATCH -hist").unwrap());
 
-        let channel = &app.channels["#public"];
+        let channel = &app.conversations["#public"];
         let contents: Vec<&str> = channel
             .messages
             .iter()
@@ -11974,13 +12513,17 @@ pub(crate) mod tests {
     fn duplicate_server_history_is_not_reported_as_new_history() {
         let mut app = test_app();
         app.prepare_history_target("#room");
-        app.channels.get_mut("#room").unwrap().messages.push_back(
-            ChatMessage::new_fmt("alice", "already visible", "short").with_irc_metadata(
-                None,
-                Some("same-id".into()),
-                None,
-            ),
-        );
+        app.conversations
+            .get_mut("#room")
+            .unwrap()
+            .messages
+            .push_back(
+                ChatMessage::new_fmt("alice", "already visible", "short").with_irc_metadata(
+                    None,
+                    Some("same-id".into()),
+                    None,
+                ),
+            );
         app.handle_incoming_message(
             IrcMessage::parse("@draft/chathistory-end :srv BATCH +hist chathistory #room").unwrap(),
         );
@@ -11990,7 +12533,7 @@ pub(crate) mod tests {
         );
         app.handle_incoming_message(IrcMessage::parse(":srv BATCH -hist").unwrap());
 
-        let contents: Vec<&str> = app.channels["#room"]
+        let contents: Vec<&str> = app.conversations["#room"]
             .messages
             .iter()
             .map(|message| message.content.as_str())
@@ -12022,7 +12565,7 @@ pub(crate) mod tests {
         );
         app.handle_incoming_message(IrcMessage::parse(":alice BATCH -ml").unwrap());
 
-        let message = app.channels["#room"].messages.back().unwrap();
+        let message = app.conversations["#room"].messages.back().unwrap();
         assert_eq!(message.content, "onetwo\nthree");
         assert_eq!(message.msgid.as_deref(), Some("ml1"));
         assert_eq!(
@@ -12113,7 +12656,7 @@ pub(crate) mod tests {
         );
         app.handle_incoming_message(IrcMessage::parse(":srv BATCH -hist").unwrap());
 
-        let gap = app.channels["#room"]
+        let gap = app.conversations["#room"]
             .messages
             .iter()
             .find(|message| message.msgid.as_deref() == Some("gap1"))
@@ -12126,7 +12669,7 @@ pub(crate) mod tests {
     fn historical_events_are_displayed_without_mutating_live_membership() {
         let mut app = test_app();
         app.prepare_history_target("#room");
-        app.channels
+        app.conversations
             .get_mut("#room")
             .unwrap()
             .add_user("present", UserMode::Normal);
@@ -12141,7 +12684,7 @@ pub(crate) mod tests {
         );
         app.handle_incoming_message(IrcMessage::parse(":srv BATCH -hist").unwrap());
 
-        let channel = &app.channels["#room"];
+        let channel = &app.conversations["#room"];
         assert!(channel.has_user("present"));
         assert!(!channel.has_user("gone"));
         assert!(
@@ -12166,7 +12709,7 @@ pub(crate) mod tests {
         ] {
             let mut app = test_app();
             app.prepare_history_target("#old");
-            app.current_channel = Some("#old".to_string());
+            app.select_target("#old");
             app.handle_incoming_message(
                 IrcMessage::parse("@draft/chathistory-end :srv BATCH +hist chathistory #old")
                     .unwrap(),
@@ -12178,17 +12721,17 @@ pub(crate) mod tests {
                 .unwrap(),
             );
             // The replay is still open: nothing may have moved yet.
-            assert!(app.channels.contains_key("#old"), "{event}");
-            assert!(!app.channels.contains_key("#new"), "{event}");
-            assert_eq!(app.current_channel.as_deref(), Some("#old"), "{event}");
+            assert!(app.conversations.contains_key("#old"), "{event}");
+            assert!(!app.conversations.contains_key("#new"), "{event}");
+            assert_eq!(app.current_target_name(), Some("#old"), "{event}");
             app.handle_incoming_message(IrcMessage::parse(":srv BATCH -hist").unwrap());
 
-            let mut tabs: Vec<&String> = app.channels.keys().collect();
+            let mut tabs: Vec<&String> = app.conversations.keys().collect();
             tabs.sort();
             assert_eq!(tabs, ["#old"], "{event}");
-            assert_eq!(app.current_channel.as_deref(), Some("#old"), "{event}");
+            assert_eq!(app.current_target_name(), Some("#old"), "{event}");
             assert!(
-                app.channels["#old"]
+                app.conversations["#old"]
                     .messages
                     .iter()
                     .any(|message| message.content == shown
@@ -12202,7 +12745,7 @@ pub(crate) mod tests {
     fn outbound_multiline_uses_a_tagged_batch() {
         let (mut app, mut rx) = test_app_connected();
         app.handle_incoming_message(IrcMessage::parse(":srv CAP me ACK :draft/multiline").unwrap());
-        assert!(app.send_privmsg_text("#room", "one\ntwo"));
+        assert!(app.send_privmsg_text("#room", "one\ntwo").complete);
 
         let IrcCommand::Batch(open, Some(kind), Some(target)) = rx.try_recv().unwrap() else {
             panic!("expected multiline batch opener");
@@ -12228,7 +12771,7 @@ pub(crate) mod tests {
     #[test]
     fn chathistory_empty_batch_falls_back_to_local_log_history() {
         let dir = temporary_log_dir("chathistory-empty-fallback");
-        let (mut app, _rx) = test_app_connected();
+        let mut app = test_app();
         app.log_manager = logging::LogManager::with_test_dir(dir.clone());
         app.logging_enabled = true;
         app.logging_load_history = true;
@@ -12236,6 +12779,8 @@ pub(crate) mod tests {
         app.server_port = "6697".into();
         app.use_tls = true;
         assert!(app.start_session_from_form());
+        let (tx, _rx) = mpsc::unbounded_channel();
+        app.test_set_registered(tx);
 
         let (network, _, _) = app.active_log_context().unwrap();
         app.log_manager.log_message(
@@ -12256,7 +12801,7 @@ pub(crate) mod tests {
         );
         app.handle_incoming_message(IrcMessage::parse(":srv BATCH -hist").unwrap());
 
-        let channel = &app.channels["#room"];
+        let channel = &app.conversations["#room"];
         assert!(channel.history_loaded);
         let contents: Vec<&str> = channel
             .messages
@@ -12279,7 +12824,7 @@ pub(crate) mod tests {
     #[test]
     fn short_server_history_includes_saved_local_history() {
         let dir = temporary_log_dir("chathistory-short-server");
-        let (mut app, _rx) = test_app_connected();
+        let mut app = test_app();
         app.log_manager = logging::LogManager::with_test_dir(dir.clone());
         app.logging_enabled = true;
         app.logging_load_history = true;
@@ -12287,6 +12832,8 @@ pub(crate) mod tests {
         app.server_port = "6697".into();
         app.use_tls = true;
         assert!(app.start_session_from_form());
+        let (tx, _rx) = mpsc::unbounded_channel();
+        app.test_set_registered(tx);
 
         let (network, _, _) = app.active_log_context().unwrap();
         app.log_manager.log_message(
@@ -12310,7 +12857,7 @@ pub(crate) mod tests {
         );
         app.handle_incoming_message(IrcMessage::parse(":srv BATCH -hist").unwrap());
 
-        let contents: Vec<&str> = app.channels["#room"]
+        let contents: Vec<&str> = app.conversations["#room"]
             .messages
             .iter()
             .map(|message| message.content.as_str())
@@ -12332,7 +12879,7 @@ pub(crate) mod tests {
     #[test]
     fn chathistory_fail_reply_falls_back_to_local_log_history() {
         let dir = temporary_log_dir("chathistory-fail-fallback");
-        let (mut app, _rx) = test_app_connected();
+        let mut app = test_app();
         app.log_manager = logging::LogManager::with_test_dir(dir.clone());
         app.logging_enabled = true;
         app.logging_load_history = true;
@@ -12340,6 +12887,8 @@ pub(crate) mod tests {
         app.server_port = "6697".into();
         app.use_tls = true;
         assert!(app.start_session_from_form());
+        let (tx, _rx) = mpsc::unbounded_channel();
+        app.test_set_registered(tx);
 
         let (network, _, _) = app.active_log_context().unwrap();
         app.log_manager.log_message(
@@ -12362,7 +12911,7 @@ pub(crate) mod tests {
             .unwrap(),
         );
 
-        let channel = &app.channels["#room"];
+        let channel = &app.conversations["#room"];
         assert!(channel.history_loaded);
         assert!(
             channel
@@ -12424,34 +12973,33 @@ pub(crate) mod tests {
             "#room",
             &["hello me", "second line"],
         );
-        let row = app.channels["#room"].messages.back().unwrap();
+        let row = app.conversations["#room"].messages.back().unwrap();
         assert_eq!(row.content, "hello me\nsecond line");
         assert!(row.is_highlight, "#289: multiline mention not highlighted");
         assert_eq!(notified(&app).len(), 1);
-        assert_eq!(
-            notified(&app)[0].0,
-            "alice mentioned you in #room"
-        );
+        assert_eq!(notified(&app)[0].0, "alice mentioned you in #room");
 
         // A multiline PM notifies even while the window is focused.
         app.events.clear();
         app.window_focused = true;
         deliver_multiline(&mut app, "m2", "bob!u@h", "me", &["psst", "are you there"]);
-        let row = app.channels["bob"].messages.back().unwrap();
+        let row = app.conversations["bob"].messages.back().unwrap();
         assert_eq!(row.content, "psst\nare you there");
         assert!(!row.is_highlight);
-        assert_eq!(
-            notified(&app).len(),
-            1,
-            "#289: PM not notified"
-        );
+        assert_eq!(notified(&app).len(), 1, "#289: PM not notified");
         assert_eq!(notified(&app)[0].0, "PM from bob");
 
         // A plain channel message neither highlights nor notifies.
         app.events.clear();
         app.window_focused = false;
         deliver_multiline(&mut app, "m3", "alice!u@h", "#room", &["nothing", "here"]);
-        assert!(!app.channels["#room"].messages.back().unwrap().is_highlight);
+        assert!(
+            !app.conversations["#room"]
+                .messages
+                .back()
+                .unwrap()
+                .is_highlight
+        );
         assert!(notified(&app).is_empty());
     }
 
@@ -12469,7 +13017,7 @@ pub(crate) mod tests {
             "#room",
             &["\x01ACTION waves at me", "and smiles\x01"],
         );
-        let row = app.channels["#room"].messages.back().unwrap();
+        let row = app.conversations["#room"].messages.back().unwrap();
         assert!(row.is_action && row.is_highlight, "#289: {row:?}");
 
         // Our own multiline message (echo-message) never notifies.
@@ -12500,7 +13048,7 @@ pub(crate) mod tests {
         );
         app.handle_incoming_message(IrcMessage::parse(":bob!u@h BATCH -hm").unwrap());
         app.handle_incoming_message(IrcMessage::parse(":srv BATCH -hist").unwrap());
-        let replayed = app.channels["#room"]
+        let replayed = app.conversations["#room"]
             .messages
             .iter()
             .find(|row| row.content == "old news for me\nsecond")
@@ -12518,7 +13066,7 @@ pub(crate) mod tests {
             IrcMessage::parse(":srv CAP me ACK :draft/read-marker").unwrap(),
         );
         app.add_message_to_channel("alice", ChatMessage::new_fmt("alice", "hi", "short"));
-        app.current_channel = Some("alice".to_string());
+        app.select_target("alice");
 
         // A bouncer replay / reconnect echoes our JOIN for channels the user
         // did not just ask for (#290): the view must not jump to them.
@@ -12526,8 +13074,8 @@ pub(crate) mod tests {
             app.handle_incoming_message(
                 IrcMessage::parse(&format!(":me!u@h JOIN {channel}")).unwrap(),
             );
-            assert_eq!(app.current_channel.as_deref(), Some("alice"), "{channel}");
-            assert!(app.channels[channel].joined);
+            assert_eq!(app.current_target_name(), Some("alice"), "{channel}");
+            assert!(app.conversations[channel].joined);
         }
 
         // Messages for the never-selected tab count as unread and are not
@@ -12538,7 +13086,7 @@ pub(crate) mod tests {
             )
             .unwrap(),
         );
-        assert_eq!(app.channels["#c"].unread, 1);
+        assert_eq!(app.conversations["#c"].unread, 1);
         assert!(
             !std::iter::from_fn(|| rx.try_recv().ok())
                 .any(|cmd| matches!(cmd, IrcCommand::Markread(..))),
@@ -12551,39 +13099,39 @@ pub(crate) mod tests {
         let (mut app, _rx) = test_app_connected();
         app.set_session_nick("me".to_string(), true);
         app.add_message_to_channel("alice", ChatMessage::new_fmt("alice", "hi", "short"));
-        app.current_channel = Some("alice".to_string());
+        app.select_target("alice");
 
         app.process_command("/join #wanted");
         // The server confirms a different channel first (bouncer replay): no
         // focus change for it, and the request stays pending for #wanted.
         app.handle_incoming_message(IrcMessage::parse(":me!u@h JOIN #replayed").unwrap());
-        assert_eq!(app.current_channel.as_deref(), Some("alice"));
+        assert_eq!(app.current_target_name(), Some("alice"));
         app.handle_incoming_message(IrcMessage::parse(":me!u@h JOIN #WANTED").unwrap());
-        assert_eq!(app.current_channel.as_deref(), Some("#WANTED"));
+        assert_eq!(app.current_target_name(), Some("#WANTED"));
 
         // The request is consumed: a later rejoin of it does not refocus.
-        app.current_channel = Some("alice".to_string());
+        app.select_target("alice");
         app.handle_incoming_message(IrcMessage::parse(":me!u@h JOIN #WANTED").unwrap());
-        assert_eq!(app.current_channel.as_deref(), Some("alice"));
+        assert_eq!(app.current_target_name(), Some("alice"));
     }
 
     #[test]
     fn auto_join_from_the_server_buffer_lands_on_the_first_channel_only() {
         let mut app = test_app();
         app.set_session_nick("me".to_string(), true);
-        assert!(app.current_channel.is_none());
+        assert!(app.current_conversation.is_none());
 
         app.handle_incoming_message(IrcMessage::parse(":me!u@h JOIN #first").unwrap());
         app.handle_incoming_message(IrcMessage::parse(":me!u@h JOIN #second").unwrap());
-        assert_eq!(app.current_channel.as_deref(), Some("#first"));
+        assert_eq!(app.current_target_name(), Some("#first"));
     }
 
     #[test]
     fn selected_tab_keeps_unread_while_the_window_is_unfocused_until_focus_returns() {
         let (mut app, mut rx) = test_app_connected();
         app.set_session_nick("me".into(), true);
-        app.current_channel = Some("#room".into());
-        app.channels.insert("#room".into(), Channel::new());
+        app.conversations.insert("#room".into(), Channel::new());
+        app.select_target("#room");
         app.handle_incoming_message(
             IrcMessage::parse(":srv CAP me ACK :draft/read-marker").unwrap(),
         );
@@ -12599,7 +13147,7 @@ pub(crate) mod tests {
             );
         }
         assert_eq!(
-            app.channels["#room"].unread, 5,
+            app.conversations["#room"].unread, 5,
             "#305: unfocused current tab silently treated as read"
         );
         assert!(
@@ -12610,7 +13158,7 @@ pub(crate) mod tests {
         // Restoring the window is when the user sees them: badge cleared,
         // read marker sent for the newest message.
         app.set_window_focused(true);
-        assert_eq!(app.channels["#room"].unread, 0);
+        assert_eq!(app.conversations["#room"].unread, 0);
         assert_eq!(
             rx.try_recv().unwrap(),
             IrcCommand::Markread(
@@ -12624,13 +13172,13 @@ pub(crate) mod tests {
             IrcMessage::parse("@time=2026-09-12T12:00:09.000Z :alice!u@h PRIVMSG #room :seen")
                 .unwrap(),
         );
-        assert_eq!(app.channels["#room"].unread, 0);
+        assert_eq!(app.conversations["#room"].unread, 0);
     }
 
     #[test]
     fn server_buffer_counts_unread_while_unfocused_and_clears_on_focus() {
         let mut app = test_app();
-        assert!(app.current_channel.is_none());
+        assert!(app.current_conversation.is_none());
         app.add_server_message(ChatMessage::system("seen live"));
         assert_eq!(app.server_unread, 0);
 
@@ -12661,11 +13209,11 @@ pub(crate) mod tests {
                 None,
             ),
         );
-        app.channels.insert("alice".into(), query);
+        app.conversations.insert("alice".into(), query);
         let mut room = Channel::new();
         room.joined = true;
-        app.channels.insert("#room".into(), room);
-        app.current_channel = Some("#room".into());
+        app.conversations.insert("#room".into(), room);
+        app.select_target("#room");
         app.handle_numeric(RPL_WELCOME, &["mynick".into(), "welcome".into()]);
         assert_eq!(
             rx.try_recv().unwrap(),
@@ -12698,25 +13246,18 @@ pub(crate) mod tests {
         );
         app.handle_incoming_message(IrcMessage::parse(":srv BATCH -h").unwrap());
 
-        let alice = &app.channels["alice"];
+        let alice = &app.conversations["alice"];
         assert_eq!(alice.messages.back().unwrap().content, "on my way");
         assert_eq!(alice.unread, 2, "#306: catch-up PMs left no unread badge");
-        assert_eq!(
-            notified(&app).len(),
-            1,
-            "#306: no notification"
-        );
-        assert_eq!(
-            notified(&app)[0].0,
-            "2 new messages from alice"
-        );
+        assert_eq!(notified(&app).len(), 1, "#306: no notification");
+        assert_eq!(notified(&app)[0].0, "2 new messages from alice");
         assert_eq!(notified(&app)[0].1, "hello?");
     }
 
     #[test]
     fn catch_up_in_the_selected_focused_tab_is_already_seen() {
         let (mut app, _rx) = reconnected_app_reading_a_channel();
-        app.current_channel = Some("alice".into());
+        app.select_target("alice");
         app.window_focused = true;
 
         app.handle_incoming_message(IrcMessage::parse(":srv BATCH +h chathistory alice").unwrap());
@@ -12728,23 +13269,27 @@ pub(crate) mod tests {
         );
         app.handle_incoming_message(IrcMessage::parse(":srv BATCH -h").unwrap());
 
-        assert_eq!(app.channels["alice"].unread, 0);
+        assert_eq!(app.conversations["alice"].unread, 0);
     }
 
     #[test]
     fn channel_catch_up_notifies_only_for_mentions_and_old_backlog_stays_silent() {
         let (mut app, mut rx) = reconnected_app_reading_a_channel();
         app.window_focused = false;
-        app.current_channel = Some("alice".into());
+        app.select_target("alice");
 
         // Retained channel rejoin: Append catch-up after the last known msgid.
-        app.channels.get_mut("#room").unwrap().messages.push_back(
-            ChatMessage::new_fmt("bob", "earlier", "short").with_irc_metadata(
-                Some("2026-09-12T11:00:00.000Z".into()),
-                Some("room-last".into()),
-                None,
-            ),
-        );
+        app.conversations
+            .get_mut("#room")
+            .unwrap()
+            .messages
+            .push_back(
+                ChatMessage::new_fmt("bob", "earlier", "short").with_irc_metadata(
+                    Some("2026-09-12T11:00:00.000Z".into()),
+                    Some("room-last".into()),
+                    None,
+                ),
+            );
         while rx.try_recv().is_ok() {}
         assert!(app.request_latest_history("#room", None, HistoryPlacement::Append));
         assert!(matches!(
@@ -12761,7 +13306,7 @@ pub(crate) mod tests {
             );
         }
         app.handle_incoming_message(IrcMessage::parse(":srv BATCH -c").unwrap());
-        assert_eq!(app.channels["#room"].unread, 2);
+        assert_eq!(app.conversations["#room"].unread, 2);
         assert!(
             notified(&app).is_empty(),
             "no mention, no notification: {:?}",
@@ -12793,10 +13338,7 @@ pub(crate) mod tests {
         );
         app.handle_incoming_message(IrcMessage::parse(":srv BATCH -d").unwrap());
         assert_eq!(notified(&app).len(), 1);
-        assert_eq!(
-            notified(&app)[0].0,
-            "bob mentioned you in #room"
-        );
+        assert_eq!(notified(&app)[0].0, "bob mentioned you in #room");
     }
 
     #[test]
@@ -12816,8 +13358,8 @@ pub(crate) mod tests {
             row.timestamp.clone_from(&stamp);
             room.messages.push_back(row);
         }
-        app.channels.insert("#room".into(), room);
-        app.current_channel = Some("#room".into());
+        app.conversations.insert("#room".into(), room);
+        app.select_target("#room");
 
         app.handle_incoming_message(IrcMessage::parse(":mynick!u@h JOIN #room").unwrap());
         assert_eq!(
@@ -12840,7 +13382,7 @@ pub(crate) mod tests {
         }
         app.handle_incoming_message(IrcMessage::parse(":srv BATCH -h").unwrap());
 
-        let rows: Vec<(&str, &str)> = app.channels["#room"]
+        let rows: Vec<(&str, &str)> = app.conversations["#room"]
             .messages
             .iter()
             .filter(|row| !row.is_system)
@@ -12863,8 +13405,8 @@ pub(crate) mod tests {
         let mut local = ChatMessage::new_fmt("alice", "ok", &app.timestamp_format);
         local.timestamp.clone_from(&stamp);
         room.messages.push_back(local);
-        app.channels.insert("#room".into(), room);
-        app.current_channel = Some("#room".into());
+        app.conversations.insert("#room".into(), room);
+        app.select_target("#room");
         app.pending_history_requests
             .entry("#room".into())
             .or_default()
@@ -12891,7 +13433,7 @@ pub(crate) mod tests {
         }
         app.handle_incoming_message(IrcMessage::parse(":srv BATCH -h").unwrap());
 
-        let ok_rows = app.channels["#room"]
+        let ok_rows = app.conversations["#room"]
             .messages
             .iter()
             .filter(|row| row.content == "ok")
@@ -12905,8 +13447,8 @@ pub(crate) mod tests {
         app.set_session_nick("me".into(), true);
         let mut room = Channel::new();
         room.joined = true;
-        app.channels.insert("#room".into(), room);
-        app.channels.insert("NickServ".into(), Channel::new());
+        app.conversations.insert("#room".into(), room);
+        app.conversations.insert("NickServ".into(), Channel::new());
         let secret_lines = [
             "IDENTIFY hunter2",
             "identify hunter2",
@@ -12937,7 +13479,7 @@ pub(crate) mod tests {
             "/ghost me hunter2",
         ];
         for current in ["#room", "NickServ"] {
-            app.current_channel = Some(current.into());
+            app.select_target(current);
             for line in secret_lines {
                 app.input_text = line.to_string();
                 app.process_input();
@@ -12960,18 +13502,71 @@ pub(crate) mod tests {
     fn incoming_routing_never_panics_on_hostile_lines() {
         let (mut app, _rx) = test_app_connected();
         app.set_session_nick("me".into(), true);
-        app.channels.insert("#a".into(), Channel::new());
-        app.current_channel = Some("#a".into());
+        app.conversations.insert("#a".into(), Channel::new());
+        app.select_target("#a");
         // Wire-line soup: commands, numerics and tags assembled from a small
         // alphabet so state (channels, batches, lists) actually builds up.
         let tokens = [
-            ":alice!u@h", ":bob!u@h", ":srv", "PRIVMSG", "NOTICE", "JOIN", "PART", "QUIT",
-            "NICK", "MODE", "KICK", "TOPIC", "BATCH", "+b1", "-b1", "chathistory",
-            "draft/multiline", "#a", "#b", "me", "alice", "bob", "+o", "-o", "+b", "*!*@h",
-            "001", "005", "324", "329", "332", "333", "353", "366", "367", "368", "352",
-            "354", "315", "322", "323", "728", "729", "730", "731", "CAP", "ACK", "LS",
-            "multi-prefix", "CHANTYPES=#", "@batch=b1", "@time=2025-01-01T00:00:00.000Z",
-            ":", ":hi there", "hello", "\u{1}ACTION waves\u{1}", "%", "@", "=", "42",
+            ":alice!u@h",
+            ":bob!u@h",
+            ":srv",
+            "PRIVMSG",
+            "NOTICE",
+            "JOIN",
+            "PART",
+            "QUIT",
+            "NICK",
+            "MODE",
+            "KICK",
+            "TOPIC",
+            "BATCH",
+            "+b1",
+            "-b1",
+            "chathistory",
+            "draft/multiline",
+            "#a",
+            "#b",
+            "me",
+            "alice",
+            "bob",
+            "+o",
+            "-o",
+            "+b",
+            "*!*@h",
+            "001",
+            "005",
+            "324",
+            "329",
+            "332",
+            "333",
+            "353",
+            "366",
+            "367",
+            "368",
+            "352",
+            "354",
+            "315",
+            "322",
+            "323",
+            "728",
+            "729",
+            "730",
+            "731",
+            "CAP",
+            "ACK",
+            "LS",
+            "multi-prefix",
+            "CHANTYPES=#",
+            "@batch=b1",
+            "@time=2025-01-01T00:00:00.000Z",
+            ":",
+            ":hi there",
+            "hello",
+            "\u{1}ACTION waves\u{1}",
+            "%",
+            "@",
+            "=",
+            "42",
         ];
         let mut state: u64 = 0x5eed_5eed_5eed_5eed;
         let mut next = move || {
@@ -12995,10 +13590,1011 @@ pub(crate) mod tests {
             IrcMessage::parse(":alice!u@h PRIVMSG #a :still alive").unwrap(),
         );
         assert!(
-            app.channels["#a"]
+            app.conversations["#a"]
                 .messages
                 .iter()
                 .any(|m| m.content == "still alive")
         );
+    }
+}
+
+#[cfg(test)]
+mod recovery_and_echo_regressions {
+    use super::*;
+
+    fn session() -> (Session, mpsc::UnboundedReceiver<IrcCommand>) {
+        let mut app = Session::with_settings(Settings {
+            nickname: "me".into(),
+            auto_join_channels: "#configured".into(),
+            logging_enabled: false,
+            logging_load_history: false,
+            ..Settings::default()
+        });
+        assert!(app.start_session_from_form());
+        app.test_set_connected(true);
+        app.test_set_connecting_flag(false);
+        let rx = transport(&mut app);
+        (app, rx)
+    }
+
+    fn transport(app: &mut Session) -> mpsc::UnboundedReceiver<IrcCommand> {
+        let (tx, rx) = mpsc::unbounded_channel();
+        app.test_set_sender(tx);
+        rx
+    }
+
+    fn feed(app: &mut Session, line: &str) {
+        app.handle_incoming_message(IrcMessage::parse(line).unwrap());
+    }
+
+    fn drain(rx: &mut mpsc::UnboundedReceiver<IrcCommand>) -> Vec<IrcCommand> {
+        std::iter::from_fn(|| rx.try_recv().ok()).collect()
+    }
+
+    fn joins(rx: &mut mpsc::UnboundedReceiver<IrcCommand>) -> Vec<(String, Option<String>)> {
+        drain(rx)
+            .into_iter()
+            .filter_map(|cmd| match cmd {
+                IrcCommand::Join(name, key, _, _) => Some((name, key)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn automatic_and_explicit_reconnect_restore_actual_keyed_memberships() {
+        for explicit in [false, true] {
+            let (mut app, mut rx) = session();
+            app.process_command("/join #manual secret-key");
+            feed(&mut app, ":me!u@h JOIN #manual");
+            feed(&mut app, ":me!u@h JOIN #kicked");
+            feed(&mut app, ":op!u@h KICK #kicked me :bye");
+            feed(&mut app, ":me!u@h JOIN #parted");
+            feed(&mut app, ":me!u@h PART #parted");
+            app.open_query("alice");
+            drain(&mut rx);
+            if explicit {
+                app.request_reconnect_after_close("Reconnecting");
+                // The lifecycle clears this after the old worker closes.
+                app.test_finish_close();
+            } else {
+                app.mark_connection_lost();
+            }
+            // Repeated pre-registration failures must retain the original key.
+            for _ in 0..2 {
+                app.begin_connection_attempt();
+                app.mark_connection_lost();
+            }
+            let mut rx = transport(&mut app);
+            feed(&mut app, ":srv 001 me :Welcome back");
+            assert_eq!(
+                joins(&mut rx),
+                [("#manual".into(), Some("secret-key".into()))]
+            );
+            feed(&mut app, ":me!u@h JOIN #manual");
+            assert!(app.conversations["#manual"].joined);
+            assert!(app.send_privmsg_text("#manual", "hello").complete);
+        }
+    }
+
+    #[test]
+    fn recovery_survives_unconfirmed_joins_and_update_restart() {
+        let (mut app, mut rx) = session();
+        app.process_command("/join #first first-key");
+        feed(&mut app, ":me!u@h JOIN #first");
+        app.process_command("/join #pending pending-key");
+        app.mark_connection_lost();
+        app.begin_connection_attempt();
+        let mut recovered = transport(&mut app);
+        feed(&mut app, ":srv 001 me :Welcome back");
+        assert_eq!(joins(&mut recovered).len(), 2);
+        feed(&mut app, ":me!u@h JOIN #first");
+        // A second loss happens before #pending's JOIN is confirmed.
+        app.mark_connection_lost();
+        app.test_set_connecting_flag(true);
+        let snapshot = app.update_session();
+        let mut restored = Session::with_settings(Settings {
+            logging_enabled: false,
+            logging_load_history: false,
+            ..Settings::default()
+        });
+        restored.restore_update_session(snapshot);
+        restored.begin_connection_attempt();
+        let mut wire = transport(&mut restored);
+        feed(&mut restored, ":srv 001 me :Welcome after update");
+        let mut sent = joins(&mut wire);
+        sent.sort();
+        assert_eq!(
+            sent,
+            [
+                ("#first".into(), Some("first-key".into())),
+                ("#pending".into(), Some("pending-key".into())),
+            ]
+        );
+        drain(&mut rx);
+    }
+
+    #[test]
+    fn update_snapshot_prefers_confirmed_key_after_an_ignored_redundant_join() {
+        let (mut app, _rx) = session();
+        app.process_command("/join #room real-key");
+        feed(&mut app, ":me!u@h JOIN #room");
+        // Servers ignore JOIN for a channel we already belong to.
+        app.process_command("/join #room wrong-key");
+        let snapshot = app.update_session();
+        let (_, key, joined) = snapshot
+            .tabs
+            .iter()
+            .find(|(name, _, _)| name == "#room")
+            .unwrap();
+        assert_eq!(key.as_deref(), Some("real-key"));
+        assert!(*joined);
+    }
+
+    #[test]
+    fn recovery_cancellation_and_initial_registration_keep_autojoin_semantics() {
+        let (mut app, _rx) = session();
+        feed(&mut app, ":me!u@h JOIN #configured");
+        feed(&mut app, ":me!u@h PART #configured");
+        app.mark_connection_lost();
+        let mut wire = transport(&mut app);
+        feed(&mut app, ":srv 001 me :Welcome back");
+        assert!(
+            joins(&mut wire).is_empty(),
+            "do not resurrect a deliberately parted channel"
+        );
+        app.request_manual_disconnect(None);
+        assert!(app.pending_rejoins.is_none());
+        app.test_set_connecting_flag(true);
+        app.test_finish_close();
+        app.mark_connection_lost();
+        assert!(
+            app.pending_rejoins.is_none(),
+            "initial failure must not suppress auto-join"
+        );
+        let mut wire = transport(&mut app);
+        feed(&mut app, ":srv 001 me :Welcome");
+        assert_eq!(joins(&mut wire), [("#configured".into(), None)]);
+        // The initial auto-join itself must survive a loss before its echo.
+        app.mark_connection_lost();
+        app.begin_connection_attempt();
+        let mut wire = transport(&mut app);
+        feed(&mut app, ":srv 001 me :Welcome again");
+        assert_eq!(joins(&mut wire), [("#configured".into(), None)]);
+    }
+
+    #[test]
+    fn closed_refused_and_foreign_endpoint_memberships_do_not_reappear() {
+        let (mut app, _rx) = session();
+        for name in ["#kept", "#closed", "#denied"] {
+            feed(&mut app, &format!(":me!u@h JOIN {name}"));
+        }
+        app.mark_connection_lost();
+        app.close_tab("#closed");
+        let mut wire = transport(&mut app);
+        feed(&mut app, ":srv 001 me :Welcome back");
+        joins(&mut wire);
+        feed(&mut app, ":srv 475 me #denied :Bad key");
+        app.mark_connection_lost();
+        let mut wire = transport(&mut app);
+        feed(&mut app, ":srv 001 me :Welcome again");
+        assert_eq!(joins(&mut wire), [("#kept".into(), None)]);
+        app.server_host = "different.example".into();
+        app.auto_join_channels.clear();
+        assert!(app.switch_session_from_form("Switching"));
+        app.test_finish_close();
+        app.begin_connection_attempt();
+        let mut wire = transport(&mut app);
+        feed(&mut app, ":srv 001 me :Different network");
+        assert!(joins(&mut wire).is_empty());
+    }
+
+    fn echo(app: &mut Session, wire: &[IrcCommand]) {
+        for (index, command) in wire.iter().enumerate() {
+            let tags = format!("time=2026-11-14T12:00:00.000Z;msgid=echo{index}");
+            let line = if let IrcCommand::Raw(raw) = command {
+                if let Some((existing, rest)) =
+                    raw.strip_prefix('@').and_then(|line| line.split_once(' '))
+                {
+                    format!("@{tags};{existing} :me!u@h {rest}")
+                } else {
+                    format!("@{tags} :me!u@h {raw}")
+                }
+            } else {
+                format!("@{tags} :me!u@h {command}")
+            };
+            feed(app, &line);
+        }
+    }
+
+    #[test]
+    fn all_chat_entrypoints_echo_actual_fallback_chunks_once() {
+        for command in [
+            "",
+            "/msg alice ",
+            "/query alice ",
+            "/say ",
+            "/me ",
+            "/describe alice ",
+            "/slap alice ",
+            "/amsg ",
+            "/ame ",
+        ] {
+            let (mut app, mut rx) = session();
+            feed(&mut app, ":me!u@h JOIN #room");
+            feed(&mut app, ":srv CAP me ACK :echo-message");
+            app.input_text = format!("{command}{}", "🙂word".repeat(150));
+            app.process_input();
+            let wire = drain(&mut rx);
+            assert!(wire.len() > 1, "{command}");
+            assert!(
+                wire.iter()
+                    .all(|cmd| matches!(cmd, IrcCommand::Privmsg(_, _)))
+            );
+            echo(&mut app, &wire);
+            let rows: Vec<_> = app
+                .conversations
+                .values()
+                .flat_map(|channel| &channel.messages)
+                .filter(|row| !row.is_system)
+                .collect();
+            assert_eq!(rows.len(), wire.len(), "{command}");
+            assert!(
+                rows.iter()
+                    .all(|row| !row.pending_echo && row.msgid.is_some()),
+                "{command}"
+            );
+        }
+    }
+
+    #[test]
+    fn more_than_32_chunks_reconcile_and_acquire_server_identity() {
+        let (mut app, mut rx) = session();
+        feed(&mut app, ":srv CAP me ACK :echo-message");
+        app.process_command(&format!("/msg alice {}", "x".repeat(20_000)));
+        let wire = drain(&mut rx);
+        assert!(wire.len() > 32);
+        echo(&mut app, &wire);
+        assert_eq!(app.conversations["alice"].messages.len(), wire.len());
+        assert!(
+            app.conversations["alice"]
+                .messages
+                .iter()
+                .all(|row| !row.pending_echo && row.msgid.is_some())
+        );
+    }
+
+    #[test]
+    fn a_new_connection_does_not_confirm_an_old_identical_pending_row() {
+        let (mut app, mut rx) = session();
+        feed(&mut app, ":srv CAP me ACK :echo-message");
+        app.process_command("/msg alice same text");
+        drain(&mut rx);
+        app.mark_connection_lost();
+        app.begin_connection_attempt();
+        let mut rx = transport(&mut app);
+        feed(&mut app, ":srv 001 me :Welcome back");
+        drain(&mut rx);
+        feed(&mut app, ":srv CAP me ACK :echo-message");
+        app.process_command("/msg alice same text");
+        echo(&mut app, &drain(&mut rx));
+        let rows = &app.conversations["alice"].messages;
+        assert_eq!(rows.len(), 2);
+        assert!(rows[0].msgid.is_none());
+        assert!(rows[1].msgid.is_some());
+        assert!(rows.iter().all(|row| !row.pending_echo));
+    }
+
+    #[test]
+    fn multiline_and_limit_fallback_echo_the_transmitted_shape() {
+        for fallback in [false, true] {
+            for action in [false, true] {
+                let (mut app, mut rx) = session();
+                feed(&mut app, ":srv CAP me ACK :echo-message draft/multiline");
+                if fallback {
+                    app.network_support.multiline_max_lines = Some(1);
+                }
+                let text = format!("{}\nsecond", "x".repeat(700));
+                assert!(app.send_chat_text("alice", &text, action));
+                let wire = drain(&mut rx);
+                let expected = if fallback { wire.len() } else { 1 };
+                echo(&mut app, &wire);
+                let rows = &app.conversations["alice"].messages;
+                assert_eq!(rows.len(), expected);
+                assert!(rows.iter().all(|row| row.is_action == action
+                    && !row.pending_echo
+                    && row.msgid.is_some()));
+            }
+        }
+    }
+
+    #[test]
+    fn notices_confirm_each_chunk_and_suppress_live_echoes_including_multiline() {
+        for multiline in [false, true] {
+            let (mut app, mut rx) = session();
+            feed(&mut app, ":me!u@h JOIN #room");
+            feed(&mut app, ":srv CAP me ACK :echo-message");
+            if multiline {
+                feed(&mut app, ":srv CAP me ACK :draft/multiline");
+            }
+            app.process_command(&format!("/notice alice {}", "n".repeat(700)));
+            let wire = drain(&mut rx);
+            let confirmations = app.conversations["#room"]
+                .messages
+                .iter()
+                .filter(|row| row.content.starts_with("-> -alice- "))
+                .count();
+            assert_eq!(confirmations, if multiline { 1 } else { wire.len() });
+            let before = app
+                .conversations
+                .values()
+                .map(|channel| channel.messages.len())
+                .sum::<usize>();
+            echo(&mut app, &wire);
+            let after = app
+                .conversations
+                .values()
+                .map(|channel| channel.messages.len())
+                .sum::<usize>();
+            assert_eq!(before, after);
+        }
+    }
+
+    #[test]
+    fn invalid_pastes_and_fragmented_credentials_never_queue_partial_input() {
+        for (target, text) in [
+            ("alice", "valid\ninvalid\0".into()),
+            ("NickServ", format!("IDENTIFY {}", "s".repeat(700))),
+        ] {
+            let (mut app, mut rx) = session();
+            app.process_command(&format!("/msg {target} {text}"));
+            assert!(drain(&mut rx).is_empty());
+            assert!(
+                app.conversations
+                    .values()
+                    .flat_map(|channel| &channel.messages)
+                    .all(|row| !row.content.contains(&"s".repeat(32)))
+            );
+        }
+        let (mut app, rx) = session();
+        drop(rx);
+        assert!(!app.send_chat_text("alice", "not queued", false));
+        assert!(!app.conversations.contains_key("alice"));
+    }
+
+    #[test]
+    fn multiline_service_credentials_are_redacted_on_every_line_and_echo_path() {
+        for action in [false, true] {
+            let (mut app, mut rx) = session();
+            feed(&mut app, ":srv CAP me ACK :echo-message draft/multiline");
+            app.open_query("NickServ");
+            app.input_text = if action {
+                "/me hello\nIDENTIFY secret-on-second-line".into()
+            } else {
+                "/msg NickServ hello\nIDENTIFY secret-on-second-line".into()
+            };
+            app.process_input();
+            assert!(app.command_history.is_empty());
+            let wire = drain(&mut rx);
+            assert!(wire.len() > 2);
+            echo(&mut app, &wire);
+            assert!(app.conversations["NickServ"].messages.iter().all(|row| {
+                !row.content.contains("secret-on-second-line")
+                    && (!row.content.contains("credential command") || row.no_log)
+            }));
+        }
+    }
+}
+
+#[cfg(test)]
+mod history_interleaving_tests {
+    use super::*;
+
+    fn feed(app: &mut Session, line: &str) {
+        app.handle_incoming_message(IrcMessage::parse(line).unwrap());
+    }
+
+    fn session(page_limit: usize) -> (Session, mpsc::UnboundedReceiver<IrcCommand>) {
+        let mut app = Session::with_settings(Settings {
+            nickname: "me".into(),
+            logging_enabled: false,
+            logging_load_history: false,
+            ..Settings::default()
+        });
+        assert!(app.start_session_from_form());
+        app.test_set_connected(true);
+        app.test_set_connecting_flag(false);
+        let (tx, rx) = mpsc::unbounded_channel();
+        app.test_set_sender(tx);
+        feed(
+            &mut app,
+            &format!(":srv CAP me ACK :draft/chathistory={page_limit} draft/read-marker"),
+        );
+        (app, rx)
+    }
+
+    fn message(app: &mut Session, batch: Option<&str>, second: usize, id: &str) {
+        let batch = batch.map(|id| format!(";batch={id}")).unwrap_or_default();
+        feed(
+            app,
+            &format!(
+                "@time=2026-11-14T12:00:{second:02}.000Z;msgid={id}{batch} \
+                 :alice!u@h PRIVMSG #room :{id}"
+            ),
+        );
+    }
+
+    fn ids(app: &Session) -> Vec<String> {
+        app.conversations["#room"]
+            .messages
+            .iter()
+            .filter_map(|message| message.msgid.clone())
+            .collect()
+    }
+
+    fn drain(rx: &mut mpsc::UnboundedReceiver<IrcCommand>) -> Vec<IrcCommand> {
+        std::iter::from_fn(|| rx.try_recv().ok()).collect()
+    }
+
+    #[test]
+    fn catch_up_rows_precede_interleaved_live_traffic_without_rewinding_read_marker() {
+        let (mut app, mut rx) = session(100);
+        message(&mut app, None, 0, "m0");
+        app.process_command("/history after #room msgid=m0 10");
+        feed(&mut app, ":srv BATCH +h chathistory #room");
+        message(&mut app, Some("h"), 1, "m1");
+        message(&mut app, None, 3, "m3");
+        message(&mut app, Some("h"), 2, "m2");
+        feed(&mut app, ":srv BATCH -h");
+
+        assert_eq!(ids(&app), ["m0", "m1", "m2", "m3"]);
+        let markers: Vec<_> = drain(&mut rx)
+            .into_iter()
+            .filter_map(|command| match command {
+                IrcCommand::Markread(_, marker) => marker,
+                _ => None,
+            })
+            .collect();
+        assert_eq!(markers, ["timestamp=2026-11-14T12:00:03.000Z"]);
+        assert_eq!(
+            app.conversations["#room"].read_marker.as_deref(),
+            Some("timestamp=2026-11-14T12:00:03.000Z")
+        );
+    }
+
+    #[test]
+    fn subsequent_catch_up_pages_merge_before_live_rows_and_keep_page_cursors() {
+        let (mut app, mut rx) = session(2);
+        app.window_focused = false;
+        message(&mut app, None, 0, "m0");
+        app.conversations.get_mut("#room").unwrap().unread = 0;
+        assert!(app.request_latest_history("#room", Some(4), HistoryPlacement::Append));
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            IrcCommand::ChathistoryAfter("#room".into(), "msgid=m0".into(), 2)
+        );
+
+        feed(&mut app, ":srv BATCH +first chathistory #room");
+        message(&mut app, Some("first"), 2, "m2");
+        message(&mut app, None, 5, "m5");
+        message(&mut app, Some("first"), 1, "m1");
+        feed(&mut app, ":srv BATCH -first");
+        assert_eq!(ids(&app), ["m0", "m1", "m2", "m5"]);
+        assert_eq!(app.conversations["#room"].unread, 3);
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            IrcCommand::ChathistoryAfter("#room".into(), "msgid=m2".into(), 2)
+        );
+
+        feed(&mut app, ":srv BATCH +second chathistory #room");
+        message(&mut app, Some("second"), 4, "m4");
+        message(&mut app, Some("second"), 3, "m3");
+        feed(&mut app, ":srv BATCH -second");
+        assert_eq!(ids(&app), ["m0", "m1", "m2", "m3", "m4", "m5"]);
+        assert_eq!(app.conversations["#room"].unread, 5);
+        assert!(app.pending_history_requests.is_empty());
+        assert!(drain(&mut rx).is_empty());
+        assert!(app.conversations["#room"].messages.iter().any(|row| {
+            row.is_system && row.content.contains("4 lines of server history loaded")
+        }));
+    }
+
+    #[test]
+    fn live_overlap_is_deduplicated_and_scrollback_keeps_the_newest_live_row() {
+        let (mut app, mut rx) = session(100);
+        app.window_focused = false;
+        app.max_scrollback = 4;
+        message(&mut app, None, 0, "m0");
+        app.conversations.get_mut("#room").unwrap().unread = 0;
+        assert!(app.request_latest_history("#room", Some(3), HistoryPlacement::Append));
+        feed(&mut app, ":srv BATCH +h chathistory #room");
+        message(&mut app, Some("h"), 1, "m1");
+        message(&mut app, None, 3, "m3");
+        message(&mut app, Some("h"), 3, "m3");
+        message(&mut app, Some("h"), 2, "m2");
+        feed(&mut app, ":srv BATCH -h");
+
+        assert_eq!(ids(&app), ["m1", "m2", "m3"]);
+        assert_eq!(app.conversations["#room"].messages.len(), 4);
+        assert_eq!(
+            app.conversations["#room"]
+                .messages
+                .back()
+                .unwrap()
+                .msgid
+                .as_deref(),
+            Some("m3")
+        );
+        assert_eq!(app.conversations["#room"].unread, 3);
+        assert_eq!(
+            drain(&mut rx).len(),
+            1,
+            "overlap still counts toward the page limit"
+        );
+    }
+
+    #[test]
+    fn automatic_read_markers_use_the_newest_time_and_preserve_a_newer_server_marker() {
+        let (mut app, mut rx) = session(100);
+        app.window_focused = false;
+        message(&mut app, None, 12, "newest");
+        message(&mut app, None, 11, "last-arrived");
+        app.conversations.get_mut("#room").unwrap().read_marker =
+            Some("timestamp=2026-11-14T12:00:10.000Z".into());
+        app.mark_target_read("#room");
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            IrcCommand::Markread(
+                "#room".into(),
+                Some("timestamp=2026-11-14T12:00:12.000Z".into())
+            )
+        );
+        let channel = app.conversations.get_mut("#room").unwrap();
+        channel.messages.clear();
+        channel.messages.push_back(
+            ChatMessage::new_fmt("alice", "older retained row", "short").with_irc_metadata(
+                Some("2026-11-14T12:00:04.000Z".into()),
+                Some("older".into()),
+                None,
+            ),
+        );
+        app.mark_target_read("#room");
+        assert!(drain(&mut rx).is_empty());
+        assert_eq!(
+            app.conversations["#room"].read_marker.as_deref(),
+            Some("timestamp=2026-11-14T12:00:12.000Z")
+        );
+    }
+
+    #[test]
+    fn page_ordering_keeps_untagged_rows_in_their_arrival_slots() {
+        let (mut app, _rx) = session(100);
+        app.process_command("/history #room 10");
+        feed(&mut app, ":srv BATCH +h chathistory #room");
+        message(&mut app, Some("h"), 5, "m5");
+        feed(
+            &mut app,
+            "@batch=h;msgid=untagged-a :alice!u@h PRIVMSG #room :untagged A",
+        );
+        message(&mut app, Some("h"), 1, "m1");
+        feed(
+            &mut app,
+            "@batch=h;msgid=untagged-b :alice!u@h PRIVMSG #room :untagged B",
+        );
+        message(&mut app, Some("h"), 3, "m3");
+        feed(&mut app, ":srv BATCH -h");
+        assert_eq!(ids(&app), ["m1", "untagged-a", "m3", "untagged-b", "m5"]);
+    }
+
+    #[test]
+    fn catch_up_preserves_untagged_rows_with_their_existing_stream_anchors() {
+        let (mut app, _rx) = session(100);
+        message(&mut app, None, 0, "m0");
+        app.conversations
+            .get_mut("#room")
+            .unwrap()
+            .messages
+            .push_back(ChatMessage::system_fmt("local before live", "short"));
+        message(&mut app, None, 3, "m3");
+        app.conversations
+            .get_mut("#room")
+            .unwrap()
+            .messages
+            .push_back(ChatMessage::system_fmt("local after live", "short"));
+        app.process_command("/history after #room msgid=m0 10");
+        feed(&mut app, ":srv BATCH +h chathistory #room");
+        message(&mut app, Some("h"), 2, "m2");
+        message(&mut app, Some("h"), 1, "m1");
+        feed(&mut app, ":srv BATCH -h");
+        let contents: Vec<_> = app.conversations["#room"]
+            .messages
+            .iter()
+            .filter_map(|row| {
+                (row.msgid.is_some() || row.content.starts_with("local "))
+                    .then_some(row.content.as_str())
+            })
+            .collect();
+        assert_eq!(
+            contents,
+            [
+                "m0",
+                "local before live",
+                "m1",
+                "m2",
+                "m3",
+                "local after live"
+            ]
+        );
+    }
+}
+
+#[cfg(test)]
+mod leave_and_handoff_regressions {
+    use super::*;
+
+    fn session() -> (Session, mpsc::UnboundedReceiver<IrcCommand>) {
+        let mut app = Session::with_settings(Settings {
+            server_host: "a.example".into(),
+            nickname: "me".into(),
+            auto_join_channels: String::new(),
+            logging_enabled: false,
+            logging_load_history: false,
+            ..Settings::default()
+        });
+        assert!(app.start_session_from_form());
+        app.test_set_connected(true);
+        app.test_set_connecting_flag(false);
+        let rx = transport(&mut app);
+        app.process_command("/join #room room-key");
+        feed(&mut app, ":me!u@h JOIN #room");
+        (app, rx)
+    }
+
+    fn transport(app: &mut Session) -> mpsc::UnboundedReceiver<IrcCommand> {
+        let (tx, rx) = mpsc::unbounded_channel();
+        app.test_set_sender(tx);
+        rx
+    }
+
+    fn feed(app: &mut Session, line: &str) {
+        app.handle_incoming_message(IrcMessage::parse(line).unwrap());
+    }
+
+    fn joins(rx: &mut mpsc::UnboundedReceiver<IrcCommand>) -> Vec<(String, Option<String>)> {
+        std::iter::from_fn(|| rx.try_recv().ok())
+            .filter_map(|cmd| match cmd {
+                IrcCommand::Join(target, key, _, _) => Some((target, key)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn part_and_window_close_exclude_unacknowledged_membership_from_recovery() {
+        for command in ["/part #room", "/raw PART #room", "/raw JOIN 0", "/close"] {
+            let (mut app, _rx) = session();
+            app.process_command(command);
+            assert!(app.is_parting("#ROOM"));
+            let snapshot = app.update_session();
+            assert!(
+                !snapshot
+                    .tabs
+                    .iter()
+                    .find(|(name, _, _)| name == "#room")
+                    .unwrap()
+                    .2
+            );
+            app.mark_connection_lost();
+            app.begin_connection_attempt();
+            let mut rx = transport(&mut app);
+            feed(&mut app, ":srv 001 me :Welcome back");
+            assert!(joins(&mut rx).is_empty(), "{command}");
+        }
+    }
+
+    #[test]
+    fn part_during_registration_cancels_recovery_join() {
+        let (mut app, _rx) = session();
+        app.mark_connection_lost();
+        app.begin_connection_attempt();
+        let mut rx = transport(&mut app);
+        app.test_set_connecting_flag(true);
+        app.process_command("/part #room");
+        feed(&mut app, ":srv 001 me :Welcome back");
+        assert!(joins(&mut rx).is_empty());
+    }
+
+    #[test]
+    fn failed_part_does_not_discard_confirmed_membership() {
+        let (mut app, _rx) = session();
+        app.process_command(&format!("/part #room {}", "x".repeat(600)));
+        assert!(!app.is_parting("#room"));
+        app.mark_connection_lost();
+        app.begin_connection_attempt();
+        let mut rx = transport(&mut app);
+        feed(&mut app, ":srv 001 me :Welcome back");
+        assert_eq!(joins(&mut rx), [("#room".into(), Some("room-key".into()))]);
+    }
+
+    #[test]
+    fn cycle_and_explicit_rejoin_supersede_leave_intent_even_before_join_echo() {
+        for command in ["/cycle", "/part #room"] {
+            let (mut app, _rx) = session();
+            app.process_command(command);
+            if command.starts_with("/part") {
+                app.process_command("/join #room room-key");
+            }
+            assert!(!app.is_parting("#room"));
+            feed(&mut app, ":me!u@h PART #room");
+            // The JOIN following PART has not been confirmed yet.
+            app.mark_connection_lost();
+            app.begin_connection_attempt();
+            let mut rx = transport(&mut app);
+            feed(&mut app, ":srv 001 me :Welcome back");
+            assert_eq!(joins(&mut rx), [("#room".into(), Some("room-key".into()))]);
+        }
+    }
+
+    #[test]
+    fn update_during_explicit_reconnect_keeps_nick_intent_and_memberships() {
+        let (mut app, _rx) = session();
+        app.nickname = "next-nick".into();
+        assert!(app.switch_session_from_form("Reconnecting"));
+        assert!(app.is_closing() && app.has_pending_connect());
+        let snapshot = app.update_session();
+        assert!(snapshot.reconnect);
+        assert_eq!(snapshot.session.as_ref().unwrap().server.nick, "next-nick");
+        let mut after = Session::with_settings(Settings {
+            logging_enabled: false,
+            logging_load_history: false,
+            ..Settings::default()
+        });
+        after.restore_update_session(snapshot);
+        assert!(after.is_connecting());
+        after.begin_connection_attempt();
+        let mut rx = transport(&mut after);
+        feed(&mut after, ":srv 001 next-nick :Welcome back");
+        assert_eq!(joins(&mut rx), [("#room".into(), Some("room-key".into()))]);
+    }
+
+    #[test]
+    fn update_during_server_switch_preserves_pending_endpoint_without_old_secrets() {
+        let (mut app, _rx) = session();
+        app.input_text = "old-network draft".into();
+        app.away_status = Some("old-network away".into());
+        app.server_host = "b.example".into();
+        app.nickname = "new-nick".into();
+        app.auto_join_channels = "#new new-key".into();
+        assert!(app.switch_session_from_form("Changing servers"));
+        assert!(app.update_changes_endpoint());
+        let snapshot = app.update_session();
+        assert!(snapshot.reconnect);
+        assert_eq!(snapshot.session.as_ref().unwrap().server.host, "b.example");
+        assert_eq!(snapshot.session.as_ref().unwrap().server.nick, "new-nick");
+        assert!(snapshot.tabs.is_empty() && snapshot.selected.is_none());
+        assert!(snapshot.input.is_empty() && snapshot.away.is_none());
+        let json = serde_json::to_string(&snapshot).unwrap();
+        assert!(!json.contains("room-key") && !json.contains("old-network"));
+        let mut after = Session::with_settings(Settings {
+            logging_enabled: false,
+            logging_load_history: false,
+            ..Settings::default()
+        });
+        after.restore_update_session(snapshot);
+        after.begin_connection_attempt();
+        let mut rx = transport(&mut after);
+        feed(&mut after, ":srv 001 new-nick :Welcome to B");
+        assert_eq!(joins(&mut rx), [("#new".into(), Some("new-key".into()))]);
+    }
+
+    #[test]
+    fn update_during_initial_registration_preserves_configured_autojoin() {
+        let mut app = Session::with_settings(Settings {
+            nickname: "me".into(),
+            auto_join_channels: "#initial initial-key".into(),
+            logging_enabled: false,
+            logging_load_history: false,
+            ..Settings::default()
+        });
+        assert!(app.start_session_from_form());
+        assert!(app.is_connecting() && !app.is_connected());
+        let snapshot = app.update_session();
+        assert!(snapshot.fresh_connect);
+        let mut after = Session::with_settings(Settings {
+            logging_enabled: false,
+            logging_load_history: false,
+            ..Settings::default()
+        });
+        after.restore_update_session(snapshot);
+        after.begin_connection_attempt();
+        let mut rx = transport(&mut after);
+        feed(&mut after, ":srv 001 me :Welcome");
+        assert_eq!(
+            joins(&mut rx),
+            [("#initial".into(), Some("initial-key".into()))]
+        );
+    }
+
+    #[test]
+    fn catch_up_repairs_optimistic_echo_timestamp_inversion() {
+        let row = |id: &str, second| {
+            ChatMessage::new_fmt("peer", id, "short").with_irc_metadata(
+                Some(format!("2026-11-14T12:00:0{second}.000Z")),
+                Some(id.into()),
+                None,
+            )
+        };
+        let mut shown = VecDeque::from([row("own-echo", 3), row("peer", 2)]);
+        Session::merge_catch_up_history(&mut shown, VecDeque::from([row("history", 1)]));
+        assert_eq!(
+            shown
+                .iter()
+                .filter_map(|row| row.msgid.as_deref())
+                .collect::<Vec<_>>(),
+            ["history", "peer", "own-echo"]
+        );
+    }
+}
+
+#[cfg(test)]
+mod conversation_identity_tests {
+    use super::*;
+
+    fn session() -> Session {
+        let mut session = Session::with_settings(Settings {
+            server_host: "one.example".into(),
+            nickname: "me".into(),
+            logging_enabled: false,
+            logging_load_history: false,
+            ..Settings::default()
+        });
+        assert!(session.start_session_from_form());
+        session
+    }
+
+    #[test]
+    fn peer_nick_and_case_changes_keep_conversation_and_selection() {
+        let mut session = session();
+        assert!(session.open_query("alice"));
+        let original = session.current_conversation.unwrap();
+        session.handle_incoming_message(IrcMessage::parse(":alice!a@h NICK bob").unwrap());
+        assert_eq!(session.id_for_target("bob"), Some(original));
+        assert_eq!(session.current_conversation, Some(original));
+        session.handle_incoming_message(IrcMessage::parse(":bob!a@h NICK BOB").unwrap());
+        assert_eq!(session.target_name(original), Some("BOB"));
+        assert_eq!(session.current_conversation, Some(original));
+        assert!(
+            !session
+                .events
+                .iter()
+                .any(|event| matches!(event, SessionEvent::ConversationMerged { .. }))
+        );
+    }
+
+    #[test]
+    fn explicit_rename_keeps_source_and_redirects_destination_selection() {
+        let mut session = session();
+        let destination = session.ensure_target("#destination");
+        let source = session.ensure_target("#source");
+        session
+            .conversation_channel_mut(destination)
+            .unwrap()
+            .messages
+            .push_back(ChatMessage::system("destination history"));
+        session
+            .conversation_channel_mut(source)
+            .unwrap()
+            .messages
+            .push_back(ChatMessage::system("source history"));
+        session.select_conversation(Some(destination));
+        session.handle_incoming_message(
+            IrcMessage::parse(":server RENAME #source #destination :moving").unwrap(),
+        );
+        assert_eq!(session.current_conversation, Some(source));
+        assert_eq!(session.id_for_target("#destination"), Some(source));
+        assert!(session.target_name(destination).is_none());
+        let rows = &session.conversation_channel(source).unwrap().messages;
+        assert!(rows.iter().any(|row| row.content == "source history"));
+        assert!(rows.iter().any(|row| row.content == "destination history"));
+        assert_eq!(session.events.iter().filter(|event| matches!(event, SessionEvent::ConversationMerged { survivor, retired } if *survivor == source && *retired == destination)).count(), 1);
+    }
+
+    #[test]
+    fn stale_selection_cannot_resolve_a_reopened_name_or_another_endpoint() {
+        let mut session = session();
+        let first = session.ensure_target("alice");
+        session.close_tab("alice");
+        let second = session.ensure_target("alice");
+        assert_ne!(first, second);
+        assert!(!session.select_conversation(Some(first)));
+        assert!(session.select_conversation(Some(second)));
+        session.apply_unprofiled_endpoint("two.example", "6697", true);
+        assert!(session.switch_session_from_form("Changing servers"));
+        let third = session.ensure_target("alice");
+        assert_ne!(second, third);
+        assert!(!session.select_conversation(Some(second)));
+        assert!(
+            session
+                .events
+                .iter()
+                .any(|event| matches!(event, SessionEvent::EndpointChanged))
+        );
+    }
+
+    #[test]
+    fn legacy_snapshot_keeps_exact_names_until_explicit_casemapping() {
+        let mut before = session();
+        before.network_support.case_mapping = CaseMapping::Ascii;
+        before
+            .conversations
+            .provisional_support(&before.network_support);
+        before.ensure_target("#[room");
+        before.ensure_target("#{room");
+        before.select_target("#{room");
+        let json = serde_json::to_string(&before.update_session()).unwrap();
+        assert!(!json.contains("ConversationId"));
+        let mut after = Session::with_settings(Settings {
+            logging_enabled: false,
+            logging_load_history: false,
+            ..Settings::default()
+        });
+        after.restore_update_session(serde_json::from_str(&json).unwrap());
+        assert_eq!(after.conversations.len(), 2);
+        assert_eq!(after.current_target_name(), Some("#{room"));
+        after.handle_incoming_message(
+            IrcMessage::parse(":srv 005 me CASEMAPPING=ascii :supported").unwrap(),
+        );
+        assert_eq!(after.conversations.len(), 2);
+        let oldest = after.conversations.ids().next().unwrap();
+        after.handle_incoming_message(
+            IrcMessage::parse(":srv 005 me CASEMAPPING=rfc1459 :supported").unwrap(),
+        );
+        assert_eq!(after.conversations.len(), 1);
+        assert_eq!(after.current_conversation, Some(oldest));
+    }
+
+    #[test]
+    fn casemapping_merge_preserves_live_metadata_when_oldest_tab_was_unjoined() {
+        let mut session = session();
+        session.network_support.case_mapping = CaseMapping::Ascii;
+        session
+            .conversations
+            .provisional_support(&session.network_support);
+        let oldest = session.ensure_target("#[room");
+        let live = session.ensure_target("#{room");
+        let channel = session.conversation_channel_mut(live).unwrap();
+        channel.joined = true;
+        channel.apply_channel_mode('+', 'k', Some("channel-key"));
+        channel.apply_channel_mode('+', 'n', None);
+        channel.add_user("alice", UserMode::Op);
+        channel.set_user_realname("alice", Some("Alice".into()));
+        session.select_conversation(Some(live));
+        session.handle_incoming_message(
+            IrcMessage::parse(":srv 005 me CASEMAPPING=rfc1459 :supported").unwrap(),
+        );
+        assert_eq!(session.current_conversation, Some(oldest));
+        let merged = session.conversation_channel(oldest).unwrap();
+        assert!(merged.joined);
+        assert_eq!(merged.key.as_deref(), Some("channel-key"));
+        assert!(merged.modes.contains('k') && merged.modes.contains('n'));
+        assert_eq!(
+            merged.get_user("alice").unwrap().realname.as_deref(),
+            Some("Alice")
+        );
+        assert_eq!(merged.get_user("alice").unwrap().mode, UserMode::Op);
+    }
+
+    #[test]
+    fn retained_kick_and_reconnect_keep_conversation_ids() {
+        let mut session = session();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        session.test_set_registered(tx);
+        session.handle_incoming_message(IrcMessage::parse(":me!u@h JOIN #room").unwrap());
+        let original = session.id_for_target("#room").unwrap();
+        session.handle_incoming_message(IrcMessage::parse(":op!u@h KICK #room me :bye").unwrap());
+        assert_eq!(session.id_for_target("#room"), Some(original));
+        assert!(!session.conversation_channel(original).unwrap().joined);
+        session.request_reconnect_after_close("Reconnecting");
+        assert_eq!(session.id_for_target("#room"), Some(original));
     }
 }

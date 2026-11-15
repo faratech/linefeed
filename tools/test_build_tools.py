@@ -2,6 +2,8 @@
 """Focused regression tests for the repository build helpers."""
 
 import importlib.util
+import io
+import json
 import shutil
 import subprocess
 import tempfile
@@ -29,6 +31,132 @@ class BuildScriptTests(unittest.TestCase):
         )
         self.assertTrue(failed)
         self.assertEqual(sizes, {"linefeed_linux": (100, 100)})
+
+
+class BuildArtifactTests(unittest.IsolatedAsyncioTestCase):
+    def artifact(self, root, executable, *, manifest=None, name="linefeed", kind="bin", fresh=False):
+        return json.dumps({
+            "reason": "compiler-artifact",
+            "manifest_path": str(manifest or root / "Cargo.toml"),
+            "target": {"name": name, "kind": [kind]},
+            "executable": str(executable) if executable is not None else None,
+            "fresh": fresh,
+        })
+
+    async def run_build(self, build, root, output, *, target=None, success=True):
+        source_name = "linefeed.exe" if target else "linefeed"
+        destination = "linefeed_x64.exe" if target else "linefeed_linux_arm64"
+        (root / "dist").mkdir(exist_ok=True)
+        stream = io.StringIO()
+        runner = mock.AsyncMock(return_value=(success, output))
+        with mock.patch.object(build, "SCRIPT_DIR", root), \
+                mock.patch.object(build, "OUT_DIR", root / "dist"), \
+                mock.patch.object(build, "run_cmd", runner), \
+                mock.patch("sys.stdout", stream):
+            result = await build.build_target("Test target", target, source_name, destination)
+        return result, root / "dist" / destination, stream.getvalue(), runner
+
+    async def test_cargo_artifact_paths_override_stale_default_output_for_native_and_cross_builds(self):
+        for target, fresh in [(None, False), ("x86_64-pc-windows-gnullvm", True)]:
+            with self.subTest(target=target, cached=fresh), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                build = load_module("linefeed_build_artifacts", ROOT / "build.py")
+                source_name = "linefeed.exe" if target else "linefeed"
+                stale = root / "target"
+                if target:
+                    stale /= target
+                stale = stale / "dist" / source_name
+                stale.parent.mkdir(parents=True)
+                stale.write_bytes(b"stale executable")
+                artifact = root / "configured output with spaces"
+                if target:
+                    artifact /= target
+                artifact = artifact / "dist" / source_name
+                artifact.parent.mkdir(parents=True)
+                artifact.write_bytes(b"current executable")
+                foreign = root / "dependency executable"
+                foreign.write_bytes(b"wrong executable")
+                output = "\n".join([
+                    self.artifact(root, foreign, manifest=root / "dependency" / "Cargo.toml"),
+                    self.artifact(root, foreign, name="other-bin"),
+                    self.artifact(root, foreign, kind="lib"),
+                    self.artifact(root, artifact, fresh=fresh),
+                ])
+
+                # The native case models CARGO_TARGET_DIR; the cross case
+                # models Cargo's configured build.target-dir. Both must use
+                # Cargo's path instead of any conventional ./target path.
+                if target:
+                    (root / ".cargo").mkdir()
+                    (root / ".cargo" / "config.toml").write_text(
+                        "[build]\ntarget-dir = " + json.dumps(str(root / "configured output with spaces")) + "\n"
+                    )
+                build_environment = {} if target else {
+                    "CARGO_TARGET_DIR": str(root / "configured output with spaces"),
+                }
+                with mock.patch.dict("os.environ", build_environment):
+                    result, destination, _, runner = await self.run_build(
+                        build, root, output, target=target,
+                    )
+
+                self.assertTrue(result)
+                self.assertEqual(destination.read_bytes(), b"current executable")
+                command = runner.call_args.args[0]
+                self.assertIn("--message-format=json-render-diagnostics", command)
+                self.assertEqual(command[command.index("--bin") + 1], "linefeed")
+                if target:
+                    self.assertEqual(command[command.index("--target") + 1], target)
+
+    async def test_missing_ambiguous_and_unavailable_artifacts_fail_without_copying_stale_binary(self):
+        for scenario in ["missing", "ambiguous", "unavailable"]:
+            with self.subTest(scenario=scenario), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                build = load_module("linefeed_build_missing_artifacts", ROOT / "build.py")
+                stale = root / "target" / "dist" / "linefeed"
+                stale.parent.mkdir(parents=True)
+                stale.write_bytes(b"stale executable")
+                first = root / "custom" / "linefeed"
+                if scenario == "missing":
+                    output = self.artifact(root, stale, manifest=root / "other" / "Cargo.toml")
+                elif scenario == "ambiguous":
+                    output = "\n".join([
+                        self.artifact(root, first),
+                        self.artifact(root, root / "other output" / "linefeed"),
+                    ])
+                else:
+                    output = self.artifact(root, first)
+
+                result, destination, diagnostics, _ = await self.run_build(build, root, output)
+
+                self.assertFalse(result)
+                self.assertFalse(destination.exists())
+                self.assertIn("ERROR", diagnostics)
+
+    async def test_copy_failure_is_reported_as_a_failed_build(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            build = load_module("linefeed_build_copy_failure", ROOT / "build.py")
+            artifact = root / "custom" / "linefeed"
+            with mock.patch.object(build.shutil, "copy2", side_effect=PermissionError("read-only output")):
+                result, _, diagnostics, _ = await self.run_build(
+                    build, root, self.artifact(root, artifact),
+                )
+            self.assertFalse(result)
+            self.assertIn("read-only output", diagnostics)
+
+    async def test_failed_build_keeps_rendered_and_plain_diagnostics(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            build = load_module("linefeed_build_diagnostics", ROOT / "build.py")
+            output = "\n".join([
+                json.dumps({"reason": "compiler-message", "message": {"rendered": "error: broken code\n"}}),
+                "error: could not compile linefeed",
+            ])
+            result, destination, diagnostics, _ = await self.run_build(build, root, output, success=False)
+            self.assertFalse(result)
+            self.assertFalse(destination.exists())
+            self.assertIn("error: broken code", diagnostics)
+            self.assertIn("error: could not compile linefeed", diagnostics)
 
 
 class BuildRsTests(unittest.TestCase):

@@ -118,11 +118,13 @@ src/
 ├── systray.rs           # Windows system tray via direct Win32 APIs (show/hide, flash, notify, single-instance)
 ├── icon_data.rs         # Generated: embedded icon as raw RGBA bytes
 ├── opener.rs            # Opening hyperlinks in the browser
+├── persistence.rs       # Private atomic configuration writes and cross-process locks
 ├── updater/             # Automatic updates: check, download, install on exit, recovery
 ├── gui/
-│   ├── app.rs           # App: sessions, settings, notifications, toolbar/switchbar, windows, detached viewports (~2600 lines)
-│   ├── mod.rs           # Session: one connection's state, message routing, numeric handlers (~12700 lines)
-│   ├── connection.rs    # Per-session connection worker lifecycle (thread, intent, reconnect)
+│   ├── app.rs           # App: sessions, settings, notifications, toolbar/switchbar, windows, detached viewports
+│   ├── mod.rs           # Session: protocol state, message routing, numeric handlers, conversation selection
+│   ├── connection.rs    # Private connection phases, worker/transport ownership, cancellation and reconnect
+│   ├── conversations.rs # Stable process-local ConversationIds, target-name indexes and collision merges
 │   ├── windows.rs       # WindowManager: placement, tile/cascade, layout.json
 │   ├── snap.rs          # Snap layouts: window captions, layout flyout/bar, edge snaps, Snap Assist
 │   ├── view.rs          # Drawing one window: topic, user list, scrollback, input line
@@ -140,10 +142,14 @@ src/
 ```
 
 **Key types:**
+
 - `LinefeedApp` (main.rs): eframe::App wrapper around `App`, tray/minimized handling
 - `App` (gui/app.rs): owns every `Session` plus everything global: canonical `Settings` (only a validated connect form is ever adopted into them), favorites/network profiles, updater, desktop-notification policy, the `WindowManager`; draws the toolbar, switchbar, windows and detached OS windows. Sessions talk to it through `SessionEvent`s
-- `Session` (gui/mod.rs): one connection (its status window, channels, queries), its own connect form, mirrored behaviour settings (`apply_config`/`export_config`), its worker thread; `SessionConfig` snapshots the live connection's endpoint/credentials so form edits cannot contaminate it
-- `WindowManager` (gui/windows.rs): which window is active, maximized vs floating, per-window placement and input line (`TargetView`, swapped into the session while the window draws)
+- `Session` (gui/mod.rs): one network's status, channels, queries, connect form and mirrored behaviour settings (`apply_config`/`export_config`); owns a private `ConnectionLifecycle` and `ConversationStore`. `SessionConfig` snapshots the active endpoint/credentials so form edits cannot contaminate it
+- `ConnectionLifecycle` (gui/connection.rs): private `Idle`, `Queued`, `Connecting`, `Registered`, `Closing` and `RetryWait` phases. Live phases own their worker and channels; `Closing` owns the retiring worker and any replacement plan. Callers use derived queries such as `is_connected()`, `is_connecting()` and `has_worker()`, never independent writable flags or transport fields
+- `RecoveryPolicy` (gui/connection.rs): `ConfiguredAutoJoin` for an initial connection, or `ExactMemberships` for recovery; an exact empty list deliberately restores no channels. Successfully queued leave/join intents determine membership recovery
+- `ConversationStore` / `ConversationId` (gui/conversations.rs): channels and queries indexed by IDs that are never reused in a session. Nick/channel names are mutable metadata with exact and negotiated-casemapping lookup indexes; renames preserve identity and collisions merge into an explicit survivor
+- `WindowManager` (gui/windows.rs): active/maximized/floating windows, placement and each input line (`TargetView`, swapped into the session while the window draws). Runtime `WindowKey`s contain `(ConnId, Option<ConversationId>)`; `None` identifies the status window
 - `IrcClient` (irc/client.rs): Async connection, TLS, SASL negotiation
 - `IrcCommand` (irc/message.rs): Enum for all IRC commands, implements Display for wire format
 - `IrcMessage` (irc/message.rs): Parsed message with IRCv3 tags, prefix, command
@@ -153,10 +159,18 @@ src/
 - `LogManager` (gui/logging.rs): Chat history at `~/.config/linefeed/logs/<network>/<target>.log`, endpoint-scoped paths, credential filtering at write time
 
 **Threading model:**
+
 1. Main thread runs egui event loop via `LinefeedApp::ui()`; detached windows are immediate viewports on the same thread
 2. Each `Session` spawns its own connection thread with a single-threaded tokio runtime
-3. Two mpsc channels per session bridge threads: `cmd_tx` (GUI→IRC), `msg_rx` (IRC→GUI)
-4. IrcClient auto-handles PING/PONG; all messages forwarded to GUI
+3. Each live connection phase privately owns two mpsc channels (GUI→IRC commands and IRC→GUI messages) and an attempt generation. Dispatch checks the generation and whether the current phase accepts messages
+4. QUIT retirement keeps the receiver alive for a bounded flush period; a replacement worker starts only after the old worker exits. Final messages retain the old endpoint identity, while update snapshots project the requested replacement
+5. IrcClient auto-handles PING/PONG; all messages forwarded to GUI
+
+Conversation IDs key runtime selections, window state, deferred UI work and
+native viewports. Resolve an ID to its current target name when sending IRC
+commands. Layout and updater snapshots retain compatible name-based formats;
+restoration allocates fresh runtime IDs rather than persisting process-local
+identity. Closing and reopening the same name must not revive stale UI work.
 
 ## Module Responsibilities
 
@@ -164,8 +178,9 @@ src/
 - **systray.rs**: Windows-only tray icon, minimize-to-tray, taskbar flash, balloon notifications, single-instance activation (finds the main window by its exact title, which no detached window may use)
 - **gui/app.rs**: multi-session frame (pump, timers, lifecycles, `SessionEvent`s), window activation and close semantics, switchbar/shortcuts, floating and detached windows, settings persistence, notifications, update-restart snapshot of every session
 - **gui/mod.rs**: `handle_incoming_message()` routes by IrcCommand type, `handle_numeric()` for server replies, lag meter, auto-away
-- **gui/connection.rs**: per-session worker thread, `ConnectionIntent` handling, auto-reconnect
-- **gui/windows.rs**: window set derived from the sessions, placement memory, tile/cascade geometry, layout.json (kept apart from settings.json)
+- **gui/connection.rs**: explicit connection transitions, exclusive worker/transport ownership, attempt generations, bounded cancellation/QUIT retirement, auto-reconnect and derived lifecycle queries
+- **gui/conversations.rs**: conversation identity, current wire/display names, casemapped lookup, rename/collision resolution and revision tracking
+- **gui/windows.rs**: window set derived from conversation IDs, placement memory, tile/cascade geometry, layout.json name-based compatibility boundary (kept apart from settings.json)
 - **gui/snap.rs**: the floating windows' own captions (drag to move, maximize, close) and Windows 11 style snap layouts: flyout on the maximize button, layout bar when dragged to the top, halves/quarters at the edges, Snap Assist for the zones left
 - **commands.rs**: All /slash commands including service shortcuts (/ns, /cs), /monitor, /slap
 - **dialogs.rs**: Modal windows with tabbed Settings (Connection, Display, Automation, Behavior, About)

@@ -9,6 +9,29 @@
 /// should not reach the OS shell handler at any size, let alone megabytes.
 const MAX_URL_LEN: usize = 2048;
 
+/// Drain links from the viewport currently being drawn. Immediate native
+/// viewports must do this before returning their output to eframe.
+fn take_pending_urls(ctx: &egui::Context) -> Vec<String> {
+    ctx.output_mut(|output| {
+        let mut urls = Vec::new();
+        output.commands.retain(|command| {
+            if let egui::OutputCommand::OpenUrl(open) = command {
+                urls.push(open.url.clone());
+                false
+            } else {
+                true
+            }
+        });
+        urls
+    })
+}
+
+pub(crate) fn dispatch_pending_urls(ctx: &egui::Context) {
+    for url in take_pending_urls(ctx) {
+        open_in_browser(&url);
+    }
+}
+
 /// True when `url` is safe to hand to the OS shell handler: an http(s)
 /// absolute URL free of whitespace and control characters.
 ///
@@ -23,7 +46,9 @@ pub fn is_openable_url(url: &str) -> bool {
     };
     scheme_ok
         && url.len() <= MAX_URL_LEN
-        && !url.bytes().any(|b| b.is_ascii_control() || b.is_ascii_whitespace())
+        && !url
+            .bytes()
+            .any(|b| b.is_ascii_control() || b.is_ascii_whitespace())
 }
 
 /// Open `url` in the user's default browser. Failures are logged, never
@@ -44,9 +69,9 @@ pub fn open_in_browser(url: &str) {
 
 #[cfg(windows)]
 fn spawn_open(url: &str) -> Result<(), String> {
-    use windows::core::{PCWSTR, w};
     use windows::Win32::UI::Shell::ShellExecuteW;
     use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+    use windows::core::{PCWSTR, w};
 
     // ShellExecuteW dispatches on the registered protocol handler; the verb
     // "open" plus our http(s)-only validation keeps arbitrary program
@@ -102,6 +127,77 @@ fn spawn_open(url: &str) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn drains_links_once_and_preserves_other_output_commands() {
+        let ctx = egui::Context::default();
+        let mut output = ctx.run_ui(Default::default(), |ui| {
+            ui.ctx()
+                .open_url(egui::OpenUrl::new_tab("https://example.com/one"));
+            ui.ctx().copy_text("copied text".into());
+            ui.ctx()
+                .open_url(egui::OpenUrl::same_tab("https://example.com/two"));
+            assert_eq!(
+                take_pending_urls(ui.ctx()),
+                ["https://example.com/one", "https://example.com/two"]
+            );
+            assert!(take_pending_urls(ui.ctx()).is_empty());
+        });
+        output.textures_delta.clear();
+        assert!(matches!(output.platform_output.commands.as_slice(),
+            [egui::OutputCommand::CopyText(text)] if text == "copied text"));
+    }
+
+    #[test]
+    fn child_url_output_is_drained_in_its_own_viewport() {
+        use std::cell::Cell;
+        use std::rc::Rc;
+        let ctx = egui::Context::default();
+        ctx.set_embed_viewports(false);
+        let saw_child_link = Rc::new(Cell::new(false));
+        let saw_link = saw_child_link.clone();
+        egui::Context::set_immediate_viewport_renderer(move |ctx, mut viewport| {
+            let mut output = ctx.run_ui(
+                egui::RawInput {
+                    viewport_id: viewport.ids.this,
+                    viewports: [
+                        (egui::ViewportId::ROOT, egui::ViewportInfo::default()),
+                        (
+                            viewport.ids.this,
+                            egui::ViewportInfo {
+                                parent: Some(viewport.ids.parent),
+                                ..Default::default()
+                            },
+                        ),
+                    ]
+                    .into_iter()
+                    .collect(),
+                    ..Default::default()
+                },
+                |ui| (viewport.viewport_ui_cb)(ui),
+            );
+            output.textures_delta.clear();
+            assert!(output.platform_output.commands.is_empty());
+            saw_link.set(true);
+        });
+        let mut output = ctx.run_ui(Default::default(), |ui| {
+            ui.ctx()
+                .open_url(egui::OpenUrl::new_tab("https://root.example"));
+            ui.ctx().show_viewport_immediate(
+                egui::ViewportId::from_hash_of("link-test"),
+                Default::default(),
+                |ui, class| {
+                    assert!(class == egui::ViewportClass::Immediate);
+                    ui.ctx()
+                        .open_url(egui::OpenUrl::new_tab("https://child.example"));
+                    assert_eq!(take_pending_urls(ui.ctx()), ["https://child.example"]);
+                },
+            );
+            assert_eq!(take_pending_urls(ui.ctx()), ["https://root.example"]);
+        });
+        output.textures_delta.clear();
+        assert!(saw_child_link.get());
+    }
 
     #[test]
     fn accepts_ordinary_web_urls() {

@@ -274,40 +274,13 @@ impl Settings {
                 return;
             }
         };
-        // Write to a temp file and rename over the original: a crash or power
-        // loss mid-write can then never leave settings.json truncated.
-        let tmp = path.with_extension("json.tmp");
-        let write_result = write_settings_file(&tmp, &data);
-        match write_result.and_then(|_| std::fs::rename(&tmp, &path)) {
+        match crate::persistence::write_private_atomic(&path, data.as_bytes()) {
             Ok(_) => tracing::debug!("Saved settings to {:?}", path),
             Err(e) => {
                 tracing::error!("Failed to save settings: {}", e);
-                let _ = std::fs::remove_file(&tmp);
             }
         }
     }
-}
-
-/// Write the settings payload to `tmp`, private (0600) on Unix since it
-/// contains server and SASL passwords, and fsynced so the atomic rename that
-/// follows lands on durable bytes.
-#[cfg(unix)]
-pub(super) fn write_settings_file(tmp: &std::path::Path, data: &str) -> std::io::Result<()> {
-    use std::io::Write;
-    use std::os::unix::fs::OpenOptionsExt;
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(tmp)?;
-    file.write_all(data.as_bytes())?;
-    file.sync_all()
-}
-
-#[cfg(not(unix))]
-pub(super) fn write_settings_file(tmp: &std::path::Path, data: &str) -> std::io::Result<()> {
-    std::fs::write(tmp, data)
 }
 
 /// Cached scrollback row height for one message, valid for one layout key
@@ -1214,6 +1187,94 @@ impl Channel {
         self.add_user_with_prefixes(nick, mode, "~&@%+");
     }
 
+    /// Merge colliding conversations in one user-list rebuild. Identity fields
+    /// and status modes must survive even when the oldest tab was unjoined.
+    pub(crate) fn merge_users(&mut self, users: Vec<ChannelUser>) {
+        for user in users {
+            if let Some(existing) = self.get_user_mut(&user.nick) {
+                for mode in user.mode_letters {
+                    if !existing.mode_letters.contains(&mode) {
+                        existing.mode_letters.push(mode);
+                    }
+                }
+                if existing.username.is_none() {
+                    existing.username = user.username;
+                }
+                if existing.hostname.is_none() {
+                    existing.hostname = user.hostname;
+                }
+                if existing.account.is_none() {
+                    existing.account = user.account;
+                }
+                if existing.realname.is_none() {
+                    existing.realname = user.realname;
+                }
+                if existing.away.is_none() {
+                    existing.away = user.away;
+                }
+                existing.bot |= user.bot;
+            } else {
+                self.users.push(user);
+            }
+        }
+        for user in &mut self.users {
+            user.refresh_display_mode(&self.prefix_modes, &self.prefix_symbols);
+        }
+        self.sort_users();
+    }
+
+    pub(crate) fn merge_metadata_from(&mut self, other: &Self) {
+        if self.topic.is_none() {
+            self.topic = other.topic.clone();
+            self.topic_set_by = other.topic_set_by.clone();
+            self.topic_set_time = other.topic_set_time;
+        }
+        if self.key.is_none() {
+            self.key = other.key.clone();
+        }
+        if self.created.is_none() {
+            self.created = other.created;
+        }
+        for mode in other
+            .modes
+            .chars()
+            .filter(|mode| !matches!(mode, '+' | '-'))
+        {
+            if !self.modes.contains(mode) {
+                self.apply_channel_mode(
+                    '+',
+                    mode,
+                    other.mode_parameters.get(&mode).map(String::as_str),
+                );
+            }
+        }
+        for (mode, entries) in &other.mode_lists {
+            let list = self.mode_lists.entry(*mode).or_default();
+            for entry in entries {
+                if !list
+                    .iter()
+                    .any(|existing| self.case_mapping.eq(&existing.mask, &entry.mask))
+                {
+                    list.push(entry.clone());
+                }
+            }
+        }
+        for entry in &other.bans {
+            if !self
+                .bans
+                .iter()
+                .any(|existing| self.case_mapping.eq(&existing.mask, &entry.mask))
+            {
+                self.bans.push(entry.clone());
+            }
+        }
+        self.mode_lists_complete.extend(&other.mode_lists_complete);
+        self.ban_list_complete |= other.ban_list_complete;
+        if self.read_marker < other.read_marker {
+            self.read_marker.clone_from(&other.read_marker);
+        }
+    }
+
     pub fn add_user_with_prefixes(&mut self, nick: &str, mode: UserMode, prefixes: &str) {
         let clean_nick = nick.trim_start_matches(|c| prefixes.contains(c));
         // Ignore tokens that are only mode prefixes (e.g. a stray "@"): they would
@@ -2094,9 +2155,7 @@ mod tests {
             };
             for left in samples {
                 for right in samples {
-                    let expected = support
-                        .canonicalize(left)
-                        .cmp(&support.canonicalize(right));
+                    let expected = support.canonicalize(left).cmp(&support.canonicalize(right));
                     assert_eq!(
                         support.cmp_canonical(left, right),
                         expected,
@@ -2234,10 +2293,13 @@ mod tests {
                     let new_nick = nicks[(next() as usize) % nicks.len()];
                     ch.rename_user(nick, new_nick);
                 }
-                3 => ch.add_user_status_mode(nick, ['q', 'a', 'o', 'h', 'v'][(next() as usize) % 5]),
-                4 => {
-                    ch.remove_user_status_mode(nick, ['q', 'a', 'o', 'h', 'v'][(next() as usize) % 5])
+                3 => {
+                    ch.add_user_status_mode(nick, ['q', 'a', 'o', 'h', 'v'][(next() as usize) % 5])
                 }
+                4 => ch.remove_user_status_mode(
+                    nick,
+                    ['q', 'a', 'o', 'h', 'v'][(next() as usize) % 5],
+                ),
                 5 => {
                     ch.begin_user_burst();
                     for _ in 0..3 {

@@ -1,7 +1,7 @@
 //! Drawing one session's pieces for the window manager in `app.rs`: the
 //! toolbar status summary and join box, and a window's contents (topic,
 //! user list, scrollback and input line). A window draws with its session's
-//! `current_channel` pointed at the window's target and the window's input
+//! `current_conversation` pointed at the window's target and the window's input
 //! state swapped in (see `app::with_window_view`).
 
 use egui::{Color32, RichText, ScrollArea, TextEdit};
@@ -14,7 +14,7 @@ impl Session {
     /// Connection status for the toolbar: state dot, nick, network, lag and
     /// away message.
     pub(crate) fn draw_status_summary(&self, ui: &mut egui::Ui, network_label: &str) {
-        if self.connected {
+        if self.is_connected() {
             if self.away_status.is_some() {
                 ui.label(RichText::new("●").color(Color32::from_rgb(255, 200, 0)));
             } else {
@@ -46,7 +46,7 @@ impl Session {
                         .color(Color32::from_rgb(255, 200, 0)),
                 );
             }
-        } else if self.connecting {
+        } else if self.is_connecting() {
             ui.label(RichText::new("●").color(Color32::YELLOW));
             ui.label(format!("Connecting to {network_label}..."));
         } else {
@@ -74,7 +74,7 @@ impl Session {
 
     /// Open the Channel Info dialog for `channel`, asking for fresh modes.
     pub(crate) fn open_channel_info(&mut self, channel: &str) {
-        self.channel_info_target = Some(channel.to_string());
+        self.channel_info_target = self.id_for_target(channel);
         self.show_channel_info = true;
         self.send_command(IrcCommand::Mode(channel.to_string(), None, Vec::new()));
     }
@@ -85,19 +85,19 @@ impl Session {
     /// beyond it, so a floating window keeps the size it was tiled to or
     /// dragged to instead of growing to fit its content.
     pub(crate) fn draw_target(&mut self, ui: &mut egui::Ui) {
-        let salt = (self.id, self.current_channel.clone());
+        let salt = (self.id, self.current_conversation);
         self.draw_target_header(ui);
-        if let Some(channel_name) = self.current_channel.clone()
+        if let Some(channel_name) = self.current_target_name().map(str::to_string)
             && self.is_channel_name(&channel_name)
         {
-            egui::Panel::right(("users", salt.clone()))
+            egui::Panel::right(("users", salt))
                 .resizable(true)
                 .default_size(140.0)
                 .min_size(80.0)
                 .max_size((ui.available_width() * 0.35).max(80.0))
                 .show(ui, |ui| self.draw_user_list(ui, &channel_name));
         }
-        egui::Panel::bottom(("input", salt.clone()))
+        egui::Panel::bottom(("input", salt))
             .show_separator_line(true)
             .show(ui, |ui| self.draw_input_row(ui));
         egui::CentralPanel::default().show(ui, |ui| {
@@ -107,10 +107,10 @@ impl Session {
     }
 
     fn draw_target_header(&self, ui: &mut egui::Ui) {
-        let Some(channel_name) = &self.current_channel else {
+        let Some(channel_name) = self.current_target_name() else {
             return;
         };
-        let Some(channel) = self.channels.get(channel_name) else {
+        let Some(channel) = self.conversations.get(channel_name) else {
             return;
         };
         if self.is_channel_name(channel_name) && !channel.modes.is_empty() {
@@ -145,7 +145,7 @@ impl Session {
         let mut voice_nick: Option<(String, String)> = None;
         let mut kick_nick: Option<(String, String)> = None;
 
-        if let Some(channel) = self.channels.get(channel_name) {
+        if let Some(channel) = self.conversations.get(channel_name) {
             let away_count = channel.away_count();
             if away_count > 0 {
                 ui.heading(format!(
@@ -164,7 +164,7 @@ impl Session {
             // which matters for channels with thousands of users.
             let row_height = ui.text_style_height(&egui::TextStyle::Body);
             ScrollArea::vertical()
-                .id_salt(("user_list", self.id, channel_name))
+                .id_salt(("user_list", self.id, self.current_conversation))
                 .show_rows(ui, row_height, channel.users.len(), |ui, row_range| {
                     for user in &channel.users[row_range] {
                         let nick = &user.nick;
@@ -328,7 +328,7 @@ impl Session {
                 }
                 let response = ui.add(
                     TextEdit::singleline(&mut self.input_text)
-                        .id_salt(("input", self.id, self.current_channel.clone()))
+                        .id_salt(("input", self.id, self.current_conversation))
                         .hint_text("Type a message...")
                         .desired_width(ui.available_width()),
                 );

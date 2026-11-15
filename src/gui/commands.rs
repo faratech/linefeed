@@ -82,7 +82,7 @@ impl Session {
                 // Split off a leading channel token; otherwise treat args as a reason
                 // for the current channel (so the channel field never contains spaces).
                 let (channel, inline_reason) = if args.is_empty() {
-                    (self.current_channel.clone(), None)
+                    (self.current_target().map(str::to_string), None)
                 } else {
                     let (first, rest) = split_word(args);
                     if self.is_channel_name(first) {
@@ -91,7 +91,10 @@ impl Session {
                             Some(rest).filter(|r| !r.is_empty()).map(str::to_string),
                         )
                     } else {
-                        (self.current_channel.clone(), Some(args.to_string()))
+                        (
+                            self.current_target().map(str::to_string),
+                            Some(args.to_string()),
+                        )
                     }
                 };
                 let channel = match channel {
@@ -114,7 +117,7 @@ impl Session {
                         }
                     });
                     if !self.send_command(IrcCommand::Part(ch.clone(), reason))
-                        && self.cmd_tx.is_none()
+                        && !self.has_transport()
                     {
                         // Disconnected: the server can't confirm the part, so
                         // close the stale channel window locally instead of
@@ -122,9 +125,14 @@ impl Session {
                         // failure on a live channel (e.g. a line-too-long
                         // reason) must never destroy a joined tab (#162) —
                         // send_command already reported the real cause.
+                        let was_current = self.current_target_is(&ch);
                         self.remove_channel(&ch);
-                        if self.current_target_is(&ch) {
-                            self.current_channel = self.channels.keys().next().cloned();
+                        if was_current {
+                            self.current_conversation = self
+                                .conversations
+                                .keys()
+                                .next()
+                                .and_then(|target| self.id_for_target(target));
                         }
                     }
                 }
@@ -137,16 +145,8 @@ impl Session {
                 // split_word also drops the whole run of separators.
                 let (target, message) = split_word(args);
                 if !target.is_empty() && !message.is_empty() {
-                    if self.connected {
-                        if self.send_privmsg_text(target, message) {
-                            let chat_msg = outgoing_local_echo(
-                                target,
-                                &self.my_nick,
-                                message,
-                                &self.timestamp_format,
-                            );
-                            self.add_message_to_channel(target, chat_msg);
-                        } else {
+                    if self.is_connected() {
+                        if !self.send_chat_text(target, message, false) {
                             self.add_message_to_current(
                                 ChatMessage::system_fmt("Message not sent", &self.timestamp_format)
                                     .without_logging(),
@@ -184,16 +184,8 @@ impl Session {
                 }
                 // If there's a message, send it
                 if !message.is_empty() {
-                    if self.connected {
-                        if self.send_privmsg_text(target, message) {
-                            let chat_msg = outgoing_local_echo(
-                                target,
-                                &self.my_nick,
-                                message,
-                                &self.timestamp_format,
-                            );
-                            self.add_message_to_channel(target, chat_msg);
-                        } else {
+                    if self.is_connected() {
+                        if !self.send_chat_text(target, message, false) {
                             self.add_message_to_current(
                                 ChatMessage::system_fmt("Message not sent", &self.timestamp_format)
                                     .without_logging(),
@@ -214,17 +206,9 @@ impl Session {
             "ME" => {
                 if args.is_empty() {
                     self.add_message_to_current(ChatMessage::system("Usage: /me <action>"));
-                } else if let Some(channel) = &self.current_channel.clone() {
-                    if self.connected {
-                        if self.send_action_text(channel, args) {
-                            let msg = ChatMessage::action_fmt(
-                                &self.my_nick,
-                                args,
-                                &self.timestamp_format,
-                            )
-                            .with_pending_echo();
-                            self.add_message_to_channel(channel, msg);
-                        } else {
+                } else if let Some(channel) = &self.current_target().map(str::to_string) {
+                    if self.is_connected() {
+                        if !self.send_chat_text(channel, args, true) {
                             self.add_message_to_current(
                                 ChatMessage::system_fmt("Action not sent", &self.timestamp_format)
                                     .without_logging(),
@@ -246,7 +230,7 @@ impl Session {
                 // Classic IRC slap action, with an optional custom phrase:
                 // "/slap <nick> [text...]" — a bare slap keeps the trout.
                 const DEFAULT_TROUT: &str = "around a bit with a large trout";
-                if let Some(channel) = &self.current_channel.clone() {
+                if let Some(channel) = &self.current_target().map(str::to_string) {
                     let (target, custom) = args
                         .split_once(char::is_whitespace)
                         .map_or((args, ""), |(target, custom)| {
@@ -257,16 +241,8 @@ impl Session {
                         nick if custom.is_empty() => format!("slaps {nick} {DEFAULT_TROUT}"),
                         nick => format!("slaps {nick} {custom}"),
                     };
-                    if self.connected {
-                        if self.send_action_text(channel, &action_text) {
-                            let msg = ChatMessage::action_fmt(
-                                &self.my_nick,
-                                &action_text,
-                                &self.timestamp_format,
-                            )
-                            .with_pending_echo();
-                            self.add_message_to_channel(channel, msg);
-                        } else {
+                    if self.is_connected() {
+                        if !self.send_chat_text(channel, &action_text, true) {
                             self.add_message_to_current(
                                 ChatMessage::system_fmt("Action not sent", &self.timestamp_format)
                                     .without_logging(),
@@ -304,7 +280,7 @@ impl Session {
             "TOPIC" => {
                 // current_channel is a nick in a query tab: TOPIC <nick> is
                 // a server error, so only a channel tab qualifies (#314).
-                if let Some(channel) = &self.current_channel.clone()
+                if let Some(channel) = &self.current_target().map(str::to_string)
                     && self.is_channel_name(channel)
                 {
                     if args.is_empty() {
@@ -445,7 +421,7 @@ impl Session {
 
             "REPLY" => {
                 let (msgid, content) = split_word(args);
-                if let Some(target) = self.current_channel.clone()
+                if let Some(target) = self.current_target().map(str::to_string)
                     && self.enabled_caps.contains("message-tags")
                     && valid_message_reference(msgid)
                     && !content.is_empty()
@@ -470,7 +446,7 @@ impl Session {
 
             "REACT" => {
                 let (msgid, reaction) = split_word(args);
-                if let Some(target) = self.current_channel.clone()
+                if let Some(target) = self.current_target().map(str::to_string)
                     && self.enabled_caps.contains("message-tags")
                     && valid_message_reference(msgid)
                     && !reaction.is_empty()
@@ -489,7 +465,7 @@ impl Session {
 
             "TYPING" => {
                 let state = args.to_ascii_lowercase();
-                if let Some(target) = self.current_channel.clone()
+                if let Some(target) = self.current_target().map(str::to_string)
                     && self.enabled_caps.contains("message-tags")
                     && matches!(state.as_str(), "active" | "paused" | "done")
                 {
@@ -527,17 +503,21 @@ impl Session {
                     {
                         (Some(target.to_string()), parts.next().map(str::to_string))
                     }
-                    Some(timestamp) if timestamp.starts_with("timestamp=") => {
-                        (self.current_channel.clone(), Some(timestamp.to_string()))
-                    }
-                    Some("*") => (self.current_channel.clone(), Some("*".to_string())),
+                    Some(timestamp) if timestamp.starts_with("timestamp=") => (
+                        self.current_target().map(str::to_string),
+                        Some(timestamp.to_string()),
+                    ),
+                    Some("*") => (
+                        self.current_target().map(str::to_string),
+                        Some("*".to_string()),
+                    ),
                     Some(_) => (None, None),
                     None => {
-                        let target = self.current_channel.clone();
+                        let target = self.current_target().map(str::to_string);
                         let timestamp = target
                             .as_deref()
                             .and_then(|target| self.channel_key(target))
-                            .and_then(|key| self.channels.get(&key))
+                            .and_then(|key| self.conversations.get(&key))
                             .and_then(|channel| {
                                 channel.messages.iter().rev().find_map(|message| {
                                     message
@@ -571,7 +551,7 @@ impl Session {
                     )
                 } else {
                     (
-                        self.current_channel.clone(),
+                        self.current_target().map(str::to_string),
                         first.to_string(),
                         Some(rest).filter(|reason| !reason.is_empty()),
                     )
@@ -590,7 +570,7 @@ impl Session {
 
             "RENAME" => {
                 let (new_name, reason) = split_word(args);
-                if let Some(old_name) = self.current_channel.clone()
+                if let Some(old_name) = self.current_target().map(str::to_string)
                     && self.is_channel_name(&old_name)
                     && self.is_channel_name(new_name)
                 {
@@ -609,7 +589,7 @@ impl Session {
 
             "RELOCATE" => {
                 let (new_name, reason) = split_word(args);
-                if let Some(old_name) = self.current_channel.clone()
+                if let Some(old_name) = self.current_target().map(str::to_string)
                     && self.is_channel_name(&old_name)
                     && self.is_channel_name(new_name)
                 {
@@ -784,10 +764,12 @@ impl Session {
                     return;
                 }
                 let (target, requested_limit) = match parts.as_slice() {
-                    [] => (self.current_channel.clone(), None),
+                    [] => (self.current_target().map(str::to_string), None),
                     [limit] if limit.chars().all(|c| c.is_ascii_digit()) => {
                         match limit.parse::<usize>() {
-                            Ok(limit) if limit > 0 => (self.current_channel.clone(), Some(limit)),
+                            Ok(limit) if limit > 0 => {
+                                (self.current_target().map(str::to_string), Some(limit))
+                            }
                             _ => {
                                 self.add_message_to_current(ChatMessage::system(
                                     "Usage: /history [#channel] [limit]",
@@ -925,8 +907,8 @@ impl Session {
             }
 
             "CLEAR" => {
-                if let Some(channel) = &self.current_channel {
-                    if let Some(ch) = self.channels.get_mut(channel) {
+                if let Some(conversation) = self.current_conversation {
+                    if let Some(ch) = self.conversation_channel_mut(conversation) {
                         ch.messages.clear();
                     }
                 } else {
@@ -937,7 +919,7 @@ impl Session {
             "WHO" => {
                 if !args.is_empty() {
                     self.send_command(IrcCommand::Who(args.to_string()));
-                } else if let Some(channel) = &self.current_channel.clone() {
+                } else if let Some(channel) = &self.current_target().map(str::to_string) {
                     self.send_command(IrcCommand::Who(channel.clone()));
                 }
             }
@@ -961,7 +943,7 @@ impl Session {
             "NAMES" => {
                 if !args.is_empty() {
                     self.send_command(IrcCommand::Names(Some(args.to_string())));
-                } else if let Some(channel) = &self.current_channel.clone()
+                } else if let Some(channel) = &self.current_target().map(str::to_string)
                     && self.is_channel_name(channel)
                 {
                     self.send_command(IrcCommand::Names(Some(channel.clone())));
@@ -1031,7 +1013,7 @@ impl Session {
                     self.add_message_to_current(ChatMessage::system(
                         "Usage: /kick <nick> [reason]",
                     ));
-                } else if let Some(channel) = &self.current_channel.clone()
+                } else if let Some(channel) = &self.current_target().map(str::to_string)
                     && self.is_channel_name(channel)
                 {
                     let reason = Some(reason).filter(|r| !r.is_empty()).map(str::to_string);
@@ -1049,7 +1031,7 @@ impl Session {
                         "Usage: /ban <nick|mask> (one target at a time)",
                     ));
                 } else if !target.is_empty() {
-                    if let Some(channel) = &self.current_channel.clone()
+                    if let Some(channel) = &self.current_target().map(str::to_string)
                         && self.is_channel_name(channel)
                     {
                         // Convert nick to ban mask if it's just a nick
@@ -1062,7 +1044,7 @@ impl Session {
                     }
                 } else {
                     // Show ban list
-                    if let Some(channel) = &self.current_channel.clone() {
+                    if let Some(channel) = &self.current_target().map(str::to_string) {
                         self.send_command(IrcCommand::Mode(
                             channel.clone(),
                             Some("+b".to_string()),
@@ -1079,7 +1061,7 @@ impl Session {
                         "Usage: /unban <nick|mask> (one target at a time)",
                     ));
                 } else if !target.is_empty() {
-                    if let Some(channel) = &self.current_channel.clone()
+                    if let Some(channel) = &self.current_target().map(str::to_string)
                         && self.is_channel_name(channel)
                     {
                         let plan = self.unban_masks_for(target);
@@ -1107,7 +1089,7 @@ impl Session {
                     self.add_message_to_current(ChatMessage::system(
                         "Usage: /kickban <nick> [reason]",
                     ));
-                } else if let Some(channel) = &self.current_channel.clone()
+                } else if let Some(channel) = &self.current_target().map(str::to_string)
                     && self.is_channel_name(channel)
                 {
                     // Ban first, then kick. nick_to_mask passes a full/partial
@@ -1141,7 +1123,7 @@ impl Session {
 
             "OP" => {
                 if !args.is_empty() {
-                    if let Some(channel) = &self.current_channel.clone()
+                    if let Some(channel) = &self.current_target().map(str::to_string)
                         && self.is_channel_name(channel)
                     {
                         for nick in args.split_whitespace() {
@@ -1161,7 +1143,7 @@ impl Session {
 
             "DEOP" => {
                 if !args.is_empty() {
-                    if let Some(channel) = &self.current_channel.clone()
+                    if let Some(channel) = &self.current_target().map(str::to_string)
                         && self.is_channel_name(channel)
                     {
                         for nick in args.split_whitespace() {
@@ -1181,7 +1163,7 @@ impl Session {
 
             "VOICE" | "V" => {
                 if !args.is_empty() {
-                    if let Some(channel) = &self.current_channel.clone()
+                    if let Some(channel) = &self.current_target().map(str::to_string)
                         && self.is_channel_name(channel)
                     {
                         for nick in args.split_whitespace() {
@@ -1201,7 +1183,7 @@ impl Session {
 
             "DEVOICE" => {
                 if !args.is_empty() {
-                    if let Some(channel) = &self.current_channel.clone()
+                    if let Some(channel) = &self.current_target().map(str::to_string)
                         && self.is_channel_name(channel)
                     {
                         for nick in args.split_whitespace() {
@@ -1221,7 +1203,7 @@ impl Session {
 
             "HALFOP" => {
                 if !args.is_empty()
-                    && let Some(channel) = &self.current_channel.clone()
+                    && let Some(channel) = &self.current_target().map(str::to_string)
                     && self.is_channel_name(channel)
                 {
                     for nick in args.split_whitespace() {
@@ -1236,7 +1218,7 @@ impl Session {
 
             "DEHALFOP" | "DEHOP" => {
                 if !args.is_empty()
-                    && let Some(channel) = &self.current_channel.clone()
+                    && let Some(channel) = &self.current_target().map(str::to_string)
                     && self.is_channel_name(channel)
                 {
                     for nick in args.split_whitespace() {
@@ -1254,8 +1236,7 @@ impl Session {
                     // The "/mode +m" shorthand applies to the current channel;
                     // a query tab's target is a peer nick, not a channel.
                     let shorthand_target = self
-                        .current_channel
-                        .as_deref()
+                        .current_target()
                         .filter(|name| self.network_support.is_channel(name));
                     if let Some((target, mode, params)) = mode_command_args(args, shorthand_target)
                     {
@@ -1265,7 +1246,7 @@ impl Session {
                             "Usage: /mode [target] [+/-modes] [params]",
                         ));
                     }
-                } else if let Some(channel) = &self.current_channel.clone() {
+                } else if let Some(channel) = &self.current_target().map(str::to_string) {
                     // Query channel modes
                     self.send_command(IrcCommand::Mode(channel.clone(), None, Vec::new()));
                 }
@@ -1317,23 +1298,8 @@ impl Session {
                 // Whitespace separator: see the MSG arm (#148).
                 let (target, message) = split_word(args);
                 if !target.is_empty() && !message.is_empty() {
-                    if self.connected {
-                        if self.send_notice_text(target, message) {
-                            let confirmation =
-                                if service_message_contains_credentials(target, message) {
-                                    ChatMessage::system_fmt(
-                                        &format!("-> -{}- <credential command sent>", target),
-                                        &self.timestamp_format,
-                                    )
-                                    .without_logging()
-                                } else {
-                                    ChatMessage::system_fmt(
-                                        &format!("-> -{}- {}", target, message),
-                                        &self.timestamp_format,
-                                    )
-                                };
-                            self.add_message_to_current(confirmation);
-                        } else {
+                    if self.is_connected() {
+                        if !self.send_notice_with_confirmation(target, message) {
                             self.add_message_to_current(
                                 ChatMessage::system_fmt("Notice not sent", &self.timestamp_format)
                                     .without_logging(),
@@ -1359,17 +1325,12 @@ impl Session {
                 // Send notice to channel ops
                 let message = args;
                 if !message.is_empty() {
-                    if let Some(channel) = &self.current_channel.clone()
+                    if let Some(channel) = &self.current_target().map(str::to_string)
                         && self.is_channel_name(channel)
                     {
                         let target = format!("@{}", channel);
-                        if self.connected {
-                            if self.send_notice_text(&target, message) {
-                                self.add_message_to_current(ChatMessage::system_fmt(
-                                    &format!("-> -{}- {}", target, message),
-                                    &self.timestamp_format,
-                                ));
-                            } else {
+                        if self.is_connected() {
+                            if !self.send_notice_with_confirmation(&target, message) {
                                 self.add_message_to_current(
                                     ChatMessage::system_fmt(
                                         "Notice not sent",
@@ -1397,7 +1358,7 @@ impl Session {
                 // Send message to all channels
                 if args.is_empty() {
                     self.add_message_to_current(ChatMessage::system("Usage: /amsg <message>"));
-                } else if !self.connected {
+                } else if !self.is_connected() {
                     self.add_message_to_current(
                         ChatMessage::system_fmt(
                             "Not connected - message not sent",
@@ -1406,16 +1367,11 @@ impl Session {
                         .without_logging(),
                     );
                 } else {
-                    for channel_name in self.channels.keys().cloned().collect::<Vec<_>>() {
+                    for channel_name in self.conversations.keys().cloned().collect::<Vec<_>>() {
                         if !self.is_channel_name(&channel_name) {
                             continue;
                         }
-                        if self.send_privmsg_text(&channel_name, args) {
-                            let msg =
-                                ChatMessage::new_fmt(&self.my_nick, args, &self.timestamp_format)
-                                    .with_pending_echo();
-                            self.add_message_to_channel(&channel_name, msg);
-                        } else {
+                        if !self.send_chat_text(&channel_name, args, false) {
                             // A stale (kicked-from) tab must not swallow the
                             // broadcast silently.
                             self.add_message_to_channel(
@@ -1431,7 +1387,7 @@ impl Session {
                 // Send action to all channels
                 if args.is_empty() {
                     self.add_message_to_current(ChatMessage::system("Usage: /ame <action>"));
-                } else if !self.connected {
+                } else if !self.is_connected() {
                     self.add_message_to_current(
                         ChatMessage::system_fmt(
                             "Not connected - action not sent",
@@ -1440,19 +1396,11 @@ impl Session {
                         .without_logging(),
                     );
                 } else {
-                    for channel_name in self.channels.keys().cloned().collect::<Vec<_>>() {
+                    for channel_name in self.conversations.keys().cloned().collect::<Vec<_>>() {
                         if !self.is_channel_name(&channel_name) {
                             continue;
                         }
-                        if self.send_action_text(&channel_name, args) {
-                            let msg = ChatMessage::action_fmt(
-                                &self.my_nick,
-                                args,
-                                &self.timestamp_format,
-                            )
-                            .with_pending_echo();
-                            self.add_message_to_channel(&channel_name, msg);
-                        } else {
+                        if !self.send_chat_text(&channel_name, args, true) {
                             self.add_message_to_channel(
                                 &channel_name,
                                 ChatMessage::system_fmt("Action not sent", &self.timestamp_format),
@@ -1468,14 +1416,9 @@ impl Session {
                     self.add_message_to_current(
                         ChatMessage::system("Usage: /say <message>").without_logging(),
                     );
-                } else if let Some(channel) = &self.current_channel.clone() {
-                    if self.connected {
-                        if self.send_privmsg_text(channel, args) {
-                            let msg =
-                                ChatMessage::new_fmt(&self.my_nick, args, &self.timestamp_format)
-                                    .with_pending_echo();
-                            self.add_message_to_channel(channel, msg);
-                        } else {
+                } else if let Some(channel) = &self.current_target().map(str::to_string) {
+                    if self.is_connected() {
+                        if !self.send_chat_text(channel, args, false) {
                             self.add_message_to_current(
                                 ChatMessage::system_fmt("Message not sent", &self.timestamp_format)
                                     .without_logging(),
@@ -1505,16 +1448,8 @@ impl Session {
                 // Whitespace separator: see the MSG arm (#148).
                 let (target, action_text) = split_word(args);
                 if !target.is_empty() && !action_text.is_empty() {
-                    if self.connected {
-                        if self.send_action_text(target, action_text) {
-                            let msg = ChatMessage::action_fmt(
-                                &self.my_nick,
-                                action_text,
-                                &self.timestamp_format,
-                            )
-                            .with_pending_echo();
-                            self.add_message_to_channel(target, msg);
-                        } else {
+                    if self.is_connected() {
+                        if !self.send_chat_text(target, action_text, true) {
                             self.add_message_to_current(
                                 ChatMessage::system_fmt("Action not sent", &self.timestamp_format)
                                     .without_logging(),
@@ -1544,8 +1479,8 @@ impl Session {
                     .map(str::to_string)
                     // The fallback must be a channel: a query tab holds a nick (#314).
                     .or_else(|| {
-                        self.current_channel
-                            .clone()
+                        self.current_target()
+                            .map(str::to_string)
                             .filter(|current| self.is_channel_name(current))
                     })
                     .unwrap_or_default();
@@ -1572,22 +1507,26 @@ impl Session {
 
             "CYCLE" | "REJOIN" | "HOP" => {
                 let channel = if args.is_empty() {
-                    self.current_channel.clone()
+                    self.current_target().map(str::to_string)
                 } else {
                     Some(args.to_string())
                 };
                 if let Some(ch) = channel
                     && self.is_channel_name(&ch)
                 {
-                    // Get the stored key for auto-rejoin if available
-                    let key = self
-                        .channel_key(&ch)
-                        .and_then(|stored| self.channels.get(&stored))
-                        .and_then(|c| c.key.clone());
-                    self.send_command(IrcCommand::Part(ch.clone(), Some("Cycling".to_string())));
-                    // The own-PART handler drops the tab, so the key must
-                    // travel with this JOIN to reach the replacement tab (#250).
-                    self.send_rejoin(ch, key);
+                    if let Some(conversation) = self.id_for_target(&ch) {
+                        // Keep the same conversation through the PART/JOIN
+                        // acknowledgments, including its draft and queued work.
+                        self.cycle_conversation(conversation);
+                    } else {
+                        // An explicit target can name a channel with no local
+                        // conversation yet; retain the existing wire behavior.
+                        self.send_command(IrcCommand::Part(
+                            ch.clone(),
+                            Some("Cycling".to_string()),
+                        ));
+                        self.send_rejoin(ch, None);
+                    }
                 }
             }
 
@@ -1759,8 +1698,7 @@ impl Session {
                         match subcmd.as_str() {
                             "+" => {
                                 if let Some(targets) = &targets {
-                                    for nick in targets.split(',').filter(|nick| !nick.is_empty())
-                                    {
+                                    for nick in targets.split(',').filter(|nick| !nick.is_empty()) {
                                         self.monitored_users
                                             .insert(self.network_support.canonicalize(nick));
                                     }
@@ -1822,7 +1760,10 @@ impl Session {
                 }
                 let port = port.unwrap_or_else(|| self.server_port.clone());
                 if let Err(error) = parse_server_port(&port) {
-                    self.add_server_message(ChatMessage::system_fmt(&error, &self.timestamp_format));
+                    self.add_server_message(ChatMessage::system_fmt(
+                        &error,
+                        &self.timestamp_format,
+                    ));
                     return;
                 }
                 let use_tls = tls.unwrap_or(self.use_tls);
@@ -1903,10 +1844,10 @@ impl Session {
                 // request_manual_disconnect clears connecting/connection_lost, which
                 // suppresses further reconnect attempts without touching the
                 // persisted auto_reconnect setting.
-                if self.connected
-                    || self.connecting
-                    || self.connection_lost
-                    || self.cmd_tx.is_some()
+                if self.is_connected()
+                    || self.is_connecting()
+                    || self.connection_lost()
+                    || self.has_transport()
                 {
                     let reason = if args.is_empty() {
                         None
@@ -1972,8 +1913,8 @@ impl Session {
 
                     // Collect matching messages first to avoid borrow issues
                     let matches: Vec<String> = {
-                        let messages = if let Some(channel_name) = &self.current_channel {
-                            self.channels.get(channel_name).map(|c| &c.messages)
+                        let messages = if let Some(conversation) = self.current_conversation {
+                            self.conversation_channel(conversation).map(|c| &c.messages)
                         } else {
                             Some(&self.server_messages)
                         };
@@ -2085,7 +2026,7 @@ impl Session {
                 match WindowCommand::parse(&action) {
                     Some(command) => self.events.push(SessionEvent::Window {
                         command,
-                        target: self.current_channel.clone(),
+                        conversation: self.current_conversation,
                     }),
                     None => self.add_message_to_current(ChatMessage::system(
                         "Usage: /window tile|cascade|max|restore|detach|attach|close|new",
@@ -2167,13 +2108,8 @@ impl Session {
     /// dropping e.g. "/ns identify <pass>" would leave the user believing they
     /// are identified.
     fn send_service_message(&mut self, service: &str, args: &str) {
-        if self.connected {
-            if self.send_privmsg_text(service, args) {
-                self.add_message_to_channel(
-                    service,
-                    outgoing_local_echo(service, &self.my_nick, args, &self.timestamp_format),
-                );
-            } else {
+        if self.is_connected() {
+            if !self.send_chat_text(service, args, false) {
                 self.add_message_to_current(
                     ChatMessage::system_fmt("Message not sent", &self.timestamp_format)
                         .without_logging(),
@@ -2299,10 +2235,8 @@ impl Session {
         if is_extended_ban(value) || value.contains(['!', '@', '*']) {
             return nick_to_mask(value);
         }
-        self.current_channel
-            .as_deref()
-            .and_then(|channel| self.channel_key(channel))
-            .and_then(|channel| self.channels.get(&channel))
+        self.current_conversation
+            .and_then(|conversation| self.conversation_channel(conversation))
             .and_then(|channel| channel.get_user(value))
             .and_then(|user| match (&user.username, &user.hostname) {
                 (Some(username), Some(hostname)) => Some(format!("*!{username}@{hostname}")),
@@ -2342,10 +2276,8 @@ impl Session {
         }
         let built = self.ban_mask_for(value);
         let channel = self
-            .current_channel
-            .as_deref()
-            .and_then(|channel| self.channel_key(channel))
-            .and_then(|channel| self.channels.get(&channel));
+            .current_conversation
+            .and_then(|conversation| self.conversation_channel(conversation));
         let mut broad_only: Option<String> = None;
         if let Some(channel) = channel {
             let nick_key = self.network_support.canonicalize(value);
@@ -2796,7 +2728,9 @@ pub(super) fn service_message_contains_credentials(target: &str, message: &str) 
         return false;
     }
 
-    content_has_auth_command(message)
+    // Multiline messages can contain a service command on any line. The
+    // shared display, logging, history, and replay gates must agree on this.
+    message.split(['\r', '\n']).any(content_has_auth_command)
 }
 
 pub(super) fn command_line_contains_credentials(line: &str) -> bool {
@@ -2871,7 +2805,12 @@ pub(super) fn command_line_contains_credentials(line: &str) -> bool {
     }
 }
 
-fn outgoing_local_echo(target: &str, sender: &str, content: &str, format: &str) -> ChatMessage {
+pub(super) fn outgoing_local_echo(
+    target: &str,
+    sender: &str,
+    content: &str,
+    format: &str,
+) -> ChatMessage {
     if service_message_contains_credentials(target, content) {
         ChatMessage::new_fmt(sender, "<credential command sent>", format).without_logging()
     } else {
@@ -3125,9 +3064,15 @@ mod tests {
             ..crate::gui::Settings::default()
         });
         let (tx, rx) = mpsc::unbounded_channel();
-        app.cmd_tx = Some(tx);
-        app.connected = true;
+        app.test_set_registered(tx);
         (app, rx)
+    }
+
+    fn test_select_target(app: &mut Session, target: &str) {
+        if app.id_for_target(target).is_none() {
+            app.conversations.insert(target.to_string(), Channel::new());
+        }
+        assert!(app.select_target(target));
     }
 
     #[test]
@@ -3156,12 +3101,12 @@ mod tests {
         let stored = ChatMessage::new_fmt("alice", "hello world", "short");
         let expected = format!("{} <alice> hello world", stored.timestamp);
         channel.messages.push_back(stored);
-        app.channels.insert("#room".to_string(), channel);
-        app.current_channel = Some("#room".to_string());
+        app.conversations.insert("#room".to_string(), channel);
+        test_select_target(&mut app, "#room");
 
         app.process_command("/lastlog hello");
 
-        let contents: Vec<&str> = app.channels["#room"]
+        let contents: Vec<&str> = app.conversations["#room"]
             .messages
             .iter()
             .map(|message| message.content.as_str())
@@ -3202,9 +3147,10 @@ mod tests {
     fn hop_cycles_channel_while_halfop_remains_a_mode_command() {
         let (mut app, mut rx) = connected_command_app();
         let mut channel = Channel::new();
+        channel.joined = true;
         channel.key = Some("secret-key".into());
-        app.channels.insert("#Room".into(), channel);
-        app.current_channel = Some("#Room".into());
+        app.conversations.insert("#Room".into(), channel);
+        test_select_target(&mut app, "#Room");
 
         app.process_command("/hop");
         assert_eq!(
@@ -3224,9 +3170,188 @@ mod tests {
     }
 
     #[test]
+    fn cycle_keeps_the_conversation_identity_through_part_and_join() {
+        let (mut app, mut rx) = connected_command_app();
+        app.set_session_nick("me".into(), true);
+        let mut channel = Channel::new();
+        channel.joined = true;
+        channel.key = Some("secret-key".into());
+        channel
+            .messages
+            .push_back(ChatMessage::system("retained scrollback"));
+        app.conversations.insert("#Room".into(), channel);
+        test_select_target(&mut app, "#Room");
+        let original = app.current_conversation.unwrap();
+        app.input_text = "unsent cycle draft".into();
+
+        app.process_command("/cycle");
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            IrcCommand::Part("#Room".into(), Some("Cycling".into()))
+        );
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            IrcCommand::Join("#Room".into(), Some("secret-key".into()), None, None)
+        );
+        app.handle_incoming_message(
+            crate::irc::IrcMessage::parse(":me!u@h PART #Room :Cycling").unwrap(),
+        );
+        assert_eq!(app.id_for_target("#Room"), Some(original));
+        assert_eq!(app.current_conversation, Some(original));
+        assert_eq!(app.input_text, "unsent cycle draft");
+        assert!(
+            app.conversations["#Room"]
+                .messages
+                .iter()
+                .all(|message| message.content != "retained scrollback")
+        );
+
+        app.handle_incoming_message(crate::irc::IrcMessage::parse(":me!u@h JOIN #Room").unwrap());
+        assert_eq!(app.id_for_target("#Room"), Some(original));
+        assert_eq!(app.current_conversation, Some(original));
+        assert!(app.conversations["#Room"].joined);
+        assert_eq!(
+            app.conversations["#Room"].key.as_deref(),
+            Some("secret-key")
+        );
+    }
+
+    #[test]
+    fn repeated_cycle_queues_only_one_part_join_pair() {
+        let (mut app, mut rx) = connected_command_app();
+        let mut channel = Channel::new();
+        channel.joined = true;
+        app.conversations.insert("#room".into(), channel);
+        test_select_target(&mut app, "#room");
+        let original = app.current_conversation;
+
+        app.process_command("/cycle");
+        app.process_command("/cycle");
+
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            IrcCommand::Part("#room".into(), Some("Cycling".into()))
+        );
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            IrcCommand::Join("#room".into(), None, None, None)
+        );
+        assert!(rx.try_recv().is_err());
+        assert_eq!(app.current_conversation, original);
+    }
+
+    #[test]
+    fn refused_cycle_join_keeps_the_unjoined_conversation_and_allows_retry() {
+        let (mut app, mut rx) = connected_command_app();
+        app.set_session_nick("me".into(), true);
+        let mut channel = Channel::new();
+        channel.joined = true;
+        app.conversations.insert("#room".into(), channel);
+        test_select_target(&mut app, "#room");
+        let original = app.current_conversation.unwrap();
+        app.input_text = "draft to preserve".into();
+        app.process_command("/cycle");
+        assert!(matches!(rx.try_recv(), Ok(IrcCommand::Part(..))));
+        assert!(matches!(rx.try_recv(), Ok(IrcCommand::Join(..))));
+        app.handle_incoming_message(
+            crate::irc::IrcMessage::parse(":me!u@h PART #room :Cycling").unwrap(),
+        );
+        app.handle_incoming_message(
+            crate::irc::IrcMessage::parse(":server 473 me #room :Invite only").unwrap(),
+        );
+
+        assert_eq!(app.id_for_target("#room"), Some(original));
+        assert_eq!(app.current_conversation, Some(original));
+        assert!(!app.conversations["#room"].joined);
+        assert_eq!(app.input_text, "draft to preserve");
+        app.process_command("/cycle");
+        assert!(matches!(rx.try_recv(), Ok(IrcCommand::Part(..))));
+        assert!(matches!(rx.try_recv(), Ok(IrcCommand::Join(..))));
+        assert!(rx.try_recv().is_err());
+        app.handle_incoming_message(
+            crate::irc::IrcMessage::parse(":server 442 me #room :Not on channel").unwrap(),
+        );
+        app.handle_incoming_message(crate::irc::IrcMessage::parse(":me!u@h JOIN #room").unwrap());
+        assert_eq!(app.id_for_target("#room"), Some(original));
+        assert_eq!(app.current_conversation, Some(original));
+        assert!(app.conversations["#room"].joined);
+        assert_eq!(app.input_text, "draft to preserve");
+    }
+
+    #[test]
+    fn locally_refused_cycle_join_still_retains_the_parted_conversation() {
+        let (mut app, mut rx) = connected_command_app();
+        app.set_session_nick("me".into(), true);
+        let mut channel = Channel::new();
+        channel.joined = true;
+        channel.key = Some("x".repeat(600));
+        app.conversations.insert("#room".into(), channel);
+        test_select_target(&mut app, "#room");
+        let original = app.current_conversation.unwrap();
+        app.input_text = "draft to preserve".into();
+
+        app.process_command("/cycle");
+        assert!(matches!(rx.try_recv(), Ok(IrcCommand::Part(..))));
+        assert!(
+            rx.try_recv().is_err(),
+            "oversized JOIN must not reach the wire"
+        );
+        app.handle_incoming_message(
+            crate::irc::IrcMessage::parse(":me!u@h PART #room :Cycling").unwrap(),
+        );
+
+        assert_eq!(app.id_for_target("#room"), Some(original));
+        assert_eq!(app.current_conversation, Some(original));
+        assert!(!app.conversations["#room"].joined);
+        assert_eq!(app.input_text, "draft to preserve");
+        app.process_command("/join #room");
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            IrcCommand::Join("#room".into(), None, None, None)
+        );
+        app.handle_incoming_message(crate::irc::IrcMessage::parse(":me!u@h JOIN #room").unwrap());
+        assert_eq!(app.id_for_target("#room"), Some(original));
+        assert!(app.conversations["#room"].joined);
+    }
+
+    #[test]
+    fn queued_window_command_keeps_its_conversation_through_a_nick_change() {
+        let (mut app, _rx) = connected_command_app();
+        assert!(app.open_query("bob"));
+        let original = app.id_for_target("bob").unwrap();
+        app.process_command("/window detach");
+        app.handle_incoming_message(
+            crate::irc::IrcMessage::parse(":bob!u@h NICK :robert").unwrap(),
+        );
+
+        assert_eq!(app.id_for_target("robert"), Some(original));
+        assert!(app.events.iter().any(|event| matches!(
+            event,
+            SessionEvent::Window { command: WindowCommand::Detach, conversation: Some(id) } if *id == original
+        )));
+    }
+
+    #[test]
+    fn queued_window_command_does_not_retarget_a_reopened_query() {
+        let (mut app, _rx) = connected_command_app();
+        assert!(app.open_query("bob"));
+        let original = app.id_for_target("bob").unwrap();
+        app.process_command("/window close");
+        app.close_tab("bob");
+        assert!(app.open_query("bob"));
+        let reopened = app.id_for_target("bob").unwrap();
+
+        assert_ne!(original, reopened);
+        assert!(app.events.iter().any(|event| matches!(
+            event,
+            SessionEvent::Window { command: WindowCommand::Close, conversation: Some(id) } if *id == original
+        )));
+    }
+
+    #[test]
     fn targetless_mode_queues_current_channel() {
         let (mut app, mut rx) = connected_command_app();
-        app.current_channel = Some("#room".into());
+        test_select_target(&mut app, "#room");
         app.process_command("/mode +m");
         assert_eq!(
             rx.try_recv().unwrap(),
@@ -3246,15 +3371,15 @@ mod tests {
             rx.try_recv().unwrap(),
             IrcCommand::ChathistoryLatest("#public".into(), "*".into(), 50)
         );
-        assert_eq!(app.current_channel.as_deref(), Some("#public"));
-        assert!(!app.channels["#public"].joined);
+        assert_eq!(app.current_target(), Some("#public"));
+        assert!(!app.conversations["#public"].joined);
     }
 
     #[test]
     fn reply_reaction_and_typing_use_client_only_tags() {
         let (mut app, mut rx) = connected_command_app();
-        app.current_channel = Some("#room".into());
-        app.channels.insert("#room".into(), Channel::new());
+        app.conversations.insert("#room".into(), Channel::new());
+        test_select_target(&mut app, "#room");
         app.handle_cap_message("ACK", &["message-tags".into()]);
 
         app.process_command("/reply abc hello there");
@@ -3277,8 +3402,8 @@ mod tests {
     #[test]
     fn tab_separated_args_parse_like_spaces_in_tag_and_channel_commands() {
         let (mut app, mut rx) = connected_command_app();
-        app.current_channel = Some("#room".into());
-        app.channels.insert("#room".into(), Channel::new());
+        app.conversations.insert("#room".into(), Channel::new());
+        test_select_target(&mut app, "#room");
         app.handle_cap_message("ACK", &["message-tags labeled-response".into()]);
 
         app.process_command("/reply abc\thello there");
@@ -3332,7 +3457,7 @@ mod tests {
         let mut channel = Channel::new();
         channel.joined = true;
         channel.add_user("alice", crate::gui::types::UserMode::Normal);
-        app.channels.insert("#chan".into(), channel);
+        app.conversations.insert("#chan".into(), channel);
         app.update_user_identity(
             "alice",
             Some(Some("~alice".into())),
@@ -3343,7 +3468,7 @@ mod tests {
             None,
             Some(true),
         );
-        app.current_channel = Some("#chan".into());
+        test_select_target(&mut app, "#chan");
         (app, rx)
     }
 
@@ -3365,7 +3490,7 @@ mod tests {
         let (mut app, mut rx) = ban_command_app();
         app.process_command("/ban alice");
         expect_mode(&mut rx, "+b", "*!~alice@host.example");
-        app.channels
+        app.conversations
             .get_mut("#chan")
             .unwrap()
             .apply_mode_list_change('+', 'b', "*!~alice@host.example", "me");
@@ -3375,7 +3500,7 @@ mod tests {
         assert!(rx.try_recv().is_err());
 
         // Even before the ban list was fetched, the same host mask is used.
-        app.channels.get_mut("#chan").unwrap().bans.clear();
+        app.conversations.get_mut("#chan").unwrap().bans.clear();
         app.process_command("/unban alice");
         expect_mode(&mut rx, "-b", "*!~alice@host.example");
     }
@@ -3384,7 +3509,7 @@ mod tests {
     fn unban_nick_matches_broader_bans_and_departed_nicks() {
         let (mut app, mut rx) = ban_command_app();
         {
-            let channel = app.channels.get_mut("#chan").unwrap();
+            let channel = app.conversations.get_mut("#chan").unwrap();
             channel.apply_mode_list_change('+', 'b', "*!*@*.example", "op");
             channel.apply_mode_list_change('+', 'b', "*!*@other.test", "op");
             channel.apply_mode_list_change('+', 'b', "carol!*@*", "op");
@@ -3410,7 +3535,7 @@ mod tests {
     }
 
     fn set_bans(app: &mut Session, masks: &[&str]) {
-        let channel = app.channels.get_mut("#chan").unwrap();
+        let channel = app.conversations.get_mut("#chan").unwrap();
         channel.bans.clear();
         for mask in masks {
             channel.apply_mode_list_change('+', 'b', mask, "op");
@@ -3418,7 +3543,7 @@ mod tests {
     }
 
     fn last_note(app: &Session) -> String {
-        app.channels["#chan"]
+        app.conversations["#chan"]
             .messages
             .back()
             .map(|row| row.content.clone())
@@ -3598,8 +3723,8 @@ mod tests {
         let (mut app, mut rx) = connected_command_app();
         let mut channel = Channel::new();
         channel.joined = true;
-        app.channels.insert("#room".into(), channel);
-        app.current_channel = Some("#room".into());
+        app.conversations.insert("#room".into(), channel);
+        test_select_target(&mut app, "#room");
 
         for (input, text) in [
             ("//me hi", "/me hi"),
@@ -3630,8 +3755,8 @@ mod tests {
         let (mut app, mut rx) = connected_command_app();
         let mut channel = Channel::new();
         channel.joined = true;
-        app.channels.insert("#room".into(), channel);
-        app.current_channel = Some("#room".into());
+        app.conversations.insert("#room".into(), channel);
+        test_select_target(&mut app, "#room");
 
         for input in [
             "//ns identify hunter2",
@@ -3644,7 +3769,7 @@ mod tests {
             app.process_command(input);
             assert!(rx.try_recv().is_err(), "{input} must not be sent");
         }
-        let shown: Vec<&str> = app.channels["#room"]
+        let shown: Vec<&str> = app.conversations["#room"]
             .messages
             .iter()
             .map(|row| row.content.as_str())
@@ -3710,8 +3835,8 @@ mod tests {
             IrcCommand::Part("#chan".into(), None)
         );
         // Without a channel token the whole argument is the reason.
-        app.channels.insert("#room".into(), Channel::new());
-        app.current_channel = Some("#room".into());
+        app.conversations.insert("#room".into(), Channel::new());
+        test_select_target(&mut app, "#room");
         app.process_command("/part  gone   fishing");
         assert_eq!(
             rx.try_recv().unwrap(),
@@ -3724,45 +3849,44 @@ mod tests {
         // current_channel holds the partner's nick in a query tab; PART <nick>
         // is a server error and left the tab open (#293).
         let (mut app, mut rx) = connected_command_app();
-        app.channels.insert("#room".into(), Channel::new());
+        app.conversations.insert("#room".into(), Channel::new());
         for input in ["/part", "/part bye", "/leave"] {
             assert!(app.open_query("bob"), "{input}");
-            assert_eq!(app.current_channel.as_deref(), Some("bob"));
+            assert_eq!(app.current_target(), Some("bob"));
             app.process_command(input);
             assert!(rx.try_recv().is_err(), "{input} must not send PART bob");
             assert!(
-                !app.channels.contains_key("bob"),
+                !app.conversations.contains_key("bob"),
                 "{input} closes the query tab"
             );
-            assert_ne!(app.current_channel.as_deref(), Some("bob"), "{input}");
+            assert_ne!(app.current_target(), Some("bob"), "{input}");
         }
 
         // Disconnected the outcome is the same, and other tabs survive.
-        app.cmd_tx = None;
-        app.connected = false;
+        app.test_set_disconnected();
         assert!(app.open_query("carol"));
         app.process_command("/part");
-        assert!(!app.channels.contains_key("carol"));
-        assert!(app.channels.contains_key("#room"));
+        assert!(!app.conversations.contains_key("carol"));
+        assert!(app.conversations.contains_key("#room"));
 
         // An explicit channel still parts for real from inside a query.
         let (mut app, mut rx) = connected_command_app();
         let mut room = Channel::new();
         room.joined = true;
-        app.channels.insert("#room".into(), room);
+        app.conversations.insert("#room".into(), room);
         assert!(app.open_query("bob"));
         app.process_command("/part #room later");
         assert_eq!(
             rx.try_recv().unwrap(),
             IrcCommand::Part("#room".into(), Some("later".into()))
         );
-        assert!(app.channels.contains_key("bob"), "the query tab stays");
+        assert!(app.conversations.contains_key("bob"), "the query tab stays");
     }
 
     #[test]
     fn double_slash_and_say_report_when_there_is_no_target() {
         let (mut app, mut rx) = connected_command_app();
-        assert!(app.current_channel.is_none());
+        assert!(app.current_conversation.is_none());
         for input in ["//shrug", "/say hello"] {
             let before = app.server_messages.len();
             app.process_command(input);
@@ -3778,8 +3902,8 @@ mod tests {
     #[test]
     fn runs_of_whitespace_between_arguments_are_one_separator() {
         let (mut app, mut rx) = connected_command_app();
-        app.current_channel = Some("#room".into());
-        app.channels.insert("#room".into(), Channel::new());
+        test_select_target(&mut app, "#room");
+        app.conversations.insert("#room".into(), Channel::new());
         app.handle_cap_message("ACK", &["message-tags labeled-response".into()]);
 
         app.process_command("/ctcp bob  VERSION");
@@ -3938,11 +4062,11 @@ mod tests {
         let (mut app, mut rx) = connected_command_app();
         assert!(app.open_query("bob"));
         for input in ["/topic hi", "/topic", "/names", "/invite carol"] {
-            let before = app.channels["bob"].messages.len();
+            let before = app.conversations["bob"].messages.len();
             app.process_command(input);
             assert!(rx.try_recv().is_err(), "{input} must not reach the wire");
             assert_eq!(
-                app.channels["bob"].messages.len(),
+                app.conversations["bob"].messages.len(),
                 before + 1,
                 "{input} tells the user why nothing happened"
             );
@@ -3961,8 +4085,8 @@ mod tests {
         );
 
         // In a channel tab the shorthand forms fall back to that channel.
-        app.channels.insert("#room".into(), Channel::new());
-        app.current_channel = Some("#room".into());
+        app.conversations.insert("#room".into(), Channel::new());
+        test_select_target(&mut app, "#room");
         app.process_command("/topic hi");
         assert_eq!(
             rx.try_recv().unwrap(),
@@ -4035,8 +4159,8 @@ mod tests {
     #[test]
     fn redact_keeps_the_whole_multi_word_reason() {
         let (mut app, mut rx) = connected_command_app();
-        app.current_channel = Some("#room".into());
-        app.channels.insert("#room".into(), Channel::new());
+        test_select_target(&mut app, "#room");
+        app.conversations.insert("#room".into(), Channel::new());
 
         for (input, target, reason) in [
             (
@@ -4184,16 +4308,14 @@ mod tests {
 
         // Dropped connection: neither removing one nick nor clearing the
         // list takes effect locally.
-        app.cmd_tx = None;
-        app.connected = false;
+        app.test_set_disconnected();
         app.process_command("/monitor - alice");
         app.process_command("/monitor C");
         assert_eq!(app.monitored_users.len(), 2);
 
         // Back online, remove and clear apply once they are sent.
         let (tx, mut rx) = mpsc::unbounded_channel();
-        app.cmd_tx = Some(tx);
-        app.connected = true;
+        app.test_set_registered(tx);
         app.process_command("/monitor - alice");
         assert!(rx.try_recv().is_ok());
         assert_eq!(app.monitored_users.len(), 1);
@@ -4210,7 +4332,7 @@ mod tests {
         app.process_command("/monitor +alice");
         assert!(rx.try_recv().is_ok());
         assert_eq!(app.monitored_users.len(), 1);
-        app.cmd_tx = None;
+        app.test_drop_transport();
         app.process_command("/monitor - alice");
         assert_eq!(app.monitored_users.len(), 1);
     }
@@ -4252,7 +4374,7 @@ mod tests {
         app.handle_cap_message("ACK", &["draft/chathistory".into()]);
         app.process_command("/history before #chan *");
         assert!(
-            !app.channels.contains_key("#chan"),
+            !app.conversations.contains_key("#chan"),
             "the tab must not be created for an unsent request"
         );
         assert!(
@@ -4267,19 +4389,19 @@ mod tests {
         let (mut app, mut rx) = connected_command_app();
         let mut stale = Channel::new();
         stale.joined = false;
-        app.channels.insert("#stale".into(), stale);
-        app.current_channel = Some("#stale".into());
+        app.conversations.insert("#stale".into(), stale);
+        test_select_target(&mut app, "#stale");
 
         app.process_command("/msg #stale hello");
         assert!(rx.try_recv().is_err());
         assert!(
-            app.channels["#stale"]
+            app.conversations["#stale"]
                 .messages
                 .iter()
                 .any(|message| message.content == "Message not sent")
         );
         assert!(
-            app.channels["#stale"]
+            app.conversations["#stale"]
                 .messages
                 .iter()
                 .all(|message| !message.content.contains("Not connected"))
@@ -4287,11 +4409,10 @@ mod tests {
 
         // While actually disconnected, the disconnection is still what's
         // reported.
-        app.connected = false;
-        app.cmd_tx = None;
+        app.test_set_disconnected();
         app.process_command("/msg #stale hello again");
         assert!(
-            app.channels["#stale"]
+            app.conversations["#stale"]
                 .messages
                 .iter()
                 .any(|message| message.content.contains("Not connected - message not sent"))
@@ -4481,7 +4602,7 @@ mod tests {
         app.input_text = "/join #x".into();
         app.process_input();
         assert_eq!(app.command_history, vec!["/join #x".to_string()]);
-        let query = &app.channels["NickServ"];
+        let query = &app.conversations["NickServ"];
         for secret in ["hunter17", "KEY18"] {
             assert!(
                 query
@@ -4742,7 +4863,7 @@ mod tests {
         }
         assert!(app.command_history.is_empty(), "{:?}", app.command_history);
         // The scrollback redaction (defense in depth) still applies.
-        let query = &app.channels["NickServ"];
+        let query = &app.conversations["NickServ"];
         for secret in ["hunter8", "hunter9"] {
             assert!(
                 query
@@ -4781,11 +4902,11 @@ mod tests {
         app.process_input();
 
         assert!(
-            !app.channels.keys().any(|key| key.contains('\t')),
+            !app.conversations.keys().any(|key| key.contains('\t')),
             "no junk tab: {:?}",
-            app.channels.keys().collect::<Vec<_>>()
+            app.conversations.keys().collect::<Vec<_>>()
         );
-        let query = &app.channels["NickServ"];
+        let query = &app.conversations["NickServ"];
         assert!(
             query
                 .messages
@@ -4848,10 +4969,10 @@ mod tests {
     fn slap_supports_a_custom_action() {
         let (mut app, mut rx) = connected_command_app();
         app.set_session_nick("me".into(), true);
-        app.current_channel = Some("#chan".into());
+        test_select_target(&mut app, "#chan");
         let mut channel = Channel::new();
         channel.joined = true;
-        app.channels.insert("#chan".into(), channel);
+        app.conversations.insert("#chan".into(), channel);
 
         app.process_command("/slap alice with a frozen herring");
         assert!(matches!(
@@ -4996,7 +5117,7 @@ mod tests {
         app.input_text = "/server irc.x.net 6667 hunter2".into();
         app.process_input();
 
-        assert!(!app.connecting);
+        assert!(!app.is_connecting());
         assert_eq!(app.server_host, "irc.libera.chat");
         assert!(
             app.server_messages
@@ -5051,7 +5172,7 @@ mod tests {
         app.process_command("/server new.example 0");
         assert_eq!(app.server_host, original_host);
         assert_eq!(app.password, "server-pass");
-        assert!(!app.connecting);
+        assert!(!app.is_connecting());
         assert!(
             app.server_messages
                 .back()
@@ -5061,7 +5182,7 @@ mod tests {
         // Even naming the current endpoint is an unprofiled /server action.
         let command = format!("/server {} {}", app.server_host, app.server_port);
         app.process_command(&command);
-        assert!(app.connecting);
+        assert!(app.is_connecting());
         let active = app.active_server_config().unwrap();
         assert!(active.password.is_none());
         assert!(active.sasl_username.is_none());
@@ -5175,16 +5296,63 @@ mod tests {
         room.joined = true;
         room.add_user("alice", crate::gui::UserMode::Op);
         room.add_user("bob", crate::gui::UserMode::Normal);
-        app.channels.insert("#room".into(), room);
-        app.current_channel = Some("#room".into());
+        app.conversations.insert("#room".into(), room);
+        test_select_target(&mut app, "#room");
         let tokens = [
-            "/join", "/part", "/kick", "/ban", "/unban", "/kickban", "/mode", "/msg",
-            "/notice", "/query", "/me", "/say", "/topic", "/away", "/nick", "/whois",
-            "/monitor", "/silence", "/ignore", "/unignore", "/list", "/names", "/invite",
-            "/quit", "/raw", "/quote", "/perform", "/server", "/umode", "/op", "/deop",
-            "/voice", "/halfop", "/ctcp", "/lastlog", "/clear", "/help", "/window",
-            "/hop", "/cycle", "#room", "alice", "bob", "me", "+o", "-b", "key", "*!*@h",
-            "https://x.test", "\u{1}", "", "  ", "\t", "999999999999999999999999",
+            "/join",
+            "/part",
+            "/kick",
+            "/ban",
+            "/unban",
+            "/kickban",
+            "/mode",
+            "/msg",
+            "/notice",
+            "/query",
+            "/me",
+            "/say",
+            "/topic",
+            "/away",
+            "/nick",
+            "/whois",
+            "/monitor",
+            "/silence",
+            "/ignore",
+            "/unignore",
+            "/list",
+            "/names",
+            "/invite",
+            "/quit",
+            "/raw",
+            "/quote",
+            "/perform",
+            "/server",
+            "/umode",
+            "/op",
+            "/deop",
+            "/voice",
+            "/halfop",
+            "/ctcp",
+            "/lastlog",
+            "/clear",
+            "/help",
+            "/window",
+            "/hop",
+            "/cycle",
+            "#room",
+            "alice",
+            "bob",
+            "me",
+            "+o",
+            "-b",
+            "key",
+            "*!*@h",
+            "https://x.test",
+            "\u{1}",
+            "",
+            "  ",
+            "\t",
+            "999999999999999999999999",
         ];
         let mut state: u64 = 0xc0ff_ee00_1234_5678;
         let mut next = move || {
@@ -5201,13 +5369,13 @@ mod tests {
                 .join(" ");
             app.process_command(&line);
             // Commands may legitimately switch or close the current tab.
-            if app.current_channel.is_none() {
-                app.current_channel = Some("#room".into());
-                if !app.channels.contains_key("#room") {
+            if app.current_conversation.is_none() {
+                if !app.conversations.contains_key("#room") {
                     let mut room = Channel::new();
                     room.joined = true;
-                    app.channels.insert("#room".into(), room);
+                    app.conversations.insert("#room".into(), room);
                 }
+                test_select_target(&mut app, "#room");
             }
         }
         app.process_command("/say still alive");
@@ -5221,7 +5389,7 @@ mod tests {
         assert!(
             app.server_messages
                 .iter()
-                .chain(app.channels.values().flat_map(|c| c.messages.iter()))
+                .chain(app.conversations.values().flat_map(|c| c.messages.iter()))
                 .any(|m| m.content.contains("must not start with ':'"))
         );
         app.process_command("/nick alice");

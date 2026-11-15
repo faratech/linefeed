@@ -3,6 +3,7 @@
 
 import argparse
 import asyncio
+import json
 import os
 import platform
 import shutil
@@ -119,29 +120,71 @@ async def update_deps():
         sys.exit(1)
 
 
+def cargo_build_artifacts(output: str, binary_name: str) -> tuple[set[Path], list[str]]:
+    """Read this package's executable paths and readable Cargo diagnostics."""
+    artifacts = set()
+    diagnostics = []
+    manifest = (SCRIPT_DIR / "Cargo.toml").resolve()
+    for line in output.splitlines():
+        try:
+            message = json.loads(line)
+        except json.JSONDecodeError:
+            diagnostics.append(line)
+            continue
+        if not isinstance(message, dict):
+            continue
+        if message.get("reason") == "compiler-message":
+            rendered = message.get("message", {}).get("rendered")
+            if rendered:
+                diagnostics.append(rendered.rstrip("\n"))
+        if message.get("reason") != "compiler-artifact":
+            continue
+        artifact_target = message.get("target", {})
+        if artifact_target.get("name") != binary_name or "bin" not in artifact_target.get("kind", []):
+            continue
+        manifest_path = message.get("manifest_path")
+        executable = message.get("executable")
+        if not isinstance(manifest_path, str) or not isinstance(executable, str) or not executable:
+            continue
+        if (SCRIPT_DIR / manifest_path).resolve() != manifest:
+            continue
+        # Cargo reports artifacts even when cached (`fresh: true`), and its
+        # path already accounts for target-dir configuration and cross builds.
+        artifacts.add((SCRIPT_DIR / executable).resolve())
+    return artifacts, diagnostics
+
+
 async def build_target(name: str, target: str | None, src_name: str, dst_name: str) -> bool:
     """Build a single target"""
     print(f"  Building {name}...")
 
-    cmd = ["cargo", "build", "--locked", "--profile", "dist"]
+    binary_name = Path(src_name).stem
+    cmd = ["cargo", "build", "--locked", "--profile", "dist",
+           "--bin", binary_name, "--message-format=json-render-diagnostics"]
     if target:
         cmd.extend(["--target", target])
 
     success, output = await run_cmd(cmd)
+    artifacts, diagnostics = cargo_build_artifacts(output, binary_name)
+    if diagnostics:
+        print("\n".join(diagnostics))
 
     if not success:
         print(f"ERROR building {name}:")
-        print(output)
         return False
 
-    # Copy to output directory
-    if target:
-        src = SCRIPT_DIR / "target" / target / "dist" / src_name
-    else:
-        src = SCRIPT_DIR / "target" / "dist" / src_name
+    if len(artifacts) != 1:
+        print(f"ERROR building {name}: expected one {binary_name} executable artifact, "
+              f"found {len(artifacts)}")
+        return False
+    src = next(iter(artifacts))
 
     dst = OUT_DIR / dst_name
-    shutil.copy2(src, dst)
+    try:
+        shutil.copy2(src, dst)
+    except OSError as error:
+        print(f"ERROR copying {name} artifact {src}: {error}")
+        return False
     print(f"    -> {dst.relative_to(SCRIPT_DIR)}")
     return True
 

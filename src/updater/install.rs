@@ -12,6 +12,8 @@ use std::{
 };
 
 pub const MAX_BINARY: u64 = 128 * 1024 * 1024;
+/// The same bound applies before publishing update state and when reading it.
+pub(super) const MAX_JSON_STATE: usize = 4 * 1024 * 1024;
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Paths {
@@ -166,18 +168,57 @@ fn lock_file(path: &Path) -> io::Result<File> {
 pub fn read_json<T: DeserializeOwned>(path: &Path) -> io::Result<T> {
     let mut bytes = Vec::new();
     File::open(path)?
-        .take(4 * 1024 * 1024 + 1)
+        .take(MAX_JSON_STATE as u64 + 1)
         .read_to_end(&mut bytes)?;
-    if bytes.len() > 4 * 1024 * 1024 {
+    if bytes.len() > MAX_JSON_STATE {
         return Err(io::Error::other("Update state exceeds limit"));
     }
     serde_json::from_slice(&bytes).map_err(|_| io::Error::other("Invalid update state"))
 }
+/// Bound the encoded bytes, including JSON escapes, without first allocating
+/// an arbitrarily large serialization of the user's drafts.
+fn json_bytes(value: &impl Serialize) -> io::Result<Vec<u8>> {
+    struct LimitedJson(Vec<u8>);
+    impl Write for LimitedJson {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            if bytes.len() > MAX_JSON_STATE - self.0.len() {
+                return Err(io::Error::other("Update state exceeds the 4 MiB limit"));
+            }
+            self.0.extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut buffer = LimitedJson(Vec::new());
+    serde_json::to_writer(&mut buffer, value).map_err(io::Error::other)?;
+    Ok(buffer.0)
+}
+
+fn snapshot_bytes(snapshot: &crate::gui::UpdateSession) -> io::Result<Vec<u8>> {
+    json_bytes(snapshot).map_err(|error| {
+        io::Error::other(format!(
+            "Cannot restart to update: the session snapshot exceeds the 4 MiB limit. \
+             Save your unsent drafts elsewhere, shorten the input text, and try again. {error}"
+        ))
+    })
+}
+
+pub(super) fn validate_snapshot(snapshot: &crate::gui::UpdateSession) -> io::Result<()> {
+    snapshot_bytes(snapshot).map(|_| ())
+}
+
 pub fn write_json(path: &Path, value: &impl Serialize) -> io::Result<()> {
+    let bytes = json_bytes(value)?;
+    write_json_bytes(path, &bytes)
+}
+
+fn write_json_bytes(path: &Path, bytes: &[u8]) -> io::Result<()> {
     let tmp = path.with_extension(format!("{}.tmp", nonce()?));
     let result = (|| {
         let mut file = new_file(&tmp)?;
-        serde_json::to_writer(&mut file, value).map_err(io::Error::other)?;
+        file.write_all(bytes)?;
         file.sync_all()?;
         drop(file);
         fs::rename(&tmp, path)?;
@@ -799,6 +840,10 @@ impl Armed {
 }
 
 pub fn arm(mut tx: Transaction, snapshot: Option<&crate::gui::UpdateSession>) -> io::Result<Armed> {
+    // Reject an unreadable handoff before changing restart intent, touching a
+    // previous snapshot, or spawning the helper. Controller also checks this
+    // before it asks the worker to prepare, so the current GUI stays running.
+    let snapshot = snapshot.map(snapshot_bytes).transpose()?;
     let lock = tx.paths.transaction_lock()?;
     lock.try_lock().map_err(io::Error::other)?;
     let persisted: Transaction = read_json(&tx.paths.journal())?;
@@ -812,7 +857,7 @@ pub fn arm(mut tx: Transaction, snapshot: Option<&crate::gui::UpdateSession>) ->
     verify_candidate(&tx)?;
     tx.restart = snapshot.is_some();
     if let Some(snapshot) = snapshot {
-        write_json(&tx.snapshot(), snapshot)?;
+        write_json_bytes(&tx.snapshot(), &snapshot)?;
     } else {
         // No restart was requested: drop any snapshot an abandoned arm left.
         let _ = fs::remove_file(tx.snapshot());
@@ -1302,6 +1347,96 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.root);
         }
+    }
+
+    fn snapshot_with_size(size: usize) -> crate::gui::UpdateSession {
+        let mut snapshot = crate::gui::UpdateSession::default();
+        let overhead = serde_json::to_vec(&snapshot).unwrap().len();
+        snapshot.set_input("x".repeat(size - overhead));
+        assert_eq!(serde_json::to_vec(&snapshot).unwrap().len(), size);
+        snapshot
+    }
+
+    #[test]
+    fn snapshot_at_the_state_limit_round_trips_without_truncation() {
+        let fixture = Fixture::new();
+        let snapshot = snapshot_with_size(MAX_JSON_STATE);
+        let bytes = snapshot_bytes(&snapshot).unwrap();
+        assert_eq!(bytes.len(), MAX_JSON_STATE);
+        write_json(&fixture.tx.snapshot(), &snapshot).unwrap();
+        let restored: crate::gui::UpdateSession = read_json(&fixture.tx.snapshot()).unwrap();
+        assert_eq!(restored.input(), snapshot.input());
+    }
+
+    #[test]
+    fn oversized_state_is_rejected_before_publishing_or_replacing_a_file() {
+        let fixture = Fixture::new();
+        let path = fixture.tx.snapshot();
+        write_json(&path, &crate::gui::UpdateSession::default()).unwrap();
+        let original = fs::read(&path).unwrap();
+        let files_before = fs::read_dir(&fixture.tx.paths.state).unwrap().count();
+        let snapshot = snapshot_with_size(MAX_JSON_STATE + 1);
+        assert!(snapshot_bytes(&snapshot).is_err());
+        assert!(write_json(&path, &snapshot).is_err());
+        assert_eq!(fs::read(&path).unwrap(), original);
+        assert_eq!(
+            fs::read_dir(&fixture.tx.paths.state).unwrap().count(),
+            files_before
+        );
+    }
+
+    #[test]
+    fn snapshot_limit_counts_json_escapes_and_every_window_draft() {
+        let mut snapshot = crate::gui::UpdateSession::default();
+        // The plain text fits easily, but control characters cost six JSON
+        // bytes each and occur in both the selected and per-window drafts.
+        let draft = "\0".repeat(MAX_JSON_STATE / 10);
+        snapshot.set_input(draft.clone());
+        snapshot.set_drafts(vec![(None, draft)]);
+        assert!(snapshot_bytes(&snapshot).is_err());
+
+        snapshot.set_input("selected draft".into());
+        snapshot.set_drafts(vec![
+            (None, "selected draft".into()),
+            (Some("#room".into()), "  other draft\t\0".into()),
+        ]);
+        let encoded = snapshot_bytes(&snapshot).unwrap();
+        let mut restored: crate::gui::UpdateSession = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(restored.input(), snapshot.input());
+        assert_eq!(restored.take_drafts(), snapshot.take_drafts());
+    }
+
+    #[test]
+    fn arming_an_oversized_snapshot_keeps_the_stage_and_previous_snapshot() {
+        let fixture = Fixture::new();
+        write_json(
+            &fixture.tx.snapshot(),
+            &crate::gui::UpdateSession::default(),
+        )
+        .unwrap();
+        let original_snapshot = fs::read(fixture.tx.snapshot()).unwrap();
+        let original_journal = fs::read(fixture.tx.paths.journal()).unwrap();
+        let snapshot = snapshot_with_size(MAX_JSON_STATE + 1);
+        // Hold the transaction lock to prove validation precedes even that
+        // operation; this must return the actionable size error on Windows too,
+        // where the fixture executable would fail signature verification.
+        let lock = fixture.tx.paths.transaction_lock().unwrap();
+        lock.lock().unwrap();
+        let error = arm(fixture.tx.clone(), Some(&snapshot)).err().unwrap();
+        assert!(error.to_string().contains("Save your unsent drafts"));
+        assert_eq!(fs::read(fixture.tx.snapshot()).unwrap(), original_snapshot);
+        assert_eq!(
+            fs::read(fixture.tx.paths.journal()).unwrap(),
+            original_journal
+        );
+        assert!(!fixture.tx.directory.join("ready").exists());
+        assert_eq!(hash(&fixture.tx.paths.target).unwrap(), fixture.tx.old_hash);
+        assert_eq!(hash(&fixture.tx.candidate()).unwrap(), fixture.tx.new_hash);
+        drop(lock);
+        fixture.tx.validate().unwrap();
+        let journal: Transaction = read_json(&fixture.tx.paths.journal()).unwrap();
+        assert!(journal.phase == Phase::Staged);
+        assert!(!journal.restart);
     }
 
     #[test]
@@ -1900,7 +2035,9 @@ mod tests {
             if path.ends_with("download.part") {
                 return Err(io::Error::other("in use"));
             }
-            removed.borrow_mut().push(path.file_name().unwrap().to_owned());
+            removed
+                .borrow_mut()
+                .push(path.file_name().unwrap().to_owned());
             real(path)
         });
         assert!(directory.join(CLAIM).exists() && directory.join("download.part").exists());
@@ -1910,7 +2047,9 @@ mod tests {
         // nested directory went on the first pass.)
         removed.borrow_mut().clear();
         remove_tombstone_with(&directory, |path| {
-            removed.borrow_mut().push(path.file_name().unwrap().to_owned());
+            removed
+                .borrow_mut()
+                .push(path.file_name().unwrap().to_owned());
             real(path)
         });
         assert!(!directory.exists());

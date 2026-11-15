@@ -19,6 +19,7 @@ use egui::{Pos2, Rect, Vec2};
 use serde::{Deserialize, Serialize};
 
 use super::TabCompletion;
+use super::conversations::ConversationId;
 
 /// Identifies a running session for the lifetime of the process. Never reused.
 pub(crate) type ConnId = u32;
@@ -29,15 +30,15 @@ pub(crate) const UNCONNECTED_PREFIX: &str = "unconnected:";
 
 /// One window: a session's status window (`target == None`) or one of its
 /// channel/query tabs, named by the session's tab key.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct WindowKey {
     pub conn: ConnId,
-    pub target: Option<String>,
+    pub conversation: Option<ConversationId>,
 }
 
 impl WindowKey {
-    pub(crate) fn new(conn: ConnId, target: Option<String>) -> Self {
-        Self { conn, target }
+    pub(crate) fn new(conn: ConnId, conversation: Option<ConversationId>) -> Self {
+        Self { conn, conversation }
     }
 }
 
@@ -82,6 +83,33 @@ pub(crate) struct TargetView {
     pub input_focus_request: bool,
     /// Whether this window's input line had focus when last drawn.
     pub input_had_focus: bool,
+}
+
+pub(crate) fn merge_drafts(source: &str, destination: &str) -> String {
+    if source.is_empty() {
+        destination.to_string()
+    } else if destination.is_empty() || source == destination {
+        source.to_string()
+    } else {
+        format!("{source}\n{destination}")
+    }
+}
+
+impl TargetView {
+    fn merge_from(&mut self, destination: Self) {
+        self.input_text = merge_drafts(&self.input_text, &destination.input_text);
+        self.command_history.extend(destination.command_history);
+        if self.command_history.len() > 100 {
+            self.command_history
+                .drain(..self.command_history.len() - 100);
+        }
+        // The merged history no longer has either window's browsing indices.
+        self.history_index = None;
+        self.history_temp.clear();
+        self.tab_completion = None;
+        self.input_focus_request |= destination.input_focus_request;
+        self.input_had_focus |= destination.input_had_focus;
+    }
 }
 
 pub(crate) struct TargetWindow {
@@ -154,6 +182,9 @@ pub(crate) struct WindowManager {
     /// The window set last reconciled by `sync`: an unchanged set makes
     /// the next `sync` a no-op, so steady-state frames skip the reconcile.
     last_present: Vec<PresentWindow>,
+    /// A merge adopted a destination view before the source first appeared.
+    /// Its following metadata event may still carry the source's saved place.
+    adopted: std::collections::HashSet<WindowKey>,
 }
 
 impl WindowManager {
@@ -172,6 +203,7 @@ impl WindowManager {
             dirty: false,
             area: layout.area.map(rect_from_array),
             last_present: Vec::new(),
+            adopted: Default::default(),
         }
     }
 
@@ -181,6 +213,70 @@ impl WindowManager {
 
     pub(crate) fn get_mut(&mut self, key: &WindowKey) -> Option<&mut TargetWindow> {
         self.windows.iter_mut().find(|w| &w.key == key)
+    }
+
+    /// Metadata changes keep the runtime identity, viewport and editing state.
+    /// Saved name-based placement must also follow renames before first sync.
+    pub(crate) fn rename_metadata(
+        &mut self,
+        key: &WindowKey,
+        old_persist: &PersistKey,
+        new_persist: PersistKey,
+    ) {
+        let source_placement = self
+            .adopted
+            .remove(key)
+            .then(|| self.saved.remove(old_persist))
+            .flatten();
+        if let Some(window) = self.get_mut(key) {
+            if let Some(saved) = source_placement {
+                window.detached = saved.detached;
+                window.child_rect = saved.child_rect.map(rect_from_array);
+                window.pending_place = window.child_rect;
+                window.os_pos = saved.os_pos.map(|p| Pos2::new(p[0], p[1]));
+                window.os_size = saved.os_size.map(|s| Vec2::new(s[0], s[1]));
+            }
+            window.persist = new_persist.clone();
+            self.saved.remove(old_persist);
+        } else if let Some(mut saved) = self.saved.remove(old_persist) {
+            saved.key = new_persist.clone();
+            self.saved.insert(new_persist.clone(), saved);
+        }
+        if self.restore_active.as_ref() == Some(old_persist) {
+            self.restore_active = Some(new_persist);
+        }
+        self.last_present.clear();
+        self.dirty = true;
+    }
+
+    /// Explicit merges retire one ID. Keep the survivor's view and placement;
+    /// when it has not appeared yet, adopt the retired window's existing view.
+    pub(crate) fn merge_conversations(&mut self, survivor: WindowKey, retired: WindowKey) {
+        let source_index = self
+            .windows
+            .iter()
+            .position(|window| window.key == survivor);
+        if let Some(index) = source_index {
+            let mut source = self.windows.remove(index);
+            if let Some(destination) = self.windows.iter().position(|window| window.key == retired)
+            {
+                source
+                    .view
+                    .merge_from(self.windows.remove(destination).view);
+            }
+            self.windows.insert(index.min(self.windows.len()), source);
+        } else if let Some(window) = self.get_mut(&retired) {
+            window.key = survivor;
+            self.adopted.insert(survivor);
+        }
+        if self.active == Some(retired) {
+            self.active = Some(survivor);
+        }
+        if self.restore_match == Some(retired) {
+            self.restore_match = Some(survivor);
+        }
+        self.last_present.clear();
+        self.dirty = true;
     }
 
     /// Reconcile the window list with the windows the sessions currently
@@ -236,6 +332,11 @@ impl WindowManager {
             if let Some(persist) = seen.remove(&window.key)
                 && window.persist != *persist
             {
+                if self.restore_active.as_ref() == Some(&window.persist) {
+                    self.restore_active = Some(persist.clone());
+                    self.restore_match = Some(window.key);
+                }
+                self.saved.remove(&window.persist);
                 window.persist = persist.clone();
             }
         }
@@ -243,10 +344,10 @@ impl WindowManager {
         let mut appeared: Vec<(&WindowKey, &PersistKey)> = seen.into_iter().collect();
         // Deterministic order for windows that appear in the same frame.
         appeared.sort_by(|a, b| {
-            (a.0.conn, a.0.target.is_some(), &a.0.target).cmp(&(
+            (a.0.conn, a.0.conversation.is_some(), &a.1.target).cmp(&(
                 b.0.conn,
-                b.0.target.is_some(),
-                &b.0.target,
+                b.0.conversation.is_some(),
+                &b.1.target,
             ))
         });
         let mut keys = Vec::with_capacity(appeared.len());
@@ -254,16 +355,14 @@ impl WindowManager {
             let saved = self.saved.remove(persist);
             if self.restore_active.as_ref() == Some(persist) {
                 self.restore_active = None;
-                self.restore_match = Some(key.clone());
+                self.restore_match = Some(*key);
             }
-            self.windows.push(TargetWindow::new(
-                key.clone(),
-                persist.clone(),
-                saved.as_ref(),
-            ));
-            keys.push(key.clone());
+            self.windows
+                .push(TargetWindow::new(*key, persist.clone(), saved.as_ref()));
+            keys.push(*key);
         }
         self.last_present = present.to_vec();
+        self.adopted.clear();
         keys
     }
 
@@ -321,7 +420,7 @@ impl WindowManager {
     }
 
     fn apply_placements(&mut self, rects: Vec<Rect>) {
-        let active = self.active.clone();
+        let active = self.active;
         // The active window goes last so it ends up on top of a cascade.
         let mut order: Vec<usize> = (0..self.windows.len())
             .filter(|&i| !self.windows[i].detached)
@@ -522,13 +621,7 @@ impl LayoutFile {
             std::fs::create_dir_all(parent)?;
         }
         let data = serde_json::to_string_pretty(self).map_err(std::io::Error::other)?;
-        let tmp = path.with_extension("json.tmp");
-        let result = super::types::write_settings_file(&tmp, &data)
-            .and_then(|_| std::fs::rename(&tmp, path));
-        if result.is_err() {
-            let _ = std::fs::remove_file(&tmp);
-        }
-        result
+        crate::persistence::write_private_atomic(path, data.as_bytes())
     }
 
     pub(crate) fn save(&self) {
@@ -545,7 +638,14 @@ mod tests {
     use super::*;
 
     fn key(conn: ConnId, target: Option<&str>) -> WindowKey {
-        WindowKey::new(conn, target.map(str::to_string))
+        WindowKey::new(
+            conn,
+            target.map(|target| {
+                ConversationId(target.bytes().fold(1u64, |hash, byte| {
+                    hash.wrapping_mul(31).wrapping_add(u64::from(byte))
+                }))
+            }),
+        )
     }
 
     fn present(conn: ConnId, network: &str, target: Option<&str>) -> PresentWindow {
@@ -621,6 +721,63 @@ mod tests {
         assert_eq!(window.child_rect, Some(rect));
         // Closed windows come back inside the main window.
         assert!(!window.detached);
+    }
+
+    #[test]
+    fn a_case_only_rename_preserves_layout_before_the_window_first_appears() {
+        let old = present(1, "net", Some("alice"));
+        let mut new = present(1, "net", Some("ALICE"));
+        new.key = old.key;
+        let mut original = WindowManager::default();
+        original.sync(std::slice::from_ref(&old));
+        let source = original.get_mut(&old.key).unwrap();
+        source.detached = true;
+        source.os_pos = Some(Pos2::new(100.0, 200.0));
+        source.os_size = Some(Vec2::new(700.0, 500.0));
+        original.active = Some(old.key);
+        let mut manager = WindowManager::from_layout(original.layout());
+        manager.rename_metadata(&old.key, &old.persist, new.persist.clone());
+        manager.sync(std::slice::from_ref(&new));
+        let renamed = manager.get(&new.key).unwrap();
+        assert!(renamed.detached);
+        assert_eq!(renamed.os_pos, Some(Pos2::new(100.0, 200.0)));
+        assert_eq!(renamed.os_size, Some(Vec2::new(700.0, 500.0)));
+        assert_eq!(manager.restore_match, Some(new.key));
+    }
+
+    #[test]
+    fn merging_conversation_drafts_keeps_distinct_text_once() {
+        assert_eq!(merge_drafts("source", "destination"), "source\ndestination");
+        assert_eq!(merge_drafts("same", "same"), "same");
+        assert_eq!(merge_drafts("", "destination"), "destination");
+        assert_eq!(merge_drafts("source", ""), "source");
+    }
+
+    #[test]
+    fn an_unmaterialized_source_keeps_its_saved_placement_when_merging_a_live_destination() {
+        let old = present(1, "net", Some("alice"));
+        let destination = present(1, "net", Some("bob"));
+        let mut original = WindowManager::default();
+        original.sync(std::slice::from_ref(&old));
+        let source = original.get_mut(&old.key).unwrap();
+        source.detached = true;
+        source.os_pos = Some(Pos2::new(100.0, 200.0));
+        source.os_size = Some(Vec2::new(700.0, 500.0));
+        let mut manager = WindowManager::from_layout(original.layout());
+        manager.sync(std::slice::from_ref(&destination));
+        let live = manager.get_mut(&destination.key).unwrap();
+        live.view.input_text = "destination draft".into();
+        live.os_pos = Some(Pos2::new(900.0, 900.0));
+        manager.merge_conversations(old.key, destination.key);
+        manager.rename_metadata(&old.key, &old.persist, destination.persist.clone());
+        let mut renamed = destination;
+        renamed.key = old.key;
+        manager.sync(std::slice::from_ref(&renamed));
+        let survivor = manager.get(&old.key).unwrap();
+        assert!(survivor.detached);
+        assert_eq!(survivor.os_pos, Some(Pos2::new(100.0, 200.0)));
+        assert_eq!(survivor.os_size, Some(Vec2::new(700.0, 500.0)));
+        assert_eq!(survivor.view.input_text, "destination draft");
     }
 
     #[test]

@@ -4,6 +4,7 @@ mod gui;
 mod icon_data;
 mod irc;
 mod opener;
+mod persistence;
 mod updater;
 
 #[cfg(windows)]
@@ -241,8 +242,8 @@ fn has_interactive_desktop() -> bool {
 /// on the transaction lock or downgrade a `Prepared` transaction. A supervised
 /// update launch defers the check until after recovery: the outgoing instance
 /// may still hold the mutex while its replacement validates the handoff.
-fn single_instance_allows_startup(supervised: bool) -> bool {
-    supervised || ensure_single_instance()
+fn single_instance_allows_startup(supervised: bool, instance_check: impl FnOnce() -> bool) -> bool {
+    supervised || instance_check()
 }
 
 fn main() -> eframe::Result<()> {
@@ -264,7 +265,7 @@ fn main() -> eframe::Result<()> {
     // Second launches activate the running instance before updater recovery
     // can stall on its lock or touch a pending transaction (issue #199).
     let startup_supervised = supervised.is_some();
-    if !single_instance_allows_startup(startup_supervised) {
+    if !single_instance_allows_startup(startup_supervised, ensure_single_instance) {
         return Ok(());
     }
     let startup = updater::install::startup(supervised)
@@ -542,24 +543,9 @@ impl eframe::App for LinefeedApp {
         self.app.tray_hidden = false;
         self.app.ui(ui);
 
-        // Hyperlink clicks queue OpenUrl commands that eframe's native
-        // backends ignore (only its web backend acts on them), so open them
-        // here ourselves. Draining keeps the queue from growing unbounded if
-        // the opener fails.
-        let mut urls: Vec<String> = Vec::new();
-        ctx.output_mut(|output| {
-            for command in &output.commands {
-                if let egui::OutputCommand::OpenUrl(open) = command {
-                    urls.push(open.url.clone());
-                }
-            }
-            output
-                .commands
-                .retain(|command| !matches!(command, egui::OutputCommand::OpenUrl(_)));
-        });
-        for url in urls {
-            opener::open_in_browser(&url);
-        }
+        // Detached viewports drain their own output before returning to
+        // eframe; this handles the root viewport's links.
+        opener::dispatch_pending_urls(ctx);
 
         // Track when we last received messages for adaptive repaint intervals
         if self.app.had_messages_this_frame {
@@ -671,13 +657,16 @@ mod tests {
     fn connections_keep_draining_while_the_window_is_minimized() {
         let mut linefeed = hermetic_linefeed();
         let (tx, rx) = tokio::sync::mpsc::channel(4);
-        linefeed.app.sessions[0].msg_rx = Some(rx);
+        linefeed.app.sessions[0].test_set_incoming(rx);
         tx.try_send(irc::IrcMessage::parse(":srv NOTICE * :while minimized").unwrap())
             .unwrap();
 
         // Visible: the ui pass does this work, `logic` must not.
         run_hidden(&mut linefeed, false);
-        assert!(!tx.is_closed() && tx.capacity() == 3, "drained by logic while visible");
+        assert!(
+            !tx.is_closed() && tx.capacity() == 3,
+            "drained by logic while visible"
+        );
 
         let commands = run_hidden(&mut linefeed, true);
         assert!(
@@ -739,7 +728,7 @@ mod tests {
         let mut linefeed = hermetic_linefeed();
         linefeed.app.detach_status_window_for_tests();
         let (tx, rx) = tokio::sync::mpsc::channel(4);
-        linefeed.app.sessions[0].msg_rx = Some(rx);
+        linefeed.app.sessions[0].test_set_incoming(rx);
         // A normal frame first: the detached window's viewport exists.
         ctx.run_ui(egui::RawInput::default(), |ui| linefeed.app.ui(ui))
             .textures_delta
@@ -814,9 +803,18 @@ mod tests {
 
     #[test]
     fn single_instance_gate_runs_before_recovery_except_when_supervised() {
-        // Normal launches gate (and pass here) before recovery; supervised
-        // update launches defer the gate until after recovery (issue #199).
-        assert!(single_instance_allows_startup(false));
-        assert!(single_instance_allows_startup(true));
+        // Exercise the gate without acquiring the real named mutex or
+        // activating the user's running Windows instance.
+        let checks = std::cell::Cell::new(0);
+        assert!(single_instance_allows_startup(false, || {
+            checks.set(checks.get() + 1);
+            true
+        }));
+        assert_eq!(checks.get(), 1);
+        assert!(!single_instance_allows_startup(false, || false));
+        // Supervised update launches defer the check until after recovery.
+        assert!(single_instance_allows_startup(true, || {
+            panic!("supervised startup must defer the instance check")
+        }));
     }
 }

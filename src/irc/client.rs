@@ -643,26 +643,30 @@ fn sts_store_path() -> Option<std::path::PathBuf> {
     dirs::config_dir().map(|path| path.join("linefeed").join("sts_policies.json"))
 }
 
-fn load_sts_policies() -> HashMap<String, StsPolicy> {
-    let Some(path) = sts_store_path() else {
-        return HashMap::new();
+fn load_sts_policies_from(path: &std::path::Path) -> std::io::Result<HashMap<String, StsPolicy>> {
+    let data = match std::fs::read(path) {
+        Ok(data) => data,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(HashMap::new()),
+        Err(error) => return Err(error),
     };
-    std::fs::read(path)
-        .ok()
-        .and_then(|data| serde_json::from_slice(&data).ok())
-        .unwrap_or_default()
+    serde_json::from_slice(&data)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
 }
 
-fn save_sts_policies(policies: &HashMap<String, StsPolicy>) -> std::io::Result<()> {
-    let Some(path) = sts_store_path() else {
-        return Ok(());
-    };
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let temporary = path.with_extension("json.tmp");
-    std::fs::write(&temporary, serde_json::to_vec_pretty(policies)?)?;
-    std::fs::rename(temporary, path)
+fn save_sts_policies_to(
+    path: &std::path::Path,
+    policies: &HashMap<String, StsPolicy>,
+) -> std::io::Result<()> {
+    let data = serde_json::to_vec_pretty(policies).map_err(std::io::Error::other)?;
+    crate::persistence::write_private_atomic(path, &data)
+}
+
+const STS_STORE_LOCK_TIMEOUT: Duration = Duration::from_secs(2);
+
+fn sts_policy_lock_path(path: &std::path::Path) -> std::path::PathBuf {
+    let mut name = path.as_os_str().to_os_string();
+    name.push(".lock");
+    name.into()
 }
 
 fn unix_now() -> u64 {
@@ -772,7 +776,26 @@ fn update_sts_policy(host: &str, port: u16, duration: u64) {
 
 #[cfg_attr(test, allow(dead_code))]
 fn persist_sts_policy(host: &str, port: u16, duration: u64) {
-    let mut policies = load_sts_policies();
+    let Some(path) = sts_store_path() else {
+        return;
+    };
+    if let Err(error) = persist_sts_policy_at(&path, host, port, duration) {
+        tracing::warn!("Failed to save STS policy: {error}");
+    }
+}
+
+fn persist_sts_policy_at(
+    path: &std::path::Path,
+    host: &str,
+    port: u16,
+    duration: u64,
+) -> std::io::Result<()> {
+    // Each network has its own worker, and non-Windows builds can run more
+    // than one instance. Serialize the full transaction with a stable file
+    // lock: locking the policy file itself would stop protecting it at rename.
+    let _lock =
+        crate::persistence::exclusive_lock(&sts_policy_lock_path(path), STS_STORE_LOCK_TIMEOUT)?;
+    let mut policies = load_sts_policies_from(path)?;
     let key = host.to_ascii_lowercase();
     if duration == 0 {
         policies.remove(&key);
@@ -786,22 +809,50 @@ fn persist_sts_policy(host: &str, port: u16, duration: u64) {
             },
         );
     }
-    if let Err(error) = save_sts_policies(&policies) {
-        tracing::warn!("Failed to save STS policy: {error}");
-    }
+    save_sts_policies_to(path, &policies)
 }
 
 fn active_sts_policy(host: &str) -> Option<StsPolicy> {
-    let mut policies = load_sts_policies();
+    let path = sts_store_path()?;
+    match active_sts_policy_at(&path, host) {
+        Ok(policy) => policy,
+        Err(error) => {
+            tracing::warn!("Failed to load STS policy: {error}");
+            None
+        }
+    }
+}
+
+fn active_sts_policy_at(path: &std::path::Path, host: &str) -> std::io::Result<Option<StsPolicy>> {
+    // Atomic replacement makes a read-only lookup safe without a lock. Only
+    // expiration cleanup needs a transaction, and it rechecks the file after
+    // acquiring the lock so a concurrent policy refresh is never erased.
+    let mut policies = load_sts_policies_from(path)?;
     let key = host.to_ascii_lowercase();
+    let Some(policy) = policies.remove(&key) else {
+        return Ok(None);
+    };
+    if policy.expires_at > unix_now() {
+        return Ok(Some(policy));
+    }
+    recheck_expired_sts_policy_at(path, &key)
+}
+
+fn recheck_expired_sts_policy_at(
+    path: &std::path::Path,
+    key: &str,
+) -> std::io::Result<Option<StsPolicy>> {
+    let _lock =
+        crate::persistence::exclusive_lock(&sts_policy_lock_path(path), STS_STORE_LOCK_TIMEOUT)?;
+    let mut policies = load_sts_policies_from(path)?;
     let policy = policies
-        .get(&key)
+        .get(key)
         .filter(|policy| policy.expires_at > unix_now())
         .cloned();
-    if policy.is_none() && policies.remove(&key).is_some() {
-        let _ = save_sts_policies(&policies);
+    if policy.is_none() && policies.remove(key).is_some() {
+        save_sts_policies_to(path, &policies)?;
     }
-    policy
+    Ok(policy)
 }
 
 fn hmac_sha256(key: &[u8], data: &[u8]) -> Vec<u8> {
@@ -2691,6 +2742,143 @@ mod tests {
     use super::*;
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 
+    struct StsStoreFixture(std::path::PathBuf);
+
+    impl StsStoreFixture {
+        fn new() -> Self {
+            let mut random = [0u8; 8];
+            getrandom::fill(&mut random).unwrap();
+            let nonce = u64::from_ne_bytes(random);
+            let directory = std::env::temp_dir().join(format!("linefeed-sts-{nonce:016x}"));
+            std::fs::create_dir(&directory).unwrap();
+            Self(directory.join("sts_policies.json"))
+        }
+    }
+
+    impl Drop for StsStoreFixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(self.0.parent().unwrap());
+        }
+    }
+
+    #[test]
+    fn sts_store_preserves_concurrent_workers_updates() {
+        let fixture = StsStoreFixture::new();
+        let start = std::sync::Arc::new(std::sync::Barrier::new(8));
+        let workers: Vec<_> = (0..8)
+            .map(|worker| {
+                let path = fixture.0.clone();
+                let start = start.clone();
+                std::thread::spawn(move || {
+                    start.wait();
+                    let host = format!("IRC{worker}.example");
+                    for attempt in 0..4 {
+                        persist_sts_policy_at(&path, &host, 6697 + attempt, 3600).unwrap();
+                    }
+                })
+            })
+            .collect();
+        for worker in workers {
+            worker.join().unwrap();
+        }
+        let policies = load_sts_policies_from(&fixture.0).unwrap();
+        assert_eq!(policies.len(), 8);
+        for worker in 0..8 {
+            let policy = &policies[&format!("irc{worker}.example")];
+            assert_eq!(policy.port, 6700);
+            assert_eq!(policy.duration_secs, 3600);
+            assert!(policy.expires_at > unix_now());
+        }
+        // The stable lock stays in place; every writer cleans up its own temp.
+        assert_eq!(
+            std::fs::read_dir(fixture.0.parent().unwrap())
+                .unwrap()
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn sts_expiration_cleanup_and_explicit_removal_preserve_other_hosts() {
+        let fixture = StsStoreFixture::new();
+        let expired = StsPolicy {
+            port: 6697,
+            duration_secs: 1,
+            expires_at: unix_now() - 1,
+        };
+        let active = StsPolicy {
+            port: 6698,
+            duration_secs: 3600,
+            expires_at: unix_now() + 3600,
+        };
+        save_sts_policies_to(
+            &fixture.0,
+            &HashMap::from([
+                ("expired.example".into(), expired),
+                ("active.example".into(), active),
+            ]),
+        )
+        .unwrap();
+
+        assert!(
+            active_sts_policy_at(&fixture.0, "EXPIRED.example")
+                .unwrap()
+                .is_none()
+        );
+        let policies = load_sts_policies_from(&fixture.0).unwrap();
+        assert!(!policies.contains_key("expired.example"));
+        assert_eq!(policies["active.example"].port, 6698);
+        assert_eq!(
+            active_sts_policy_at(&fixture.0, "ACTIVE.example")
+                .unwrap()
+                .unwrap()
+                .port,
+            6698
+        );
+
+        persist_sts_policy_at(&fixture.0, "ACTIVE.example", 6698, 0).unwrap();
+        assert!(load_sts_policies_from(&fixture.0).unwrap().is_empty());
+    }
+
+    #[test]
+    fn sts_expiration_cleanup_does_not_erase_a_concurrent_refresh() {
+        let fixture = StsStoreFixture::new();
+        save_sts_policies_to(
+            &fixture.0,
+            &HashMap::from([(
+                "irc.example".into(),
+                StsPolicy {
+                    port: 6697,
+                    duration_secs: 1,
+                    expires_at: unix_now() - 1,
+                },
+            )]),
+        )
+        .unwrap();
+        // Lookup A observed expiration, then worker B refreshed the policy
+        // before A acquired its cleanup lock. Production must re-read here.
+        let snapshot = load_sts_policies_from(&fixture.0).unwrap();
+        assert!(snapshot["irc.example"].expires_at <= unix_now());
+        persist_sts_policy_at(&fixture.0, "IRC.example", 6699, 3600).unwrap();
+        let rechecked = recheck_expired_sts_policy_at(&fixture.0, "irc.example")
+            .unwrap()
+            .unwrap();
+        assert_eq!(rechecked.port, 6699);
+        assert_eq!(
+            load_sts_policies_from(&fixture.0).unwrap()["irc.example"].port,
+            6699
+        );
+    }
+
+    #[test]
+    fn sts_store_does_not_replace_an_unreadable_map_with_one_host() {
+        let fixture = StsStoreFixture::new();
+        std::fs::write(&fixture.0, b"invalid JSON").unwrap();
+        let error = persist_sts_policy_at(&fixture.0, "irc.example", 6697, 3600).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert_eq!(std::fs::read(&fixture.0).unwrap(), b"invalid JSON");
+    }
+
     #[test]
     fn scram_sha256_matches_rfc_7677_vector() {
         let client_nonce = "rOprNGfwEbeRWgbNEkqO";
@@ -3252,9 +3440,7 @@ mod tests {
                     .unwrap();
                 assert_eq!(read_wire_line(&mut reader).await, "CAP END");
                 write_half
-                    .write_all(
-                        b":srv 001 tester :Welcome\r\n:alice!a@h PRIVMSG #chan :hello\r\n",
-                    )
+                    .write_all(b":srv 001 tester :Welcome\r\n:alice!a@h PRIVMSG #chan :hello\r\n")
                     .await
                     .unwrap();
             });
