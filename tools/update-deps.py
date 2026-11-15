@@ -66,15 +66,29 @@ def _collect_deps(deps: dict[str, dict], table: object, section: str) -> None:
         _record_dep(deps, name, version, f'{name} = "{version}"')
 
 
-def _fallback_parse_deps(content: str) -> dict[str, dict]:
+def _fallback_parse_deps(
+    content: str, strict_crates: set[str] | None = None
+) -> dict[str, dict]:
     """Line parser used when tomllib rejects Cargo extensions (e.g.
-    multi-line inline tables). Loudly warns on unparsed entries."""
+    multi-line inline tables). Loudly warns on unparsed entries.
+
+    Verification fails closed for targeted crates: dropping an unsupported
+    second occurrence must never turn a partial rewrite into success.
+    """
     deps: dict[str, dict] = {}
     section = ""
     subdep: str | None = None
     lines = content.splitlines()
     i = 0
     dep_sections = ("dependencies", "dev-dependencies", "build-dependencies")
+
+    def unsupported(name: str | None) -> None:
+        if strict_crates is not None and name in strict_crates:
+            raise RuntimeError(
+                f"could not verify every version spec of '{name}' in "
+                f"{CARGO_TOML.name}: unsupported dependency form"
+            )
+
     while i < len(lines):
         raw = lines[i]
         i += 1
@@ -100,6 +114,8 @@ def _fallback_parse_deps(content: str) -> dict[str, dict]:
             m = re.match(r"""\s*version\s*=\s*(?:"([^"]+)"|'([^']+)')""", raw)
             if m:
                 _record_dep(deps, subdep, m.group(1) or m.group(2), raw)
+            elif re.match(r"\s*version\s*=", raw):
+                unsupported(subdep)
             continue
         # Accumulate multi-line inline table / array values.
         entry = raw
@@ -108,11 +124,14 @@ def _fallback_parse_deps(content: str) -> dict[str, dict]:
             entry += "\n" + lines[i]
             i += 1
         m = re.match(
-            r"""\s*(?:"([^"]+)"|'([^']+)'|([A-Za-z0-9_-]+))\s*=\s*(?:"([^"]+)"|'([^']+)'|\{(.*)\})\s*(?:#.*)?$""",
+            r"""\s*(?:"([^"]+)"|'([^']+)'|([A-Za-z0-9_-]+))(?:[ \t]*\.[ \t]*version)?\s*=\s*(?:"([^"]+)"|'([^']+)'|\{(.*)\})\s*(?:#.*)?$""",
             entry,
             re.DOTALL,
         )
         if not m:
+            key = re.match(r"""\s*(?:"([^"]+)"|'([^']+)'|([A-Za-z0-9_-]+))(?:[ \t]*\.[ \t]*version)?\s*=""", entry)
+            if key:
+                unsupported(key.group(1) or key.group(2) or key.group(3))
             print(
                 f"Warning: skipping unparsed dependency in [{section}]: "
                 f"{stripped!r}",
@@ -125,6 +144,8 @@ def _fallback_parse_deps(content: str) -> dict[str, dict]:
             vm = re.search(r"""version\s*=\s*(?:"([^"]+)"|'([^']+)')""", m.group(6))
             version = (vm.group(1) or vm.group(2)) if vm else None
         if version is None:
+            if re.search(r"\bversion\s*=", m.group(6) or ""):
+                unsupported(name)
             print(
                 f"Warning: skipping unparsed dependency '{name}' in "
                 f"[{section}] (no version spec found)",
@@ -179,7 +200,9 @@ def get_outdated_deps() -> dict[str, dict]:
     return _deps_from_toml(data)
 
 
-def _parse_dep_specs(content: str) -> dict[str, dict]:
+def _parse_dep_specs(
+    content: str, strict_crates: set[str] | None = None
+) -> dict[str, dict]:
     """Parse manifest text with tomllib, else the line parser; stays silent."""
     with contextlib.redirect_stderr(io.StringIO()):
         if tomllib is not None:
@@ -187,7 +210,7 @@ def _parse_dep_specs(content: str) -> dict[str, dict]:
                 return _deps_from_toml(tomllib.loads(content))
             except Exception:
                 pass
-        return _fallback_parse_deps(content)
+        return _fallback_parse_deps(content, strict_crates=strict_crates)
 
 
 def get_latest_version(crate_name: str) -> str | None:
@@ -392,7 +415,7 @@ def _verify_rewritten(
     written in different forms into one, so a writer that missed one of them
     would otherwise still report success.
     """
-    remaining = _parse_dep_specs(content)
+    remaining = _parse_dep_specs(content, strict_crates=set(updates))
     for crate_name, new_version in updates.items():
         only = targets.get(crate_name) if targets is not None else None
         stale = [

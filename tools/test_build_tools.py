@@ -339,6 +339,34 @@ class DependencyVersionAndParsingTests(unittest.TestCase):
                     u.update_cargo_toml({"serde": "2"}, dry_run=True)
                 self.assertEqual(manifest.read_text(), original)
 
+    def test_without_tomllib_partial_unsupported_specs_fail_closed(self):
+        # Model Python 3.10 at import time even when this suite runs on 3.11+.
+        with mock.patch.dict("sys.modules", {"tomllib": None}):
+            u = load_module("linefeed_update_deps_without_tomllib", ROOT / "tools" / "update-deps.py")
+        self.assertIsNone(u.tomllib)
+        unsupported = (
+            "[target.'cfg(unix)'.dependencies]\nserde = \"\"\"1\"\"\"\n",
+            "[target.'cfg(unix)'.dependencies]\nserde = '''1'''\n",
+            "[target.'cfg(unix)'.dependencies]\nserde = { version = \"\"\"1\"\"\" }\n",
+            "[target.'cfg(unix)'.dependencies.serde]\nversion = \"\"\"1\"\"\"\n",
+        )
+        for spec in unsupported:
+            with self.subTest(spec=spec), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                original = '[dependencies]\nserde = "1"\n' + spec
+                manifest, lock = root / "Cargo.toml", root / "Cargo.lock"
+                manifest.write_text(original)
+                lock.write_text("original lock\n")
+                u.CARGO_TOML, u.CARGO_LOCK = manifest, lock
+                with mock.patch.object(u, "run_cmd") as run:
+                    self.assertFalse(u.update_manifest_and_lock({"serde": "2"}))
+                run.assert_not_called()
+                self.assertEqual(manifest.read_text(), original)
+                self.assertEqual(lock.read_text(), "original lock\n")
+                with self.assertRaisesRegex(RuntimeError, "unsupported dependency form"):
+                    u.update_cargo_toml({"serde": "2"}, dry_run=True)
+                self.assertEqual(manifest.read_text(), original)
+
     def test_single_quoted_literal_specs_are_rewritten_too(self):
         # The parser collapses `serde = "1"` and `serde = '1'` into one spec,
         # so the writer must edit both, never just one (#325).
@@ -371,13 +399,14 @@ class DependencyVersionAndParsingTests(unittest.TestCase):
         deps = u._fallback_parse_deps(
             "[dependencies]\n"
             "plain = '1'\n"
+            "dotted.version = '4'\n"
             "inline = { version = '2' }\n"
             "[dependencies.table]\n"
             "version = '3'\n"
         )
         self.assertEqual(
             {n: d["specs"] for n, d in deps.items()},
-            {"plain": ["1"], "inline": ["2"], "table": ["3"]},
+            {"plain": ["1"], "dotted": ["4"], "inline": ["2"], "table": ["3"]},
         )
 
     DIVERGENT_SERDE = (
