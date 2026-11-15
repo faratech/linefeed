@@ -390,41 +390,67 @@ impl Session {
                 history_down = Self::consume_plain_composer_key(ui, egui::Key::ArrowDown);
             }
         }
-        ui.horizontal_wrapped(|ui| {
-            for (label, code, help) in [
-                ("B", '\x02', "Bold"),
-                ("U", '\x1f', "Underline"),
-                ("I", '\x1d', "Italic"),
-                ("Reset", '\x0f', "Reset formatting"),
-            ] {
-                if ui.small_button(label).on_hover_text(help).clicked() {
-                    insert = Some(code);
-                }
-            }
-            if ui.small_button("Color").clicked() {
-                self.show_color_picker = true;
-                self.color_picker_fg = true;
-            }
-            self.draw_upload_controls(ui);
-            if ui
-                .button("Send")
-                .on_hover_text("Enter sends; Shift+Enter adds a line")
-                .clicked()
-            {
-                send = true;
-            }
-            ui.label(
-                RichText::new("Enter sends · Shift+Enter new line")
-                    .small()
-                    .color(Color32::GRAY),
-            );
-        });
-        let output = TextEdit::multiline(&mut self.input_text)
-            .id(input_id)
-            .hint_text("Type a message…")
-            .desired_rows(3)
-            .desired_width(ui.available_width())
-            .show(ui);
+        let input_font = egui::TextStyle::Monospace.resolve(ui.style());
+        let line_height = ui.fonts_mut(|fonts| fonts.row_height(&input_font))
+            + ui.spacing().extra_text_line_spacing;
+        let max_height = line_height * 4.0 + 8.0;
+        let output = ui
+            .scope_builder(
+                egui::UiBuilder::new().scope_id(input_id.with("row")),
+                |ui| {
+                    ui.horizontal_top(|ui| {
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
+                            if ui
+                                .button("Send")
+                                .on_hover_text("Enter sends; Shift+Enter adds a line")
+                                .clicked()
+                            {
+                                send = true;
+                            }
+                            ui.menu_button("Format", |ui| {
+                                for (label, code) in [
+                                    ("Bold", '\x02'),
+                                    ("Underline", '\x1f'),
+                                    ("Italic", '\x1d'),
+                                    ("Reset formatting", '\x0f'),
+                                ] {
+                                    if ui.button(label).clicked() {
+                                        insert = Some(code);
+                                        ui.close();
+                                    }
+                                }
+                                if ui.button("Color…").clicked() {
+                                    self.show_color_picker = true;
+                                    self.color_picker_fg = true;
+                                    ui.close();
+                                }
+                            });
+                            // The panel starts at its previous height. Allow the
+                            // draft to grow, then shrink the viewport to its text.
+                            ui.set_max_height(max_height);
+                            ScrollArea::vertical()
+                                .id_salt(("composer_scroll", self.id, self.current_conversation))
+                                .auto_shrink([false, true])
+                                .min_scrolled_height(0.0)
+                                .max_height(max_height)
+                                .show(ui, |ui| {
+                                    TextEdit::multiline(&mut self.input_text)
+                                        .id(input_id)
+                                        .font(input_font.clone())
+                                        .hint_text("Type a message…")
+                                        .align(egui::Align2::LEFT_TOP)
+                                        .desired_rows(1)
+                                        .desired_width(ui.available_width())
+                                        .show(ui)
+                                })
+                                .inner
+                        })
+                        .inner
+                    })
+                    .inner
+                },
+            )
+            .inner;
         if std::mem::take(&mut self.input_focus_request) {
             output.response.request_focus();
             if let Some(cursor) = self.composer.cursor {
@@ -447,9 +473,10 @@ impl Session {
         if let Some(code) = insert {
             let cursor = output
                 .cursor_range
-                .map_or(self.input_text.chars().count(), |range| {
-                    range.primary.index.into()
-                });
+                .map(|range| range.primary.index.into())
+                .or(self.composer.cursor)
+                .unwrap_or_else(|| self.input_text.chars().count())
+                .min(self.input_text.chars().count());
             let byte = self
                 .input_text
                 .char_indices()
@@ -505,16 +532,26 @@ mod composer_tests {
         size: egui::Vec2,
         events: Vec<egui::Event>,
         _modifiers: egui::Modifiers,
-    ) {
+    ) -> egui::Vec2 {
+        let mut used = egui::Vec2::ZERO;
         let mut output = ctx.run_ui(
             egui::RawInput {
                 screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)),
                 events,
                 ..Default::default()
             },
-            |ui| session.draw_input_row(ui),
+            |ui| {
+                egui::Panel::bottom("test_composer").show(ui, |ui| {
+                    used = ui
+                        .scope(|ui| session.draw_input_row(ui))
+                        .response
+                        .rect
+                        .size();
+                });
+            },
         );
         output.textures_delta.clear();
+        used
     }
     fn key(key: egui::Key, modifiers: egui::Modifiers) -> egui::Event {
         egui::Event::Key {
@@ -581,6 +618,42 @@ mod composer_tests {
                 matches!(rx.try_recv(),Ok(IrcCommand::ClientChat{commands:lines,..})if lines.len()==2)
             );
             assert!(rx.try_recv().is_err());
+        }
+    }
+
+    #[test]
+    fn composer_starts_on_one_row_and_bounds_long_drafts() {
+        for width in [320.0, 640.0] {
+            for target in [None, Some("#room")] {
+                let mut session = Session::with_settings(Settings::default());
+                if let Some(target) = target {
+                    session.conversations.insert(target.into(), Channel::new());
+                    session.current_conversation = session.id_for_target(target);
+                }
+                let ctx = egui::Context::default();
+                let size = egui::vec2(width, 240.0);
+                let mut measure = |text: &str| {
+                    session.input_text = text.into();
+                    frame(&mut session, &ctx, size, Vec::new(), egui::Modifiers::NONE);
+                    frame(&mut session, &ctx, size, Vec::new(), egui::Modifiers::NONE)
+                };
+                let empty = measure("");
+                let short = measure("Hello");
+                let multiline = measure("First\nSecond\nThird");
+                let many_lines = measure(&"Line\n".repeat(100));
+                let wrapped = measure(&"A long wrapped draft ".repeat(100));
+                let cleared = measure("");
+                assert!(empty.y <= 36.0, "{target:?} {width}: {empty:?}");
+                assert!((short.y - empty.y).abs() <= 1.0);
+                assert!(multiline.y > short.y);
+                assert!(many_lines.y <= 88.0, "{target:?} {width}: {many_lines:?}");
+                assert!(wrapped.y <= 88.0, "{target:?} {width}: {wrapped:?}");
+                assert!(wrapped.y > short.y);
+                assert!((cleared.y - empty.y).abs() <= 1.0);
+                for measured in [empty, short, multiline, many_lines, wrapped, cleared] {
+                    assert!(measured.x <= width + 1.0, "{width}: {measured:?}");
+                }
+            }
         }
     }
 }

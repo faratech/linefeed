@@ -53,9 +53,9 @@ InspIRCd, UnrealIRCd, Solanum, Ergo, Bahamut, ircu, Hybrid, and Plexus features.
 - IRCv3 multiline send/replay, echo reconciliation, replies, reactions, and typing tags
 - Message redaction, read markers, and stable message IDs
 - Message Reply/React actions, quoted previews, original-message navigation and grouped reactions
-- Multiline composer: Enter sends; Shift+Enter inserts a newline
+- Compact message input that grows to four lines, with formatting in a menu: Enter sends; Shift+Enter inserts a newline
 - Incoming typing indicators enabled by default; sending typing indicators is opt-in
-- File picker, clipboard images/files and drag-and-drop HTTPS FILEHOST uploads with progress and cancellation; completed links are added to the originating draft
+- Optional Window → File sharing window, plus clipboard images/files and drag-and-drop HTTPS uploads with progress and cancellation; completed links are added to the originating draft
 - CTCP support (VERSION, TIME, PING, FINGER, CLIENTINFO)
 - IRC formatting rendering, including mIRC colors and reverse video
 - Outbound message splitting at IRC line-length limits
@@ -356,7 +356,7 @@ Additional private state is stored alongside settings:
 - `automation.json`: aliases, macros and keyboard bindings.
 - `archive/`: structured message journals and a rebuildable SQLite search index. Existing text logs remain compatible and searchable; older entries without a reliable date are labeled accordingly.
 
-File sharing uses the standard FILEHOST protocol. In Connection settings, select the network-advertised service or configure a custom HTTPS endpoint and its separate credentials. Custom endpoints must support OPTIONS and raw POST with a 201 response and Location header. Uploading does not automatically send a message. Typing, notification, workspace and automation controls are in Behavior; connection/account-specific choices remain in Connection.
+Open Window → File sharing to choose files or use copied files. The destination is shown before uploading, and the resulting link is added to that conversation's draft for you to send. File sharing uses the standard FILEHOST protocol. In Connection settings, select the network-advertised service or configure a custom HTTPS endpoint and its separate credentials. Custom endpoints must support OPTIONS and raw POST with a 201 response and Location header. Typing, notification, workspace and automation controls are in Behavior; connection/account-specific choices remain in Connection.
 
 ## Architecture
 

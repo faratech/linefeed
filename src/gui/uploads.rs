@@ -347,37 +347,62 @@ impl Session {
         }
     }
     pub(crate) fn draw_upload_settings(&mut self, ui: &mut egui::Ui) {
-        egui::CollapsingHeader::new("File sharing").show(ui,|ui|{
-            ui.checkbox(&mut self.upload_settings.use_custom,"Use a custom HTTPS FILEHOST provider");
-            if self.upload_settings.use_custom{
-                ui.label("Provider URL (standard FILEHOST raw POST / 201 Location)");ui.text_edit_singleline(&mut self.upload_settings.url);
-                ui.horizontal_wrapped(|ui|{ui.label("Authentication:");for(value,label)in[(CustomAuth::None,"None"),(CustomAuth::Basic,"Basic"),(CustomAuth::Bearer,"Bearer token")]{ui.selectable_value(&mut self.upload_settings.auth,value,label);}});
-                if self.upload_settings.auth==CustomAuth::Basic{ui.horizontal_wrapped(|ui|{ui.label("Upload username:");ui.text_edit_singleline(&mut self.upload_settings.username);});}
-                if self.upload_settings.auth!=CustomAuth::None{ui.add(egui::TextEdit::singleline(&mut self.upload_settings.secret).password(true).hint_text("Upload credential (separate from IRC login)"));}
-            }else{ui.label("Use the network or bouncer's advertised FILEHOST; generated service tokens are used when available.");}
-            ui.horizontal_wrapped(|ui|{ui.label("Maximum file size (MiB):");let mut size=(self.upload_settings.max_bytes/(1024*1024)).max(1);if ui.add(egui::DragValue::new(&mut size).range(1..=1024)).changed(){self.upload_settings.max_bytes=size*1024*1024;}});
+        egui::CollapsingHeader::new("File sharing").show(ui, |ui| {
+            ui.checkbox(
+                &mut self.upload_settings.use_custom,
+                "Use a custom file host",
+            );
+            if self.upload_settings.use_custom {
+                ui.label("HTTPS upload URL").on_hover_text(
+                    "Use a FILEHOST-compatible provider that accepts uploads and returns a link.",
+                );
+                ui.text_edit_singleline(&mut self.upload_settings.url);
+                ui.horizontal_wrapped(|ui| {
+                    ui.label("Authentication:");
+                    for (value, label) in [
+                        (CustomAuth::None, "None"),
+                        (CustomAuth::Basic, "Username and password"),
+                        (CustomAuth::Bearer, "Bearer token"),
+                    ] {
+                        ui.selectable_value(&mut self.upload_settings.auth, value, label);
+                    }
+                });
+                if self.upload_settings.auth == CustomAuth::Basic {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label("File host username:");
+                        ui.text_edit_singleline(&mut self.upload_settings.username);
+                    });
+                }
+                if self.upload_settings.auth != CustomAuth::None {
+                    let label = if self.upload_settings.auth == CustomAuth::Basic {
+                        "File host password"
+                    } else {
+                        "Bearer token"
+                    };
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.upload_settings.secret)
+                            .password(true)
+                            .hint_text(label),
+                    );
+                }
+            } else {
+                ui.label("Use the file host provided by this network.");
+            }
+            ui.horizontal_wrapped(|ui| {
+                ui.label("File size limit:");
+                let mut size = (self.upload_settings.max_bytes / (1024 * 1024)).max(1);
+                if ui
+                    .add(
+                        egui::DragValue::new(&mut size)
+                            .range(1..=1024)
+                            .suffix(" MiB"),
+                    )
+                    .changed()
+                {
+                    self.upload_settings.max_bytes = size * 1024 * 1024;
+                }
+            });
         });
-    }
-    pub(crate) fn draw_upload_controls(&mut self, ui: &mut egui::Ui) {
-        if ui
-            .add_enabled(
-                self.current_conversation.is_some(),
-                egui::Button::new("Attach"),
-            )
-            .on_hover_text("Upload a file and add its URL to this draft")
-            .clicked()
-        {
-            self.request_upload(UploadSource::Pick);
-        }
-        if ui
-            .add_enabled(
-                self.current_conversation.is_some(),
-                egui::Button::new("Paste file"),
-            )
-            .clicked()
-        {
-            self.request_upload(UploadSource::Clipboard);
-        }
     }
     fn request_upload(&mut self, source: UploadSource) {
         self.events.push(SessionEvent::UploadRequested {
@@ -1012,23 +1037,113 @@ impl App {
             });
         }
     }
+    fn sharing_destination(&self) -> Option<(usize, WindowKey, String)> {
+        let key = self.windows.active?;
+        let conversation = key.conversation?;
+        let index = self.session_index(key.conn)?;
+        self.sessions[index].target_name(conversation)?;
+        let window = self.windows.get(&key)?;
+        Some((index, key, window.view.composer.nonce.clone()))
+    }
+
+    fn request_upload_from_sharing_window(&mut self, source: UploadSource) {
+        let Some((index, key, nonce)) = self.sharing_destination() else {
+            self.uploads.notice = Some("Open a channel or private conversation first.".into());
+            return;
+        };
+        // The session's composer is swapped out here. Only the actual window
+        // owns the draft lifetime that an eventual upload result may change.
+        self.handle_upload_request(index, key.conversation, nonce, source);
+    }
+
     pub(crate) fn show_uploads(&mut self, ctx: &egui::Context) {
         if !self.uploads.open {
             return;
         }
         let mut open = true;
         let mut cancel = Vec::new();
-        egui::Window::new("File transfers").open(&mut open).default_size(egui::vec2(470.0,280.0)).show(ctx,|ui|{
-            if let Some(notice)=&self.uploads.notice{ui.colored_label(egui::Color32::YELLOW,notice);}
-            egui::ScrollArea::vertical().max_height((ui.available_height()-24.0).max(80.0)).show(ui,|ui|{
-                for job in &self.uploads.jobs{ui.group(|ui|{ui.label(&job.name);match &job.state{
-                    State::Queued=>{ui.label("Queued");},State::Token=>{ui.label("Obtaining upload token…");},State::Uploading=>{ui.label(format!("Uploading: {} KiB",job.bytes.load(Ordering::Relaxed)/1024));ctx.request_repaint_after(Duration::from_millis(100));},
-                    State::Done(url)=>{ui.label("Uploaded; URL added to the original draft when still available.");if ui.button("Copy URL").clicked(){ctx.copy_text(url.clone());}},State::Failed(error)=>{ui.colored_label(egui::Color32::RED,error);},State::Cancelled=>{ui.label("Cancelled");}}
-                    if matches!(job.state,State::Queued|State::Token|State::Uploading)&&ui.button("Cancel").clicked(){cancel.push(job.id.clone());}
-                });}
-            });
+        let mut request = None;
+        let destination = self.sharing_destination().and_then(|(index, key, _)| {
+            let target = self.sessions[index].target_name(key.conversation?)?;
+            Some(format!(
+                "Destination: {target} · {}",
+                self.network_label(&self.sessions[index])
+            ))
         });
+        egui::Window::new("File sharing")
+            // Retain the existing window's identity when changing its title.
+            .id(egui::Id::unique("File transfers"))
+            .open(&mut open)
+            .default_size(egui::vec2(470.0, 280.0))
+            .show(ctx, |ui| {
+                if let Some(destination) = &destination {
+                    ui.label(destination);
+                } else {
+                    ui.label("Open a channel or private conversation to share a file.");
+                }
+                ui.horizontal_wrapped(|ui| {
+                    if ui
+                        .add_enabled(destination.is_some(), egui::Button::new("Choose file…"))
+                        .clicked()
+                    {
+                        request = Some(UploadSource::Pick);
+                    }
+                    if ui
+                        .add_enabled(
+                            destination.is_some(),
+                            egui::Button::new("Paste copied files").small(),
+                        )
+                        .on_hover_text("Use files copied in your file manager")
+                        .clicked()
+                    {
+                        request = Some(UploadSource::Clipboard);
+                    }
+                });
+                ui.label(egui::RichText::new(
+                    "Adds a link to your draft. You send it when ready.",
+                ).small());
+                if let Some(notice) = &self.uploads.notice {
+                    ui.colored_label(egui::Color32::YELLOW, notice);
+                }
+                ui.separator();
+                if self.uploads.jobs.is_empty() {
+                    ui.label("No files shared yet.");
+                }
+                egui::ScrollArea::vertical()
+                    .max_height((ui.available_height() - 24.0).max(80.0))
+                    .show(ui, |ui| {
+                        for job in &self.uploads.jobs {
+                            ui.group(|ui| {
+                                ui.label(&job.name);
+                                match &job.state {
+                                    State::Queued => { ui.label("Queued"); }
+                                    State::Token => { ui.label("Preparing upload…"); }
+                                    State::Uploading => {
+                                        ui.label(format!("Uploading: {} KiB", job.bytes.load(Ordering::Relaxed) / 1024));
+                                        ctx.request_repaint_after(Duration::from_millis(100));
+                                    }
+                                    State::Done(url) => {
+                                        ui.label("Uploaded; link added to its original draft when available.");
+                                        if ui.small_button("Copy link").clicked() {
+                                            ctx.copy_text(url.clone());
+                                        }
+                                    }
+                                    State::Failed(error) => { ui.colored_label(egui::Color32::RED, error); }
+                                    State::Cancelled => { ui.label("Cancelled"); }
+                                }
+                                if matches!(job.state, State::Queued | State::Token | State::Uploading)
+                                    && ui.small_button("Cancel").clicked()
+                                {
+                                    cancel.push(job.id.clone());
+                                }
+                            });
+                        }
+                    });
+            });
         self.uploads.open = open;
+        if let Some(source) = request {
+            self.request_upload_from_sharing_window(source);
+        }
         for id in cancel {
             self.uploads.cancel(&id);
         }
@@ -1635,6 +1750,52 @@ mod tests {
             },
         }]);
         (app, key, rx)
+    }
+
+    #[test]
+    fn sharing_window_upload_uses_the_active_window_draft_lifetime() {
+        let (mut app, key, mut outgoing) = upload_app();
+        app.windows.active = Some(key);
+        app.sessions[0].current_conversation = None;
+        let parked_nonce = app.sessions[0].composer.nonce.clone();
+        let window = app.windows.get_mut(&key).unwrap();
+        window.view.input_text = "keep this draft".into();
+        let actual_nonce = window.view.composer.nonce.clone();
+        assert_ne!(actual_nonce, parked_nonce);
+
+        app.request_upload_from_sharing_window(UploadSource::Files(vec![PathBuf::from(
+            "not-opened.txt",
+        )]));
+        let job = app.uploads.jobs.first_mut().unwrap();
+        assert_eq!(job.origin.window, key);
+        assert_eq!(job.origin.nonce, actual_nonce);
+        job.state = State::Uploading;
+        job.input = None;
+        let id = job.id.clone();
+        app.uploads
+            .tx
+            .send(Event::Completed(id, Ok("https://cdn.example/file".into())))
+            .unwrap();
+        app.tick_uploads();
+        assert_eq!(
+            app.windows.get(&key).unwrap().view.input_text,
+            "keep this draft https://cdn.example/file"
+        );
+        assert!(outgoing.try_recv().is_err());
+
+        app.windows.active = Some(WindowKey::new(key.conn, None));
+        app.request_upload_from_sharing_window(UploadSource::Files(vec![PathBuf::from(
+            "not-opened-on-status.txt",
+        )]));
+        assert_eq!(app.uploads.jobs.len(), 1);
+        assert!(
+            app.uploads
+                .notice
+                .as_ref()
+                .unwrap()
+                .contains("conversation")
+        );
+        assert!(outgoing.try_recv().is_err());
     }
 
     #[test]
