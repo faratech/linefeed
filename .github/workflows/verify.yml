@@ -27,6 +27,9 @@ jobs:
           sudo apt-get install -y libssl-dev pkg-config libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-dev libwayland-dev
       - name: Install Rust
         run: rustup toolchain install 1.99.1 --profile minimal --component clippy && rustup default 1.99.1
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.13'
       - name: Test and lint
         env:
           XDG_CONFIG_HOME: ${{ runner.temp }}/linefeed-config
