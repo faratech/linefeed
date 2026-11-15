@@ -20,6 +20,73 @@ struct CachedWriter {
     writer: std::io::BufWriter<File>,
     identity: same_file::Handle,
     last_used: std::time::Instant,
+    generation: String,
+    logical_offset: u64,
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub(crate) struct LogSpan {
+    pub path: String,
+    pub generation: String,
+    pub offset: u64,
+    pub len: u64,
+    pub digest: String,
+}
+
+pub(crate) fn line_digest(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+pub(crate) fn line_record_id(generation: &str, offset: u64, bytes: &[u8]) -> String {
+    line_digest(
+        format!(
+            "{generation}:{offset}:{}:{}",
+            bytes.len(),
+            line_digest(bytes)
+        )
+        .as_bytes(),
+    )
+}
+
+pub(crate) fn file_generation(file: &File) -> std::io::Result<String> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let metadata = file.metadata()?;
+        Ok(format!(
+            "unix:{}:{}:{:?}",
+            metadata.dev(),
+            metadata.ino(),
+            metadata.created().ok()
+        ))
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsRawHandle;
+        use windows::Win32::{
+            Foundation::HANDLE,
+            Storage::FileSystem::{BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle},
+        };
+        let mut info = BY_HANDLE_FILE_INFORMATION::default();
+        unsafe { GetFileInformationByHandle(HANDLE(file.as_raw_handle()), &mut info) }
+            .map_err(std::io::Error::other)?;
+        Ok(format!(
+            "windows:{}:{}:{}:{}:{}",
+            info.dwVolumeSerialNumber,
+            info.nFileIndexHigh,
+            info.nFileIndexLow,
+            info.ftCreationTime.dwHighDateTime,
+            info.ftCreationTime.dwLowDateTime
+        ))
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        Ok(format!("created:{:?}", file.metadata()?.created()?))
+    }
 }
 
 /// Manages chat logging to disk
@@ -81,11 +148,11 @@ impl LogManager {
     /// close syscalls from the hot path (called for every incoming message).
     /// On write failure the cached handle is evicted so the next write retries
     /// a fresh open (which also recreates deleted directories).
-    fn with_writer<F: FnOnce(&mut std::io::BufWriter<File>) -> std::io::Result<()>>(
+    fn with_writer<T, F: FnOnce(&mut CachedWriter) -> std::io::Result<T>>(
         &self,
         path: PathBuf,
         f: F,
-    ) {
+    ) -> Option<T> {
         use std::collections::hash_map::Entry;
         let mut writers = self.writers.borrow_mut();
 
@@ -122,10 +189,20 @@ impl LogManager {
                     && let Err(e) = create_private_log_dir(parent)
                 {
                     tracing::error!("Failed to create log directory: {}", e);
-                    return;
+                    return None;
                 }
                 match open_private_log_file(&path) {
                     Ok(file) => {
+                        let (generation, logical_offset) =
+                            match file_generation(&file).and_then(|generation| {
+                                file.metadata().map(|metadata| (generation, metadata.len()))
+                            }) {
+                                Ok(value) => value,
+                                Err(error) => {
+                                    tracing::error!("Cannot identify log extent: {error}");
+                                    return None;
+                                }
+                            };
                         let identity = match file.try_clone().and_then(same_file::Handle::from_file)
                         {
                             Ok(identity) => identity,
@@ -135,29 +212,43 @@ impl LogManager {
                                     path,
                                     e
                                 );
-                                return;
+                                return None;
                             }
                         };
                         v.insert(CachedWriter {
                             writer: std::io::BufWriter::new(file),
                             identity,
                             last_used: std::time::Instant::now(),
+                            generation,
+                            logical_offset,
                         })
                     }
                     Err(e) => {
                         tracing::error!("Failed to open log file {:?}: {}", path, e);
-                        return;
+                        return None;
                     }
                 }
             }
         };
-        cached.last_used = std::time::Instant::now();
-        if let Err(e) = f(&mut cached.writer) {
-            tracing::error!("Failed to write to log {:?}: {}", path, e);
-            writers.remove(&path);
+        let physical_len = cached.writer.get_ref().metadata().ok().map(|m| m.len());
+        if let Some(physical_len) = physical_len {
+            let pending = cached.writer.buffer().len() as u64;
+            if physical_len != cached.logical_offset.saturating_sub(pending) {
+                cached.logical_offset = physical_len.saturating_add(pending);
+            }
         }
+        cached.last_used = std::time::Instant::now();
+        let result = match f(cached) {
+            Ok(value) => Some(value),
+            Err(error) => {
+                tracing::error!("Failed to write to log {:?}: {}", path, error);
+                writers.remove(&path);
+                None
+            }
+        };
         // Flushing is deferred to flush_all(), called once per GUI frame, so a
         // message flood does not pay one flush syscall per logged line.
+        result
     }
 
     /// Flush all cached writers. Called once per frame (and on shutdown via
@@ -279,17 +370,33 @@ impl LogManager {
     }
 
     /// Log a message to disk
-    pub fn log_message(&self, network: &str, channel: &str, msg: &ChatMessage) {
+    pub(crate) fn log_message(
+        &self,
+        network: &str,
+        channel: &str,
+        msg: &ChatMessage,
+    ) -> Option<LogSpan> {
         if !self.enabled
             || super::commands::service_message_contains_credentials(channel, &msg.content)
         {
-            return;
+            return None;
         }
 
         let path = self.log_path(network, channel);
         // Format message (irssi-style)
-        let line = format_log_line(msg);
-        self.with_writer(path, |w| writeln!(w, "{}", line));
+        let line = format!("{}\n", format_log_line(msg));
+        self.with_writer(path.clone(), |cached| {
+            let span = LogSpan {
+                path: path.to_string_lossy().into_owned(),
+                generation: cached.generation.clone(),
+                offset: cached.logical_offset,
+                len: line.len() as u64,
+                digest: line_digest(line.as_bytes()),
+            };
+            cached.writer.write_all(line.as_bytes())?;
+            cached.logical_offset = cached.logical_offset.saturating_add(line.len() as u64);
+            Ok(span)
+        })
     }
 
     pub fn load_history_with_legacy(
@@ -333,38 +440,18 @@ impl LogManager {
             Ok(size) => size,
             Err(_) => return Vec::new(),
         };
-
-        // For small files, just read the whole thing
-        if file_size < 65536 {
-            if file.seek(SeekFrom::Start(0)).is_err() {
-                return Vec::new();
-            }
-            let mut raw = String::with_capacity(file_size as usize);
-            // Decode lossily like the large-file branch below: BufRead::lines
-            // yields Err on the first non-UTF-8 byte and would silently
-            // truncate history at that point (irssi logs carry raw wire bytes).
-            if file.read_to_string(&mut raw).is_err() {
-                let mut bytes = Vec::with_capacity(file_size as usize);
-                if file.seek(SeekFrom::Start(0)).is_err() || file.read_to_end(&mut bytes).is_err() {
-                    return Vec::new();
-                }
-                raw = String::from_utf8_lossy(&bytes).into_owned();
-            }
-            let lines: Vec<&str> = raw.lines().collect();
-            let start = lines.len().saturating_sub(max_lines);
-            let mut messages: Vec<ChatMessage> = lines[start..]
-                .iter()
-                .filter_map(|line| parse_log_line(line))
-                .collect();
-            redact_sensitive_history(channel, &mut messages);
-            return messages;
-        }
-
-        // For larger files, read backwards in chunks to find the last N lines
-        let lines = read_last_n_lines(&mut file, file_size, max_lines);
+        let generation = file_generation(&file).ok();
+        let lines = read_last_n_physical_lines(&mut file, file_size, max_lines);
         let mut messages: Vec<ChatMessage> = lines
             .iter()
-            .filter_map(|line| parse_log_line(line))
+            .filter_map(|(offset, bytes)| {
+                let text = String::from_utf8_lossy(bytes);
+                let mut message = parse_log_line(text.trim_end_matches(['\r', '\n']))?;
+                if let Some(generation) = &generation {
+                    message.message_key = line_record_id(generation, *offset, bytes);
+                }
+                Some(message)
+            })
             .collect();
         redact_sensitive_history(channel, &mut messages);
         messages
@@ -436,7 +523,12 @@ impl LogManager {
 
         let path = self.log_path(network, channel);
         let now = current_datetime_string();
-        self.with_writer(path, |w| writeln!(w, "--- Log opened {}", now));
+        self.with_writer(path, |cached| {
+            let line = format!("--- Log opened {now}\n");
+            cached.writer.write_all(line.as_bytes())?;
+            cached.logical_offset = cached.logical_offset.saturating_add(line.len() as u64);
+            Ok(())
+        });
     }
 }
 
@@ -559,7 +651,7 @@ fn split_timestamp(line: &str) -> Option<(String, &str)> {
 }
 
 /// Parse a log line back into a ChatMessage
-fn parse_log_line(line: &str) -> Option<ChatMessage> {
+pub(super) fn parse_log_line(line: &str) -> Option<ChatMessage> {
     // Skip session markers
     if line.starts_with("---") {
         return None;
@@ -574,12 +666,17 @@ fn parse_log_line(line: &str) -> Option<ChatMessage> {
     if let Some(system_rest) = rest.strip_prefix("-!- ") {
         // System message
         Some(ChatMessage {
+            message_key: super::new_profile_id(),
+            reactions: Vec::new(),
+            presentation_revision: 0,
+            delivery: Default::default(),
             timestamp,
             server_time: None,
             msgid: None,
             account: None,
             oper: None,
             reply_to: None,
+            reply_preview: None,
             sender: "*".to_string(),
             content: system_rest.to_string(),
             is_action: false,
@@ -595,12 +692,17 @@ fn parse_log_line(line: &str) -> Option<ChatMessage> {
         let action_parts: Vec<&str> = action_rest.splitn(2, ' ').collect();
         if action_parts.len() >= 2 {
             Some(ChatMessage {
+                message_key: super::new_profile_id(),
+                reactions: Vec::new(),
+                presentation_revision: 0,
+                delivery: Default::default(),
                 timestamp,
                 server_time: None,
                 msgid: None,
                 account: None,
                 oper: None,
                 reply_to: None,
+                reply_preview: None,
                 sender: action_parts[0].to_string(),
                 content: action_parts[1].to_string(),
                 is_action: true,
@@ -621,12 +723,17 @@ fn parse_log_line(line: &str) -> Option<ChatMessage> {
             let after_nick = &rest[end + 1..];
             let content = after_nick.strip_prefix(' ').unwrap_or(after_nick);
             Some(ChatMessage {
+                message_key: super::new_profile_id(),
+                reactions: Vec::new(),
+                presentation_revision: 0,
+                delivery: Default::default(),
                 timestamp,
                 server_time: None,
                 msgid: None,
                 account: None,
                 oper: None,
                 reply_to: None,
+                reply_preview: None,
                 sender: nick.to_string(),
                 content: content.to_string(),
                 is_action: false,
@@ -645,8 +752,13 @@ fn parse_log_line(line: &str) -> Option<ChatMessage> {
     }
 }
 
-/// Read the last N lines from a file by reading backwards in chunks
-fn read_last_n_lines(file: &mut File, file_size: u64, max_lines: usize) -> Vec<String> {
+/// Keep physical offsets and original bytes so log-row identities survive
+/// reloads, tail-window shifts, CRLF and lossy decoding of old wire bytes.
+fn read_last_n_physical_lines(
+    file: &mut File,
+    file_size: u64,
+    max_lines: usize,
+) -> Vec<(u64, Vec<u8>)> {
     const CHUNK_SIZE: u64 = 8192;
     // Chunks are collected newest-first and concatenated once at the end;
     // prepending per chunk would re-copy the accumulated buffer every
@@ -681,11 +793,32 @@ fn read_last_n_lines(file: &mut File, file_size: u64, max_lines: usize) -> Vec<S
         remaining_bytes.extend_from_slice(chunk);
     }
 
-    // Decode once (not per chunk), then return only the last `max_lines` lines.
-    let text = String::from_utf8_lossy(&remaining_bytes);
-    let lines: Vec<&str> = text.lines().collect();
+    let mut offset = pos;
+    let lines: Vec<_> = remaining_bytes
+        .split_inclusive(|byte| *byte == b'\n')
+        .map(|bytes| {
+            let start = offset;
+            offset += bytes.len() as u64;
+            (start, bytes)
+        })
+        .collect();
     let start = lines.len().saturating_sub(max_lines);
-    lines[start..].iter().map(|s| s.to_string()).collect()
+    lines[start..]
+        .iter()
+        .map(|(offset, bytes)| (*offset, bytes.to_vec()))
+        .collect()
+}
+
+#[cfg(test)]
+fn read_last_n_lines(file: &mut File, file_size: u64, max_lines: usize) -> Vec<String> {
+    read_last_n_physical_lines(file, file_size, max_lines)
+        .into_iter()
+        .map(|(_, bytes)| {
+            String::from_utf8_lossy(&bytes)
+                .trim_end_matches(['\r', '\n'])
+                .to_owned()
+        })
+        .collect()
 }
 
 /// Get current date/time as a string for session markers
@@ -751,12 +884,17 @@ mod tests {
 
     fn msg(ts: &str, sender: &str, content: &str, system: bool, action: bool) -> ChatMessage {
         ChatMessage {
+            message_key: super::super::new_profile_id(),
+            reactions: Vec::new(),
+            presentation_revision: 0,
+            delivery: Default::default(),
             timestamp: ts.to_string(),
             server_time: None,
             msgid: None,
             account: None,
             oper: None,
             reply_to: None,
+            reply_preview: None,
             sender: sender.to_string(),
             content: content.to_string(),
             is_action: action,
@@ -1183,17 +1321,63 @@ mod tests {
         fs::remove_dir_all(dir).expect("remove temporary log directory");
     }
 
+    #[test]
+    fn loaded_log_rows_keep_stable_distinct_keys_when_reloaded_and_appended() {
+        for large in [false, true] {
+            let (manager, dir) = test_manager("stable-loaded-keys");
+            let network = "tls:irc.example:6697";
+            let path = manager.log_path(network, "#room");
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            let mut bytes = if large {
+                b"ignored padding\n".repeat(5000)
+            } else {
+                Vec::new()
+            };
+            bytes.extend_from_slice(b"[12:00] <alice> repeated\n[12:00] <alice> repeated\n");
+            fs::write(&path, bytes).unwrap();
+
+            let first = manager.load_history_with_legacy(network, "", "#room", 2, false);
+            assert_eq!(first.len(), 2);
+            assert_ne!(first[0].message_key, first[1].message_key);
+            let again = manager.load_history_with_legacy(network, "", "#room", 2, false);
+            assert_eq!(first[0].message_key, again[0].message_key);
+            assert_eq!(first[1].message_key, again[1].message_key);
+
+            manager.log_message(
+                network,
+                "#room",
+                &msg("[12:01]", "alice", "later", false, false),
+            );
+            let after_append = manager.load_history_with_legacy(network, "", "#room", 2, false);
+            assert_eq!(after_append[0].content, "repeated");
+            assert_eq!(first[1].message_key, after_append[0].message_key);
+            assert_eq!(after_append[1].content, "later");
+            drop(manager);
+            fs::remove_dir_all(dir).unwrap();
+        }
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn flush_failure_evicts_the_cached_writer() {
         let (manager, dir) = test_manager("flush-failure");
-        let full = PathBuf::from("/dev/full");
-        manager.with_writer(full.clone(), |writer| writeln!(writer, "buffered line"));
-        assert!(manager.writers.borrow().contains_key(&full));
+        let path = dir.join("flush.log");
+        manager.with_writer(path.clone(), |_| Ok(()));
+        // Inject a real failing sink after opening a normal private log. Using
+        // with_writer on /dev/full would try to chmod /dev and the device,
+        // which fails for unprivileged users and can change a root test host.
+        let sink = OpenOptions::new().write(true).open("/dev/full").unwrap();
+        {
+            let mut writers = manager.writers.borrow_mut();
+            let cached = writers.get_mut(&path).unwrap();
+            cached.writer = std::io::BufWriter::new(sink);
+            writeln!(cached.writer, "buffered line").unwrap();
+        }
+        assert!(manager.writers.borrow().contains_key(&path));
 
         manager.flush_all();
 
-        assert!(!manager.writers.borrow().contains_key(&full));
+        assert!(!manager.writers.borrow().contains_key(&path));
         fs::remove_dir_all(dir).expect("remove temporary log directory");
     }
 
@@ -1297,6 +1481,8 @@ mod tests {
                 writer,
                 identity,
                 last_used: std::time::Instant::now(),
+                generation: "fixture".into(),
+                logical_offset: 0,
             },
         );
 
@@ -1308,5 +1494,29 @@ mod tests {
         assert!(!manager.writers.borrow().contains_key(&path));
         drop(manager);
         fs::remove_dir_all(dir).expect("remove temporary log directory");
+    }
+    #[test]
+    fn archive_spans_follow_buffered_lines_and_rotation_without_content_deduplication() {
+        let (manager, dir) = test_manager("archive-spans");
+        let network = "tls:irc.example:6697";
+        let row = msg("[12:00]", "alice", "repeat", false, false);
+        let first = manager.log_message(network, "#room", &row).unwrap();
+        let second = manager.log_message(network, "#room", &row).unwrap();
+        assert_eq!(first.offset, 0);
+        assert_eq!(second.offset, first.len);
+        assert_eq!(first.digest, second.digest);
+        manager.flush_all();
+        let path = PathBuf::from(&first.path);
+        let bytes = fs::read(&path).unwrap();
+        assert_eq!(line_digest(&bytes[..first.len as usize]), first.digest);
+        let rotated = path.with_extension("old");
+        fs::rename(&path, &rotated).unwrap();
+        fs::write(&path, b"").unwrap();
+        let third = manager.log_message(network, "#room", &row).unwrap();
+        assert_eq!(third.offset, 0);
+        assert_ne!(third.generation, first.generation);
+        manager.flush_all();
+        drop(manager);
+        fs::remove_dir_all(dir).unwrap();
     }
 }

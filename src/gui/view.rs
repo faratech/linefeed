@@ -23,6 +23,7 @@ impl Session {
             ui.label(&self.my_nick);
             ui.label("@");
             ui.label(network_label);
+            self.draw_account_security_status(ui);
 
             if let Some(lag) = self.lag_ms {
                 let lag_color = if lag < 100 {
@@ -53,6 +54,41 @@ impl Session {
             ui.label(RichText::new("●").color(Color32::RED));
             ui.label("Disconnected");
         }
+    }
+
+    pub(crate) fn draw_account_security_status(&self, ui: &mut egui::Ui) {
+        if !self.is_connected() {
+            return;
+        }
+        use crate::irc::client::{AuthenticationStatus, TlsStatus};
+        let auth = match &self.connection_status.authentication {
+            AuthenticationStatus::LoggedIn { account } => format!("Logged in as {account}"),
+            AuthenticationStatus::Authenticated => "Authenticated (account not reported)".into(),
+            AuthenticationStatus::Authenticating => "Authenticating…".into(),
+            _ => "Connected · not authenticated".into(),
+        };
+        ui.label(RichText::new(auth).small()).on_hover_text(self.connection_status.sasl_mechanism.map_or_else(||"Account status is confirmed by server account events or a correlated self-WHOIS.".into(),|mechanism|format!("SASL used on this connection: {mechanism:?}\nAccount status is confirmed by the server.")));
+        let (tls, color) = match self.connection_status.tls {
+            TlsStatus::Verified => ("TLS verified", Color32::GREEN),
+            TlsStatus::Unverified => ("TLS unverified", Color32::YELLOW),
+            TlsStatus::Negotiating => ("TLS negotiating", Color32::YELLOW),
+            TlsStatus::Plaintext => ("Plaintext", Color32::YELLOW),
+        };
+        let endpoint = self
+            .connection_status
+            .effective_host
+            .as_ref()
+            .zip(self.connection_status.effective_port)
+            .map(|(host, port)| {
+                super::identity::TransportEndpointKey::new(
+                    host,
+                    port,
+                    self.connection_status.effective_use_tls.unwrap_or(false),
+                )
+                .label()
+            })
+            .unwrap_or_else(|| "Awaiting transport confirmation".into());
+        ui.label(RichText::new(tls).small().color(color)).on_hover_text(format!("Effective endpoint: {endpoint}\nUnverified TLS means certificate validation was explicitly bypassed."));
     }
 
     /// The "#channel [+]" join box.
@@ -86,7 +122,21 @@ impl Session {
     /// dragged to instead of growing to fit its content.
     pub(crate) fn draw_target(&mut self, ui: &mut egui::Ui) {
         let salt = (self.id, self.current_conversation);
+        self.capture_upload_drop(ui);
         self.draw_target_header(ui);
+        if self.timeline.borrow().restore_pending {
+            ui.horizontal_wrapped(|ui| {
+                ui.label(egui::RichText::new("Restoring saved reading position…").small());
+                if ui.small_button("Jump to latest").clicked() {
+                    let mut timeline = self.timeline.borrow_mut();
+                    timeline.restore_pending = false;
+                    timeline.restored_hold = false;
+                    timeline.hydrating = false;
+                    timeline.anchor = Some(Default::default());
+                    timeline.pending_offset = Some(f32::MAX);
+                }
+            });
+        }
         if let Some(channel_name) = self.current_target_name().map(str::to_string)
             && self.is_channel_name(&channel_name)
         {
@@ -267,111 +317,158 @@ impl Session {
         }
     }
 
+    fn consume_plain_composer_key(ui: &mut egui::Ui, key: egui::Key) -> bool {
+        ui.input_mut(|input|{let mut pressed=false;input.events.retain(|event|{if matches!(event,egui::Event::Key{key:event_key,pressed:true,modifiers,..} if *event_key==key&&modifiers.is_none()){pressed=true;false}else{true}});pressed})
+    }
     fn draw_input_row(&mut self, ui: &mut egui::Ui) {
+        let input_before = self.input_text.clone();
+        let mut send = false;
+        let mut insert = None;
         let mut history_up = false;
         let mut history_down = false;
         let mut tab_complete = false;
-        let mut insert_bold = false;
-        let mut insert_underline = false;
-        let mut insert_italic = false;
-        let mut insert_color = false;
-        let mut insert_reset = false;
-        let input_before = self.input_text.clone();
-
-        let mut send = false;
-        ui.horizontal(|ui| {
-            // The formatting buttons give way in narrow windows; their
-            // keyboard shortcuts still work.
-            if ui.available_width() >= 300.0 {
-                if ui
-                    .small_button("B")
-                    .on_hover_text("Bold (Ctrl+B)")
-                    .clicked()
-                {
-                    insert_bold = true;
+        if let Some(reference) = self.composer.reply_to.clone() {
+            let preview = self
+                .current_target_name()
+                .and_then(|target| self.conversations.get(target))
+                .and_then(|channel| {
+                    channel.messages.iter().find(|message| {
+                        reference.archive_id.as_deref() == Some(message.message_key.as_str())
+                            || reference
+                                .server_msgid
+                                .as_ref()
+                                .is_some_and(|id| message.msgid.as_ref() == Some(id))
+                    })
+                })
+                .map(|message| {
+                    format!(
+                        "{}: {}",
+                        message.sender,
+                        super::truncate_chars(&message.content, 100)
+                    )
+                })
+                .unwrap_or_else(|| "Message unavailable locally".into());
+            ui.horizontal_wrapped(|ui| {
+                ui.label(RichText::new(format!("Replying to {preview}")).small());
+                if ui.small_button("Cancel reply").clicked() {
+                    self.composer.reply_to = None;
                 }
-                if ui
-                    .small_button("U")
-                    .on_hover_text("Underline (Ctrl+U)")
-                    .clicked()
-                {
-                    insert_underline = true;
-                }
-                if ui
-                    .small_button("I")
-                    .on_hover_text("Italic (Ctrl+I)")
-                    .clicked()
-                {
-                    insert_italic = true;
-                }
-                if ui
-                    .small_button("C")
-                    .on_hover_text("Color (Ctrl+K)")
-                    .clicked()
-                {
-                    insert_color = true;
-                }
+            });
+        }
+        if self.attention.show_typing {
+            let label = self.typing_label();
+            if !label.is_empty() {
+                ui.label(RichText::new(label).small().color(Color32::GRAY));
+                ui.ctx()
+                    .request_repaint_after(std::time::Duration::from_secs(1));
             }
-
-            let has_formatting = self.input_text.contains('\x02')
-                || self.input_text.contains('\x1F')
-                || self.input_text.contains('\x1D')
-                || self.input_text.contains('\x03');
-            if has_formatting {
-                ui.label(RichText::new("*").color(Color32::YELLOW).small());
-            }
-
-            // Send at the right edge, the text box filling what is left.
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui.button("Send").clicked() {
-                    send = true;
-                }
-                let response = ui.add(
-                    TextEdit::singleline(&mut self.input_text)
-                        .id_salt(("input", self.id, self.current_conversation))
-                        .hint_text("Type a message...")
-                        .desired_width(ui.available_width()),
-                );
-
-                if std::mem::take(&mut self.input_focus_request) {
-                    response.request_focus();
-                }
-                self.input_had_focus = response.has_focus();
-                if response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
-                    send = true;
-                    response.request_focus();
-                    self.input_had_focus = true;
-                }
-
-                if response.has_focus() {
-                    if ui.input(|i| i.key_pressed(egui::Key::ArrowUp)) {
-                        history_up = true;
-                    }
-                    if ui.input(|i| i.key_pressed(egui::Key::ArrowDown)) {
-                        history_down = true;
-                    }
-                    if ui.input(|i| !i.modifiers.ctrl && i.key_pressed(egui::Key::Tab)) {
-                        tab_complete = true;
-                    }
-                    if ui.input(|i| i.modifiers.ctrl && i.key_pressed(egui::Key::B)) {
-                        insert_bold = true;
-                    }
-                    if ui.input(|i| i.modifiers.ctrl && i.key_pressed(egui::Key::U)) {
-                        insert_underline = true;
-                    }
-                    // Note: Ctrl+I may be captured by the system; use the button.
-                    if ui.input(|i| i.modifiers.ctrl && i.key_pressed(egui::Key::K)) {
-                        insert_color = true;
-                    }
-                    if ui.input(|i| i.modifiers.ctrl && i.key_pressed(egui::Key::O)) {
-                        insert_reset = true;
+        }
+        let input_id = egui::Id::unique(("composer", self.id, self.current_conversation));
+        let focused = ui.ctx().memory(|memory| memory.has_focus(input_id));
+        if focused {
+            self.capture_upload_input(ui.ctx());
+            let ime_was_active = self.composer.ime_active;
+            ui.input(|input| {
+                for event in &input.events {
+                    match event {
+                        egui::Event::Ime(egui::ImeEvent::Preedit { text, .. }) => {
+                            self.composer.ime_active = !text.is_empty()
+                        }
+                        egui::Event::Ime(egui::ImeEvent::Commit(_)) => {
+                            self.composer.ime_active = false
+                        }
+                        _ => {}
                     }
                 }
             });
+            if !ime_was_active && !self.composer.ime_active {
+                send = Self::consume_plain_composer_key(ui, egui::Key::Enter);
+            }
+            tab_complete = Self::consume_plain_composer_key(ui, egui::Key::Tab);
+            if !self.input_text.contains('\n') {
+                history_up = Self::consume_plain_composer_key(ui, egui::Key::ArrowUp);
+                history_down = Self::consume_plain_composer_key(ui, egui::Key::ArrowDown);
+            }
+        }
+        ui.horizontal_wrapped(|ui| {
+            for (label, code, help) in [
+                ("B", '\x02', "Bold"),
+                ("U", '\x1f', "Underline"),
+                ("I", '\x1d', "Italic"),
+                ("Reset", '\x0f', "Reset formatting"),
+            ] {
+                if ui.small_button(label).on_hover_text(help).clicked() {
+                    insert = Some(code);
+                }
+            }
+            if ui.small_button("Color").clicked() {
+                self.show_color_picker = true;
+                self.color_picker_fg = true;
+            }
+            self.draw_upload_controls(ui);
+            if ui
+                .button("Send")
+                .on_hover_text("Enter sends; Shift+Enter adds a line")
+                .clicked()
+            {
+                send = true;
+            }
+            ui.label(
+                RichText::new("Enter sends · Shift+Enter new line")
+                    .small()
+                    .color(Color32::GRAY),
+            );
         });
-
+        let output = TextEdit::multiline(&mut self.input_text)
+            .id(input_id)
+            .hint_text("Type a message…")
+            .desired_rows(3)
+            .desired_width(ui.available_width())
+            .show(ui);
+        if std::mem::take(&mut self.input_focus_request) {
+            output.response.request_focus();
+            if let Some(cursor) = self.composer.cursor {
+                let mut state = output.state.clone();
+                state
+                    .cursor
+                    .set_char_range(Some(egui::text::CCursorRange::one(
+                        egui::text::CCursor::new(cursor),
+                    )));
+                state.store(ui.ctx(), input_id);
+            }
+        }
+        if output.response.lost_focus() {
+            self.share_typing("done", true);
+        }
+        self.input_had_focus = output.response.has_focus();
+        if let Some(range) = output.cursor_range {
+            self.composer.cursor = Some(range.primary.index.into());
+        }
+        if let Some(code) = insert {
+            let cursor = output
+                .cursor_range
+                .map_or(self.input_text.chars().count(), |range| {
+                    range.primary.index.into()
+                });
+            let byte = self
+                .input_text
+                .char_indices()
+                .nth(cursor)
+                .map_or(self.input_text.len(), |(index, _)| index);
+            self.input_text.insert(byte, code);
+            self.composer.cursor = Some(cursor + 1);
+            let mut state = output.state;
+            state
+                .cursor
+                .set_char_range(Some(egui::text::CCursorRange::one(
+                    egui::text::CCursor::new(cursor + 1),
+                )));
+            state.store(ui.ctx(), input_id);
+            output.response.request_focus();
+        }
         if send {
-            self.process_input();
+            self.submit_composer();
+            output.response.request_focus();
         }
         if history_up {
             self.history_up();
@@ -384,21 +481,106 @@ impl Session {
         } else if self.input_text != input_before {
             self.reset_tab_completion();
         }
-        if insert_bold {
-            self.input_text.push('\x02');
+        if self.input_text != input_before && output.response.has_focus() && !send {
+            self.share_typing(
+                if self.input_text.is_empty() {
+                    "done"
+                } else {
+                    "active"
+                },
+                self.input_text.is_empty(),
+            );
         }
-        if insert_underline {
-            self.input_text.push('\x1F');
+    }
+}
+
+#[cfg(test)]
+mod composer_tests {
+    use super::*;
+    use crate::gui::{Channel, Settings};
+    use tokio::sync::mpsc;
+    fn frame(
+        session: &mut Session,
+        ctx: &egui::Context,
+        size: egui::Vec2,
+        events: Vec<egui::Event>,
+        _modifiers: egui::Modifiers,
+    ) {
+        let mut output = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)),
+                events,
+                ..Default::default()
+            },
+            |ui| session.draw_input_row(ui),
+        );
+        output.textures_delta.clear();
+    }
+    fn key(key: egui::Key, modifiers: egui::Modifiers) -> egui::Event {
+        egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers,
         }
-        if insert_italic {
-            self.input_text.push('\x1D');
-        }
-        if insert_color {
-            self.show_color_picker = true;
-            self.color_picker_fg = true;
-        }
-        if insert_reset {
-            self.input_text.push('\x0F');
+    }
+    #[test]
+    fn enter_sends_and_shift_enter_preserves_multiline_at_compact_sizes() {
+        for size in [egui::vec2(640.0, 480.0), egui::vec2(320.0, 240.0)] {
+            let mut session = Session::with_settings(Settings {
+                nickname: "me".into(),
+                logging_enabled: false,
+                logging_load_history: false,
+                ..Settings::default()
+            });
+            assert!(session.start_session_from_form());
+            let (tx, mut rx) = mpsc::unbounded_channel();
+            session.test_set_registered(tx);
+            let mut channel = Channel::new();
+            channel.joined = true;
+            session.conversations.insert("#room".into(), channel);
+            session.current_conversation = session.id_for_target("#room");
+            session.input_text = "first".into();
+            session.input_focus_request = true;
+            let ctx = egui::Context::default();
+            frame(&mut session, &ctx, size, Vec::new(), egui::Modifiers::NONE);
+            // Move to the end explicitly, then Shift+Enter remains a text-edit event.
+            frame(
+                &mut session,
+                &ctx,
+                size,
+                vec![key(egui::Key::End, egui::Modifiers::NONE)],
+                egui::Modifiers::NONE,
+            );
+            frame(
+                &mut session,
+                &ctx,
+                size,
+                vec![key(egui::Key::Enter, egui::Modifiers::SHIFT)],
+                egui::Modifiers::SHIFT,
+            );
+            assert!(
+                session.input_text.contains('\n'),
+                "{size:?}: {:?}",
+                session.input_text
+            );
+            assert!(rx.try_recv().is_err());
+            frame(
+                &mut session,
+                &ctx,
+                size,
+                vec![
+                    egui::Event::Text("second".into()),
+                    key(egui::Key::Enter, egui::Modifiers::NONE),
+                ],
+                egui::Modifiers::NONE,
+            );
+            assert!(session.input_text.is_empty(), "{size:?}");
+            assert!(
+                matches!(rx.try_recv(),Ok(IrcCommand::ClientChat{commands:lines,..})if lines.len()==2)
+            );
+            assert!(rx.try_recv().is_err());
         }
     }
 }

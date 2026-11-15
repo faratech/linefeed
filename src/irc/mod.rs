@@ -1,3 +1,4 @@
+pub(crate) mod bouncer;
 pub mod client;
 pub mod message;
 pub mod numerics;

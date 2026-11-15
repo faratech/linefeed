@@ -72,6 +72,8 @@ pub(crate) enum LayoutMode {
 #[derive(Default)]
 pub(crate) struct TargetView {
     pub input_text: String,
+    pub(crate) composer: super::message_ui::ComposerState,
+    pub(crate) timeline: std::cell::RefCell<super::message_ui::TimelineView>,
     /// This window's own sent-line history: lines sent here are recallable
     /// here (Up/Down), never in another channel or on another network.
     pub command_history: Vec<String>,
@@ -96,8 +98,43 @@ pub(crate) fn merge_drafts(source: &str, destination: &str) -> String {
 }
 
 impl TargetView {
+    pub(crate) fn insert_composer_text(&mut self, text: &str) {
+        self.composer.insert(&mut self.input_text, text);
+        self.input_focus_request = true;
+    }
+    pub(crate) fn set_workspace_hydrating(&mut self, hydrating: bool) {
+        self.timeline.get_mut().hydrating = hydrating;
+    }
+    pub(crate) fn workspace_state(&self) -> super::workspace::WorkspaceViewState {
+        let timeline = self.timeline.borrow();
+        super::workspace::WorkspaceViewState {
+            draft: self.input_text.clone(),
+            reply_to: self.composer.reply_to.clone(),
+            last_read: timeline.last_read.clone(),
+            viewport: timeline.anchor.clone(),
+        }
+    }
+    pub(crate) fn restore_workspace_state(&mut self, state: super::workspace::WorkspaceViewState) {
+        self.input_text = state.draft;
+        self.composer = super::message_ui::ComposerState::default();
+        self.composer.reply_to = state.reply_to;
+        let timeline = self.timeline.get_mut();
+        timeline.last_read = state.last_read.clone();
+        timeline.entry_read_boundary = state.last_read;
+        timeline.restore_pending = state.viewport.is_some();
+        timeline.restored_hold = state.viewport.is_some();
+        timeline.anchor = state.viewport;
+    }
+
     fn merge_from(&mut self, destination: Self) {
         self.input_text = merge_drafts(&self.input_text, &destination.input_text);
+        self.composer.nonce = super::new_profile_id();
+        if self.composer.reply_to.is_none() {
+            self.composer.reply_to = destination.composer.reply_to;
+        }
+        if self.timeline.get_mut().last_read.is_none() {
+            self.timeline.get_mut().last_read = destination.timeline.into_inner().last_read;
+        }
         self.command_history.extend(destination.command_history);
         if self.command_history.len() > 100 {
             self.command_history

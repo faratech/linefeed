@@ -107,12 +107,7 @@ fn main() {
     });
     let year = build_year(env::var("SOURCE_DATE_EPOCH").ok().as_deref());
     let rc_path = Path::new(&out_dir).join("linefeed.rc");
-    let rc_content = resource_script(
-        &manifest_dir.replace('\\', "/"),
-        &version,
-        numeric,
-        year,
-    );
+    let rc_content = resource_script(&manifest_dir.replace('\\', "/"), &version, numeric, year);
     std::fs::write(&rc_path, rc_content).unwrap();
 
     // Compile resource

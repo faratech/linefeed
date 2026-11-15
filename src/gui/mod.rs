@@ -1,15 +1,28 @@
+mod actions;
 mod app;
+mod archive;
+mod attention;
+mod auth_history;
+mod automation;
+pub(crate) mod bouncer;
 mod commands;
 mod connection;
 mod conversations;
 mod dialogs;
 mod formatting;
 mod helpers;
+#[cfg(test)]
+mod history_regressions;
+pub(crate) mod identity;
 mod logging;
+mod message_ui;
+mod search;
 mod snap;
 mod types;
+mod uploads;
 mod view;
 mod windows;
+pub(crate) mod workspace;
 
 use connection::{ConnectionLifecycle, RecoveryPolicy};
 
@@ -67,17 +80,32 @@ impl WindowCommand {
 /// reaches the App directly: notifications, settings and new connections are
 /// global, so they go through here.
 pub(crate) enum SessionEvent {
+    UploadRequested {
+        conversation: Option<ConversationId>,
+        source: uploads::UploadSource,
+        composer_nonce: String,
+    },
+    UploadTokenReady {
+        job_id: String,
+        token: Option<String>,
+    },
+    SearchRequested {
+        query: String,
+        all_networks: bool,
+        conversation: Option<ConversationId>,
+    },
+    RevealMessage(identity::MessageRef),
+    MessageRedacted(identity::MessageRef),
     /// A desktop notification; the App applies focus, the setting and rate
     /// limits (`App::notify`).
     Notify {
         title: String,
         body: String,
         force: bool,
+        attention: Option<attention::AttentionEvent>,
     },
     /// `/settings`
     OpenSettings,
-    /// Persist this session's connect form and behaviour settings.
-    SaveSettings,
     /// Persist this session's behaviour settings and the favorites, not
     /// its connect form (#316).
     SaveConfig,
@@ -105,6 +133,7 @@ pub(crate) enum SessionEvent {
     /// A worker was not started because another session is live on the
     /// same endpoint.
     DuplicateEndpoint,
+    NewBouncerNetwork(Box<SessionConfig>),
     /// `/server -m`: connect to an endpoint in a new status window.
     NewServer {
         host: String,
@@ -113,19 +142,16 @@ pub(crate) enum SessionEvent {
     },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct EndpointKey {
-    host: String,
-    port: u16,
-    use_tls: bool,
-}
+pub(crate) use identity::TransportEndpointKey as EndpointKey;
 
 /// Immutable configuration for one connection/reconnection lifecycle. The
 /// editable Settings/Connect fields may change while a socket is active; those
 /// changes must not relabel the session or alter what an automatic reconnect
 /// authenticates with and executes.
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
-struct SessionConfig {
+pub(crate) struct SessionConfig {
+    #[serde(default)]
+    upload_settings: uploads::UploadSettings,
     /// Required: see `ServerConfig`. Without it credentials would have no
     /// endpoint to go to.
     server: ServerConfig,
@@ -216,8 +242,53 @@ enum HistoryDirection {
     After,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HistorySubcommand {
+    Latest,
+    Before,
+    After,
+    Around,
+    Between,
+    Targets,
+}
+
+impl HistorySubcommand {
+    fn parse(word: &str) -> Option<Self> {
+        Some(match word.to_ascii_uppercase().as_str() {
+            "LATEST" => Self::Latest,
+            "BEFORE" => Self::Before,
+            "AFTER" => Self::After,
+            "AROUND" => Self::Around,
+            "BETWEEN" => Self::Between,
+            "TARGETS" => Self::Targets,
+            _ => return None,
+        })
+    }
+}
+
+#[derive(Debug, Clone)]
+struct HistoryRequestCorrelation {
+    // None after the owning view is retired. Keep the record until its reply
+    // arrives, so a later same-name view cannot inherit that exchange.
+    owner: Option<ConversationId>,
+    target: String,
+    // A server can name either the requested target or an intervening rename.
+    aliases: Vec<String>,
+    subcommand: HistorySubcommand,
+    label: Option<String>,
+    sequence: u64,
+}
+
+struct OutgoingHistoryRequest {
+    target: String,
+    subcommand: HistorySubcommand,
+    label: Option<String>,
+    limit: usize,
+}
+
+#[derive(Debug, Clone)]
 struct PendingHistoryRequest {
+    correlation: Option<HistoryRequestCorrelation>,
     placement: HistoryPlacement,
     direction: HistoryDirection,
     remaining: usize,
@@ -232,6 +303,7 @@ struct PendingHistoryRequest {
 }
 
 struct ChatHistoryBatch {
+    legacy_playback: bool,
     target: String,
     messages: Vec<ChatMessage>,
     request: PendingHistoryRequest,
@@ -288,36 +360,41 @@ impl SessionConfig {
     }
 
     fn log_identity(&self) -> String {
-        let scheme = if self.server.use_tls { "tls" } else { "plain" };
-        format!("{scheme}://{}", self.endpoint_label().to_lowercase())
+        self.logical_network_key().storage_key()
     }
 
-    /// The services identity this session authenticates as: the SASL
-    /// account, or the client certificate for EXTERNAL. Normalized so
-    /// cosmetic edits (case, whitespace, an Auto↔PLAIN mechanism spelling of
-    /// the same account, path separators) do not fork the connection
-    /// lineage (#172). Held-nick attribution does not carry across a change
-    /// of this key.
+    fn logical_network_key(&self) -> identity::LogicalNetworkKey {
+        self.server.bouncer.as_ref().map_or_else(
+            || identity::LogicalNetworkKey::Direct {
+                endpoint: self.endpoint_key(),
+            },
+            |binding| binding.key(self.endpoint_key()),
+        )
+    }
+
+    /// The configured services identities this session can authenticate as.
+    /// Auto can use either the certificate or a password-account fallback,
+    /// depending on what the server offers. Track both so changing either
+    /// starts a new lineage. Explicit EXTERNAL ignores the unused account.
+    /// Account case and surrounding whitespace do not fork the lineage.
     fn services_identity_key(&self) -> (Option<String>, Option<String>) {
         let cert = self.server.tls_client_cert_path.as_deref().map(str::trim);
+        let account = self
+            .server
+            .sasl_username
+            .as_deref()
+            .map(|account| account.trim().to_ascii_lowercase());
         match self.server.sasl_mechanism {
-            // Auto authenticates via EXTERNAL first whenever a certificate
-            // is configured, so the certificate is the identity there too.
             SaslMechanism::External => (None, cert.map(str::to_string)),
-            SaslMechanism::Auto if cert.is_some() => (None, cert.map(str::to_string)),
-            _ => (
-                self.server
-                    .sasl_username
-                    .as_deref()
-                    .map(|account| account.trim().to_ascii_lowercase()),
-                None,
-            ),
+            SaslMechanism::Auto => (account, cert.map(str::to_string)),
+            _ => (account, None),
         }
     }
 
     fn allows_legacy_log_migration(&self) -> bool {
-        (self.server.use_tls && self.server.port == 6697)
-            || (!self.server.use_tls && self.server.port == 6667)
+        self.server.bouncer.is_none()
+            && ((self.server.use_tls && self.server.port == 6697)
+                || (!self.server.use_tls && self.server.port == 6667))
     }
 }
 
@@ -457,6 +534,14 @@ pub(crate) fn apply_font_size(ctx: &egui::Context, font_size: f32) {
 }
 
 pub struct Session {
+    pub(crate) upload_settings: uploads::UploadSettings,
+    pub(crate) upload_discovery: uploads::UploadDiscovery,
+    pub(crate) archive_client: Option<archive::ArchiveClient>,
+    automation: std::sync::Arc<automation::AutomationConfig>,
+    macro_jobs: VecDeque<automation::MacroJob>,
+    next_macro_at: std::time::Instant,
+    automation_send_failed: bool,
+    account_history: auth_history::AccountHistory,
     /// Outstanding memberships to recover on this endpoint. Some(empty)
     /// deliberately suppresses configured auto-join after a registered loss.
     pending_rejoins: RecoveryPolicy,
@@ -469,6 +554,7 @@ pub struct Session {
     update_join_targets: Vec<String>,
     // The phase owns the worker, transport and any replacement connection.
     connection: ConnectionLifecycle,
+    pub(crate) connection_status: crate::irc::client::ConnectionStatus,
     pub my_nick: String,
 
     // Server config
@@ -494,6 +580,12 @@ pub struct Session {
 
     // Input
     pub input_text: String,
+    pub(crate) composer: message_ui::ComposerState,
+    pub(crate) timeline: std::cell::RefCell<message_ui::TimelineView>,
+    pub(crate) message_ui: message_ui::MessageUiState,
+    pub(crate) attention: attention::AttentionSettings,
+    pub(crate) view_is_active: bool,
+    pub(crate) reading_conversation: Option<ConversationId>,
     pub join_channel: String,
 
     /// Identifies this session to the window manager; never reused.
@@ -510,6 +602,7 @@ pub struct Session {
     /// worker is never started for one of them: two sessions on one
     /// endpoint would share log files and nick state.
     pub(crate) blocked_endpoints: Vec<EndpointKey>,
+    pub(crate) blocked_networks: Vec<identity::LogicalNetworkKey>,
 
     // UI state
     pub scroll_to_bottom: bool,
@@ -600,6 +693,10 @@ pub struct Session {
     pub sasl_password: String,
     pub sasl_mechanism: SaslMechanism,
     pub sasl_required: bool,
+    pub(crate) bouncer: Option<bouncer::BouncerBinding>,
+    pub(crate) bouncer_networks: std::collections::BTreeMap<String, bouncer::BouncerNetwork>,
+    bouncer_ready: bool,
+    bouncer_retired_targets: std::collections::HashSet<String>,
     pub tls_client_cert_path: String,
     pub tls_client_key_path: String,
 
@@ -627,9 +724,11 @@ pub struct Session {
     chathistory_limit: Option<usize>,
     chathistory_batches: HashMap<String, ChatHistoryBatch>,
     batch_parents: HashMap<String, String>,
+    batch_labels: HashMap<String, String>,
     multiline_batches: HashMap<String, MultilineBatch>,
     authtoken_batches: HashMap<String, AuthtokenBatch>,
     pending_history_requests: HashMap<String, VecDeque<PendingHistoryRequest>>,
+    next_history_request: u64,
     known_users: HashMap<String, KnownUser>,
     monitored_users: std::collections::HashSet<String>,
     /// Outstanding WHOX queries as (token, channel), oldest first: a 315 names
@@ -710,12 +809,21 @@ impl Session {
         let self_nick_keys = vec![my_nick_lower.clone()];
 
         Self {
+            automation: std::sync::Arc::new(automation::AutomationConfig::default()),
+            macro_jobs: VecDeque::new(),
+            next_macro_at: std::time::Instant::now(),
+            automation_send_failed: false,
+            account_history: auth_history::AccountHistory::default(),
+            archive_client: None,
+            upload_settings: settings.upload_settings,
+            upload_discovery: Default::default(),
             pending_rejoins: RecoveryPolicy::ConfiguredAutoJoin,
             pending_parts: Vec::new(),
             pending_cycles: std::collections::HashSet::new(),
             update_selected: None,
             update_join_targets: Vec::new(),
             connection: ConnectionLifecycle::default(),
+            connection_status: crate::irc::client::ConnectionStatus::default(),
             my_nick: nickname.clone(),
 
             server_host: settings.server_host,
@@ -735,12 +843,19 @@ impl Session {
             server_unread: 0,
 
             input_text: String::new(),
+            composer: message_ui::ComposerState::default(),
+            timeline: Default::default(),
+            message_ui: Default::default(),
+            attention: settings.attention.clone(),
+            view_is_active: false,
+            reading_conversation: None,
             join_channel: String::new(),
 
             id: 0,
             profile_id: None,
             form_profile: None,
             blocked_endpoints: Vec::new(),
+            blocked_networks: Vec::new(),
             input_focus_request: false,
             input_had_focus: false,
             events: Vec::new(),
@@ -816,6 +931,10 @@ impl Session {
             sasl_password: settings.sasl_password,
             sasl_mechanism: settings.sasl_mechanism,
             sasl_required: settings.sasl_required,
+            bouncer: settings.bouncer,
+            bouncer_networks: std::collections::BTreeMap::new(),
+            bouncer_ready: false,
+            bouncer_retired_targets: Default::default(),
             tls_client_cert_path: settings.tls_client_cert_path,
             tls_client_key_path: settings.tls_client_key_path,
             log_manager: logging::LogManager::new(settings.logging_enabled),
@@ -839,9 +958,11 @@ impl Session {
             chathistory_limit: None,
             chathistory_batches: HashMap::new(),
             batch_parents: HashMap::new(),
+            batch_labels: HashMap::new(),
             multiline_batches: HashMap::new(),
             authtoken_batches: HashMap::new(),
             pending_history_requests: HashMap::new(),
+            next_history_request: 1,
             known_users: HashMap::new(),
             monitored_users: std::collections::HashSet::new(),
             pending_whox: VecDeque::new(),
@@ -894,6 +1015,7 @@ impl Session {
 
     /// Write this session's connect form into `settings`.
     pub(crate) fn export_form(&self, settings: &mut Settings) {
+        settings.upload_settings = self.upload_settings.clone();
         settings.server_host = self.server_host.clone();
         settings.server_port = self.server_port.clone();
         settings.use_tls = self.use_tls;
@@ -911,12 +1033,14 @@ impl Session {
         settings.sasl_password = self.sasl_password.clone();
         settings.sasl_mechanism = self.sasl_mechanism;
         settings.sasl_required = self.sasl_required;
+        settings.bouncer = self.bouncer.clone();
         settings.tls_client_cert_path = self.tls_client_cert_path.clone();
         settings.tls_client_key_path = self.tls_client_key_path.clone();
     }
 
     /// Write this session's copy of the behaviour settings into `settings`.
     pub(crate) fn export_config(&self, settings: &mut Settings) {
+        settings.attention = self.attention.clone();
         settings.auto_reconnect = self.auto_reconnect;
         settings.ignore_list = self.ignore_list.clone();
         settings.auto_away_enabled = self.auto_away_enabled;
@@ -940,6 +1064,7 @@ impl Session {
     /// Mirror the App's behaviour settings into this session, with the same
     /// floors as loading them (#144).
     pub(crate) fn apply_config(&mut self, settings: &Settings) {
+        self.attention = settings.attention.clone();
         self.auto_reconnect = settings.auto_reconnect;
         self.ignore_list = settings.ignore_list.clone();
         self.auto_away_enabled = settings.auto_away_enabled;
@@ -1017,7 +1142,10 @@ impl Session {
         if self.connection.is_closing() {
             return;
         }
+        self.connection_status = Default::default();
+        self.message_ui = Default::default();
         self.pump(None);
+        self.mark_pending_sends_uncertain();
         self.capture_rejoin_memberships();
         self.connection
             .enter_retry_wait(Some(std::time::Instant::now()));
@@ -1053,6 +1181,7 @@ impl Session {
     /// whether more were left queued. Logged lines are flushed once per call
     /// instead of once per message.
     pub(crate) fn pump(&mut self, limit: Option<usize>) -> bool {
+        self.drain_connection_events();
         let (generation, messages, has_more) = self.connection.take_messages(limit);
         self.had_messages_this_frame = !messages.is_empty();
         for msg in messages {
@@ -1093,6 +1222,17 @@ impl Session {
     /// The user is looking at the selected tab (or the server buffer): clear
     /// its unread badge and report it read.
     fn mark_selected_tab_seen(&mut self) {
+        if self.reading_conversation != self.current_conversation
+            || self.timeline.borrow().restore_pending
+            || self
+                .timeline
+                .borrow()
+                .anchor
+                .as_ref()
+                .is_some_and(|anchor| !anchor.at_bottom)
+        {
+            return;
+        }
         match self.current_target_name().map(str::to_owned) {
             Some(target) => {
                 if let Some(channel) = self.channel_mut(&target) {
@@ -1109,24 +1249,29 @@ impl Session {
     /// lag ping. Called from `ui()` and from `update_minimal()`, which is all
     /// that runs while minimized or hidden to the tray (#237).
     pub(crate) fn run_timed_tasks(&mut self) {
-        // Execute pending auto-perform commands (one per frame to avoid flooding)
-        if let Some(ref mut commands) = self.pending_auto_perform.take()
-            && let Some(cmd) = commands.first().cloned()
-        {
-            // Process command (add / prefix if not present)
-            let cmd = if cmd.starts_with('/') {
-                cmd
-            } else {
-                format!("/{}", cmd)
-            };
-            self.process_command(&cmd);
-
-            // Put remaining commands back
-            let remaining: Vec<_> = commands.iter().skip(1).cloned().collect();
-            if !remaining.is_empty() {
-                self.pending_auto_perform = Some(remaining);
+        self.expire_upload_token();
+        self.expire_typing();
+        self.run_macro_jobs(std::time::Instant::now());
+        // Serialize login commands until the preceding attempt is answered.
+        if let Some(mut commands) = self.pending_auto_perform.take() {
+            if let Some(command) = commands.first().cloned()
+                && self.auto_perform_can_run(&command)
+            {
+                commands.remove(0);
+                self.auto_perform_dequeued(&command);
+                let command = command.trim();
+                let command = if command.starts_with('/') {
+                    command.to_owned()
+                } else {
+                    format!("/{command}")
+                };
+                self.process_builtin_command(&command);
+            }
+            if !commands.is_empty() {
+                self.pending_auto_perform = Some(commands);
             }
         }
+        self.flush_authenticated_history();
 
         // Check for idle timeout and set auto-away
         if self.is_connected() && self.away_status.is_none() && self.auto_away_enabled {
@@ -1160,7 +1305,27 @@ impl Session {
         preview: &str,
         is_pm: bool,
         is_highlight: bool,
+        message: &ChatMessage,
     ) {
+        if message.msgid.as_ref().is_some_and(|id| {
+            self.conversations.get(target_name).is_some_and(|channel| {
+                channel
+                    .messages
+                    .iter()
+                    .any(|message| message.msgid.as_ref() == Some(id))
+            })
+        }) {
+            return;
+        }
+        if !is_pm
+            && !is_highlight
+            && !self
+                .attention
+                .rule(&self.conversation_key(target_name))
+                .is_some_and(|rule| rule.level == attention::AlertLevel::All)
+        {
+            return;
+        }
         // Skip if we sent it ourselves. Current nick only, not held nicks: a
         // peer squatting a nick we vacated must not suppress the user's
         // notifications (#168) - a racing echo under the old nick costs at
@@ -1168,15 +1333,23 @@ impl Session {
         if self.identifiers_equal(sender, &self.my_nick) {
             return;
         }
-        if is_pm {
-            self.send_notification(&format!("PM from {sender}"), preview, true);
+        let title = if is_pm {
+            format!("PM from {sender}")
         } else if is_highlight {
-            self.send_notification(
-                &format!("{sender} mentioned you in {target_name}"),
-                preview,
-                false,
-            );
-        }
+            format!("{sender} mentioned you in {target_name}")
+        } else {
+            format!("{sender} in {target_name}")
+        };
+        self.events.push(SessionEvent::Notify {
+            title,
+            body: preview.into(),
+            force: is_pm,
+            attention: Some(attention::AttentionEvent {
+                reference: self.live_message_reference(target_name, message),
+                private: is_pm,
+                mention: is_highlight,
+            }),
+        });
     }
 
     /// Ask the App for a desktop notification; it decides from focus, the
@@ -1186,15 +1359,8 @@ impl Session {
             title: title.to_string(),
             body: body.to_string(),
             force,
+            attention: None,
         });
-    }
-
-    /// Ask the App to persist this session's connect form and behaviour
-    /// settings (it validates the form first, #316).
-    fn save_settings(&mut self) {
-        self.update_cached_lowercase();
-        ChatMessage::configure_default_timestamp_format(&self.timestamp_format);
-        self.events.push(SessionEvent::SaveSettings);
     }
 
     /// Ask the App to persist the auto-perform list on its own, not the
@@ -1215,7 +1381,7 @@ impl Session {
         self.connection.staged_config().is_some_and(|pending| {
             self.active_session
                 .as_ref()
-                .is_none_or(|active| active.endpoint_key() != pending.endpoint_key())
+                .is_none_or(|active| active.logical_network_key() != pending.logical_network_key())
         })
     }
 
@@ -1280,7 +1446,7 @@ impl Session {
             selected: (!changes_endpoint)
                 .then(|| self.current_target_name().map(str::to_owned))
                 .flatten(),
-            input: if changes_endpoint {
+            input: if changes_endpoint || self.draft_is_sensitive(&self.input_text) {
                 String::new()
             } else {
                 self.input_text.clone()
@@ -1328,7 +1494,7 @@ impl Session {
             self.conversations.insert(name, channel);
         }
         self.update_join_targets = rejoins.iter().map(|(name, _)| name.clone()).collect();
-        self.pending_rejoins = if snapshot.fresh_connect {
+        self.pending_rejoins = if snapshot.fresh_connect || self.membership_managed_by_bouncer() {
             RecoveryPolicy::ConfiguredAutoJoin
         } else {
             RecoveryPolicy::ExactMemberships(rejoins)
@@ -1556,8 +1722,10 @@ impl Session {
         self.forget_rejoin_membership(name);
         let key = self.channel_key(name)?;
         let id = self.id_for_target(&key)?;
+        self.retire_history_owner(id);
         let removed = self.conversations.remove(&key);
         self.pending_cycles.remove(&id);
+        self.forget_automatic_history(id);
         if self.current_conversation == Some(id) {
             self.current_conversation = self.conversations.ids().next();
         }
@@ -1661,6 +1829,10 @@ impl Session {
     /// Remember actual memberships before a registered transport is retired.
     /// Preserve unconfirmed recovery JOINs when another retry fails early.
     fn capture_rejoin_memberships(&mut self) {
+        if self.membership_managed_by_bouncer() {
+            self.pending_rejoins = RecoveryPolicy::ConfiguredAutoJoin;
+            return;
+        }
         if !self.is_connected()
             && self.pending_rejoins.is_none()
             && !self.conversations.values().any(|channel| channel.joined)
@@ -1769,6 +1941,12 @@ impl Session {
     /// the next batch for that target, and leaked batches eventually stop new
     /// history from being collected (#248).
     fn reset_per_connection_state(&mut self) {
+        self.bouncer_retired_targets.clear();
+        self.upload_discovery = Default::default();
+        self.mark_pending_sends_uncertain();
+        self.message_ui = Default::default();
+        self.macro_jobs.clear();
+        self.reset_history_authentication();
         self.pending_cycles.clear();
         // Recovery membership was captured before retiring the old socket,
         // excluding its unconfirmed PARTs. Its acknowledgments cannot arrive
@@ -1779,9 +1957,11 @@ impl Session {
         self.chathistory_limit = None;
         self.chathistory_batches.clear();
         self.batch_parents.clear();
+        self.batch_labels.clear();
         self.multiline_batches.clear();
         self.authtoken_batches.clear();
         self.pending_history_requests.clear();
+        self.next_history_request = 1;
         self.monitored_users.clear();
         self.pending_whox.clear();
         self.next_whox_token = 1;
@@ -1974,18 +2154,11 @@ impl Session {
 
     fn queue_history_request(
         &mut self,
-        target: &str,
+        _target: &str,
         command: IrcCommand,
         request: PendingHistoryRequest,
     ) -> bool {
-        if !self.send_command(command) {
-            return false;
-        }
-        self.pending_history_requests
-            .entry(self.network_support.canonicalize(target))
-            .or_default()
-            .push_back(request);
-        true
+        self.send_command_with_history(command, Some(request))
     }
 
     fn request_latest_history(
@@ -2028,6 +2201,7 @@ impl Session {
             target,
             command,
             PendingHistoryRequest {
+                correlation: None,
                 placement,
                 direction,
                 remaining: total,
@@ -2040,6 +2214,11 @@ impl Session {
     }
 
     fn prepare_history_target(&mut self, target: &str) {
+        let id = self.ensure_history_target(target);
+        self.select_conversation(Some(id));
+    }
+
+    fn ensure_history_target(&mut self, target: &str) -> ConversationId {
         let key = if let Some(key) = self.channel_key(target) {
             key
         } else {
@@ -2052,7 +2231,232 @@ impl Session {
             self.conversations.insert(target.to_string(), channel);
             target.to_string()
         };
-        self.select_target(&key);
+        self.id_for_target(&key)
+            .expect("history target was inserted")
+    }
+
+    fn outgoing_history_request(command: &IrcCommand) -> Option<OutgoingHistoryRequest> {
+        if !matches!(
+            command,
+            IrcCommand::ChathistoryLatest(..)
+                | IrcCommand::ChathistoryBefore(..)
+                | IrcCommand::ChathistoryAfter(..)
+                | IrcCommand::ChathistoryAround(..)
+                | IrcCommand::ChathistoryBetween(..)
+                | IrcCommand::ChathistoryTargets(..)
+                | IrcCommand::Raw(..)
+                | IrcCommand::Extension(..)
+        ) {
+            return None;
+        }
+        // Parse the actual wire form, including /raw, /quote and /label. The
+        // incoming CHATHISTORY parser intentionally recognizes only TARGETS
+        // replies, so its typed command is not an outgoing request descriptor.
+        let line = command.to_string();
+        let message = IrcMessage::parse(&line)?;
+        let mut body = line.trim_start();
+        for prefix in ['@', ':'] {
+            if body.starts_with(prefix) {
+                body = body.split_once(' ')?.1.trim_start();
+            }
+        }
+        let mut words = body.split_whitespace();
+        if !words.next()?.eq_ignore_ascii_case("CHATHISTORY") {
+            return None;
+        }
+        let subcommand = HistorySubcommand::parse(words.next()?)?;
+        let target = if subcommand == HistorySubcommand::Targets {
+            String::new()
+        } else {
+            words.next()?.to_string()
+        };
+        let limit = words.last().and_then(|word| word.parse().ok()).unwrap_or(1);
+        Some(OutgoingHistoryRequest {
+            target,
+            subcommand,
+            label: message.get_tag("label").filter(|label| !label.is_empty()),
+            limit,
+        })
+    }
+
+    fn record_history_request(
+        &mut self,
+        outgoing: OutgoingHistoryRequest,
+        request: Option<PendingHistoryRequest>,
+    ) {
+        let mut request = request.unwrap_or(PendingHistoryRequest {
+            correlation: None,
+            placement: if outgoing.subcommand == HistorySubcommand::After {
+                HistoryPlacement::Append
+            } else {
+                HistoryPlacement::Prepend
+            },
+            direction: if outgoing.subcommand == HistorySubcommand::After {
+                HistoryDirection::After
+            } else {
+                HistoryDirection::Before
+            },
+            remaining: 0,
+            loaded: 0,
+            shown: 0,
+            page_limit: outgoing.limit.max(1),
+            announce_arrivals: false,
+        });
+        let owner = if let Some(correlation) = &request.correlation {
+            correlation.owner
+        } else if outgoing.subcommand == HistorySubcommand::Targets {
+            None
+        } else {
+            Some(self.ensure_history_target(&outgoing.target))
+        };
+        request.correlation = Some(HistoryRequestCorrelation {
+            owner,
+            target: outgoing.target.clone(),
+            aliases: Vec::new(),
+            subcommand: outgoing.subcommand,
+            label: outgoing.label,
+            sequence: self.next_history_request,
+        });
+        self.next_history_request = self
+            .next_history_request
+            .checked_add(1)
+            .expect("history request sequence exhausted");
+        self.pending_history_requests
+            .entry(self.network_support.canonicalize(&outgoing.target))
+            .or_default()
+            .push_back(request);
+    }
+
+    fn history_request_matches_target(
+        &self,
+        key: &str,
+        request: &PendingHistoryRequest,
+        target: &str,
+    ) -> bool {
+        request.correlation.as_ref().map_or_else(
+            || self.identifiers_equal(key, target),
+            |correlation| {
+                self.identifiers_equal(&correlation.target, target)
+                    || correlation
+                        .aliases
+                        .iter()
+                        .any(|alias| self.identifiers_equal(alias, target))
+                    || correlation
+                        .owner
+                        .and_then(|id| self.target_name(id))
+                        .is_some_and(|name| self.identifiers_equal(name, target))
+            },
+        )
+    }
+
+    fn has_pending_history_target(&self, target: &str) -> bool {
+        self.pending_history_requests.iter().any(|(key, requests)| {
+            requests
+                .iter()
+                .any(|request| self.history_request_matches_target(key, request, target))
+        })
+    }
+
+    fn take_history_request(
+        &mut self,
+        target: &str,
+        subcommand: Option<HistorySubcommand>,
+        label: Option<&str>,
+    ) -> Option<PendingHistoryRequest> {
+        let mut candidates = Vec::new();
+        for (key, requests) in &self.pending_history_requests {
+            for (index, request) in requests.iter().enumerate() {
+                let correlation = request.correlation.as_ref();
+                if subcommand
+                    .is_some_and(|kind| correlation.is_some_and(|value| value.subcommand != kind))
+                {
+                    continue;
+                }
+                let matches = if let Some(label) = label {
+                    correlation.and_then(|value| value.label.as_deref()) == Some(label)
+                        && (target.is_empty()
+                            || self.history_request_matches_target(key, request, target))
+                } else {
+                    self.history_request_matches_target(key, request, target)
+                };
+                if matches {
+                    candidates.push((
+                        key.clone(),
+                        index,
+                        correlation.map_or(0, |value| value.sequence),
+                    ));
+                }
+            }
+        }
+        // Labels identify a single exchange. Otherwise preserve wire order
+        // among requests compatible with the target and explicit subcommand,
+        // including cancelled requests whose owner was closed.
+        if label.is_some() && candidates.len() != 1 {
+            return None;
+        }
+        let (key, index, _) = candidates.into_iter().min_by_key(|value| value.2)?;
+        let request = &self.pending_history_requests[&key][index];
+        if let Some(correlation) = &request.correlation
+            && ((label.is_none() && correlation.label.is_some())
+                || subcommand.is_some_and(|kind| correlation.subcommand != kind))
+        {
+            return None;
+        }
+        let mut request = self.pending_history_requests.get_mut(&key)?.remove(index)?;
+        if self
+            .pending_history_requests
+            .get(&key)
+            .is_some_and(VecDeque::is_empty)
+        {
+            self.pending_history_requests.remove(&key);
+        }
+        // Test fixtures and unsolicited batches have no outgoing descriptor.
+        // Capture only an already-open conversation, never create one here.
+        if request.correlation.is_none() {
+            request.correlation = Some(HistoryRequestCorrelation {
+                owner: self.id_for_target(target),
+                target: target.to_string(),
+                aliases: Vec::new(),
+                subcommand: subcommand.unwrap_or(HistorySubcommand::Latest),
+                label: label.map(str::to_owned),
+                sequence: 0,
+            });
+        }
+        Some(request)
+    }
+
+    fn response_label(&self, message: &IrcMessage) -> Option<String> {
+        if let Some(label) = message.get_tag("label") {
+            return Some(label);
+        }
+        let mut current = message.get_batch()?;
+        for _ in 0..32 {
+            if let Some(label) = self.batch_labels.get(&current) {
+                return Some(label.clone());
+            }
+            current = self.batch_parents.get(&current)?.clone();
+        }
+        None
+    }
+
+    fn retire_history_owner(&mut self, owner: ConversationId) {
+        if self.membership_managed_by_bouncer()
+            && let Some(target) = self.target_name(owner)
+        {
+            self.bouncer_retired_targets
+                .insert(self.network_support.canonicalize(target));
+        }
+        for request in self.pending_history_requests.values_mut().flatten().chain(
+            self.chathistory_batches
+                .values_mut()
+                .map(|batch| &mut batch.request),
+        ) {
+            if let Some(correlation) = &mut request.correlation
+                && correlation.owner == Some(owner)
+            {
+                correlation.owner = None;
+            }
+        }
     }
 
     fn load_local_history_fallback(&mut self, target: &str) -> Option<VecDeque<ChatMessage>> {
@@ -2204,9 +2608,21 @@ impl Session {
     }
 
     fn finish_authtoken_batch(&mut self, batch_id: &str) {
+        let upload_label = self.upload_batch_label(batch_id);
         let Some(batch) = self.authtoken_batches.remove(batch_id) else {
             return;
         };
+        if self.complete_upload_token(
+            &batch.service,
+            if batch.oversized {
+                String::new()
+            } else {
+                batch.token.clone()
+            },
+            upload_label,
+        ) {
+            return;
+        }
         if batch.oversized {
             self.add_server_message(
                 ChatMessage::system_fmt(
@@ -2264,7 +2680,7 @@ impl Session {
         };
         // Highlight like a live PRIVMSG (#289): without it a nick mention in a
         // multiline message rendered as a plain row.
-        let is_highlight = !batch.is_notice && self.check_nick_mention(content);
+        let is_highlight = !batch.is_notice && self.attention_highlight(&batch.target, content);
         let fmt = &self.timestamp_format;
         let message = if batch.is_notice {
             ChatMessage::system_fmt(&format!("-{}- {}", batch.sender, content), fmt)
@@ -2302,6 +2718,7 @@ impl Session {
                 &notified_content,
                 is_pm,
                 is_highlight,
+                &message,
             );
         }
         if !self.merge_server_echo(&target, &message) {
@@ -2347,12 +2764,16 @@ impl Session {
             return false;
         };
         local.pending_echo = false;
+        local.delivery = message_ui::MessageDelivery::Confirmed;
         local.timestamp.clone_from(&echoed.timestamp);
         local.server_time.clone_from(&echoed.server_time);
         local.msgid.clone_from(&echoed.msgid);
         local.account.clone_from(&echoed.account);
         local.oper.clone_from(&echoed.oper);
         local.reply_to.clone_from(&echoed.reply_to);
+        local.presentation_revision = local.presentation_revision.wrapping_add(1);
+        let archived = local.clone();
+        self.record_archive_message(target, &archived, false);
         true
     }
 
@@ -2519,22 +2940,37 @@ impl Session {
     }
 
     fn finish_chathistory_batch(&mut self, batch_id: &str) {
-        let Some(batch) = self.chathistory_batches.remove(batch_id) else {
+        let Some(mut batch) = self.chathistory_batches.remove(batch_id) else {
             return;
         };
-        let key = if let Some(key) = self.channel_key(&batch.target) {
-            key
-        } else {
-            let mut channel = Channel::new();
-            channel.set_case_mapping(self.network_support.case_mapping);
-            channel.set_prefix_schema(
-                &self.network_support.prefix_modes,
-                &self.network_support.user_prefixes,
-            );
-            self.conversations.insert(batch.target.clone(), channel);
-            batch.target.clone()
+        let Some(key) = batch
+            .request
+            .correlation
+            .as_ref()
+            .and_then(|correlation| correlation.owner)
+            .and_then(|owner| self.target_name(owner))
+            .map(str::to_owned)
+        else {
+            // A reply belongs to the conversation that requested it, even if
+            // a new tab now happens to have the same IRC target name.
+            return;
         };
+        batch.target.clone_from(&key);
         let mut messages = Self::order_history_page(batch.messages);
+        if batch.legacy_playback {
+            let mut existing: Vec<_> = self.conversations[&key].messages.iter().collect();
+            messages.retain(|message| {
+                let repeated = existing.iter().position(|row| {
+                    row.server_time == message.server_time && Self::same_history_row(row, message)
+                });
+                if let Some(index) = repeated {
+                    existing.remove(index);
+                    false
+                } else {
+                    true
+                }
+            });
+        }
         let page_count = messages.len();
         let remaining = batch.request.remaining.saturating_sub(page_count);
         let loaded = batch.request.loaded.saturating_add(page_count);
@@ -2636,6 +3072,10 @@ impl Session {
             };
             messages.retain(keep_row);
         }
+        // Archive only rows accepted by the same privacy and display filters.
+        for message in &messages {
+            self.record_archive_message(&key, message, true);
+        }
         let shown = batch.request.shown.saturating_add(messages.len());
         let next = if !batch.partial && !complete && remaining > 0 {
             next_reference.map(|reference| {
@@ -2655,7 +3095,7 @@ impl Session {
                         loaded,
                         shown,
                         page_limit: limit,
-                        ..batch.request
+                        ..batch.request.clone()
                     },
                 )
             })
@@ -2773,8 +3213,25 @@ impl Session {
                 channel.messages.pop_front();
             }
         }
+        let pending_ids: Vec<_> = self
+            .conversations
+            .get(&key)
+            .map(|channel| {
+                channel
+                    .messages
+                    .iter()
+                    .filter_map(|message| message.msgid.clone())
+                    .collect()
+            })
+            .unwrap_or_default();
+        for id in pending_ids {
+            self.apply_pending_reactions(&key, &id);
+        }
+        self.refresh_reply_previews(&key);
         if !arrivals.is_empty() {
-            if !(self.window_focused && self.current_target_is(&batch.target))
+            if !(self.window_focused
+                && self.current_target_is(&batch.target)
+                && self.reading_conversation == self.current_conversation)
                 && let Some(channel) = self.conversations.get_mut(&key)
             {
                 channel.unread = channel.unread.saturating_add(arrivals.len());
@@ -2783,7 +3240,10 @@ impl Session {
         }
         if let Some((command, request)) = next {
             self.queue_history_request(&batch.target, command, request);
-        } else if self.current_target_is(&batch.target) && self.window_focused {
+        } else if self.current_target_is(&batch.target)
+            && self.window_focused
+            && self.reading_conversation == self.current_conversation
+        {
             self.mark_target_read(&batch.target);
         }
     }
@@ -2794,26 +3254,46 @@ impl Session {
     /// mentions. `arrivals` holds (sender, content, is_highlight) per new
     /// chat row, oldest first.
     fn notify_history_arrivals(&mut self, target: &str, arrivals: &[(String, String, bool)]) {
-        if !self.is_channel_name(target) {
-            let Some((sender, content, _)) = arrivals.last() else {
-                return;
-            };
-            let title = match arrivals.len() {
-                1 => format!("PM from {sender}"),
-                count => format!("{count} new messages from {target}"),
-            };
-            self.send_notification(&title, &truncate_chars(content, 50), true);
-            return;
-        }
-        let mentions: Vec<_> = arrivals.iter().filter(|(_, _, mention)| *mention).collect();
-        let Some((sender, content, _)) = mentions.last() else {
+        let private = !self.is_channel_name(target);
+        let relevant: Vec<_> = arrivals
+            .iter()
+            .filter(|(_, _, mention)| private || *mention)
+            .collect();
+        let Some((sender, content, mention)) = relevant.last() else {
             return;
         };
-        let title = match mentions.len() {
-            1 => format!("{sender} mentioned you in {target}"),
-            count => format!("{count} mentions in {target}"),
+        let title = if private {
+            if relevant.len() == 1 {
+                format!("PM from {sender}")
+            } else {
+                format!("{} new messages from {target}", relevant.len())
+            }
+        } else if relevant.len() == 1 {
+            format!("{sender} mentioned you in {target}")
+        } else {
+            format!("{} mentions in {target}", relevant.len())
         };
-        self.send_notification(&title, &truncate_chars(content, 50), false);
+        let reference = self
+            .conversations
+            .get(target)
+            .and_then(|channel| {
+                channel
+                    .messages
+                    .iter()
+                    .rev()
+                    .find(|message| message.sender == *sender && message.content == *content)
+            })
+            .map(|message| self.live_message_reference(target, message));
+        self.events.push(SessionEvent::Notify {
+            title,
+            body: truncate_chars(content, 50),
+            force: private,
+            attention: reference.map(|reference| attention::AttentionEvent {
+                reference,
+                private,
+                mention: *mention,
+            }),
+        });
     }
 
     /// Clamp a QUIT reason so the resulting line always fits in one IRC line.
@@ -2835,6 +3315,9 @@ impl Session {
     }
 
     pub fn request_manual_disconnect(&mut self, reason: Option<String>) {
+        self.connection_status = Default::default();
+        self.message_ui = Default::default();
+        self.reset_history_authentication();
         self.clear_update_restore();
         self.close_connection(reason, false);
     }
@@ -2845,6 +3328,7 @@ impl Session {
     }
 
     pub fn request_reconnect_after_close(&mut self, reason: &str) {
+        self.reset_history_authentication();
         self.close_connection(Some(reason.to_string()), true);
     }
 
@@ -2872,12 +3356,18 @@ impl Session {
     }
 
     fn reset_session_state(&mut self) {
+        self.macro_jobs.clear();
+        self.reset_history_authentication();
         self.clear_update_restore();
         self.events.push(SessionEvent::EndpointChanged);
         self.pending_cycles.clear();
         self.conversations.clear();
         self.current_conversation = None;
         self.input_text.clear();
+        self.composer = Default::default();
+        self.timeline = Default::default();
+        self.message_ui = Default::default();
+        self.reading_conversation = None;
         self.command_history.clear();
         self.history_index = None;
         self.history_temp.clear();
@@ -2906,6 +3396,7 @@ impl Session {
 
     /// Load a server favorite into the connection form
     pub(crate) fn load_favorite(&mut self, fav: &ServerFavorite) {
+        self.bouncer = fav.bouncer.clone();
         self.form_profile = (!fav.id.is_empty()).then(|| fav.id.clone());
         self.server_host = fav.host.clone();
         self.server_port = fav.port.clone();
@@ -2916,6 +3407,7 @@ impl Session {
         }
         self.auto_join_channels = fav.auto_join.clone();
         self.auto_perform = fav.auto_perform.clone();
+        self.upload_settings = fav.upload_settings.clone();
         self.pre_away_message = fav.pre_away_message.clone();
         self.persistence_profile = fav.persistence_profile.clone();
         self.sasl_username = fav.sasl_username.clone();
@@ -3350,6 +3842,7 @@ mod connection_lifecycle_tests {
 
     fn history_request(placement: HistoryPlacement) -> PendingHistoryRequest {
         PendingHistoryRequest {
+            correlation: None,
             placement,
             direction: HistoryDirection::Before,
             remaining: 10,
@@ -3629,6 +4122,7 @@ fn row_height(
     layout_key: u64,
     stats: &mut ScrollbackStats,
 ) -> f32 {
+    let layout_key = layout_key ^ msg.presentation_revision.wrapping_mul(0x9e3779b97f4a7c15);
     let cached = msg.row_height.get();
     if cached.key == layout_key && cached.height > 0.0 {
         return cached.height;
@@ -3640,6 +4134,7 @@ fn row_height(
     );
     let scratch_rect = egui::Rect::from_min_size(scratch_origin, egui::vec2(content_width, 0.0));
     let mut scratch = ui.new_child(egui::UiBuilder::new().max_rect(scratch_rect));
+    scratch.disable();
     draw_chat_row(&mut scratch, msg, my_nick);
     let h = scratch.min_rect().height();
     msg.row_height.set(RowHeightEntry {
@@ -3650,13 +4145,37 @@ fn row_height(
 }
 
 /// Draw one scrollback row: timestamp, optional indicator, nick, body.
-fn draw_chat_row(ui: &mut egui::Ui, msg: &ChatMessage, my_nick: &str) {
+fn draw_chat_row(
+    ui: &mut egui::Ui,
+    msg: &ChatMessage,
+    my_nick: &str,
+) -> Option<message_ui::MessageAction> {
+    let mut action = None;
     // Current nick only, matching the other display gates (#170): held-nick
     // styling would misattribute a stranger who picked up a nick we
     // vacated, and misattribution is not the safe direction for display.
     let is_own_msg = !msg.is_system && msg.sender.eq_ignore_ascii_case(my_nick);
 
-    let render_row = |ui: &mut egui::Ui| {
+    let mut render_row = |ui: &mut egui::Ui| {
+        if let Some(reply_to) = &msg.reply_to {
+            ui.horizontal(|ui| {
+                ui.add_space(18.0);
+                if ui
+                    .link(
+                        RichText::new(format!(
+                            "↪ {}",
+                            msg.reply_preview
+                                .as_deref()
+                                .unwrap_or("Message unavailable · view context")
+                        ))
+                        .small(),
+                    )
+                    .clicked()
+                {
+                    action = Some(message_ui::MessageAction::Reveal(reply_to.clone()));
+                }
+            });
+        }
         ui.horizontal(|ui| {
             if msg.is_highlight {
                 ui.label(RichText::new("*").color(Color32::YELLOW).strong());
@@ -3683,13 +4202,6 @@ fn draw_chat_row(ui: &mut egui::Ui, msg: &ChatMessage, my_nick: &str) {
                     |oper| format!("{} [{}]", msg.sender, oper),
                 );
                 ui.label(RichText::new(format!("* {sender} ")).color(action_color));
-                if let Some(reply_to) = &msg.reply_to {
-                    ui.label(
-                        RichText::new(format!("↪ {reply_to}"))
-                            .small()
-                            .color(Color32::GRAY),
-                    );
-                }
                 render_segments(ui, msg.render_segments(), action_color);
             } else {
                 let sender = msg.oper.as_ref().map_or_else(
@@ -3703,13 +4215,6 @@ fn draw_chat_row(ui: &mut egui::Ui, msg: &ChatMessage, my_nick: &str) {
                 };
                 ui.label(nick_style);
 
-                if let Some(reply_to) = &msg.reply_to {
-                    ui.label(
-                        RichText::new(format!("↪ {reply_to}"))
-                            .small()
-                            .color(Color32::GRAY),
-                    );
-                }
 
                 let text_color = if msg.is_highlight {
                     Color32::YELLOW
@@ -3719,6 +4224,11 @@ fn draw_chat_row(ui: &mut egui::Ui, msg: &ChatMessage, my_nick: &str) {
                     Color32::WHITE
                 };
                 render_segments(ui, msg.render_segments(), text_color);
+            }
+            match &msg.delivery {
+                message_ui::MessageDelivery::Queued{..}=>{ui.label(RichText::new("Queued").small().color(Color32::GRAY));},
+                message_ui::MessageDelivery::Uncertain=>{ui.label(RichText::new("Delivery uncertain").small().color(Color32::YELLOW)).on_hover_text("The connection ended before this send was confirmed. It will not be sent again automatically.");},
+                _=>{}
             }
         });
     };
@@ -3737,6 +4247,30 @@ fn draw_chat_row(ui: &mut egui::Ui, msg: &ChatMessage, my_nick: &str) {
     } else {
         render_row(ui);
     }
+    if !msg.reactions.is_empty() {
+        ui.horizontal_wrapped(|ui| {
+            for group in &msg.reactions {
+                let own = group
+                    .actors
+                    .iter()
+                    .any(|actor| actor.eq_ignore_ascii_case(my_nick));
+                if ui
+                    .selectable_label(
+                        own,
+                        RichText::new(format!("{} {}", group.emoji, group.actors.len())).small(),
+                    )
+                    .on_hover_text(group.actors.join(", "))
+                    .clicked()
+                {
+                    action = Some(message_ui::MessageAction::React(
+                        msg.message_key.clone(),
+                        group.emoji.clone(),
+                    ));
+                }
+            }
+        });
+    }
+    action
 }
 
 /// Statistics from one virtualized scrollback pass.
@@ -3814,6 +4348,7 @@ impl Session {
     }
 
     fn session_from_form(&self) -> Result<SessionConfig, String> {
+        self.upload_settings.validate()?;
         // Mirror connect()'s wire-value rules via the shared validator so the
         // dialog rejects up front what the connection would fail on later
         // (#180).
@@ -3843,6 +4378,25 @@ impl Session {
         }
         let has_sasl_credentials = has_sasl_username && has_sasl_password;
         let has_client_cert = !self.tls_client_cert_path.trim().is_empty();
+        if let Some(binding) = &self.bouncer {
+            binding.validate()?;
+            if binding.provider == bouncer::BouncerProvider::Soju
+                && !has_sasl_credentials
+                && !has_client_cert
+            {
+                return Err("soju discovery and network binding require SASL credentials or a client certificate".into());
+            }
+            if binding.provider == bouncer::BouncerProvider::Znc
+                && !has_sasl_credentials
+                && !has_client_cert
+                && self.password.is_empty()
+            {
+                return Err("A ZNC profile requires bouncer credentials".into());
+            }
+            if has_sasl_credentials && !binding.account.eq_ignore_ascii_case(&self.sasl_username) {
+                return Err("SASL username must match the bouncer base account".into());
+            }
+        }
         if has_client_cert && !self.use_tls {
             return Err("A TLS client certificate requires TLS to be enabled".to_string());
         }
@@ -3871,6 +4425,7 @@ impl Session {
         }
 
         Ok(SessionConfig {
+            upload_settings: self.upload_settings.clone(),
             server: ServerConfig {
                 host: host.to_string(),
                 port,
@@ -3896,6 +4451,7 @@ impl Session {
                 },
                 sasl_mechanism: self.sasl_mechanism,
                 sasl_required: self.sasl_required,
+                bouncer: self.bouncer.clone(),
                 tls_client_cert_path: if self.tls_client_cert_path.trim().is_empty() {
                     None
                 } else {
@@ -3929,7 +4485,7 @@ impl Session {
         let endpoint_changed = self
             .active_session
             .as_ref()
-            .is_some_and(|active| active.endpoint_key() != session.endpoint_key());
+            .is_some_and(|active| active.logical_network_key() != session.logical_network_key());
         if endpoint_changed {
             // Do not let buffered messages from the old socket recreate tabs or
             // logs after the new endpoint identity becomes active.
@@ -4057,6 +4613,22 @@ impl Session {
     }
 
     fn current_session_automation(&self) -> (bool, String, String) {
+        if let Some(binding) = self
+            .active_session
+            .as_ref()
+            .and_then(|session| session.server.bouncer.as_ref())
+        {
+            if binding.is_control() {
+                return (false, String::new(), String::new());
+            }
+            if let Some(session) = &self.active_session {
+                return (
+                    session.set_invisible,
+                    String::new(),
+                    session.auto_perform.clone(),
+                );
+            }
+        }
         self.active_session
             .as_ref()
             .map(|session| {
@@ -4079,6 +4651,12 @@ impl Session {
         self.active_session
             .as_ref()
             .map(SessionConfig::endpoint_key)
+    }
+
+    pub(crate) fn logical_network_key(&self) -> Option<identity::LogicalNetworkKey> {
+        self.active_session
+            .as_ref()
+            .map(SessionConfig::logical_network_key)
     }
 
     #[cfg(test)]
@@ -4181,6 +4759,18 @@ impl Session {
         if self.pending_cycles.remove(&retired) {
             self.pending_cycles.insert(survivor);
         }
+        for request in self.pending_history_requests.values_mut().flatten().chain(
+            self.chathistory_batches
+                .values_mut()
+                .map(|batch| &mut batch.request),
+        ) {
+            if let Some(correlation) = &mut request.correlation
+                && correlation.owner == Some(retired)
+            {
+                correlation.owner = Some(survivor);
+            }
+        }
+        self.redirect_automatic_history(survivor, retired);
         self.events
             .push(SessionEvent::ConversationMerged { survivor, retired });
     }
@@ -4197,6 +4787,23 @@ impl Session {
     }
 
     fn notify_target_rename(&mut self, id: ConversationId, old: &str, new: &str) {
+        for request in self.pending_history_requests.values_mut().flatten().chain(
+            self.chathistory_batches
+                .values_mut()
+                .map(|batch| &mut batch.request),
+        ) {
+            if let Some(correlation) = &mut request.correlation
+                && correlation.owner == Some(id)
+            {
+                for alias in [old, new] {
+                    if correlation.target != alias
+                        && !correlation.aliases.iter().any(|value| value == alias)
+                    {
+                        correlation.aliases.push(alias.to_string());
+                    }
+                }
+            }
+        }
         let support = &self.network_support;
         if self
             .update_selected
@@ -4248,6 +4855,12 @@ impl Session {
             self.scroll_to_bottom = true;
             return;
         }
+        if history_batch.is_none() && self.observe_upload_protocol(&msg) {
+            return;
+        }
+        if history_batch.is_none() && self.observe_history_authentication(&msg) {
+            return;
+        }
         match &msg.command {
             IrcCommand::Privmsg(target, content) => {
                 let sender = msg.get_sender_nick().unwrap_or_else(|| "???".to_string());
@@ -4267,7 +4880,12 @@ impl Session {
                 let is_action = content.starts_with("\x01ACTION ") && content.ends_with('\x01');
 
                 // Check if the message mentions our nick (case-insensitive word boundary check)
-                let is_highlight = self.check_nick_mention(content);
+                let highlight_target = if self.identifiers_equal(&routed_target, &self.my_nick) {
+                    &sender
+                } else {
+                    &routed_target
+                };
+                let is_highlight = self.attention_highlight(highlight_target, content);
 
                 // Get server-time from IRCv3 tags if available, converted to
                 // local time and rendered in the user's timestamp format.
@@ -4335,6 +4953,7 @@ impl Session {
                     &truncate_chars(content, 50),
                     is_pm,
                     is_highlight,
+                    &chat_msg,
                 );
                 let is_from_self = self.identifiers_equal(&sender, &self.my_nick);
 
@@ -4484,45 +5103,7 @@ impl Session {
             }
 
             IrcCommand::Tagmsg(target) => {
-                // Typing notifications are transient UI state; until a typing
-                // indicator is visible, consuming them silently is preferable
-                // to printing protocol noise into the conversation.
-                if let Some(reaction) = msg.get_tag("+draft/react") {
-                    let sender = msg.get_sender_nick().unwrap_or_else(|| "???".to_string());
-                    if msg.prefix.is_some() && self.is_ignored(&sender, msg.prefix.as_deref()) {
-                        tracing::debug!("Ignoring reaction from {}", sender);
-                        return;
-                    }
-                    let reply_to = msg
-                        .get_reply()
-                        .map(|id| format!(" to {id}"))
-                        .unwrap_or_default();
-                    let target = self.strip_status_prefix(target).to_string();
-                    let target = if !self.is_channel_name(&target)
-                        && self.identifiers_equal(&target, &self.my_nick)
-                    {
-                        sender.clone()
-                    } else {
-                        target
-                    };
-                    let reaction_message = ChatMessage::system_fmt(
-                        &format!("{sender} reacted {reaction}{reply_to}"),
-                        &self.timestamp_format,
-                    )
-                    .with_irc_metadata(
-                        msg.get_server_time_raw(),
-                        msg.get_msgid(),
-                        msg.get_account(),
-                    );
-                    if let Some(batch_id) = history_batch.as_deref() {
-                        self.queue_chathistory_message(
-                            batch_id,
-                            reaction_message.without_logging(),
-                        );
-                    } else {
-                        self.add_message_to_channel(&target, reaction_message);
-                    }
-                }
+                self.observe_tagmsg(&msg, target, history_batch.is_some());
             }
 
             IrcCommand::StandardReply {
@@ -4545,35 +5126,52 @@ impl Session {
                     .map(str::to_string);
                 let message = ChatMessage::system_fmt(&text, &self.timestamp_format)
                     .with_irc_metadata(msg.get_server_time_raw(), None, None);
-                if command.eq_ignore_ascii_case("CHATHISTORY")
-                    && kind.eq_ignore_ascii_case("FAIL")
-                    && let Some(target) = &target
+                if command.eq_ignore_ascii_case("CHATHISTORY") && kind.eq_ignore_ascii_case("FAIL")
                 {
-                    let target_key = self.network_support.canonicalize(target);
-                    let failed_request = self
-                        .pending_history_requests
-                        .get_mut(&target_key)
-                        .and_then(VecDeque::pop_front);
-                    if self
-                        .pending_history_requests
-                        .get(&target_key)
-                        .is_some_and(VecDeque::is_empty)
-                    {
-                        self.pending_history_requests.remove(&target_key);
-                    }
-                    if failed_request.is_some_and(|req| req.placement == HistoryPlacement::Prepend)
-                        && let Some(mut history) = self.load_local_history_fallback(target)
-                        && let Some(key) = self.channel_key(target)
-                        && let Some(channel) = self.conversations.get_mut(&key)
-                    {
-                        history.append(&mut channel.messages);
-                        channel.messages = history;
-                        while channel.messages.len() > self.max_scrollback {
-                            channel.messages.pop_front();
+                    let words: Vec<_> = context
+                        .iter()
+                        .flat_map(|value| value.split_whitespace())
+                        .collect();
+                    let subcommand = words
+                        .first()
+                        .and_then(|word| HistorySubcommand::parse(word));
+                    let reply_target = if subcommand == Some(HistorySubcommand::Targets) {
+                        ""
+                    } else {
+                        words.get(1).copied().unwrap_or("")
+                    };
+                    let label = self.response_label(&msg);
+                    let failed_request = if subcommand.is_some() || label.is_some() {
+                        self.take_history_request(reply_target, subcommand, label.as_deref())
+                    } else {
+                        None
+                    };
+                    let owner_target = failed_request
+                        .as_ref()
+                        .and_then(|request| request.correlation.as_ref())
+                        .and_then(|correlation| correlation.owner)
+                        .and_then(|owner| self.target_name(owner))
+                        .map(str::to_owned);
+                    if let Some(owner_target) = owner_target {
+                        if failed_request
+                            .is_some_and(|request| request.placement == HistoryPlacement::Prepend)
+                            && let Some(mut history) =
+                                self.load_local_history_fallback(&owner_target)
+                            && let Some(channel) = self.conversations.get_mut(&owner_target)
+                        {
+                            history.append(&mut channel.messages);
+                            channel.messages = history;
+                            while channel.messages.len() > self.max_scrollback {
+                                channel.messages.pop_front();
+                            }
                         }
+                        self.add_message_to_channel(&owner_target, message);
+                    } else {
+                        // Keep genuine server errors visible without reopening
+                        // a closed tab or writing into its same-named successor.
+                        self.add_server_message(message);
                     }
-                }
-                if let Some(target) = &target {
+                } else if let Some(target) = &target {
                     self.add_message_to_channel(target, message);
                 } else {
                     self.add_server_message(message);
@@ -4589,6 +5187,26 @@ impl Session {
             }
 
             IrcCommand::Redact(target, msgid, reason) => {
+                let reference = self
+                    .conversations
+                    .get(target)
+                    .and_then(|channel| {
+                        channel
+                            .messages
+                            .iter()
+                            .find(|message| message.msgid.as_ref() == Some(msgid))
+                    })
+                    .map(|message| self.live_message_reference(target, message))
+                    .unwrap_or_else(|| identity::MessageRef {
+                        conversation: self.conversation_key(target),
+                        archive_id: None,
+                        server_msgid: Some(msgid.clone()),
+                        server_time: None,
+                    });
+                if let Some(archive) = &self.archive_client {
+                    archive.redact_reference(&reference);
+                }
+                self.events.push(SessionEvent::MessageRedacted(reference));
                 if let Some(key) = self.channel_key(target)
                     && let Some(channel) = self.conversations.get_mut(&key)
                 {
@@ -4611,6 +5229,7 @@ impl Session {
                         self.max_scrollback,
                     );
                 }
+                self.refresh_reply_previews(target);
             }
 
             IrcCommand::Rename(old, new, reason) => {
@@ -4631,14 +5250,6 @@ impl Session {
                             ),
                             self.max_scrollback,
                         );
-                    }
-                    let old_pending = self.network_support.canonicalize(old);
-                    let new_pending = self.network_support.canonicalize(new);
-                    if let Some(requests) = self.pending_history_requests.remove(&old_pending) {
-                        self.pending_history_requests
-                            .entry(new_pending)
-                            .or_default()
-                            .extend(requests);
                     }
                 }
             }
@@ -4684,6 +5295,7 @@ impl Session {
             }
 
             IrcCommand::Extension(name, params) => {
+                self.observe_bouncer_message(name, params);
                 let text = if name.eq_ignore_ascii_case("TOKEN")
                     && params
                         .first()
@@ -4723,6 +5335,12 @@ impl Session {
                 let sender = msg.get_sender_nick().unwrap_or_default();
                 let (username, hostname) = Self::prefix_user_host(msg.prefix.as_deref());
                 if self.identifiers_equal(&sender, &self.my_nick) {
+                    if account
+                        .as_deref()
+                        .is_some_and(|account| !account.is_empty() && account != "*")
+                    {
+                        self.confirm_history_authentication();
+                    }
                     self.forget_rejoin_membership(channel);
                     // We joined a channel
                     let existing_key = self.channel_key(channel);
@@ -4823,9 +5441,8 @@ impl Session {
                         tab.unread = unread;
                     }
                     if self.chathistory_enabled && self.logging_load_history {
-                        self.request_latest_history(
+                        self.request_automatic_history(
                             channel,
-                            None,
                             if is_new_channel {
                                 HistoryPlacement::Prepend
                             } else {
@@ -4876,6 +5493,7 @@ impl Session {
 
             IrcCommand::Part(channel, reason) => {
                 let sender = msg.get_sender_nick().unwrap_or_default();
+                self.clear_typing_sender(channel, &sender);
                 let reason_str = reason.as_deref().unwrap_or("");
                 if self.identifiers_equal(&sender, &self.my_nick) {
                     // /cycle may already have queued a newer JOIN after this
@@ -4890,6 +5508,8 @@ impl Session {
                         .id_for_target(channel)
                         .filter(|id| self.pending_cycles.contains(id))
                     {
+                        self.retire_history_owner(id);
+                        self.forget_automatic_history(id);
                         self.forget_rejoin_membership(channel);
                         // Reset protocol/history data just as a fresh JOIN did,
                         // while retaining the view and its immutable identity.
@@ -4968,6 +5588,7 @@ impl Session {
 
             IrcCommand::Quit(reason) => {
                 let sender = msg.get_sender_nick().unwrap_or_default();
+                self.forget_typing_nick(&sender);
                 let reason_str = reason.as_deref().unwrap_or("Quit");
 
                 // Remove user from all channels, optionally show quit message
@@ -5197,6 +5818,11 @@ impl Session {
             // Collect chathistory rows until the batch closes so they can be
             // inserted before live traffic as one chronological block.
             IrcCommand::Batch(reference, batch_type, params) => {
+                if reference.starts_with('+')
+                    && batch_type.as_deref() == Some("soju.im/bouncer-networks")
+                {
+                    self.bouncer_networks.clear();
+                }
                 if let Some(batch_id) = reference.strip_prefix('+') {
                     tracing::debug!("Batch started: {} type={:?}", reference, batch_type);
                     if let Some(parent) = msg.get_batch() {
@@ -5211,6 +5837,14 @@ impl Session {
                             self.batch_parents.remove(&evicted);
                         }
                         self.batch_parents.insert(batch_id.to_string(), parent);
+                    }
+                    if let Some(label) = msg.get_tag("label") {
+                        if self.batch_labels.len() >= 4096
+                            && let Some(evicted) = self.batch_labels.keys().next().cloned()
+                        {
+                            self.batch_labels.remove(&evicted);
+                        }
+                        self.batch_labels.insert(batch_id.to_string(), label);
                     }
                     if batch_type
                         .as_deref()
@@ -5255,36 +5889,73 @@ impl Session {
                             },
                         );
                     }
-                    if batch_type
-                        .as_deref()
-                        .is_some_and(|kind| kind.eq_ignore_ascii_case("chathistory"))
-                        && let Some(target) = params
+                    if batch_type.as_deref().is_some_and(|kind| {
+                        kind.eq_ignore_ascii_case("chathistory")
+                            || (kind.eq_ignore_ascii_case("znc.in/playback")
+                                && self.membership_managed_by_bouncer())
+                    }) && let Some(target) = params
                         && self.chathistory_batches.len() < 32
                     {
-                        let target_key = self.network_support.canonicalize(target);
-                        let request = self
-                            .pending_history_requests
-                            .get_mut(&target_key)
-                            .and_then(VecDeque::pop_front)
-                            .unwrap_or(PendingHistoryRequest {
-                                placement: HistoryPlacement::Prepend,
-                                direction: HistoryDirection::Before,
-                                remaining: 0,
-                                loaded: 0,
-                                shown: 0,
-                                page_limit: self.max_scrollback.max(1),
-                                announce_arrivals: false,
-                            });
-                        if self
-                            .pending_history_requests
-                            .get(&target_key)
-                            .is_some_and(VecDeque::is_empty)
-                        {
-                            self.pending_history_requests.remove(&target_key);
+                        let legacy_playback = batch_type
+                            .as_deref()
+                            .is_some_and(|kind| kind.eq_ignore_ascii_case("znc.in/playback"));
+                        let playback_owner = if legacy_playback {
+                            self.id_for_target(target).or_else(|| {
+                                (!self
+                                    .bouncer_retired_targets
+                                    .contains(&self.network_support.canonicalize(target)))
+                                .then(|| self.ensure_history_target(target))
+                            })
+                        } else {
+                            None
+                        };
+                        let placement = if legacy_playback
+                            && playback_owner
+                                .and_then(|id| self.conversation_channel(id))
+                                .is_some_and(|channel| {
+                                    channel
+                                        .messages
+                                        .iter()
+                                        .any(|message| Self::message_reference(message).is_some())
+                                }) {
+                            HistoryPlacement::Append
+                        } else {
+                            HistoryPlacement::Prepend
+                        };
+                        let label = self.response_label(&msg);
+                        let has_pending = self.has_pending_history_target(target);
+                        let request = if legacy_playback {
+                            None
+                        } else {
+                            self.take_history_request(target, None, label.as_deref())
                         }
+                        .unwrap_or(PendingHistoryRequest {
+                            correlation: Some(HistoryRequestCorrelation {
+                                owner: if legacy_playback {
+                                    playback_owner
+                                } else if !has_pending && label.is_none() {
+                                    self.id_for_target(target)
+                                } else {
+                                    None
+                                },
+                                target: target.clone(),
+                                aliases: Vec::new(),
+                                subcommand: HistorySubcommand::Latest,
+                                label,
+                                sequence: 0,
+                            }),
+                            placement,
+                            direction: HistoryDirection::Before,
+                            remaining: 0,
+                            loaded: 0,
+                            shown: 0,
+                            page_limit: self.max_scrollback.max(1),
+                            announce_arrivals: false,
+                        });
                         self.chathistory_batches.insert(
                             batch_id.to_string(),
                             ChatHistoryBatch {
+                                legacy_playback,
                                 target: target.clone(),
                                 messages: Vec::new(),
                                 request,
@@ -5295,12 +5966,24 @@ impl Session {
                             },
                         );
                     }
+                    if batch_type
+                        .as_deref()
+                        .is_some_and(|kind| kind.eq_ignore_ascii_case("draft/chathistory-targets"))
+                    {
+                        let label = self.response_label(&msg);
+                        self.take_history_request(
+                            "",
+                            Some(HistorySubcommand::Targets),
+                            label.as_deref(),
+                        );
+                    }
                 } else if let Some(batch_id) = reference.strip_prefix('-') {
                     tracing::debug!("Batch ended: {}", reference);
                     self.finish_multiline_batch(batch_id);
                     self.finish_authtoken_batch(batch_id);
                     self.finish_chathistory_batch(batch_id);
                     self.batch_parents.remove(batch_id);
+                    self.batch_labels.remove(batch_id);
                 }
             }
 
@@ -5632,12 +6315,25 @@ impl Session {
             }
 
             RPL_WELCOME => {
+                self.drain_connection_events();
                 // A 001 that was already in flight when QUIT was queued
                 // (disconnect, /server, /reconnect) belongs to the connection
                 // being closed. It must neither mark the session connected nor
                 // wipe the intent the lifecycle needs to finish the switch
                 // once that worker exits (#246).
                 if self.connection.is_closing() {
+                    return;
+                }
+                if self
+                    .active_session
+                    .as_ref()
+                    .and_then(|session| session.server.bouncer.as_ref())
+                    .is_some_and(|binding| binding.provider == bouncer::BouncerProvider::Soju)
+                    && !self.bouncer_ready
+                {
+                    self.fail_registration(
+                        "The bouncer registered before the selected network was bound".into(),
+                    );
                     return;
                 }
                 if !self.connection.accept_registration() {
@@ -5661,6 +6357,8 @@ impl Session {
                 self.add_server_message(ChatMessage::system(&msg));
 
                 let (set_invisible, auto_join, auto_perform) = self.current_session_automation();
+                let auto_perform = self.expand_auto_perform(&auto_perform);
+                self.prepare_history_authentication(&auto_perform);
 
                 // Set invisible mode if requested for this session snapshot.
                 if set_invisible {
@@ -5677,7 +6375,7 @@ impl Session {
                 // Restore actual memberships, including keys, through JOIN.
                 if let Some(rejoins) = self.pending_rejoins.as_ref().cloned() {
                     for (name, key) in rejoins {
-                        self.send_join_in_background(name, key);
+                        self.send_automatic_join(name, key);
                     }
                 } else if !auto_join.is_empty() {
                     for chan in auto_join.split(',') {
@@ -5689,7 +6387,7 @@ impl Session {
                             let name = words.next().unwrap_or(chan);
                             let key = words.next().map(str::to_string);
                             let channel = self.normalize_channel_name(name);
-                            self.send_join_in_background(channel.clone(), key);
+                            self.send_automatic_join(channel.clone(), key);
                             self.add_server_message(ChatMessage::system(&format!(
                                 "Auto-joining {}",
                                 channel
@@ -5724,7 +6422,7 @@ impl Session {
                         .map(|(target, _)| target.clone())
                         .collect();
                     for target in query_targets {
-                        self.request_latest_history(&target, None, HistoryPlacement::Append);
+                        self.request_automatic_history(&target, HistoryPlacement::Append);
                     }
                 }
 
@@ -5744,11 +6442,13 @@ impl Session {
                 }
 
                 // Initial lag check
+                self.begin_bouncer_playback();
                 self.ping_sent_time = Some(std::time::Instant::now());
                 self.send_command(IrcCommand::Ping("LAG".to_string()));
             }
 
             RPL_ISUPPORT => {
+                self.validate_bouncer_isupport(params);
                 self.apply_isupport_tokens(params);
             }
 
@@ -6772,24 +7472,36 @@ impl Session {
         // Always use the casemapped key: CASEMAPPING-equivalent spellings must
         // never fork one tab into multiple log files (the readable prefix of
         // the path keeps the session's display spelling).
-        if !msg.no_log
+        let text_span = if !msg.no_log
             && let Some((network, _, _)) = self.active_log_context()
         {
             let log_key = self.network_support.canonicalize(&key);
-            self.log_manager.log_message(&network, &log_key, &msg);
-        }
+            self.log_manager.log_message(&network, &log_key, &msg)
+        } else {
+            None
+        };
 
+        self.record_archive_message_with_span(&key, &msg, false, text_span);
         // Unread unless it lands in the current tab of a focused window: a
         // selected tab nobody is looking at (minimised, tray-hidden, another
         // window in front) accrues its badge and read marker is held back
         // until focus returns (#305).
-        let seen = self.window_focused && self.current_target_is(&key);
+        let pending_id = msg.msgid.clone();
+        self.clear_typing_sender(&key, &msg.sender);
+        let seen = self.window_focused
+            && self.current_target_is(&key)
+            && self.reading_conversation == self.current_conversation
+            && !self.timeline.borrow().restore_pending;
         if let Some(ch) = self.conversations.get_mut(&key) {
             ch.push_trimmed(msg, self.max_scrollback);
             if !seen {
                 ch.unread += 1;
             }
         }
+        if let Some(id) = pending_id {
+            self.apply_pending_reactions(&key, &id);
+        }
+        self.refresh_reply_previews(&key);
         if seen {
             self.mark_target_read(&key);
         }
@@ -6929,6 +7641,12 @@ impl Session {
     }
 
     fn command_fits_limits(cmd: &IrcCommand, base_limit: usize) -> bool {
+        if let IrcCommand::ClientBatch(commands) | IrcCommand::ClientChat { commands, .. } = cmd {
+            return !commands.is_empty()
+                && commands
+                    .iter()
+                    .all(|command| Self::command_fits_limits(command, base_limit));
+        }
         let line = format!("{}", cmd);
         if line.bytes().any(|byte| matches!(byte, b'\r' | b'\n' | 0)) {
             return false;
@@ -6946,6 +7664,9 @@ impl Session {
     /// logged (#227), and neither is the size of a credential command: it
     /// would give away the length of the secret.
     fn command_log_summary(cmd: &IrcCommand) -> String {
+        if let IrcCommand::ClientBatch(commands) | IrcCommand::ClientChat { commands, .. } = cmd {
+            return format!("CLIENTBATCH ({} commands)", commands.len());
+        }
         let line = cmd.to_string();
         let untagged = line
             .strip_prefix('@')
@@ -6964,6 +7685,12 @@ impl Session {
     }
 
     fn client_tag_is_denied(&self, command: &IrcCommand) -> Option<String> {
+        if let IrcCommand::ClientBatch(commands) | IrcCommand::ClientChat { commands, .. } = command
+        {
+            return commands
+                .iter()
+                .find_map(|command| self.client_tag_is_denied(command));
+        }
         let deny = self.network_support.client_tag_deny.as_deref()?;
         let line = command.to_string();
         let tags = line.strip_prefix('@')?.split_once(' ')?.0;
@@ -7080,12 +7807,14 @@ impl Session {
             complete: true,
             payloads: Vec::new(),
         };
-        for chunk in chunks {
-            if !self.send_command(make_command(chunk.clone())) {
-                outcome.complete = false;
-                break;
-            }
-            outcome.payloads.push(chunk);
+        if self.send_command(if chunks.len() == 1 {
+            make_command(chunks[0].clone())
+        } else {
+            IrcCommand::ClientBatch(chunks.iter().cloned().map(make_command).collect())
+        }) {
+            outcome.payloads = chunks;
+        } else {
+            outcome.complete = false;
         }
         outcome
     }
@@ -7197,7 +7926,11 @@ impl Session {
         if !wire.iter().all(|command| self.validate_command(command)) {
             return TextSendOutcome::default();
         }
-        if !wire.into_iter().all(|command| self.send_command(command)) {
+        if !self.send_command(if wire.len() == 1 {
+            wire.remove(0)
+        } else {
+            IrcCommand::ClientBatch(wire)
+        }) {
             return TextSendOutcome::default();
         }
         TextSendOutcome {
@@ -7230,6 +7963,30 @@ impl Session {
     /// Local rows describe exactly what was queued, so each echo can acquire
     /// the server's identity without duplicating an unsplit optimistic row.
     fn send_chat_text(&mut self, target: &str, text: &str, action: bool) -> bool {
+        if self.is_connected()
+            && let Some(id) = self.id_for_target(target)
+        {
+            let request = message_ui::ChatSendRequest {
+                target: id,
+                body: text.into(),
+                kind: if action {
+                    message_ui::ChatKind::Action
+                } else {
+                    message_ui::ChatKind::Privmsg
+                },
+                reply_to: None,
+            };
+            return match self.send_chat_request(&request) {
+                message_ui::SendReceipt::Queued => true,
+                message_ui::SendReceipt::Rejected(error) => {
+                    self.add_message_to_current(
+                        ChatMessage::system_fmt(&error.to_string(), &self.timestamp_format)
+                            .without_logging(),
+                    );
+                    false
+                }
+            };
+        }
         let outcome = if action {
             self.send_action_text(target, text)
         } else {
@@ -7266,10 +8023,31 @@ impl Session {
                 };
             self.add_message_to_channel(target, row);
         }
+        self.automation_send_failed |= !outcome.complete;
         outcome.complete
     }
 
     fn send_notice_with_confirmation(&mut self, target: &str, text: &str) -> bool {
+        if self.is_connected()
+            && let Some(id) = self.id_for_target(target)
+        {
+            let request = message_ui::ChatSendRequest {
+                target: id,
+                body: text.into(),
+                kind: message_ui::ChatKind::Notice,
+                reply_to: None,
+            };
+            return match self.send_chat_request(&request) {
+                message_ui::SendReceipt::Queued => true,
+                message_ui::SendReceipt::Rejected(error) => {
+                    self.add_message_to_current(
+                        ChatMessage::system_fmt(&error.to_string(), &self.timestamp_format)
+                            .without_logging(),
+                    );
+                    false
+                }
+            };
+        }
         let outcome = self.send_notice_text(target, text);
         let sensitive = commands::service_message_contains_credentials(target, text);
         for payload in outcome.payloads {
@@ -7286,6 +8064,7 @@ impl Session {
             };
             self.add_message_to_current(row);
         }
+        self.automation_send_failed |= !outcome.complete;
         outcome.complete
     }
 
@@ -7296,6 +8075,7 @@ impl Session {
     /// contradict it (also wrong during negotiation, where connected is
     /// still false; #161).
     fn report_send_failure(&mut self, sent: bool, message: &str) {
+        self.automation_send_failed |= !sent;
         if !sent && !self.has_transport() {
             // without_logging: connection-scope client state does not belong
             // in a channel's on-disk history, which add_message_to_channel
@@ -7323,6 +8103,7 @@ impl Session {
                 )
                 .without_logging(),
             );
+            self.automation_send_failed = true;
             return false;
         }
         if let Some(tag) = self.client_tag_is_denied(cmd) {
@@ -7333,15 +8114,45 @@ impl Session {
                 )
                 .without_logging(),
             );
+            self.automation_send_failed = true;
             return false;
         }
         true
     }
 
     pub fn send_command(&mut self, cmd: IrcCommand) -> bool {
+        self.send_command_with_history(cmd, None)
+    }
+
+    fn send_command_with_history(
+        &mut self,
+        cmd: IrcCommand,
+        history: Option<PendingHistoryRequest>,
+    ) -> bool {
         if !self.validate_command(&cmd) {
+            self.automation_send_failed = true;
             return false;
         }
+        if history
+            .as_ref()
+            .and_then(|request| request.correlation.as_ref())
+            .is_some_and(|correlation| {
+                correlation
+                    .owner
+                    .is_none_or(|owner| self.target_name(owner).is_none())
+            })
+        {
+            return false;
+        }
+        let outgoing_history = Self::outgoing_history_request(&cmd);
+        let account_login = match &cmd {
+            IrcCommand::ClientChat { commands, .. } if commands.len() == 1 => {
+                Self::account_login_service(&commands[0])
+            }
+            _ => Self::account_login_service(&cmd),
+        };
+        let upload_token_request = Self::outgoing_upload_token_request(&cmd);
+        let account_whois = self.outgoing_account_whois(&cmd);
         // Track intent only after the command really entered the transport.
         // Raw/tagged forms share the same leave/rejoin semantics.
         let parsed = if let IrcCommand::Raw(line) = &cmd {
@@ -7356,6 +8167,7 @@ impl Session {
         };
         if let Some(tx) = self.connection.sender() {
             if let Err(e) = tx.send(cmd) {
+                self.automation_send_failed = true;
                 tracing::warn!(
                     "Outgoing command not sent (disconnected): {}",
                     Self::command_log_summary(&e.0)
@@ -7365,14 +8177,28 @@ impl Session {
             if let Some((targets, keys, joining)) = membership {
                 self.note_membership_intent(&targets, keys.as_deref(), joining);
             }
+            if let Some(outgoing) = outgoing_history {
+                self.record_history_request(outgoing, history);
+            }
+            if let Some(request) = upload_token_request {
+                self.record_upload_token_request(request);
+            }
+            if let Some(service) = account_login {
+                self.note_account_login_sent(service);
+            }
+            if let Some(request) = account_whois {
+                self.note_account_whois_sent(request);
+            }
             true
         } else {
+            self.automation_send_failed = true;
             false
         }
     }
 
     fn note_membership_intent(&mut self, targets: &str, keys: Option<&str>, joining: bool) {
         if joining && targets == "0" {
+            self.cancel_all_automatic_joins();
             // JOIN 0 is the protocol spelling for leaving every channel.
             let mut names: Vec<_> = self
                 .conversations
@@ -7394,6 +8220,7 @@ impl Session {
             .map(str::trim)
             .filter(|name| !name.is_empty())
         {
+            self.cancel_automatic_join(name);
             let key = keys
                 .next()
                 .filter(|key| !key.is_empty())
@@ -7580,24 +8407,7 @@ impl Session {
         // Credentials must never enter the Up/Down command history. Besides
         // explicit /msg and /query forms, account for ordinary input and /say
         // while the active query is NickServ/AuthServ.
-        let contains_credentials = commands::command_line_contains_credentials(&input)
-            || self.current_target_name().is_some_and(|target| {
-                let candidate = if let Some(command_line) = input.strip_prefix('/') {
-                    let mut parts = command_line.splitn(2, char::is_whitespace);
-                    let command = parts.next().unwrap_or("");
-                    // SAY and ME carry the raw text to the current target; a
-                    // password typed as an action must not enter history.
-                    if command.eq_ignore_ascii_case("SAY") || command.eq_ignore_ascii_case("ME") {
-                        parts.next().unwrap_or("").trim_start()
-                    } else {
-                        ""
-                    }
-                } else {
-                    input.as_str()
-                };
-                !candidate.is_empty()
-                    && commands::service_message_contains_credentials(target, candidate)
-            });
+        let contains_credentials = self.draft_is_sensitive(&input);
 
         // Save non-sensitive input to history (avoid duplicates of last entry).
         if !contains_credentials && self.command_history.last() != Some(&input) {
@@ -7714,13 +8524,17 @@ impl Session {
         Vec::new()
     }
 
-    fn find_command_completions(prefix: &str) -> Vec<String> {
+    fn find_command_completions(&self, prefix: &str) -> Vec<String> {
         let prefix = prefix.to_ascii_lowercase();
-        COMMAND_COMPLETIONS
+        let mut matches: Vec<_> = COMMAND_COMPLETIONS
             .iter()
             .filter(|command| command.starts_with(&prefix))
             .map(|command| (*command).to_string())
-            .collect()
+            .collect();
+        matches.extend(self.alias_completions(&prefix));
+        matches.sort();
+        matches.dedup();
+        matches
     }
 
     fn handle_tab_completion(&mut self) {
@@ -7743,7 +8557,7 @@ impl Session {
             if input.starts_with('/') && !input.chars().any(char::is_whitespace) {
                 (
                     input.clone(),
-                    Self::find_command_completions(&input),
+                    self.find_command_completions(&input),
                     String::new(),
                     " ".to_string(),
                 )
@@ -7804,8 +8618,56 @@ impl Session {
                 total_rows: 0,
             };
         };
+        let unread = self
+            .current_target_name()
+            .and_then(|target| self.conversations.get(target))
+            .map_or(0, |channel| channel.unread);
+        if self.timeline.borrow().entry_read_boundary.is_none()
+            && self.timeline.borrow().last_read.is_none()
+            && unread > 0
+            && unread < msgs.len()
+            && let Some(target) = self.current_target_name()
+        {
+            self.timeline.borrow_mut().entry_read_boundary =
+                Some(self.live_message_reference(target, &msgs[msgs.len() - unread - 1]));
+        }
+        let unread_from_start = unread > 0
+            && unread >= msgs.len()
+            && self.timeline.borrow().entry_read_boundary.is_none();
         let my_nick = self.my_nick.clone();
-        let stick = self.scroll_to_bottom;
+        let stick = self
+            .timeline
+            .borrow()
+            .anchor
+            .as_ref()
+            .is_none_or(|anchor| anchor.at_bottom);
+        let reveal = self.timeline.borrow_mut().reveal.take();
+        let restore = self.timeline.borrow().restore_pending;
+        if restore {
+            self.timeline.borrow_mut().restored_hold = true;
+        }
+        let explicit_read = self.view_is_active
+            && ui.input(|input| {
+                input.pointer.any_pressed()
+                    || input.events.iter().any(|event| {
+                        matches!(
+                            event,
+                            egui::Event::Key { pressed: true, .. } | egui::Event::Text(_)
+                        )
+                    })
+            });
+        if explicit_read {
+            self.timeline.borrow_mut().restored_hold = false;
+        }
+        let scroll_interaction = ui.rect_contains_pointer(ui.max_rect())
+            && ui.input(|input| input.smooth_scroll_delta.y != 0.0 || input.pointer.any_pressed());
+        if scroll_interaction {
+            let mut timeline = self.timeline.borrow_mut();
+            timeline.restore_pending = false;
+            timeline.restored_hold = false;
+            timeline.hydrating = false;
+        }
+        let restore_anchor = self.timeline.borrow().anchor.clone();
         let mut stats = ScrollbackStats {
             drawn: 0,
             measured: 0,
@@ -7813,7 +8675,16 @@ impl Session {
         };
 
         let mut painted_offset = 0.0;
-        let output = ScrollArea::vertical()
+        let mut first_visible = None;
+        let mut last_visible = None;
+        let mut reveal_offset = None;
+        let mut first_fraction = 0.0;
+        let pending_offset = self.timeline.borrow_mut().pending_offset.take();
+        let mut scroll_area = ScrollArea::vertical();
+        if let Some(offset) = pending_offset {
+            scroll_area = scroll_area.vertical_scroll_offset(offset);
+        }
+        let output = scroll_area
             .id_salt(("chat_scrollback", self.id, self.current_conversation))
             .auto_shrink([false; 2])
             .max_height(available_height)
@@ -7836,11 +8707,43 @@ impl Session {
                 let mut first_idx = msgs.len();
                 let mut first_y = 0.0f32;
                 for (i, msg) in msgs.iter().enumerate() {
-                    let bottom =
-                        y + row_height(ui, msg, &my_nick, content_width, layout_key, &mut stats);
+                    let height =
+                        row_height(ui, msg, &my_nick, content_width, layout_key, &mut stats);
+                    if reveal.as_ref().is_some_and(|key| key == &msg.message_key)
+                        || (restore
+                            && restore_anchor
+                                .as_ref()
+                                .filter(|anchor| !anchor.at_bottom)
+                                .and_then(|anchor| anchor.message.as_ref())
+                                .is_some_and(|reference| {
+                                    reference.archive_id.as_deref()
+                                        == Some(msg.message_key.as_str())
+                                        || reference
+                                            .server_msgid
+                                            .as_ref()
+                                            .is_some_and(|id| msg.msgid.as_ref() == Some(id))
+                                }))
+                    {
+                        reveal_offset = Some(
+                            y + if restore {
+                                height
+                                    * restore_anchor
+                                        .as_ref()
+                                        .map_or(0.0, |a| a.fraction.clamp(0.0, 1.0))
+                            } else {
+                                0.0
+                            },
+                        );
+                    }
+                    let bottom = y + height;
                     if first_idx == msgs.len() && bottom >= viewport.min.y {
                         first_idx = i;
                         first_y = y;
+                        first_fraction = ((viewport.min.y - y) / height.max(1.0)).clamp(0.0, 1.0);
+                        first_visible = Some(msg);
+                    }
+                    if bottom <= viewport.max.y {
+                        last_visible = Some(msg);
                     }
                     y = bottom + spacing.y;
                 }
@@ -7894,12 +8797,149 @@ impl Session {
                         }
                         // Warm cache at this point: pass 1 measured everything.
                         cy += msg.row_height.get().height + spacing.y;
-                        draw_chat_row(rows_ui, msg, &my_nick);
+                        let row = rows_ui.scope_builder(
+                            egui::UiBuilder::new()
+                                .id_salt((&msg.message_key, "row"))
+                                .sense(egui::Sense::click()),
+                            |ui| draw_chat_row(ui, msg, &my_nick),
+                        );
+                        let divider = self
+                            .timeline
+                            .borrow()
+                            .entry_read_boundary
+                            .as_ref()
+                            .is_some_and(|reference| {
+                                reference.archive_id.as_deref() == Some(msg.message_key.as_str())
+                                    || reference
+                                        .server_msgid
+                                        .as_ref()
+                                        .is_some_and(|id| msg.msgid.as_ref() == Some(id))
+                            });
+                        if divider || (unread_from_start && msg.message_key == msgs[0].message_key)
+                        {
+                            let y = if divider {
+                                row.response.rect.bottom()
+                            } else {
+                                row.response.rect.top()
+                            };
+                            rows_ui.painter().hline(
+                                rows_ui.max_rect().x_range(),
+                                y,
+                                egui::Stroke::new(1.0, Color32::YELLOW),
+                            );
+                            rows_ui.painter().text(
+                                egui::pos2(rows_ui.max_rect().right() - 4.0, y),
+                                egui::Align2::RIGHT_BOTTOM,
+                                "Unread messages",
+                                egui::FontId::proportional(10.0),
+                                Color32::YELLOW,
+                            );
+                        }
+                        if let Some(action) = row.inner {
+                            self.timeline.borrow_mut().actions.push(action);
+                        }
+                        let response = row.response;
+                        if !msg.is_system {
+                            response.context_menu(|ui| {
+                                if ui.button("Copy message").clicked() {
+                                    ui.ctx().copy_text(msg.content.clone());
+                                    ui.close();
+                                }
+                                if ui
+                                    .add_enabled(
+                                        msg.msgid.is_some()
+                                            && self.enabled_caps.contains("message-tags"),
+                                        egui::Button::new("Reply"),
+                                    )
+                                    .clicked()
+                                {
+                                    self.timeline.borrow_mut().actions.push(
+                                        message_ui::MessageAction::Reply(msg.message_key.clone()),
+                                    );
+                                    ui.close();
+                                }
+                                if let Some(id) = &msg.reply_to
+                                    && ui.button("Show replied message").clicked()
+                                {
+                                    self.timeline
+                                        .borrow_mut()
+                                        .actions
+                                        .push(message_ui::MessageAction::Reveal(id.clone()));
+                                    ui.close();
+                                }
+                                ui.add_enabled_ui(
+                                    msg.msgid.is_some()
+                                        && self.enabled_caps.contains("message-tags"),
+                                    |ui| {
+                                        ui.horizontal(|ui| {
+                                            for emoji in ["👍", "❤️", "😂", "🎉", "👀", "👎"]
+                                            {
+                                                if ui.button(emoji).clicked() {
+                                                    self.timeline.borrow_mut().actions.push(
+                                                        message_ui::MessageAction::React(
+                                                            msg.message_key.clone(),
+                                                            emoji.into(),
+                                                        ),
+                                                    );
+                                                    ui.close();
+                                                }
+                                            }
+                                        });
+                                    },
+                                );
+                            });
+                        }
                         drawn += 1;
                     }
                 });
                 stats.drawn = drawn;
             });
+        let at_bottom = output.state.clamped_offset().y + output.inner_rect.height()
+            >= output.content_size.y - 2.0;
+        let target = self.current_target_name();
+        {
+            let mut timeline = self.timeline.borrow_mut();
+            if let Some(target) = target {
+                if timeline.entry_read_boundary.is_none() {
+                    timeline.entry_read_boundary = timeline.last_read.clone();
+                }
+                if !restore || !timeline.restore_pending || scroll_interaction {
+                    timeline.anchor = Some(identity::ScrollAnchor {
+                        message: first_visible
+                            .map(|message| self.live_message_reference(target, message)),
+                        fraction: first_fraction,
+                        at_bottom,
+                    });
+                }
+                if self.view_is_active
+                    && self.window_focused
+                    && !restore
+                    && reveal.is_none()
+                    && reveal_offset.is_none()
+                {
+                    timeline.visible_read =
+                        last_visible.map(|message| self.live_message_reference(target, message));
+                }
+            }
+            if restore
+                && !timeline.hydrating
+                && (reveal_offset.is_some()
+                    || restore_anchor
+                        .as_ref()
+                        .is_none_or(|anchor| anchor.at_bottom || anchor.message.is_none())
+                    || scroll_interaction)
+            {
+                timeline.restore_pending = false;
+            }
+        }
+        if let Some(offset) = reveal_offset {
+            let mut timeline = self.timeline.borrow_mut();
+            timeline.pending_offset = Some(offset);
+            if let Some(anchor) = &mut timeline.anchor {
+                anchor.at_bottom = false;
+            }
+            ui.ctx().request_discard("reveal saved message position");
+        }
         // egui adjusts a sticky/clamped offset after the content is drawn.
         // A history prepend therefore paints one frame at the old offset,
         // then jumps back on the next frame. Redo that layout before painting
@@ -8197,6 +9237,9 @@ impl Session {
 }
 
 #[cfg(test)]
+mod identity_tests;
+
+#[cfg(test)]
 pub(crate) mod tests {
     use super::*;
 
@@ -8227,6 +9270,22 @@ pub(crate) mod tests {
         app.test_set_sender(tx);
         app.test_set_connected(true);
         (app, rx)
+    }
+
+    fn commit_test_endpoint(app: &mut Session) {
+        let form_nick = std::mem::replace(
+            &mut app.nickname,
+            if app.my_nick.is_empty() {
+                "test".into()
+            } else {
+                app.my_nick.clone()
+            },
+        );
+        app.active_session = Some(
+            app.session_from_form()
+                .expect("typed send fixture endpoint"),
+        );
+        app.nickname = form_nick;
     }
 
     fn test_registration_transport(app: &mut Session) -> mpsc::UnboundedReceiver<IrcCommand> {
@@ -9181,6 +10240,8 @@ pub(crate) mod tests {
         // Manual/unprofiled endpoint edits clear the form's scoped secrets but
         // cannot mutate the active socket's reconnect/automation snapshot.
         app.apply_unprofiled_endpoint("new.example", "7000", false);
+        app.auto_join_channels = "#new".into();
+        app.auto_perform = "/ns identify new-nickserv-pass".into();
         assert!(app.password.is_empty());
         assert!(app.sasl_password.is_empty());
         assert_eq!(app.active_endpoint_label(), "old.example:6697");
@@ -9204,13 +10265,30 @@ pub(crate) mod tests {
         app.test_set_sender(tx);
         app.handle_numeric(RPL_WELCOME, &["me".into(), "welcome".into()]);
         assert!(matches!(rx.try_recv(), Ok(IrcCommand::Mode(_, Some(mode), _)) if mode == "+i"));
-        assert!(
-            matches!(rx.try_recv(), Ok(IrcCommand::Join(channel, _, _, _)) if channel == "#old")
-        );
         assert!(matches!(rx.try_recv(), Ok(IrcCommand::Ping(token)) if token == "LAG"));
+        assert!(
+            rx.try_recv().is_err(),
+            "automatic joins wait for service authentication"
+        );
         assert_eq!(
             app.pending_auto_perform.as_deref(),
             Some(["/ns identify old-nickserv-pass".to_string()].as_slice())
+        );
+        app.run_timed_tasks();
+        assert_eq!(
+            drain_commands(&mut rx),
+            vec![IrcCommand::Privmsg(
+                "NickServ".into(),
+                "identify old-nickserv-pass".into(),
+            )]
+        );
+        app.handle_incoming_message(
+            IrcMessage::parse(":srv 900 me me!u@h old-account :Logged in").unwrap(),
+        );
+        app.run_timed_tasks();
+        assert_eq!(
+            drain_commands(&mut rx),
+            vec![IrcCommand::Join("#old".into(), None, None, None)]
         );
     }
 
@@ -9312,6 +10390,7 @@ pub(crate) mod tests {
     fn favorite_load_preserves_its_endpoint_scoped_profile() {
         let mut app = test_app();
         let favorite = ServerFavorite {
+            upload_settings: Default::default(),
             name: "private".into(),
             host: "favorite.example".into(),
             port: "7443".into(),
@@ -9324,6 +10403,7 @@ pub(crate) mod tests {
             sasl_password: "sasl-pass".into(),
             sasl_mechanism: SaslMechanism::Auto,
             sasl_required: false,
+            bouncer: None,
             tls_client_cert_path: String::new(),
             tls_client_key_path: String::new(),
             username: "ident".into(),
@@ -9355,6 +10435,7 @@ pub(crate) mod tests {
     #[test]
     fn chathistory_replay_keeps_own_notice_rows() {
         let mut app = test_app();
+        app.prepare_history_target("#chan");
         app.set_session_nick("me".into(), true);
         app.handle_cap_message("ACK", &["echo-message".into()]);
 
@@ -9369,7 +10450,7 @@ pub(crate) mod tests {
         let chan = app
             .conversations
             .get("#chan")
-            .expect("batch creates the tab");
+            .expect("history target remains open");
         assert!(
             chan.messages
                 .iter()
@@ -9390,6 +10471,7 @@ pub(crate) mod tests {
     #[test]
     fn credential_commands_never_enter_history_search_or_local_scrollback() {
         let (mut app, mut rx) = test_app_connected();
+        commit_test_endpoint(&mut app);
         app.set_session_nick("me".into(), true);
         assert!(app.open_query("NickServ"));
 
@@ -9840,6 +10922,7 @@ pub(crate) mod tests {
         // /notice actually went out (#152 — the disconnected branch never
         // creates the row and the dedup under test would not run).
         let (mut app, _rx) = test_app_connected();
+        commit_test_endpoint(&mut app);
         app.set_session_nick("me".into(), true);
         app.handle_cap_message("ACK", &["echo-message".into(), "draft/chathistory".into()]);
         let mut channel = Channel::new();
@@ -9931,6 +11014,7 @@ pub(crate) mod tests {
     #[test]
     fn identical_consecutive_sends_pair_with_echoes_in_send_order() {
         let (mut app, _rx) = test_app_connected();
+        commit_test_endpoint(&mut app);
         app.set_session_nick("me".into(), true);
         app.handle_cap_message("ACK", &["echo-message".into()]);
         let mut channel = Channel::new();
@@ -9967,6 +11051,7 @@ pub(crate) mod tests {
     #[test]
     fn echo_never_stamps_a_row_loaded_from_the_local_log() {
         let (mut app, _rx) = test_app_connected();
+        commit_test_endpoint(&mut app);
         app.set_session_nick("me".into(), true);
         app.handle_cap_message("ACK", &["echo-message".into()]);
         let mut channel = Channel::new();
@@ -11401,16 +12486,28 @@ pub(crate) mod tests {
     fn private_reaction_routes_to_the_senders_query() {
         let mut app = test_app();
         app.set_session_nick("me".into(), true);
+        app.add_message_to_channel(
+            "alice",
+            ChatMessage::new_fmt("alice", "parent", "short").with_irc_metadata(
+                None,
+                Some("abc".into()),
+                None,
+            ),
+        );
         app.handle_incoming_message(
             IrcMessage::parse("@+draft/react=👍;+reply=abc :alice!u@h TAGMSG me").unwrap(),
         );
 
         assert!(app.conversations.contains_key("alice"));
         assert!(!app.conversations.contains_key("me"));
-        assert!(
-            app.conversations["alice"].messages[0]
-                .content
-                .contains("reacted 👍 to abc")
+        assert_eq!(app.conversations["alice"].messages.len(), 1);
+        assert_eq!(
+            app.conversations["alice"].messages[0].reactions[0].emoji,
+            "👍"
+        );
+        assert_eq!(
+            app.conversations["alice"].messages[0].reactions[0].actors,
+            ["alice"]
         );
     }
 
@@ -11459,6 +12556,8 @@ pub(crate) mod tests {
         app.set_session_nick("me".into(), true);
         app.conversations.insert("#room".into(), Channel::new());
         app.select_target("#room");
+        // The active viewport has reported that it is reading the buffer tail.
+        app.reading_conversation = app.current_conversation;
         app.handle_incoming_message(
             IrcMessage::parse(":srv CAP me ACK :draft/read-marker").unwrap(),
         );
@@ -11484,13 +12583,13 @@ pub(crate) mod tests {
         let mut app = test_app();
         app.conversations.insert("#room".into(), Channel::new());
         app.handle_incoming_message(
-            IrcMessage::parse(":srv FAIL CHATHISTORY INVALID_TARGET #room :No history").unwrap(),
+            IrcMessage::parse(":srv FAIL JOIN NO_SUCH_CHANNEL #room :No such channel").unwrap(),
         );
         assert!(
             app.conversations["#room"]
                 .messages
                 .iter()
-                .any(|message| message.content.contains("INVALID_TARGET"))
+                .any(|message| message.content.contains("NO_SUCH_CHANNEL"))
         );
         assert!(app.server_messages.is_empty());
     }
@@ -12075,16 +13174,29 @@ pub(crate) mod tests {
         assert!(app.conversations["#room"].messages.is_empty());
         assert!(!app.conversations.contains_key("#elsewhere"));
 
+        // A valid peer reaction attaches to its parent rather than adding a noise row.
+        app.add_message_to_channel(
+            "#room",
+            ChatMessage::new_fmt("bob", "parent", "short").with_irc_metadata(
+                None,
+                Some("parent".into()),
+                None,
+            ),
+        );
         // The same events from a peer are still shown.
         app.handle_incoming_message(IrcMessage::parse(":alice!u@h INVITE me #elsewhere").unwrap());
         app.handle_incoming_message(
-            IrcMessage::parse("@+draft/react=:+1: :alice!u@h TAGMSG #room").unwrap(),
+            IrcMessage::parse("@+draft/react=:+1:;+reply=parent :alice!u@h TAGMSG #room").unwrap(),
         );
         app.handle_incoming_message(
             IrcMessage::parse(":alice!u@h WALLCHOPS #room :ops only").unwrap(),
         );
         assert_eq!(app.pending_invites.len(), 1);
         assert_eq!(app.conversations["#room"].messages.len(), 2);
+        assert_eq!(
+            app.conversations["#room"].messages[0].reactions[0].actors,
+            ["alice"]
+        );
     }
 
     #[test]
@@ -12747,7 +13859,12 @@ pub(crate) mod tests {
         app.handle_incoming_message(IrcMessage::parse(":srv CAP me ACK :draft/multiline").unwrap());
         assert!(app.send_privmsg_text("#room", "one\ntwo").complete);
 
-        let IrcCommand::Batch(open, Some(kind), Some(target)) = rx.try_recv().unwrap() else {
+        let IrcCommand::ClientBatch(commands) = rx.try_recv().unwrap() else {
+            panic!("expected atomic multiline envelope")
+        };
+        assert!(rx.try_recv().is_err());
+        let mut wire = commands.into_iter();
+        let IrcCommand::Batch(open, Some(kind), Some(target)) = wire.next().unwrap() else {
             panic!("expected multiline batch opener");
         };
         assert!(open.starts_with("+lf"));
@@ -12755,15 +13872,15 @@ pub(crate) mod tests {
         assert_eq!(target, "#room");
         let batch_id = open.trim_start_matches('+');
         assert_eq!(
-            rx.try_recv().unwrap(),
+            wire.next().unwrap(),
             IrcCommand::Raw(format!("@batch={batch_id} PRIVMSG #room :one"))
         );
         assert_eq!(
-            rx.try_recv().unwrap(),
+            wire.next().unwrap(),
             IrcCommand::Raw(format!("@batch={batch_id} PRIVMSG #room :two"))
         );
         assert_eq!(
-            rx.try_recv().unwrap(),
+            wire.next().unwrap(),
             IrcCommand::Batch(format!("-{batch_id}"), None, None)
         );
     }
@@ -13132,6 +14249,8 @@ pub(crate) mod tests {
         app.set_session_nick("me".into(), true);
         app.conversations.insert("#room".into(), Channel::new());
         app.select_target("#room");
+        // The active viewport has reported that it is reading the buffer tail.
+        app.reading_conversation = app.current_conversation;
         app.handle_incoming_message(
             IrcMessage::parse(":srv CAP me ACK :draft/read-marker").unwrap(),
         );
@@ -13258,6 +14377,8 @@ pub(crate) mod tests {
     fn catch_up_in_the_selected_focused_tab_is_already_seen() {
         let (mut app, _rx) = reconnected_app_reading_a_channel();
         app.select_target("alice");
+        // The active viewport has reported that it is reading the buffer tail.
+        app.reading_conversation = app.current_conversation;
         app.window_focused = true;
 
         app.handle_incoming_message(IrcMessage::parse(":srv BATCH +h chathistory alice").unwrap());
@@ -13411,6 +14532,7 @@ pub(crate) mod tests {
             .entry("#room".into())
             .or_default()
             .push_back(PendingHistoryRequest {
+                correlation: None,
                 placement: HistoryPlacement::Append,
                 direction: HistoryDirection::Before,
                 remaining: 100,
@@ -13599,6 +14721,17 @@ pub(crate) mod tests {
 }
 
 #[cfg(test)]
+fn flatten_test_commands(command: IrcCommand) -> Vec<IrcCommand> {
+    match command {
+        IrcCommand::ClientBatch(commands) | IrcCommand::ClientChat { commands, .. } => commands
+            .into_iter()
+            .flat_map(flatten_test_commands)
+            .collect(),
+        command => vec![command],
+    }
+}
+
+#[cfg(test)]
 mod recovery_and_echo_regressions {
     use super::*;
 
@@ -13628,7 +14761,9 @@ mod recovery_and_echo_regressions {
     }
 
     fn drain(rx: &mut mpsc::UnboundedReceiver<IrcCommand>) -> Vec<IrcCommand> {
-        std::iter::from_fn(|| rx.try_recv().ok()).collect()
+        std::iter::from_fn(|| rx.try_recv().ok())
+            .flat_map(flatten_test_commands)
+            .collect()
     }
 
     fn joins(rx: &mut mpsc::UnboundedReceiver<IrcCommand>) -> Vec<(String, Option<String>)> {
@@ -14041,6 +15176,8 @@ mod history_interleaving_tests {
         let (mut app, mut rx) = session(100);
         message(&mut app, None, 0, "m0");
         app.process_command("/history after #room msgid=m0 10");
+        app.select_target("#room");
+        app.reading_conversation = app.current_conversation;
         feed(&mut app, ":srv BATCH +h chathistory #room");
         message(&mut app, Some("h"), 1, "m1");
         message(&mut app, None, 3, "m3");

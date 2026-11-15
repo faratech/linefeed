@@ -1000,11 +1000,7 @@ mod tests {
 
         // A URL that ends before the control must not swallow the next word.
         let segs = layout_irc_text("\u{2}https://a.test\u{2} plain words");
-        assert!(
-            !segs
-                .iter()
-                .any(|s| s.is_url && s.text.contains("plain"))
-        );
+        assert!(!segs.iter().any(|s| s.is_url && s.text.contains("plain")));
         assert!(segs.iter().any(|s| s.text == " plain words"));
 
         // Color control inside the URL path.
@@ -1136,4 +1132,3 @@ mod tests {
         }
     }
 }
-

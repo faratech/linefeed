@@ -5,7 +5,7 @@ use super::{ChatMessage, Session, SessionEvent, WindowCommand};
 use crate::irc::IrcCommand;
 
 impl Session {
-    pub fn process_command(&mut self, input: &str) {
+    pub(super) fn process_builtin_command(&mut self, input: &str) {
         if input.is_empty() {
             return;
         }
@@ -421,23 +421,31 @@ impl Session {
 
             "REPLY" => {
                 let (msgid, content) = split_word(args);
-                if let Some(target) = self.current_target().map(str::to_string)
-                    && self.enabled_caps.contains("message-tags")
+                if let Some(target) = self.current_conversation
                     && valid_message_reference(msgid)
                     && !content.is_empty()
                 {
-                    let tag = escape_message_tag_value(msgid);
-                    let command =
-                        IrcCommand::Raw(format!("@+reply={tag} PRIVMSG {target} :{content}"));
-                    if self.send_command(command) {
-                        self.add_message_to_channel(
-                            &target,
-                            ChatMessage::new_fmt(&self.my_nick, content, &self.timestamp_format)
-                                .with_reply_to(Some(msgid.to_string()))
-                                .with_pending_echo(),
-                        );
+                    let target_name = self.target_name(target).unwrap_or_default();
+                    let request = super::message_ui::ChatSendRequest {
+                        target,
+                        body: content.into(),
+                        kind: super::message_ui::ChatKind::Privmsg,
+                        reply_to: Some(super::identity::MessageRef {
+                            conversation: self.conversation_key(target_name),
+                            archive_id: None,
+                            server_msgid: Some(msgid.into()),
+                            server_time: None,
+                        }),
+                    };
+                    let result = match self.send_chat_request(&request) {
+                        super::message_ui::SendReceipt::Queued => Ok(()),
+                        super::message_ui::SendReceipt::Rejected(error) => Err(error),
+                    };
+                    if let Err(error) = result {
+                        self.add_message_to_current(ChatMessage::system(&error.to_string()));
                     }
                 } else {
+                    self.automation_send_failed = true;
                     self.add_message_to_current(ChatMessage::system(
                         "Usage: /reply <msgid> <message>",
                     ));
@@ -660,6 +668,7 @@ impl Session {
                                     page,
                                 ),
                                 Some(super::PendingHistoryRequest {
+                                    correlation: None,
                                     placement: super::HistoryPlacement::Prepend,
                                     direction: super::HistoryDirection::Before,
                                     remaining: total,
@@ -682,6 +691,7 @@ impl Session {
                                     page,
                                 ),
                                 Some(super::PendingHistoryRequest {
+                                    correlation: None,
                                     placement: super::HistoryPlacement::Append,
                                     direction: super::HistoryDirection::After,
                                     remaining: total,
@@ -1907,7 +1917,13 @@ impl Session {
                 }
             }
 
-            "LASTLOG" | "GREP" | "SEARCH" => {
+            "SEARCH" => self.events.push(SessionEvent::SearchRequested {
+                query: args.to_string(),
+                all_networks: false,
+                conversation: self.current_conversation,
+            }),
+
+            "LASTLOG" | "GREP" => {
                 if !args.is_empty() {
                     let pattern = args.to_lowercase();
 
@@ -1985,7 +2001,7 @@ impl Session {
                             .filter(|line| !line.trim().is_empty())
                             .enumerate()
                             .map(|(i, line)| {
-                                let shown = if command_line_contains_credentials(line) {
+                                let shown = if self.draft_is_sensitive(line) {
                                     "<credential command redacted>"
                                 } else {
                                     line
@@ -2357,6 +2373,8 @@ impl Session {
     /// Secrets and automation belong to one configured network profile. An
     /// unprofiled endpoint change must never inherit them from the old server.
     pub(crate) fn clear_endpoint_credentials(&mut self) {
+        self.upload_settings = Default::default();
+        self.bouncer = None;
         self.password.clear();
         self.sasl_username.clear();
         self.sasl_password.clear();
@@ -2378,6 +2396,8 @@ impl Session {
     /// profile (endpoint, secrets, automation). Deliberately not `Debug`.
     fn take_endpoint_form(&self) -> EndpointForm {
         EndpointForm {
+            bouncer: self.bouncer.clone(),
+            upload_settings: self.upload_settings.clone(),
             server_host: self.server_host.clone(),
             server_port: self.server_port.clone(),
             use_tls: self.use_tls,
@@ -2398,6 +2418,8 @@ impl Session {
     }
 
     fn restore_endpoint_form(&mut self, form: EndpointForm) {
+        self.bouncer = form.bouncer;
+        self.upload_settings = form.upload_settings;
         self.server_host = form.server_host;
         self.server_port = form.server_port;
         self.use_tls = form.use_tls;
@@ -2903,6 +2925,8 @@ fn mode_command_args(
 /// while `/server` borrows the form for a one-off session. Deliberately not
 /// `Debug`: it carries credentials.
 struct EndpointForm {
+    bouncer: Option<crate::irc::bouncer::BouncerBinding>,
+    upload_settings: super::uploads::UploadSettings,
     server_host: String,
     server_port: String,
     use_tls: bool,
@@ -3063,9 +3087,24 @@ mod tests {
             logging_enabled: false,
             ..crate::gui::Settings::default()
         });
+        let form_nick = std::mem::replace(&mut app.nickname, "test".into());
+        app.active_session = Some(
+            app.session_from_form()
+                .expect("registered command fixture endpoint"),
+        );
+        app.nickname = form_nick;
         let (tx, rx) = mpsc::unbounded_channel();
         app.test_set_registered(tx);
         (app, rx)
+    }
+
+    fn single_wire_command(command: IrcCommand) -> IrcCommand {
+        let mut commands = crate::gui::flatten_test_commands(command);
+        assert_eq!(commands.len(), 1, "expected one wire command");
+        commands.remove(0)
+    }
+    fn next_command(rx: &mut mpsc::UnboundedReceiver<IrcCommand>) -> IrcCommand {
+        single_wire_command(rx.try_recv().expect("queued wire command"))
     }
 
     fn test_select_target(app: &mut Session, target: &str) {
@@ -3154,17 +3193,17 @@ mod tests {
 
         app.process_command("/hop");
         assert_eq!(
-            rx.try_recv().unwrap(),
+            next_command(&mut rx),
             IrcCommand::Part("#Room".into(), Some("Cycling".into()))
         );
         assert_eq!(
-            rx.try_recv().unwrap(),
+            next_command(&mut rx),
             IrcCommand::Join("#Room".into(), Some("secret-key".into()), None, None)
         );
 
         app.process_command("/halfop alice");
         assert_eq!(
-            rx.try_recv().unwrap(),
+            next_command(&mut rx),
             IrcCommand::Mode("#Room".into(), Some("+h".into()), vec!["alice".into()])
         );
     }
@@ -3186,11 +3225,11 @@ mod tests {
 
         app.process_command("/cycle");
         assert_eq!(
-            rx.try_recv().unwrap(),
+            next_command(&mut rx),
             IrcCommand::Part("#Room".into(), Some("Cycling".into()))
         );
         assert_eq!(
-            rx.try_recv().unwrap(),
+            next_command(&mut rx),
             IrcCommand::Join("#Room".into(), Some("secret-key".into()), None, None)
         );
         app.handle_incoming_message(
@@ -3229,11 +3268,11 @@ mod tests {
         app.process_command("/cycle");
 
         assert_eq!(
-            rx.try_recv().unwrap(),
+            next_command(&mut rx),
             IrcCommand::Part("#room".into(), Some("Cycling".into()))
         );
         assert_eq!(
-            rx.try_recv().unwrap(),
+            next_command(&mut rx),
             IrcCommand::Join("#room".into(), None, None, None)
         );
         assert!(rx.try_recv().is_err());
@@ -3306,7 +3345,7 @@ mod tests {
         assert_eq!(app.input_text, "draft to preserve");
         app.process_command("/join #room");
         assert_eq!(
-            rx.try_recv().unwrap(),
+            next_command(&mut rx),
             IrcCommand::Join("#room".into(), None, None, None)
         );
         app.handle_incoming_message(crate::irc::IrcMessage::parse(":me!u@h JOIN #room").unwrap());
@@ -3354,7 +3393,7 @@ mod tests {
         test_select_target(&mut app, "#room");
         app.process_command("/mode +m");
         assert_eq!(
-            rx.try_recv().unwrap(),
+            next_command(&mut rx),
             IrcCommand::Mode("#room".into(), Some("+m".into()), Vec::new())
         );
     }
@@ -3368,7 +3407,7 @@ mod tests {
         app.process_command("/history #public 500");
 
         assert_eq!(
-            rx.try_recv().unwrap(),
+            next_command(&mut rx),
             IrcCommand::ChathistoryLatest("#public".into(), "*".into(), 50)
         );
         assert_eq!(app.current_target(), Some("#public"));
@@ -3379,22 +3418,23 @@ mod tests {
     fn reply_reaction_and_typing_use_client_only_tags() {
         let (mut app, mut rx) = connected_command_app();
         app.conversations.insert("#room".into(), Channel::new());
+        app.conversations.get_mut("#room").unwrap().joined = true;
         test_select_target(&mut app, "#room");
         app.handle_cap_message("ACK", &["message-tags".into()]);
 
         app.process_command("/reply abc hello there");
         assert_eq!(
-            rx.try_recv().unwrap(),
+            next_command(&mut rx),
             IrcCommand::Raw("@+reply=abc PRIVMSG #room :hello there".into())
         );
         app.process_command("/react abc 👍");
         assert_eq!(
-            rx.try_recv().unwrap(),
+            next_command(&mut rx),
             IrcCommand::Raw("@+draft/react=👍;+reply=abc TAGMSG #room".into())
         );
         app.process_command("/typing active");
         assert_eq!(
-            rx.try_recv().unwrap(),
+            next_command(&mut rx),
             IrcCommand::Raw("@+typing=active TAGMSG #room".into())
         );
     }
@@ -3403,32 +3443,33 @@ mod tests {
     fn tab_separated_args_parse_like_spaces_in_tag_and_channel_commands() {
         let (mut app, mut rx) = connected_command_app();
         app.conversations.insert("#room".into(), Channel::new());
+        app.conversations.get_mut("#room").unwrap().joined = true;
         test_select_target(&mut app, "#room");
         app.handle_cap_message("ACK", &["message-tags labeled-response".into()]);
 
         app.process_command("/reply abc\thello there");
         assert_eq!(
-            rx.try_recv().unwrap(),
+            next_command(&mut rx),
             IrcCommand::Raw("@+reply=abc PRIVMSG #room :hello there".into())
         );
         app.process_command("/react abc\t👍");
         assert_eq!(
-            rx.try_recv().unwrap(),
+            next_command(&mut rx),
             IrcCommand::Raw("@+draft/react=👍;+reply=abc TAGMSG #room".into())
         );
         app.process_command("/label lbl1\tWHOIS alice");
         assert_eq!(
-            rx.try_recv().unwrap(),
+            next_command(&mut rx),
             IrcCommand::Raw("@label=lbl1 WHOIS alice".into())
         );
         app.process_command("/redact abc123\tspam");
         assert_eq!(
-            rx.try_recv().unwrap(),
+            next_command(&mut rx),
             IrcCommand::Redact("#room".into(), "abc123".into(), Some("spam".into()))
         );
         app.process_command("/rename #newroom\trenamed reason");
         assert_eq!(
-            rx.try_recv().unwrap(),
+            next_command(&mut rx),
             IrcCommand::Rename(
                 "#room".into(),
                 "#newroom".into(),
@@ -3437,7 +3478,7 @@ mod tests {
         );
         app.process_command("/relocate #otherroom\tmoved reason");
         assert_eq!(
-            rx.try_recv().unwrap(),
+            next_command(&mut rx),
             IrcCommand::Relocate(
                 "#room".into(),
                 "#otherroom".into(),
@@ -3446,7 +3487,7 @@ mod tests {
         );
         app.process_command("/ctcp bob\tVERSION");
         assert_eq!(
-            rx.try_recv().unwrap(),
+            next_command(&mut rx),
             IrcCommand::Privmsg("bob".into(), "\x01VERSION\x01".into())
         );
     }
@@ -3660,7 +3701,7 @@ mod tests {
             .insert("MODES".into(), Some("3".into()));
         app.process_command("/unban alice");
         assert_eq!(
-            rx.try_recv().unwrap(),
+            next_command(&mut rx),
             IrcCommand::Mode(
                 "#chan".into(),
                 Some("-bbb".into()),
@@ -3672,7 +3713,7 @@ mod tests {
             )
         );
         assert_eq!(
-            rx.try_recv().unwrap(),
+            next_command(&mut rx),
             IrcCommand::Mode(
                 "#chan".into(),
                 Some("-b".into()),
@@ -3734,7 +3775,7 @@ mod tests {
         ] {
             app.process_command(input);
             assert_eq!(
-                rx.try_recv().unwrap(),
+                next_command(&mut rx),
                 IrcCommand::Privmsg("#room".into(), text.into()),
                 "{input}"
             );
@@ -3786,12 +3827,12 @@ mod tests {
         // An ordinary escaped command still goes out, as does a deliberate /say.
         app.process_command("//nsfw is fine");
         assert_eq!(
-            rx.try_recv().unwrap(),
+            next_command(&mut rx),
             IrcCommand::Privmsg("#room".into(), "/nsfw is fine".into())
         );
         app.process_command("/say /ns identify literal");
         assert_eq!(
-            rx.try_recv().unwrap(),
+            next_command(&mut rx),
             IrcCommand::Privmsg("#room".into(), "/ns identify literal".into())
         );
     }
@@ -3802,7 +3843,7 @@ mod tests {
 
         app.process_command("/join #chan  secret");
         assert_eq!(
-            rx.try_recv().unwrap(),
+            next_command(&mut rx),
             IrcCommand::Join("#chan".into(), Some("secret".into()), None, None)
         );
         assert_eq!(
@@ -3814,24 +3855,24 @@ mod tests {
         );
         app.process_command("/join #other \t key2");
         assert_eq!(
-            rx.try_recv().unwrap(),
+            next_command(&mut rx),
             IrcCommand::Join("#other".into(), Some("key2".into()), None, None)
         );
         // No key stays no key.
         app.process_command("/join #plain");
         assert_eq!(
-            rx.try_recv().unwrap(),
+            next_command(&mut rx),
             IrcCommand::Join("#plain".into(), None, None, None)
         );
 
         app.process_command("/part #chan  bye now");
         assert_eq!(
-            rx.try_recv().unwrap(),
+            next_command(&mut rx),
             IrcCommand::Part("#chan".into(), Some("bye now".into()))
         );
         app.process_command("/part #chan");
         assert_eq!(
-            rx.try_recv().unwrap(),
+            next_command(&mut rx),
             IrcCommand::Part("#chan".into(), None)
         );
         // Without a channel token the whole argument is the reason.
@@ -3839,7 +3880,7 @@ mod tests {
         test_select_target(&mut app, "#room");
         app.process_command("/part  gone   fishing");
         assert_eq!(
-            rx.try_recv().unwrap(),
+            next_command(&mut rx),
             IrcCommand::Part("#room".into(), Some("gone   fishing".into()))
         );
     }
@@ -3877,7 +3918,7 @@ mod tests {
         assert!(app.open_query("bob"));
         app.process_command("/part #room later");
         assert_eq!(
-            rx.try_recv().unwrap(),
+            next_command(&mut rx),
             IrcCommand::Part("#room".into(), Some("later".into()))
         );
         assert!(app.conversations.contains_key("bob"), "the query tab stays");
@@ -3904,56 +3945,57 @@ mod tests {
         let (mut app, mut rx) = connected_command_app();
         test_select_target(&mut app, "#room");
         app.conversations.insert("#room".into(), Channel::new());
+        app.conversations.get_mut("#room").unwrap().joined = true;
         app.handle_cap_message("ACK", &["message-tags labeled-response".into()]);
 
         app.process_command("/ctcp bob  VERSION");
         assert_eq!(
-            rx.try_recv().unwrap(),
+            next_command(&mut rx),
             IrcCommand::Privmsg("bob".into(), "\x01VERSION\x01".into())
         );
         app.process_command("/ctcp bob \t ping   1  2");
         assert_eq!(
-            rx.try_recv().unwrap(),
+            next_command(&mut rx),
             IrcCommand::Privmsg("bob".into(), "\x01PING 1  2\x01".into())
         );
         app.process_command("/cprivmsg bob  #room  hello there");
         assert_eq!(
-            rx.try_recv().unwrap(),
+            next_command(&mut rx),
             IrcCommand::Raw("CPRIVMSG bob #room :hello there".into())
         );
         app.process_command("/invite bob   #elsewhere");
         assert_eq!(
-            rx.try_recv().unwrap(),
+            next_command(&mut rx),
             IrcCommand::Invite("bob".into(), "#elsewhere".into())
         );
         app.process_command("/react abc   👍");
         assert_eq!(
-            rx.try_recv().unwrap(),
+            next_command(&mut rx),
             IrcCommand::Raw("@+draft/react=👍;+reply=abc TAGMSG #room".into())
         );
         app.process_command("/reply abc   hello there");
         assert_eq!(
-            rx.try_recv().unwrap(),
+            next_command(&mut rx),
             IrcCommand::Raw("@+reply=abc PRIVMSG #room :hello there".into())
         );
         app.process_command("/label lbl1   WHOIS alice");
         assert_eq!(
-            rx.try_recv().unwrap(),
+            next_command(&mut rx),
             IrcCommand::Raw("@label=lbl1 WHOIS alice".into())
         );
         app.process_command("/msg alice   hi there");
         assert_eq!(
-            rx.try_recv().unwrap(),
+            next_command(&mut rx),
             IrcCommand::Privmsg("alice".into(), "hi there".into())
         );
         app.process_command("/kick bob   too loud");
         assert_eq!(
-            rx.try_recv().unwrap(),
+            next_command(&mut rx),
             IrcCommand::Kick("#room".into(), "bob".into(), Some("too loud".into()))
         );
         app.process_command("/rename #new   moved");
         assert_eq!(
-            rx.try_recv().unwrap(),
+            next_command(&mut rx),
             IrcCommand::Rename("#room".into(), "#new".into(), Some("moved".into()))
         );
     }
@@ -3964,16 +4006,16 @@ mod tests {
 
         app.process_command("/version alice hello");
         assert_eq!(
-            rx.try_recv().unwrap(),
+            next_command(&mut rx),
             IrcCommand::Privmsg("alice".into(), "\x01VERSION\x01".into())
         );
         app.process_command("/version  alice\tignored words");
         assert_eq!(
-            rx.try_recv().unwrap(),
+            next_command(&mut rx),
             IrcCommand::Privmsg("alice".into(), "\x01VERSION\x01".into())
         );
         app.process_command("/ping alice x");
-        match rx.try_recv().unwrap() {
+        match next_command(&mut rx) {
             IrcCommand::Privmsg(target, ctcp) => {
                 assert_eq!(target, "alice");
                 assert!(ctcp.starts_with("\x01PING ") && ctcp.ends_with('\x01'));
@@ -4075,12 +4117,12 @@ mod tests {
         // Explicit channels still work from inside a query.
         app.process_command("/names #other");
         assert_eq!(
-            rx.try_recv().unwrap(),
+            next_command(&mut rx),
             IrcCommand::Names(Some("#other".into()))
         );
         app.process_command("/invite carol #other");
         assert_eq!(
-            rx.try_recv().unwrap(),
+            next_command(&mut rx),
             IrcCommand::Invite("carol".into(), "#other".into())
         );
 
@@ -4089,22 +4131,22 @@ mod tests {
         test_select_target(&mut app, "#room");
         app.process_command("/topic hi");
         assert_eq!(
-            rx.try_recv().unwrap(),
+            next_command(&mut rx),
             IrcCommand::Topic("#room".into(), Some("hi".into()))
         );
         app.process_command("/topic");
         assert_eq!(
-            rx.try_recv().unwrap(),
+            next_command(&mut rx),
             IrcCommand::Topic("#room".into(), None)
         );
         app.process_command("/names");
         assert_eq!(
-            rx.try_recv().unwrap(),
+            next_command(&mut rx),
             IrcCommand::Names(Some("#room".into()))
         );
         app.process_command("/invite carol");
         assert_eq!(
-            rx.try_recv().unwrap(),
+            next_command(&mut rx),
             IrcCommand::Invite("carol".into(), "#room".into())
         );
     }
@@ -4146,12 +4188,12 @@ mod tests {
         // Nick targets still work.
         app.process_command("/version alice");
         assert_eq!(
-            rx.try_recv().unwrap(),
+            next_command(&mut rx),
             IrcCommand::Privmsg("alice".into(), "\x01VERSION\x01".into())
         );
         app.process_command("/ctcp alice VERSION");
         assert_eq!(
-            rx.try_recv().unwrap(),
+            next_command(&mut rx),
             IrcCommand::Privmsg("alice".into(), "\x01VERSION\x01".into())
         );
     }
@@ -4188,7 +4230,7 @@ mod tests {
         ] {
             app.process_command(input);
             assert_eq!(
-                rx.try_recv().unwrap(),
+                next_command(&mut rx),
                 IrcCommand::Redact(target.into(), "abc123".into(), reason.map(str::to_string)),
                 "{input}"
             );
@@ -4199,10 +4241,10 @@ mod tests {
     fn unknown_valid_commands_pass_through_without_allowing_line_injection() {
         let (mut app, mut rx) = connected_command_app();
         app.process_command("/map");
-        assert_eq!(rx.try_recv().unwrap(), IrcCommand::Raw("MAP".into()));
+        assert_eq!(next_command(&mut rx), IrcCommand::Raw("MAP".into()));
         app.process_command("/vendorcmd one two");
         assert_eq!(
-            rx.try_recv().unwrap(),
+            next_command(&mut rx),
             IrcCommand::Raw("VENDORCMD one two".into())
         );
         app.process_command("/vendorcmd one\r\nOPER root secret");
@@ -4217,7 +4259,7 @@ mod tests {
             .insert("WATCH".into(), Some("128".into()));
         app.process_command("/monitor +alice,bob");
         assert_eq!(
-            rx.try_recv().unwrap(),
+            next_command(&mut rx),
             IrcCommand::Raw("WATCH +alice +bob".into())
         );
     }
@@ -4261,11 +4303,11 @@ mod tests {
         ));
         app.process_command("/silence +*!*@spam.example");
         assert_eq!(
-            rx.try_recv().unwrap(),
+            next_command(&mut rx),
             IrcCommand::Raw("SILENCE +*!*@spam.example".into())
         );
         app.process_command("/silence");
-        assert_eq!(rx.try_recv().unwrap(), IrcCommand::Raw("SILENCE".into()));
+        assert_eq!(next_command(&mut rx), IrcCommand::Raw("SILENCE".into()));
     }
 
     #[test]
@@ -4346,7 +4388,7 @@ mod tests {
         assert!(matches!(rx.try_recv(), Ok(IrcCommand::Monitor(..))));
         app.process_command("/silence -*!*@spam.example");
         assert_eq!(
-            rx.try_recv().unwrap(),
+            next_command(&mut rx),
             IrcCommand::Raw("SILENCE -*!*@spam.example".into())
         );
     }
@@ -4744,7 +4786,7 @@ mod tests {
         assert!(app.command_history.is_empty(), "{:?}", app.command_history);
         // The commands still reach the wire: only the history differs.
         assert_eq!(
-            rx.try_recv().unwrap(),
+            next_command(&mut rx),
             IrcCommand::Raw("NEWPASS oldpw newpw newpw".into())
         );
 
@@ -4801,7 +4843,7 @@ mod tests {
         }
         assert!(app.command_history.is_empty(), "{:?}", app.command_history);
         assert_eq!(
-            rx.try_recv().unwrap(),
+            next_command(&mut rx),
             IrcCommand::Raw("CPRIVMSG NickServ #room :IDENTIFY hunter2".into())
         );
 
@@ -4843,7 +4885,7 @@ mod tests {
         // ASCII spellings dispatch as before, in any case.
         app.process_command("/IdEnTiFy hunter13");
         assert_eq!(
-            rx.try_recv().unwrap(),
+            next_command(&mut rx),
             IrcCommand::Raw("IDENTIFY hunter13".into())
         );
     }
@@ -4976,7 +5018,7 @@ mod tests {
 
         app.process_command("/slap alice with a frozen herring");
         assert!(matches!(
-            rx.try_recv(),
+            rx.try_recv().map(single_wire_command),
             Ok(IrcCommand::Privmsg(target, content))
                 if target == "#chan"
                     && content == "\x01ACTION slaps alice with a frozen herring\x01"
@@ -4985,7 +5027,7 @@ mod tests {
         // Bare target keeps the classic trout.
         app.process_command("/slap bob");
         assert!(matches!(
-            rx.try_recv(),
+            rx.try_recv().map(single_wire_command),
             Ok(IrcCommand::Privmsg(_, content))
                 if content == "\x01ACTION slaps bob around a bit with a large trout\x01"
         ));
@@ -4993,7 +5035,7 @@ mod tests {
         // Targetless keeps the classic everyone/trout.
         app.process_command("/slap");
         assert!(matches!(
-            rx.try_recv(),
+            rx.try_recv().map(single_wire_command),
             Ok(IrcCommand::Privmsg(_, content))
                 if content == "\x01ACTION slaps everyone around a bit with a large trout\x01"
         ));

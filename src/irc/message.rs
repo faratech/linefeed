@@ -2,6 +2,13 @@ use std::fmt;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum IrcCommand {
+    /// Internal all-or-none outbound logical send; never parsed from the wire.
+    ClientBatch(Vec<IrcCommand>),
+    /// Chat send identity is local metadata and never appears on the wire.
+    ClientChat {
+        id: String,
+        commands: Vec<IrcCommand>,
+    },
     // Connection
     Pass(String),
     Nick(String),
@@ -589,6 +596,9 @@ impl IrcCommand {
     /// the field be read by the server as further protocol commands (#285).
     /// Anything that writes a command to the wire must go through this.
     pub fn to_wire_line(&self) -> Option<String> {
+        if matches!(self, Self::ClientBatch(_) | Self::ClientChat { .. }) {
+            return None;
+        }
         let line = self.to_string();
         if line.bytes().any(|byte| matches!(byte, b'\r' | b'\n' | 0)) {
             None
@@ -601,6 +611,12 @@ impl IrcCommand {
 impl fmt::Display for IrcCommand {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            IrcCommand::ClientBatch(commands) => {
+                write!(f, "<client batch: {} lines>", commands.len())
+            }
+            IrcCommand::ClientChat { commands, .. } => {
+                write!(f, "<client chat: {} lines>", commands.len())
+            }
             // Trailing form so a space or leading ':' in the password survives.
             IrcCommand::Pass(pass) => write!(f, "PASS :{}", pass),
             IrcCommand::Nick(nick) => write!(f, "NICK {}", nick),
@@ -1275,8 +1291,8 @@ mod tests {
     #[test]
     fn parser_never_panics_on_hostile_input() {
         let alphabet: Vec<char> = vec![
-            '@', ':', ';', '=', '\\', ' ', 'P', 'R', 'I', 'V', 'M', 'S', 'G', '0', '1', '#',
-            'a', '\r', '\n', '\t', 'é', '\u{1}', '*', '!', '.', '-', 'Z', 'T',
+            '@', ':', ';', '=', '\\', ' ', 'P', 'R', 'I', 'V', 'M', 'S', 'G', '0', '1', '#', 'a',
+            '\r', '\n', '\t', 'é', '\u{1}', '*', '!', '.', '-', 'Z', 'T',
         ];
         let mut state: u64 = 0xfeed_face_1234_5678;
         let mut next = move || {

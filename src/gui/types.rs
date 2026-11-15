@@ -37,6 +37,8 @@ pub enum SortDirection {
 /// Server favorite for quick connect
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ServerFavorite {
+    #[serde(default)]
+    pub(crate) upload_settings: super::uploads::UploadSettings,
     pub name: String,         // Display name (e.g., "Libera Chat")
     pub host: String,         // Server host
     pub port: String,         // Server port
@@ -54,6 +56,8 @@ pub struct ServerFavorite {
     pub sasl_mechanism: SaslMechanism,
     #[serde(default)]
     pub sasl_required: bool,
+    #[serde(default)]
+    pub(crate) bouncer: Option<super::bouncer::BouncerBinding>,
     #[serde(default)]
     pub tls_client_cert_path: String,
     #[serde(default)]
@@ -84,6 +88,7 @@ pub struct ServerFavorite {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
+    pub(crate) upload_settings: super::uploads::UploadSettings,
     pub server_host: String,
     pub server_port: String,
     pub use_tls: bool,
@@ -96,8 +101,10 @@ pub struct Settings {
     pub set_invisible: bool,
     pub minimize_to_tray: bool,
     pub automatic_updates: bool,
+    pub resume_workspace: bool,
     pub auto_reconnect: bool,
     pub notifications_enabled: bool,
+    pub attention: super::attention::AttentionSettings,
     pub ignore_list: Vec<String>,
     pub server_favorites: Vec<ServerFavorite>,
     pub auto_perform: String,
@@ -112,6 +119,7 @@ pub struct Settings {
     pub sasl_password: String,
     pub sasl_mechanism: SaslMechanism,
     pub sasl_required: bool,
+    pub(crate) bouncer: Option<super::bouncer::BouncerBinding>,
     pub tls_client_cert_path: String,
     pub tls_client_key_path: String,
     // Logging
@@ -140,6 +148,7 @@ pub struct Settings {
 impl Default for Settings {
     fn default() -> Self {
         Self {
+            upload_settings: Default::default(),
             server_host: "irc.afternet.org".to_string(),
             server_port: "6697".to_string(),
             use_tls: true,
@@ -152,8 +161,10 @@ impl Default for Settings {
             set_invisible: true,
             minimize_to_tray: false,
             automatic_updates: true,
+            resume_workspace: true,
             auto_reconnect: true,
             notifications_enabled: true,
+            attention: super::attention::AttentionSettings::default(),
             ignore_list: Vec::new(),
             server_favorites: Vec::new(),
             auto_perform: String::new(),
@@ -166,6 +177,7 @@ impl Default for Settings {
             sasl_password: String::new(),
             sasl_mechanism: SaslMechanism::Auto,
             sasl_required: false,
+            bouncer: None,
             tls_client_cert_path: String::new(),
             tls_client_key_path: String::new(),
             logging_enabled: true,
@@ -295,6 +307,11 @@ pub struct RowHeightEntry {
 /// A chat message with metadata
 #[derive(Debug, Clone)]
 pub struct ChatMessage {
+    /// Stable identity retained through echo reconciliation and archival.
+    pub message_key: String,
+    pub reactions: Vec<super::message_ui::ReactionGroup>,
+    pub presentation_revision: u64,
+    pub(crate) delivery: super::message_ui::MessageDelivery,
     pub timestamp: String,
     /// Canonical IRCv3 `time` tag retained for ordering and MARKREAD.
     pub server_time: Option<String>,
@@ -306,6 +323,7 @@ pub struct ChatMessage {
     pub oper: Option<String>,
     /// Referenced message ID from `+reply` / legacy `+draft/reply`.
     pub reply_to: Option<String>,
+    pub(crate) reply_preview: Option<String>,
     pub sender: String,
     pub content: String,
     pub is_action: bool,
@@ -360,12 +378,17 @@ impl ChatMessage {
 
     pub fn new_fmt(sender: &str, content: &str, format: &str) -> Self {
         Self {
+            message_key: super::new_profile_id(),
+            reactions: Vec::new(),
+            presentation_revision: 0,
+            delivery: Default::default(),
             timestamp: current_time_formatted(format),
             server_time: None,
             msgid: None,
             account: None,
             oper: None,
             reply_to: None,
+            reply_preview: None,
             sender: sender.to_string(),
             content: content.to_string(),
             is_action: false,
@@ -384,12 +407,17 @@ impl ChatMessage {
 
     pub fn system_fmt(content: &str, format: &str) -> Self {
         Self {
+            message_key: super::new_profile_id(),
+            reactions: Vec::new(),
+            presentation_revision: 0,
+            delivery: Default::default(),
             timestamp: current_time_formatted(format),
             server_time: None,
             msgid: None,
             account: None,
             oper: None,
             reply_to: None,
+            reply_preview: None,
             sender: "*".to_string(),
             content: content.to_string(),
             is_action: false,
@@ -404,12 +432,17 @@ impl ChatMessage {
 
     pub fn action_fmt(sender: &str, content: &str, format: &str) -> Self {
         Self {
+            message_key: super::new_profile_id(),
+            reactions: Vec::new(),
+            presentation_revision: 0,
+            delivery: Default::default(),
             timestamp: current_time_formatted(format),
             server_time: None,
             msgid: None,
             account: None,
             oper: None,
             reply_to: None,
+            reply_preview: None,
             sender: sender.to_string(),
             content: content.to_string(),
             is_action: true,
@@ -424,12 +457,17 @@ impl ChatMessage {
 
     pub fn highlighted_fmt(sender: &str, content: &str, format: &str) -> Self {
         Self {
+            message_key: super::new_profile_id(),
+            reactions: Vec::new(),
+            presentation_revision: 0,
+            delivery: Default::default(),
             timestamp: current_time_formatted(format),
             server_time: None,
             msgid: None,
             account: None,
             oper: None,
             reply_to: None,
+            reply_preview: None,
             sender: sender.to_string(),
             content: content.to_string(),
             is_action: false,
@@ -444,12 +482,17 @@ impl ChatMessage {
 
     pub fn action_highlighted_fmt(sender: &str, content: &str, format: &str) -> Self {
         Self {
+            message_key: super::new_profile_id(),
+            reactions: Vec::new(),
+            presentation_revision: 0,
+            delivery: Default::default(),
             timestamp: current_time_formatted(format),
             server_time: None,
             msgid: None,
             account: None,
             oper: None,
             reply_to: None,
+            reply_preview: None,
             sender: sender.to_string(),
             content: content.to_string(),
             is_action: true,
@@ -547,7 +590,7 @@ impl UserMode {
 }
 
 /// IRC identifier case folding advertised by ISUPPORT CASEMAPPING.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum CaseMapping {
     Ascii,
     StrictRfc1459,
