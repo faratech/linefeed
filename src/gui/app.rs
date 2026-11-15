@@ -2227,9 +2227,6 @@ impl App {
             {
                 self.open_search(self.active_index(), String::new(), false);
             }
-            if ui.small_button("Files").clicked() {
-                self.uploads.open = true;
-            }
             ui.separator();
             let active = self.active_index();
             let label = self.network_label(&self.sessions[active]);
@@ -2271,6 +2268,12 @@ impl App {
                 ui.separator();
                 if ui.button("New connection...").clicked() {
                     self.new_connection();
+                    ui.close();
+                }
+                ui.separator();
+                if ui.button("File sharing…").clicked() {
+                    self.claim_global_dialogs(None);
+                    self.uploads.open = true;
                     ui.close();
                 }
             });
@@ -4370,7 +4373,7 @@ mod tests {
             let text = texts(output.as_ref().unwrap());
             assert!(text.iter().any(|text| text
                 == if files {
-                    "File transfers"
+                    "File sharing"
                 } else {
                     "History search"
                 }));
