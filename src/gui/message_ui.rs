@@ -457,7 +457,7 @@ impl Session {
         if self.input_text.trim().is_empty() {
             return;
         }
-        if self.input_text.starts_with('/') {
+        if self.input_text.trim_start().starts_with('/') {
             self.process_input();
             if self.input_text.is_empty() {
                 self.composer = ComposerState::default();
@@ -944,6 +944,12 @@ impl Session {
         }
     }
 }
+#[cfg(unix)]
+fn reap_notification_child(mut child: std::process::Child) -> std::thread::JoinHandle<()> {
+    std::thread::spawn(move || {
+        let _ = child.wait();
+    })
+}
 #[cfg(not(test))]
 pub(crate) fn play_notification_sound() {
     #[cfg(target_os = "windows")]
@@ -958,13 +964,15 @@ pub(crate) fn play_notification_sound() {
     {
         let _ = std::process::Command::new("osascript")
             .args(["-e", "beep 1"])
-            .spawn();
+            .spawn()
+            .map(reap_notification_child);
     }
     #[cfg(all(unix, not(target_os = "macos")))]
     {
         let _ = std::process::Command::new("canberra-gtk-play")
             .args(["-i", "message-new-instant"])
-            .spawn();
+            .spawn()
+            .map(reap_notification_child);
     }
 }
 #[cfg(test)]
@@ -975,6 +983,25 @@ mod tests {
     use super::*;
     use crate::gui::{Channel, Settings};
     use tokio::sync::mpsc;
+    #[cfg(unix)]
+    #[test]
+    fn completed_notification_command_is_reaped_without_blocking_the_gui() {
+        let child = std::process::Command::new("sh")
+            .args(["-c", "exit 0"])
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        reap_notification_child(child).join().unwrap();
+        let mut status = 0;
+        assert_eq!(
+            unsafe { libc::waitpid(pid as libc::pid_t, &mut status, libc::WNOHANG) },
+            -1
+        );
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ECHILD)
+        );
+    }
     fn session() -> (Session, mpsc::UnboundedReceiver<IrcCommand>, ConversationId) {
         let mut session = Session::with_settings(Settings {
             nickname: "me".into(),
@@ -1011,6 +1038,41 @@ mod tests {
             reply_to: Some(reply(session)),
         }
     }
+    #[test]
+    fn leading_whitespace_does_not_send_a_service_login_command_to_the_channel() {
+        let (mut session, mut rx, _) = session();
+        session.input_text = "  /msg NickServ IDENTIFY synthetic-secret".into();
+        session.submit_composer();
+        let commands = crate::gui::flatten_test_commands(rx.try_recv().unwrap());
+        assert!(
+            matches!(commands.as_slice(), [IrcCommand::Privmsg(target, body)]
+            if target == "NickServ" && body == "IDENTIFY synthetic-secret")
+        );
+        assert!(
+            session.conversations["#room"]
+                .messages
+                .iter()
+                .all(|row| !row.content.contains("synthetic-secret"))
+        );
+    }
+
+    #[test]
+    fn composer_preserves_indented_chat_and_the_literal_slash_escape() {
+        for (input, expected) in [
+            ("  indented chat", "  indented chat"),
+            ("  //literal", "/literal"),
+        ] {
+            let (mut session, mut rx, _) = session();
+            session.input_text = input.into();
+            session.submit_composer();
+            let commands = crate::gui::flatten_test_commands(rx.try_recv().unwrap());
+            assert!(
+                matches!(commands.as_slice(), [IrcCommand::Privmsg(target, body)]
+                if target == "#room" && body == expected)
+            );
+        }
+    }
+
     #[test]
     fn multiline_reply_tags_only_opening_batch_and_enqueues_atomically() {
         let (mut session, mut rx, id) = session();

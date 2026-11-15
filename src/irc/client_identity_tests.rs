@@ -27,6 +27,35 @@ fn capture_protocol_debug(action: impl FnOnce()) -> String {
 }
 
 #[test]
+fn closing_gui_cancels_a_reader_waiting_for_space_in_the_pong_queue() {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(async {
+            let mut client = IrcClient::new(ServerConfig::default());
+            let (control, _stalled_writer) = mpsc::channel(1);
+            control.try_send("PONG :older\r\n".to_string()).unwrap();
+            client.tx = Some(control);
+            let (incoming, receiver) = mpsc::channel(4);
+            let reader = client.read_loop(b"PING :newer\r\n".as_slice(), incoming);
+            tokio::pin!(reader);
+            assert!(
+                tokio::time::timeout(std::time::Duration::from_millis(20), &mut reader)
+                    .await
+                    .is_err()
+            );
+            drop(receiver);
+            assert!(
+                tokio::time::timeout(std::time::Duration::from_millis(500), &mut reader)
+                    .await
+                    .is_ok(),
+                "disconnect must cancel a blocked PONG enqueue"
+            );
+        });
+}
+
+#[test]
 fn generated_upload_tokens_remain_private_in_live_protocol_logs() {
     let log = capture_protocol_debug(|| {
         tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {

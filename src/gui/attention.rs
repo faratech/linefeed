@@ -93,6 +93,7 @@ pub(crate) struct AttentionEvent {
 #[derive(Clone, Debug)]
 pub(crate) struct ActivityItem {
     pub reference: MessageRef,
+    pub read_conversation: ConversationKey,
     pub title: String,
     pub preview: String,
     pub mention: bool,
@@ -101,6 +102,8 @@ pub(crate) struct ActivityItem {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) struct ActivityRecord {
     pub reference: MessageRef,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub read_conversation: Option<ConversationKey>,
     pub mention: bool,
     pub read: bool,
 }
@@ -153,6 +156,7 @@ impl App {
             .iter()
             .map(|item| ActivityRecord {
                 reference: item.reference.clone(),
+                read_conversation: Some(item.read_conversation.clone()),
                 mention: item.mention,
                 read: item.read,
             })
@@ -162,12 +166,19 @@ impl App {
         self.activity.items = records
             .into_iter()
             .take(1000)
-            .map(|record| ActivityItem {
-                title: record.reference.conversation.target.clone(),
-                preview: "Saved activity — open message".into(),
-                reference: record.reference,
-                mention: record.mention,
-                read: record.read,
+            .map(|record| {
+                let read_conversation = record
+                    .read_conversation
+                    .filter(|owner| owner.network == record.reference.conversation.network)
+                    .unwrap_or_else(|| record.reference.conversation.clone());
+                ActivityItem {
+                    title: read_conversation.target.clone(),
+                    preview: "Saved activity — open message".into(),
+                    reference: record.reference,
+                    read_conversation,
+                    mention: record.mention,
+                    read: record.read,
+                }
             })
             .collect();
     }
@@ -195,6 +206,7 @@ impl App {
             })
         {
             self.activity.items.push_front(ActivityItem {
+                read_conversation: event.reference.conversation.clone(),
                 reference: event.reference.clone(),
                 title: title.into(),
                 preview: super::formatting::strip_irc_formatting(preview),
@@ -236,11 +248,43 @@ impl App {
         };
         if let Some(read) = position(&last_read) {
             for item in &mut self.activity.items {
-                if item.reference.conversation == last_read.conversation
+                if item.read_conversation == last_read.conversation
                     && position(&item.reference).is_some_and(|index| index <= read)
                 {
                     item.read = true;
                 }
+            }
+        }
+    }
+    pub(crate) fn rename_activity_conversation(
+        &mut self,
+        old: &ConversationKey,
+        new: &ConversationKey,
+    ) {
+        for item in &mut self.activity.items {
+            if &item.read_conversation == old {
+                item.read_conversation = new.clone();
+            }
+        }
+    }
+    pub(crate) fn reconcile_activity_conversation(
+        &mut self,
+        conn: super::windows::ConnId,
+        survivor: super::conversations::ConversationId,
+    ) {
+        let Some(index) = self.session_index(conn) else {
+            return;
+        };
+        let session = &self.sessions[index];
+        let Some(target) = session.target_name(survivor) else {
+            return;
+        };
+        let owner = session.conversation_key(target);
+        for item in &mut self.activity.items {
+            if item.read_conversation.network == owner.network
+                && session.id_for_target(&item.read_conversation.target) == Some(survivor)
+            {
+                item.read_conversation = owner.clone();
             }
         }
     }
@@ -444,5 +488,161 @@ mod tests {
         assert_eq!(app.activity.items[0].preview, "<message redacted>");
         assert_eq!(app.activity.items[0].reference, event.reference);
         assert!(!format!("{:?}", app.activity.items).contains("must disappear"));
+    }
+
+    #[test]
+    fn reading_a_renamed_query_marks_its_existing_activity_seen() {
+        let mut app = app();
+        let index = app.add_session();
+        app.sessions[index].set_session_nick("me".into(), true);
+        assert!(app.sessions[index].open_query("alice"));
+        let id = app.sessions[index].id_for_target("alice").unwrap();
+        let key = WindowKey::new(app.sessions[index].id, Some(id));
+        app.windows.sync(&[super::super::windows::PresentWindow {
+            key,
+            persist: super::super::windows::PersistKey {
+                network: "test".into(),
+                target: Some("alice".into()),
+            },
+        }]);
+        let message = super::super::ChatMessage::new_fmt("alice", "hello", "short");
+        let before = app.sessions[index].live_message_reference("alice", &message);
+        app.sessions[index]
+            .conversations
+            .get_mut("alice")
+            .unwrap()
+            .messages
+            .push_back(message);
+        app.handle_attention(
+            AttentionEvent {
+                reference: before,
+                private: true,
+                mention: false,
+            },
+            "PM from alice",
+            "hello",
+            false,
+        );
+        app.sessions[index].handle_incoming_message(
+            crate::irc::IrcMessage::parse(":alice!u@host NICK :bob").unwrap(),
+        );
+        app.process_events();
+        assert_eq!(app.sessions[index].target_name(id), Some("bob"));
+        let archived_reference = app.activity.items[0].reference.clone();
+        assert_eq!(archived_reference.conversation.target, "alice");
+        assert_eq!(app.activity.items[0].read_conversation.target, "bob");
+        let saved = serde_json::to_vec(&app.activity_records()).unwrap();
+        app.restore_activity(serde_json::from_slice(&saved).unwrap());
+        assert_eq!(app.activity.items[0].reference, archived_reference);
+        let message = app.sessions[index]
+            .conversation_channel(id)
+            .unwrap()
+            .messages
+            .back()
+            .unwrap();
+        let read = app.sessions[index].live_message_reference("bob", message);
+        app.windows
+            .get_mut(&key)
+            .unwrap()
+            .view
+            .timeline
+            .get_mut()
+            .last_read = Some(read);
+        app.mark_activity_seen(key);
+        assert!(
+            app.activity.items[0].read,
+            "the renamed query's read message stayed unread in Activity"
+        );
+        app.redact_activity(&archived_reference);
+        assert_eq!(app.activity.items[0].preview, "<message redacted>");
+    }
+
+    #[test]
+    fn legacy_activity_records_default_read_owner_to_the_archival_conversation() {
+        let mut app = app();
+        app.handle_attention(event("alice", true, false), "PM", "body", false);
+        let mut saved = serde_json::to_value(app.activity_records()).unwrap();
+        saved[0]
+            .as_object_mut()
+            .unwrap()
+            .remove("read_conversation");
+        app.restore_activity(serde_json::from_value(saved).unwrap());
+        assert_eq!(
+            app.activity.items[0].read_conversation,
+            app.activity.items[0].reference.conversation
+        );
+    }
+
+    #[test]
+    fn merged_query_activity_keeps_archival_refs_and_marks_both_sources_seen() {
+        let mut app = app();
+        let index = app.add_session();
+        app.sessions[index].set_session_nick("me".into(), true);
+        let mut present = Vec::new();
+        for target in ["alice", "bob"] {
+            assert!(app.sessions[index].open_query(target));
+            let id = app.sessions[index].id_for_target(target).unwrap();
+            let message = super::super::ChatMessage::new_fmt(target, "hello", "short");
+            let reference = app.sessions[index].live_message_reference(target, &message);
+            app.sessions[index]
+                .conversations
+                .get_mut(target)
+                .unwrap()
+                .messages
+                .push_back(message);
+            app.handle_attention(
+                AttentionEvent {
+                    reference,
+                    private: true,
+                    mention: false,
+                },
+                target,
+                "hello",
+                false,
+            );
+            present.push(super::super::windows::PresentWindow {
+                key: WindowKey::new(app.sessions[index].id, Some(id)),
+                persist: super::super::windows::PersistKey {
+                    network: "test".into(),
+                    target: Some(target.into()),
+                },
+            });
+        }
+        app.windows.sync(&present);
+        let survivor = app.sessions[index].id_for_target("alice").unwrap();
+        app.sessions[index].handle_incoming_message(
+            crate::irc::IrcMessage::parse(":alice!u@h NICK :bob").unwrap(),
+        );
+        app.process_events();
+        let key = WindowKey::new(app.sessions[index].id, Some(survivor));
+        let latest = app.sessions[index]
+            .conversation_channel(survivor)
+            .unwrap()
+            .messages
+            .back()
+            .unwrap();
+        let read = app.sessions[index].live_message_reference("bob", latest);
+        app.windows
+            .get_mut(&key)
+            .unwrap()
+            .view
+            .timeline
+            .get_mut()
+            .last_read = Some(read);
+        app.mark_activity_seen(key);
+        assert_eq!(app.activity.items.len(), 2);
+        assert!(app.activity.items.iter().all(|item| item.read));
+        assert!(
+            app.activity
+                .items
+                .iter()
+                .any(|item| item.reference.conversation.target == "alice")
+        );
+        assert!(
+            app.activity
+                .items
+                .iter()
+                .any(|item| item.reference.conversation.target == "bob")
+        );
     }
 }

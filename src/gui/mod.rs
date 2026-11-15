@@ -6375,7 +6375,7 @@ impl Session {
                 // Restore actual memberships, including keys, through JOIN.
                 if let Some(rejoins) = self.pending_rejoins.as_ref().cloned() {
                     for (name, key) in rejoins {
-                        self.send_join_in_background(name, key);
+                        self.send_automatic_join(name, key);
                     }
                 } else if !auto_join.is_empty() {
                     for chan in auto_join.split(',') {
@@ -6387,7 +6387,7 @@ impl Session {
                             let name = words.next().unwrap_or(chan);
                             let key = words.next().map(str::to_string);
                             let channel = self.normalize_channel_name(name);
-                            self.send_join_in_background(channel.clone(), key);
+                            self.send_automatic_join(channel.clone(), key);
                             self.add_server_message(ChatMessage::system(&format!(
                                 "Auto-joining {}",
                                 channel
@@ -8198,6 +8198,7 @@ impl Session {
 
     fn note_membership_intent(&mut self, targets: &str, keys: Option<&str>, joining: bool) {
         if joining && targets == "0" {
+            self.cancel_all_automatic_joins();
             // JOIN 0 is the protocol spelling for leaving every channel.
             let mut names: Vec<_> = self
                 .conversations
@@ -8219,6 +8220,7 @@ impl Session {
             .map(str::trim)
             .filter(|name| !name.is_empty())
         {
+            self.cancel_automatic_join(name);
             let key = keys
                 .next()
                 .filter(|key| !key.is_empty())
@@ -10238,6 +10240,8 @@ pub(crate) mod tests {
         // Manual/unprofiled endpoint edits clear the form's scoped secrets but
         // cannot mutate the active socket's reconnect/automation snapshot.
         app.apply_unprofiled_endpoint("new.example", "7000", false);
+        app.auto_join_channels = "#new".into();
+        app.auto_perform = "/ns identify new-nickserv-pass".into();
         assert!(app.password.is_empty());
         assert!(app.sasl_password.is_empty());
         assert_eq!(app.active_endpoint_label(), "old.example:6697");
@@ -10261,13 +10265,30 @@ pub(crate) mod tests {
         app.test_set_sender(tx);
         app.handle_numeric(RPL_WELCOME, &["me".into(), "welcome".into()]);
         assert!(matches!(rx.try_recv(), Ok(IrcCommand::Mode(_, Some(mode), _)) if mode == "+i"));
-        assert!(
-            matches!(rx.try_recv(), Ok(IrcCommand::Join(channel, _, _, _)) if channel == "#old")
-        );
         assert!(matches!(rx.try_recv(), Ok(IrcCommand::Ping(token)) if token == "LAG"));
+        assert!(
+            rx.try_recv().is_err(),
+            "automatic joins wait for service authentication"
+        );
         assert_eq!(
             app.pending_auto_perform.as_deref(),
             Some(["/ns identify old-nickserv-pass".to_string()].as_slice())
+        );
+        app.run_timed_tasks();
+        assert_eq!(
+            drain_commands(&mut rx),
+            vec![IrcCommand::Privmsg(
+                "NickServ".into(),
+                "identify old-nickserv-pass".into(),
+            )]
+        );
+        app.handle_incoming_message(
+            IrcMessage::parse(":srv 900 me me!u@h old-account :Logged in").unwrap(),
+        );
+        app.run_timed_tasks();
+        assert_eq!(
+            drain_commands(&mut rx),
+            vec![IrcCommand::Join("#old".into(), None, None, None)]
         );
     }
 

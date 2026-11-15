@@ -142,6 +142,19 @@ struct Job {
     agent: Option<ureq::Agent>,
     created: Instant,
 }
+impl Job {
+    fn finish(&mut self, state: State) {
+        debug_assert!(matches!(
+            state,
+            State::Done(_) | State::Failed(_) | State::Cancelled
+        ));
+        self.state = state;
+        self.input = None;
+        if let Some(agent) = self.agent.take() {
+            agent.shutdown();
+        }
+    }
+}
 struct PickedFiles {
     origin: Origin,
     provider: Provider,
@@ -766,11 +779,7 @@ impl UploadManager {
     fn cancel(&mut self, id: &str) {
         if let Some(job) = self.jobs.iter_mut().find(|j| j.id == id) {
             job.cancelled.store(true, Ordering::SeqCst);
-            if let Some(agent) = job.agent.take() {
-                agent.shutdown();
-            }
-            job.state = State::Cancelled;
-            job.input = None;
+            job.finish(State::Cancelled);
         }
     }
     fn token(&mut self, id: &str, token: Option<String>) {
@@ -783,9 +792,9 @@ impl UploadManager {
                 job.provider.auth = UploadAuth::ServiceBearer(token);
                 job.state = State::Queued;
             } else {
-                job.state = State::Failed(
+                job.finish(State::Failed(
                     "File host token could not be obtained; confirm your IRC account login".into(),
-                );
+                ));
             }
         }
     }
@@ -888,7 +897,7 @@ impl App {
                     job.agent = None;
                     match result {
                         Ok(url) => {
-                            job.state = State::Done(url.clone());
+                            job.finish(State::Done(url.clone()));
                             let origin = &job.origin;
                             let valid = self
                                 .sessions
@@ -914,7 +923,7 @@ impl App {
                                 window.view.input_text.push_str(&url);
                             }
                         }
-                        Err(error) => job.state = State::Failed(error),
+                        Err(error) => job.finish(State::Failed(error)),
                     }
                 }
             }
@@ -934,7 +943,7 @@ impl App {
             .collect();
         for job in &mut self.uploads.jobs {
             if job.state == State::Token && job.created.elapsed() > Duration::from_secs(30) {
-                job.state = State::Failed("File host token request timed out".into());
+                job.finish(State::Failed("File host token request timed out".into()));
                 active = active.saturating_sub(1);
             }
             if active >= 2 || job.state != State::Queued {
@@ -945,7 +954,9 @@ impl App {
                     && s.logical_network_key().as_ref() == Some(&job.origin.network)
                     && s.connection.generation() == job.origin.generation
             }) else {
-                job.state = State::Failed("The original connection was closed or changed".into());
+                job.finish(State::Failed(
+                    "The original connection was closed or changed".into(),
+                ));
                 continue;
             };
             if matches!(job.provider.auth, UploadAuth::TokenService) {
@@ -953,9 +964,9 @@ impl App {
                     .upload_discovery
                     .unlabeled_token_timed_out
                 {
-                    job.state = State::Failed(
+                    job.finish(State::Failed(
                         "The previous upload token request timed out without a response label; reconnect before uploading again".into(),
-                    );
+                    ));
                     continue;
                 }
                 if token_connections.contains(&job.origin.window.conn) {
@@ -1624,6 +1635,41 @@ mod tests {
             },
         }]);
         (app, key, rx)
+    }
+
+    #[test]
+    fn rejected_upload_token_releases_the_queued_image_payload() {
+        let (mut app, key, _rx) = upload_app();
+        let image = Arc::new(egui::ColorImage::new([1, 1], vec![egui::Color32::WHITE]));
+        let weak = Arc::downgrade(&image);
+        let nonce = app.windows.get(&key).unwrap().view.composer.nonce.clone();
+        app.handle_upload_request(0, key.conversation, nonce, UploadSource::Image(image));
+        let job = &mut app.uploads.jobs[0];
+        job.state = State::Token;
+        let id = job.id.clone();
+        assert!(weak.upgrade().is_some());
+        app.uploads.token(&id, None);
+        assert!(matches!(app.uploads.jobs[0].state, State::Failed(_)));
+        assert!(
+            weak.upgrade().is_none(),
+            "failed transfer history retained the full image payload"
+        );
+    }
+
+    #[test]
+    fn obsolete_upload_origin_releases_the_queued_image_payload() {
+        let (mut app, key, _rx) = upload_app();
+        let image = Arc::new(egui::ColorImage::new([1, 1], vec![egui::Color32::WHITE]));
+        let weak = Arc::downgrade(&image);
+        let nonce = app.windows.get(&key).unwrap().view.composer.nonce.clone();
+        app.handle_upload_request(0, key.conversation, nonce, UploadSource::Image(image));
+        app.uploads.jobs[0].origin.generation = Some(u64::MAX);
+        app.tick_uploads();
+        assert!(matches!(app.uploads.jobs[0].state, State::Failed(_)));
+        assert!(
+            weak.upgrade().is_none(),
+            "obsolete transfer retained its image payload"
+        );
     }
 
     #[test]

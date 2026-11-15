@@ -2887,6 +2887,21 @@ impl IrcClient {
         Ok(())
     }
 
+    async fn send_live_control(
+        &self,
+        line: String,
+        incoming_tx: &mpsc::Sender<IrcMessage>,
+    ) -> bool {
+        let Some(tx) = &self.tx else {
+            return true;
+        };
+        tokio::select! {
+            biased;
+            _ = incoming_tx.closed() => false,
+            sent = tx.send(line) => sent.is_ok(),
+        }
+    }
+
     async fn read_loop<R: tokio::io::AsyncBufRead + Unpin>(
         &mut self,
         mut reader: R,
@@ -2940,8 +2955,11 @@ impl IrcClient {
                 }
                 Err(_) => {
                     probe_sent = true;
-                    if let Some(ref tx) = self.tx {
-                        let _ = tx.send("PING :linefeed-keepalive\r\n".to_string()).await;
+                    if !self
+                        .send_live_control("PING :linefeed-keepalive\r\n".to_string(), &incoming_tx)
+                        .await
+                    {
+                        break;
                     }
                     continue;
                 }
@@ -3004,10 +3022,11 @@ impl IrcClient {
                                 // queue delays the PONG rather than silently
                                 // dropping it and risking a server ping-timeout.
                                 if let IrcCommand::Ping(server) = &msg.command
-                                    && let Some(ref tx) = self.tx
-                                    && tx.send(pong_line(server)).await.is_err()
+                                    && !self
+                                        .send_live_control(pong_line(server), &incoming_tx)
+                                        .await
                                 {
-                                    tracing::warn!("Writer task gone; cannot send PONG");
+                                    break;
                                 }
                                 // Awaiting send applies backpressure (and naturally throttles
                                 // our socket reads) instead of silently dropping messages when

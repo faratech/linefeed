@@ -3,11 +3,13 @@
 use super::ChatMessage;
 use super::identity::{ConversationKey, LogicalNetworkKey, MessageRef};
 use super::logging::{LogSpan, file_generation, line_digest, line_record_id};
+use base64::Engine;
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::{HashSet, VecDeque};
 use std::fs::{self, File, OpenOptions};
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{
     Arc, Mutex,
@@ -476,6 +478,300 @@ fn private_append(path: &Path) -> std::io::Result<File> {
 
 const SCHEMA_VERSION: i64 = 2;
 const MAX_ARCHIVE_LINE: usize = 1024 * 1024;
+const MAX_JOURNAL_RECORD: usize = 64 * 1024 * 1024;
+const JOURNAL_CHUNK_BYTES: usize = 256 * 1024;
+const JOURNAL_RECORD_TOO_LARGE: &str =
+    "A history entry exceeds the 64 MiB archive limit and was not saved";
+
+#[derive(Serialize, Deserialize)]
+#[serde(tag = "event", rename_all = "snake_case")]
+enum JournalFrame {
+    Chunk {
+        version: u8,
+        id: String,
+        index: usize,
+        parts: usize,
+        total: usize,
+        sha256: String,
+        data: String,
+    },
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum JournalLine {
+    Event(JournalEvent),
+    Frame(JournalFrame),
+}
+
+enum JournalWriteError {
+    TooLarge,
+    Failed(String),
+}
+impl JournalWriteError {
+    fn message(self) -> String {
+        match self {
+            Self::TooLarge => JOURNAL_RECORD_TOO_LARGE.into(),
+            Self::Failed(message) => message,
+        }
+    }
+}
+
+struct ArchiveJournal {
+    file: File,
+    name: String,
+    digest: Sha256,
+    previous: Vec<(String, String)>,
+}
+impl Write for ArchiveJournal {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        let written = self.file.write(bytes)?;
+        self.digest.update(&bytes[..written]);
+        Ok(written)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.file.flush()
+    }
+}
+impl ArchiveJournal {
+    fn append(&mut self, event: &JournalEvent) -> Result<(), JournalWriteError> {
+        struct Limited {
+            bytes: Vec<u8>,
+            exceeded: bool,
+        }
+        impl Write for Limited {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                if bytes.len() > MAX_JOURNAL_RECORD.saturating_sub(self.bytes.len()) {
+                    self.exceeded = true;
+                    return Err(std::io::Error::other(JOURNAL_RECORD_TOO_LARGE));
+                }
+                self.bytes.extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let mut encoded = Limited {
+            bytes: Vec::new(),
+            exceeded: false,
+        };
+        if let Err(error) = serde_json::to_writer(&mut encoded, event) {
+            return Err(if encoded.exceeded {
+                JournalWriteError::TooLarge
+            } else {
+                JournalWriteError::Failed(error.to_string())
+            });
+        }
+        let result = (|| -> std::io::Result<()> {
+            if encoded.bytes.len() <= MAX_ARCHIVE_LINE {
+                self.write_all(&encoded.bytes)?;
+                return self.write_all(b"\n");
+            }
+            let id = new_record_id();
+            let sha256 = line_digest(&encoded.bytes);
+            let parts = encoded.bytes.len().div_ceil(JOURNAL_CHUNK_BYTES);
+            for (index, bytes) in encoded.bytes.chunks(JOURNAL_CHUNK_BYTES).enumerate() {
+                let frame = JournalFrame::Chunk {
+                    version: 1,
+                    id: id.clone(),
+                    index,
+                    parts,
+                    total: encoded.bytes.len(),
+                    sha256: sha256.clone(),
+                    data: base64::engine::general_purpose::STANDARD.encode(bytes),
+                };
+                serde_json::to_writer(&mut *self, &frame).map_err(std::io::Error::other)?;
+                self.write_all(b"\n")?;
+            }
+            Ok(())
+        })();
+        result.map_err(|error| JournalWriteError::Failed(error.to_string()))
+    }
+
+    fn sync(&mut self, db: &Connection) -> Result<(), String> {
+        self.file
+            .flush()
+            .and_then(|_| self.file.sync_data())
+            .map_err(|e| e.to_string())?;
+        let mut sources = self.previous.clone();
+        sources.push((
+            self.name.clone(),
+            self.digest
+                .clone()
+                .finalize()
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect(),
+        ));
+        save_journal_manifest(db, &sources)
+    }
+}
+
+fn journal_manifest(sources: &[(String, String)]) -> Result<String, String> {
+    serde_json::to_vec(sources)
+        .map(|bytes| line_digest(&bytes))
+        .map_err(|e| e.to_string())
+}
+fn save_journal_manifest(db: &Connection, sources: &[(String, String)]) -> Result<(), String> {
+    db.execute(
+        "INSERT OR REPLACE INTO journal_manifest VALUES(1,?1)",
+        [journal_manifest(sources)?],
+    )
+    .map(|_| ())
+    .map_err(|e| e.to_string())
+}
+
+fn clear_projection(db: &Connection) -> Result<(), String> {
+    db.execute_batch(
+        "BEGIN IMMEDIATE;
+        DELETE FROM record_search; DELETE FROM records; DELETE FROM tombstones;
+        DELETE FROM reactions; DELETE FROM redirects; DELETE FROM sources;
+        DELETE FROM legacy_sources; DELETE FROM text_copies; DELETE FROM journal_manifest;
+        COMMIT;",
+    )
+    .map_err(|e| e.to_string())
+}
+
+struct DigestReader {
+    file: File,
+    digest: Sha256,
+}
+impl Read for DigestReader {
+    fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
+        let read = self.file.read(bytes)?;
+        self.digest.update(&bytes[..read]);
+        Ok(read)
+    }
+}
+
+fn replay_journal(path: &Path, db: &Connection, client: &ArchiveClient) -> Result<String, String> {
+    struct Assembly {
+        id: String,
+        parts: usize,
+        total: usize,
+        sha256: String,
+        next: usize,
+        bytes: Vec<u8>,
+    }
+    let mut assembly: Option<Assembly> = None;
+    let mut reader = BufReader::new(DigestReader {
+        file: File::open(path).map_err(|e| e.to_string())?,
+        digest: Sha256::new(),
+    });
+    let warn = || {
+        client.status.lock().unwrap().error =
+            Some("An incomplete or invalid history journal record was skipped".into());
+    };
+    // The larger legacy-line bound reads pre-framing journals produced by
+    // earlier builds, while all new large records use small checked frames.
+    while let Some((bytes, _, oversized)) =
+        bounded_line_limit(&mut reader, MAX_JOURNAL_RECORD).map_err(|e| e.to_string())?
+    {
+        if oversized {
+            assembly = None;
+            warn();
+            continue;
+        }
+        match serde_json::from_slice::<JournalLine>(&bytes) {
+            Ok(JournalLine::Event(event)) => {
+                if assembly.take().is_some() {
+                    warn();
+                }
+                project(db, &event)?;
+            }
+            Ok(JournalLine::Frame(JournalFrame::Chunk {
+                version,
+                id,
+                index,
+                parts,
+                total,
+                sha256,
+                data,
+            })) => {
+                let valid = version == 1
+                    && total > MAX_ARCHIVE_LINE
+                    && total <= MAX_JOURNAL_RECORD
+                    && parts == total.div_ceil(JOURNAL_CHUNK_BYTES)
+                    && index < parts
+                    && id.len() == 32
+                    && id.bytes().all(|b| b.is_ascii_hexdigit())
+                    && sha256.len() == 64
+                    && sha256.bytes().all(|b| b.is_ascii_hexdigit())
+                    && data.len() <= JOURNAL_CHUNK_BYTES.div_ceil(3) * 4;
+                if !valid {
+                    assembly = None;
+                    warn();
+                    continue;
+                }
+                let Ok(decoded) = base64::engine::general_purpose::STANDARD.decode(data) else {
+                    assembly = None;
+                    warn();
+                    continue;
+                };
+                if decoded.len() != (total - index * JOURNAL_CHUNK_BYTES).min(JOURNAL_CHUNK_BYTES) {
+                    assembly = None;
+                    warn();
+                    continue;
+                }
+                if index == 0 {
+                    if assembly.take().is_some() {
+                        warn();
+                    }
+                    assembly = Some(Assembly {
+                        id: id.clone(),
+                        parts,
+                        total,
+                        sha256: sha256.clone(),
+                        next: 0,
+                        bytes: Vec::new(),
+                    });
+                }
+                let Some(current) = assembly.as_mut() else {
+                    warn();
+                    continue;
+                };
+                if current.id != id
+                    || current.parts != parts
+                    || current.total != total
+                    || current.sha256 != sha256
+                    || current.next != index
+                {
+                    assembly = None;
+                    warn();
+                    continue;
+                }
+                current.bytes.extend_from_slice(&decoded);
+                current.next += 1;
+                if current.next == parts {
+                    let complete = assembly.take().unwrap();
+                    if complete.bytes.len() == total && line_digest(&complete.bytes) == sha256 {
+                        match serde_json::from_slice::<JournalEvent>(&complete.bytes) {
+                            Ok(event) => project(db, &event)?,
+                            Err(_) => warn(),
+                        }
+                    } else {
+                        warn();
+                    }
+                }
+            }
+            Err(_) => {
+                assembly = None;
+                warn();
+            }
+        }
+    }
+    if assembly.is_some() {
+        warn();
+    }
+    Ok(reader
+        .into_inner()
+        .digest
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect())
+}
 
 fn initialize(db: &Connection) -> rusqlite::Result<()> {
     db.busy_timeout(Duration::from_secs(2))?;
@@ -484,7 +780,7 @@ fn initialize(db: &Connection) -> rusqlite::Result<()> {
         // This database is a cache. The journal and original text logs remain authoritative.
         db.execute_batch("DROP TABLE IF EXISTS record_search; DROP TABLE IF EXISTS records;
           DROP TABLE IF EXISTS tombstones; DROP TABLE IF EXISTS reactions; DROP TABLE IF EXISTS redirects;
-          DROP TABLE IF EXISTS sources; DROP TABLE IF EXISTS legacy_sources; DROP TABLE IF EXISTS text_copies;")?;
+          DROP TABLE IF EXISTS sources; DROP TABLE IF EXISTS legacy_sources; DROP TABLE IF EXISTS text_copies; DROP TABLE IF EXISTS journal_manifest;")?;
     }
     db.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;
         CREATE TABLE IF NOT EXISTS records(seq INTEGER PRIMARY KEY AUTOINCREMENT,id TEXT NOT NULL UNIQUE,
@@ -501,6 +797,7 @@ fn initialize(db: &Connection) -> rusqlite::Result<()> {
         CREATE TABLE IF NOT EXISTS legacy_sources(id TEXT PRIMARY KEY,path TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS text_copies(generation TEXT NOT NULL,offset INTEGER NOT NULL,len INTEGER NOT NULL,
           digest TEXT NOT NULL,id TEXT NOT NULL,PRIMARY KEY(generation,offset,len,digest,id));
+        CREATE TABLE IF NOT EXISTS journal_manifest(id INTEGER PRIMARY KEY,digest TEXT NOT NULL);
         PRAGMA user_version=2;")
 }
 
@@ -926,7 +1223,7 @@ fn execute_context(
 fn process_task(
     task: Task,
     db: &mut Connection,
-    journal: &mut Option<File>,
+    journal: &mut Option<ArchiveJournal>,
     reply: &mpsc::Sender<ArchiveReply>,
     client: &ArchiveClient,
 ) -> Result<(), String> {
@@ -955,8 +1252,14 @@ fn process_task(
         }
         Task::Event(event) => {
             if let Some(file) = journal {
-                serde_json::to_writer(&mut *file, &event).map_err(|e| e.to_string())?;
-                file.write_all(b"\n").map_err(|e| e.to_string())?;
+                match file.append(&event) {
+                    Ok(()) => {}
+                    Err(JournalWriteError::TooLarge) => {
+                        client.status.lock().unwrap().error = Some(JOURNAL_RECORD_TOO_LARGE.into());
+                        return Ok(());
+                    }
+                    Err(error) => return Err(error.message()),
+                }
             }
             project(db, &event)?;
             // Exact count is refreshed at barriers, avoiding a table scan per incoming row.
@@ -965,9 +1268,7 @@ fn process_task(
             client.status.lock().unwrap().records =
                 db.query_row("SELECT count(*) FROM records", [], |r| r.get::<_, i64>(0))
                     .map_err(|e| e.to_string())? as usize;
-            let ok = journal
-                .as_mut()
-                .is_none_or(|file| file.flush().and_then(|_| file.sync_data()).is_ok());
+            let ok = journal.as_mut().is_none_or(|file| file.sync(db).is_ok());
             let _ = response.send(ok);
         }
         Task::Search(generation, query) => {
@@ -1019,7 +1320,7 @@ fn process_task(
 
 fn drain_redactions(
     db: &Connection,
-    journal: &mut Option<File>,
+    journal: &mut Option<ArchiveJournal>,
     client: &ArchiveClient,
 ) -> Result<(), String> {
     let pending = std::mem::take(&mut *client.pending_redactions.lock().unwrap());
@@ -1031,8 +1332,7 @@ fn drain_redactions(
         };
         let result = (|| {
             if let Some(file) = journal.as_mut() {
-                serde_json::to_writer(&mut *file, &event).map_err(|e| e.to_string())?;
-                file.write_all(b"\n").map_err(|e| e.to_string())?;
+                file.append(&event).map_err(JournalWriteError::message)?;
             }
             project(db, &event)
         })();
@@ -1050,6 +1350,13 @@ fn drain_redactions(
 
 /// Read one physical line while bounding retained bytes even for corrupt or hostile files.
 fn bounded_line(reader: &mut impl BufRead) -> std::io::Result<Option<(Vec<u8>, u64, bool)>> {
+    bounded_line_limit(reader, MAX_ARCHIVE_LINE)
+}
+
+fn bounded_line_limit(
+    reader: &mut impl BufRead,
+    limit: usize,
+) -> std::io::Result<Option<(Vec<u8>, u64, bool)>> {
     let mut bytes = Vec::new();
     let mut consumed = 0u64;
     let mut oversized = false;
@@ -1063,7 +1370,7 @@ fn bounded_line(reader: &mut impl BufRead) -> std::io::Result<Option<(Vec<u8>, u
             .position(|b| *b == b'\n')
             .map_or(available.len(), |i| i + 1);
         let end = available[take - 1] == b'\n';
-        if bytes.len().saturating_add(take) <= MAX_ARCHIVE_LINE && !oversized {
+        if bytes.len().saturating_add(take) <= limit && !oversized {
             bytes.extend_from_slice(&available[..take]);
         } else {
             oversized = true;
@@ -1176,33 +1483,54 @@ fn run_archive(
                 .unwrap_or_default();
             (stamp, path.clone())
         });
-        for path in journals {
-            let mut reader = BufReader::new(File::open(path).map_err(|e| e.to_string())?);
-            while let Some((bytes, _, oversized)) =
-                bounded_line(&mut reader).map_err(|e| e.to_string())?
-            {
-                if oversized {
-                    client.status.lock().unwrap().error =
-                        Some("An oversized history journal record was skipped".into());
-                    continue;
-                }
-                match serde_json::from_slice::<JournalEvent>(&bytes) {
-                    Ok(event) => project(&db, &event)?,
-                    Err(_) => {
-                        client.status.lock().unwrap().error =
-                            Some("An incomplete history journal record was skipped".into())
-                    }
-                }
+        let previous_manifest: Option<String> = db
+            .query_row(
+                "SELECT digest FROM journal_manifest WHERE id=1",
+                [],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|e| e.to_string())?;
+        let mut sources = Vec::new();
+        for path in &journals {
+            let digest = replay_journal(path, &db, client)?;
+            sources.push((
+                path.file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .into_owned(),
+                digest,
+            ));
+        }
+        if previous_manifest.as_deref() != Some(journal_manifest(&sources)?.as_str()) {
+            // Replaying changes alone cannot remove rows absent from a deleted,
+            // truncated or restored journal. Rebuild only when the actual source
+            // content/order differs, retaining the normal legacy-import cache.
+            clear_projection(&db)?;
+            for path in &journals {
+                replay_journal(path, &db, client)?;
             }
         }
+        save_journal_manifest(&db, &sources)?;
         let stamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_nanos();
-        journal = Some(
-            private_append(&dir.join(format!("{stamp:020}-{}.jsonl", new_record_id())))
-                .map_err(|e| e.to_string())?,
-        );
+        let name = format!("{stamp:020}-{}.jsonl", new_record_id());
+        let path = dir.join(&name);
+        let mut options = OpenOptions::new();
+        options.create_new(true).append(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        journal = Some(ArchiveJournal {
+            file: options.open(path).map_err(|e| e.to_string())?,
+            name,
+            digest: Sha256::new(),
+            previous: sources,
+        });
         // A successful flush barrier must also survive loss of the new journal's directory entry.
         #[cfg(unix)]
         {
@@ -1251,9 +1579,7 @@ fn run_archive(
     }
     drain_redactions(&db, &mut journal, client)?;
     if let Some(file) = journal.as_mut() {
-        file.flush()
-            .and_then(|_| file.sync_data())
-            .map_err(|e| e.to_string())?;
+        file.sync(&db)?;
     }
     Ok(())
 }
@@ -1282,7 +1608,7 @@ fn import_legacy(
     rx: &mpsc::Receiver<Task>,
     reply: &mpsc::Sender<ArchiveReply>,
     client: &ArchiveClient,
-    journal: &mut Option<File>,
+    journal: &mut Option<ArchiveJournal>,
     deferred: &mut VecDeque<Task>,
 ) -> Result<(), String> {
     let mut seen = HashSet::new();
@@ -1913,6 +2239,186 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn deleted_or_truncated_journal_does_not_leave_ghost_history_in_the_cache() {
+        for removed in [true, false] {
+            let root = Scratch::new();
+            let service = ArchiveService::open(&root.0);
+            assert!(
+                service
+                    .client
+                    .upsert(record("#a", "removed history", "one"))
+            );
+            assert!(service.client.flush_barrier(Duration::from_secs(5)));
+            drop(service);
+            let journals: Vec<_> = fs::read_dir(root.0.join("archive"))
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .filter(|path| path.extension().is_some_and(|ext| ext == "jsonl"))
+                .collect();
+            assert_eq!(journals.len(), 1);
+            if removed {
+                fs::remove_file(&journals[0]).unwrap();
+            } else {
+                fs::write(&journals[0], b"").unwrap();
+            }
+            let reopened = ArchiveService::open(&root.0);
+            assert!(reopened.client.flush_barrier(Duration::from_secs(5)));
+            reopened.client.search(SearchQuery::default());
+            assert!(
+                matches!(receive(&reopened), ArchiveReply::Search { records, .. } if records.is_empty()),
+                "projection retained a row after its only journal was removed={removed}"
+            );
+        }
+    }
+
+    #[test]
+    fn accepted_escaped_message_survives_a_projection_rebuild() {
+        let root = Scratch::new();
+        let service = ArchiveService::open(&root.0);
+        // Negotiated multiline payloads may be this large, and JSON escaping
+        // makes the journal line much larger than the original message body.
+        let body = "\\".repeat(MAX_ARCHIVE_LINE / 2 + 1024);
+        assert!(service.client.upsert(record("#a", &body, "large")));
+        assert!(service.client.flush_barrier(Duration::from_secs(5)));
+        drop(service);
+        for filename in ["index.sqlite3", "index.sqlite3-wal", "index.sqlite3-shm"] {
+            match fs::remove_file(root.0.join("archive").join(filename)) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => panic!("remove projection: {error}"),
+            }
+        }
+        let reopened = ArchiveService::open(&root.0);
+        assert!(reopened.client.flush_barrier(Duration::from_secs(5)));
+        reopened.client.search(SearchQuery::default());
+        assert!(
+            matches!(receive(&reopened), ArchiveReply::Search { records, .. }
+            if records.len() == 1 && records[0].body == body)
+        );
+    }
+    #[test]
+    fn same_size_and_mtime_journal_replacement_invalidates_the_projection() {
+        let root = Scratch::new();
+        let mut old = record("#a", "old", "one");
+        old.id = "a".repeat(32);
+        let service = ArchiveService::open(&root.0);
+        assert!(service.client.upsert(old.clone()));
+        assert!(service.client.flush_barrier(Duration::from_secs(5)));
+        drop(service);
+        let path = fs::read_dir(root.0.join("archive"))
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| path.extension().is_some_and(|ext| ext == "jsonl"))
+            .unwrap();
+        let metadata = fs::metadata(&path).unwrap();
+        old.id = "b".repeat(32);
+        old.msgid = Some("two".into());
+        old.body = "new".into();
+        let mut bytes = serde_json::to_vec(&JournalEvent::Upsert {
+            record: Box::new(old),
+        })
+        .unwrap();
+        bytes.push(b'\n');
+        assert_eq!(bytes.len() as u64, metadata.len());
+        let mut file = File::create(&path).unwrap();
+        file.write_all(&bytes).unwrap();
+        file.set_modified(metadata.modified().unwrap()).unwrap();
+        drop(file);
+        let reopened = ArchiveService::open(&root.0);
+        assert!(reopened.client.flush_barrier(Duration::from_secs(5)));
+        reopened.client.search(SearchQuery::default());
+        assert!(
+            matches!(receive(&reopened), ArchiveReply::Search { records, .. }
+            if records.len() == 1 && records[0].body == "new")
+        );
+    }
+
+    #[test]
+    fn broken_large_frames_never_project_partial_messages() {
+        let root = Scratch::new();
+        let path = root.0.join("framed.jsonl");
+        let mut journal = ArchiveJournal {
+            file: private_append(&path).unwrap(),
+            name: "framed.jsonl".into(),
+            digest: Sha256::new(),
+            previous: Vec::new(),
+        };
+        let event = JournalEvent::Upsert {
+            record: Box::new(record(
+                "#a",
+                &"\\".repeat(MAX_ARCHIVE_LINE / 2 + 1024),
+                "one",
+            )),
+        };
+        assert!(journal.append(&event).is_ok());
+        drop(journal);
+        let original = fs::read(&path).unwrap();
+        let lines: Vec<Vec<u8>> = original
+            .split_inclusive(|byte| *byte == b'\n')
+            .map(<[u8]>::to_vec)
+            .collect();
+        assert!(lines.len() > 2);
+        for mutation in 0..4 {
+            let mut changed = lines.clone();
+            match mutation {
+                0 => {
+                    changed.pop();
+                }
+                1 => {
+                    changed.swap(0, 1);
+                }
+                2 => {
+                    for line in &mut changed {
+                        let mut frame: serde_json::Value = serde_json::from_slice(line).unwrap();
+                        frame["sha256"] = serde_json::Value::String("0".repeat(64));
+                        *line = serde_json::to_vec(&frame).unwrap();
+                        line.push(b'\n');
+                    }
+                }
+                _ => {
+                    let mut frame: serde_json::Value = serde_json::from_slice(&changed[0]).unwrap();
+                    frame["total"] = serde_json::json!(MAX_JOURNAL_RECORD + 1);
+                    changed[0] = serde_json::to_vec(&frame).unwrap();
+                    changed[0].push(b'\n');
+                }
+            }
+            fs::write(&path, changed.concat()).unwrap();
+            let mut db = test_db();
+            let client = ArchiveClient::default();
+            replay_journal(&path, &db, &client).unwrap();
+            assert!(
+                all(&mut db).is_empty(),
+                "mutation {mutation} produced a partial record"
+            );
+            assert!(client.status().error.is_some());
+        }
+    }
+
+    #[test]
+    fn an_entry_beyond_the_logical_limit_reports_failure_without_stopping_history() {
+        let root = Scratch::new();
+        let service = ArchiveService::open(&root.0);
+        let body = "x".repeat(MAX_JOURNAL_RECORD);
+        assert!(service.client.upsert(record("#a", &body, "too-large")));
+        assert!(service.client.upsert(record("#a", "retained", "normal")));
+        assert!(service.client.flush_barrier(Duration::from_secs(5)));
+        assert!(
+            service
+                .client
+                .status()
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("64 MiB"))
+        );
+        service.client.search(SearchQuery::default());
+        assert!(
+            matches!(receive(&service), ArchiveReply::Search { records, .. }
+            if records.len() == 1 && records[0].body == "retained")
+        );
+    }
+
     #[test]
     fn network_pattern_is_bound_literal_and_reaction_removal_survives_late_upsert() {
         let mut db = test_db();

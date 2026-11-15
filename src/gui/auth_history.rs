@@ -15,9 +15,16 @@ pub(super) struct AccountHistory {
     queued_logins: usize,
     services: HashSet<String>,
     deferred: HashMap<ConversationId, HistoryPlacement>,
+    automatic_joins: Vec<AutomaticJoin>,
     probe: Option<AccountProbe>,
     next_probe: u64,
     whois: VecDeque<AccountWhois>,
+}
+
+struct AutomaticJoin {
+    target: String,
+    key: Option<String>,
+    owner: Option<ConversationId>,
 }
 
 struct AccountProbe {
@@ -244,10 +251,74 @@ impl Session {
                 .entry(survivor)
                 .or_insert(placement);
         }
+        for join in &mut self.account_history.automatic_joins {
+            if join.owner == Some(retired) {
+                join.owner = Some(survivor);
+            }
+        }
     }
 
     pub(super) fn forget_automatic_history(&mut self, id: ConversationId) {
         self.account_history.deferred.remove(&id);
+        self.account_history
+            .automatic_joins
+            .retain(|join| join.owner != Some(id));
+    }
+
+    /// Configured and recovery JOINs must not race an asynchronous services
+    /// login. Manual JOINs still use the regular transport path immediately.
+    pub(super) fn send_automatic_join(&mut self, target: String, key: Option<String>) {
+        if self.account_history.required || self.account_history.queued_logins > 0 {
+            let owner = self.id_for_target(&target);
+            self.cancel_automatic_join(&target);
+            self.account_history
+                .automatic_joins
+                .push(AutomaticJoin { target, key, owner });
+        } else {
+            self.send_join_in_background(target, key);
+        }
+    }
+
+    /// Accepted explicit membership changes supersede a deferred automatic
+    /// request, including raw/tagged JOIN and PART forms.
+    pub(super) fn cancel_automatic_join(&mut self, target: &str) {
+        let support = &self.network_support;
+        let conversations = &self.conversations;
+        self.account_history.automatic_joins.retain(|join| {
+            let current = join
+                .owner
+                .and_then(|id| conversations.target(id))
+                .unwrap_or(&join.target);
+            !support.identifiers_equal(current, target)
+        });
+    }
+
+    pub(super) fn cancel_all_automatic_joins(&mut self) {
+        self.account_history.automatic_joins.clear();
+    }
+
+    fn flush_authenticated_joins(&mut self) {
+        let joins = std::mem::take(&mut self.account_history.automatic_joins);
+        let mut sent = HashSet::new();
+        for join in joins {
+            let target = match join.owner {
+                Some(id) => match self.target_name(id) {
+                    Some(target) => target.to_owned(),
+                    None => continue,
+                },
+                None => join.target,
+            };
+            if !sent.insert(self.network_support.canonicalize(&target))
+                || self.is_parting(&target)
+                || self
+                    .channel_key(&target)
+                    .and_then(|key| self.conversations.get(&key))
+                    .is_some_and(|channel| channel.joined)
+            {
+                continue;
+            }
+            self.send_join_in_background(target, join.key);
+        }
     }
 
     pub(super) fn request_automatic_history(
@@ -294,6 +365,12 @@ impl Session {
         if probe_for_old_nick && self.account_history.awaiting {
             self.account_history.probe = None;
             self.request_account_verification();
+        }
+        if !self.account_history.required
+            && self.account_history.queued_logins == 0
+            && self.is_connected()
+        {
+            self.flush_authenticated_joins();
         }
         if self.account_history.required
             || self.account_history.queued_logins > 0
@@ -562,6 +639,109 @@ mod tests {
             .iter()
             .filter(|command| command.to_string().contains("CHATHISTORY "))
             .count()
+    }
+
+    #[test]
+    fn automatic_joins_wait_for_configured_service_authentication() {
+        let (mut app, mut rx) = app("/msg AuthServ AUTH account example-password");
+        feed(&mut app, ":srv 001 me :Welcome");
+        assert!(
+            !drain(&mut rx)
+                .iter()
+                .any(|command| matches!(command, IrcCommand::Join(..))),
+            "registered-only channel joins must not race services authentication"
+        );
+        app.run_timed_tasks();
+        let commands = drain(&mut rx);
+        assert!(commands.iter().any(|command| matches!(command,
+            IrcCommand::Privmsg(target, _) if target == "AuthServ")));
+        assert!(
+            !commands
+                .iter()
+                .any(|command| matches!(command, IrcCommand::Join(..)))
+        );
+        feed(&mut app, ":srv 900 me me!u@h account :Logged in");
+        app.run_timed_tasks();
+        assert_eq!(
+            drain(&mut rx)
+                .iter()
+                .filter(|command| matches!(command,
+                IrcCommand::Join(target, _, _, _) if target == "#room"))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn authenticated_recovery_join_keeps_its_key_without_server_history() {
+        let (mut app, mut rx) = app("/ns IDENTIFY example-password");
+        app.logging_load_history = false;
+        app.chathistory_enabled = false;
+        app.ensure_target("#recover");
+        app.pending_rejoins = super::super::connection::RecoveryPolicy::ExactMemberships(vec![(
+            "#recover".into(),
+            Some("saved-key".into()),
+        )]);
+        feed(&mut app, ":srv 001 me :Welcome");
+        assert!(
+            !drain(&mut rx)
+                .iter()
+                .any(|command| matches!(command, IrcCommand::Join(..)))
+        );
+        app.run_timed_tasks();
+        drain(&mut rx);
+        feed(&mut app, ":srv 900 me me!u@h account :Logged in");
+        app.run_timed_tasks();
+        assert!(drain(&mut rx).iter().any(|command| matches!(command,
+            IrcCommand::Join(target, key, _, _) if target == "#recover" && key.as_deref() == Some("saved-key"))));
+    }
+
+    #[test]
+    fn anonymous_automatic_join_remains_immediate() {
+        let (mut app, mut rx) = app("");
+        feed(&mut app, ":srv 001 me :Welcome");
+        assert!(drain(&mut rx).iter().any(|command| matches!(command,
+            IrcCommand::Join(target, _, _, _) if target == "#room")));
+    }
+
+    #[test]
+    fn manual_join_supersedes_an_authentication_deferred_join() {
+        let (mut app, mut rx) = app("/ns IDENTIFY example-password");
+        feed(&mut app, ":srv 001 me :Welcome");
+        drain(&mut rx);
+        assert!(app.send_join("#room".into(), Some("manual-key".into())));
+        assert_eq!(
+            drain(&mut rx).iter().filter(|command| matches!(command,
+                IrcCommand::Join(target, key, _, _) if target == "#room" && key.as_deref() == Some("manual-key"))).count(),
+            1
+        );
+        app.run_timed_tasks();
+        drain(&mut rx);
+        feed(&mut app, ":srv 900 me me!u@h account :Logged in");
+        app.run_timed_tasks();
+        assert!(
+            !drain(&mut rx)
+                .iter()
+                .any(|command| matches!(command, IrcCommand::Join(..)))
+        );
+    }
+
+    #[test]
+    fn closing_a_retained_tab_cancels_its_authentication_deferred_rejoin() {
+        let (mut app, mut rx) = app("/ns IDENTIFY example-password");
+        app.ensure_target("#room");
+        feed(&mut app, ":srv 001 me :Welcome");
+        drain(&mut rx);
+        app.remove_channel("#room");
+        app.run_timed_tasks();
+        drain(&mut rx);
+        feed(&mut app, ":srv 900 me me!u@h account :Logged in");
+        app.run_timed_tasks();
+        assert!(
+            !drain(&mut rx)
+                .iter()
+                .any(|command| matches!(command, IrcCommand::Join(..)))
+        );
     }
 
     #[test]

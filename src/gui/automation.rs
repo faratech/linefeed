@@ -209,6 +209,46 @@ impl AutomationConfig {
         self.expand_step(input, context, &mut Vec::new(), &mut plan)?;
         Ok(plan)
     }
+    fn expand_id(&self, id: &str, context: &ExpansionContext<'_>) -> Result<CommandPlan, String> {
+        if self.unavailable {
+            return Err("Automation configuration is unavailable; repair it in Settings before running custom commands".into());
+        }
+        let alias = self
+            .aliases
+            .iter()
+            .find(|alias| {
+                alias.id == id
+                    && (alias.scope.is_none() || alias.scope.as_deref() == Some(context.scope))
+            })
+            .ok_or("The selected alias is unavailable on this network")?;
+        let mut plan = CommandPlan {
+            steps: Vec::new(),
+            sensitive: false,
+            aliased: true,
+        };
+        self.expand_alias(alias, "", context, &mut Vec::new(), &mut plan)?;
+        Ok(plan)
+    }
+    fn expand_alias(
+        &self,
+        alias: &AliasDef,
+        args: &str,
+        context: &ExpansionContext<'_>,
+        stack: &mut Vec<String>,
+        plan: &mut CommandPlan,
+    ) -> Result<(), String> {
+        if stack.len() >= MAX_DEPTH || stack.contains(&alias.id) {
+            return Err("Alias recursion limit reached".into());
+        }
+        plan.aliased = true;
+        stack.push(alias.id.clone());
+        for template in &alias.steps {
+            let expanded = render(template, args, context)?;
+            self.expand_step(&expanded, context, stack, plan)?;
+        }
+        stack.pop();
+        Ok(())
+    }
     fn expand_step(
         &self,
         line: &str,
@@ -220,16 +260,7 @@ impl AutomationConfig {
         if !line.starts_with("//")
             && let Some(alias) = self.lookup(name, context.scope)
         {
-            if stack.len() >= MAX_DEPTH || stack.contains(&alias.id) {
-                return Err("Alias recursion limit reached".into());
-            }
-            plan.aliased = true;
-            stack.push(alias.id.clone());
-            for template in &alias.steps {
-                let expanded = render(template, args, context)?;
-                self.expand_step(&expanded, context, stack, plan)?;
-            }
-            stack.pop();
+            self.expand_alias(alias, args, context, stack, plan)?;
         } else {
             if plan.steps.len() >= MAX_STEPS
                 || line.len() + plan.steps.iter().map(String::len).sum::<usize>() > MAX_BYTES
@@ -377,11 +408,18 @@ pub(crate) struct MacroJob {
 impl Session {
     pub(crate) fn run_alias_id(&mut self, id: &str) {
         let scope = self.automation_scope();
-        if let Some(alias) = self.automation.aliases.iter().find(|alias| {
-            alias.id == id
-                && (alias.scope.is_none() || alias.scope.as_deref() == Some(scope.as_str()))
-        }) {
-            self.process_command(&format!("/{}", alias.name));
+        match self.automation.expand_id(
+            id,
+            &ExpansionContext {
+                scope: &scope,
+                target: self.current_target_name(),
+                nick: &self.my_nick,
+            },
+        ) {
+            Ok(plan) => self.execute_alias_plan(plan),
+            Err(error) => self.add_message_to_current(
+                ChatMessage::system(&format!("Alias not run: {error}")).without_logging(),
+            ),
         }
     }
     fn automation_scope(&self) -> String {
@@ -413,6 +451,7 @@ impl Session {
         self.draft_is_sensitive_for(self.current_target_name(), input)
     }
     pub(crate) fn draft_is_sensitive_for(&self, target: Option<&str>, input: &str) -> bool {
+        let input = input.trim_start();
         // Preserve the existing conservative history filter for bare service commands too.
         if super::commands::command_line_contains_credentials(input) {
             return true;
@@ -446,23 +485,27 @@ impl Session {
                 ChatMessage::system(&format!("Alias not run: {error}")).without_logging(),
             ),
             Ok(plan) if !plan.aliased => self.process_builtin_command(input),
-            Ok(plan) if plan.steps.len() == 1 => self.process_builtin_command(&plan.steps[0]),
-            Ok(plan) => {
-                if self.macro_jobs.len() >= MAX_JOBS {
-                    self.add_message_to_current(
-                        ChatMessage::system("Macro queue is full").without_logging(),
-                    );
-                    return;
-                }
-                self.macro_jobs.push_back(MacroJob {
-                    generation: self.connection.generation(),
-                    conversation: self.current_conversation,
-                    target: self.current_target_name().map(str::to_owned),
-                    steps: plan.steps.into(),
-                });
-                self.run_macro_jobs(Instant::now());
-            }
+            Ok(plan) => self.execute_alias_plan(plan),
         }
+    }
+    fn execute_alias_plan(&mut self, plan: CommandPlan) {
+        if plan.steps.len() == 1 {
+            self.process_builtin_command(&plan.steps[0]);
+            return;
+        }
+        if self.macro_jobs.len() >= MAX_JOBS {
+            self.add_message_to_current(
+                ChatMessage::system("Macro queue is full").without_logging(),
+            );
+            return;
+        }
+        self.macro_jobs.push_back(MacroJob {
+            generation: self.connection.generation(),
+            conversation: self.current_conversation,
+            target: self.current_target_name().map(str::to_owned),
+            steps: plan.steps.into(),
+        });
+        self.run_macro_jobs(Instant::now());
     }
     pub(crate) fn run_macro_jobs(&mut self, now: Instant) {
         if now < self.next_macro_at {
@@ -1026,6 +1069,57 @@ mod tests {
         session.test_set_registered(tx);
         (session, rx)
     }
+    #[test]
+    fn shortcut_runs_the_selected_alias_id_when_a_network_alias_shadows_its_name() {
+        let global = alias("greet", &["/raw PING :chosen.example"]);
+        let (mut session, mut rx) = session(config(vec![global.clone()]));
+        session.nickname = "me".into();
+        session.active_session = Some(session.session_from_form().unwrap());
+        let mut scoped = alias("greet", &["/raw PING :shadow.example"]);
+        scoped.id = "network-greet".into();
+        scoped.scope = Some(session.automation_scope());
+        session.set_automation(Arc::new(config(vec![global.clone(), scoped])));
+
+        session.run_alias_id(&global.id);
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            IrcCommand::Raw("PING :chosen.example".into())
+        );
+    }
+
+    #[test]
+    fn indented_login_alias_drafts_are_still_sensitive() {
+        let (session, _) = session(config(vec![alias("mylogin", &["/ns IDENTIFY $1"])]));
+        assert!(session.draft_is_sensitive("  /mylogin synthetic-secret"));
+    }
+
+    #[test]
+    fn selected_alias_id_keeps_scoped_resolution_for_nested_aliases() {
+        let mut nested = alias("child", &["/raw PING :network.example"]);
+        nested.id = "scoped-child".into();
+        nested.scope = Some("network".into());
+        let cfg = config(vec![
+            alias("parent", &["/child"]),
+            alias("child", &["/raw PING :global.example"]),
+            nested,
+        ]);
+        cfg.validate().unwrap();
+        assert_eq!(
+            cfg.expand_id("id-parent", &context()).unwrap().steps,
+            ["/raw PING :network.example"]
+        );
+        assert!(
+            cfg.expand_id(
+                "scoped-child",
+                &ExpansionContext {
+                    scope: "other-network",
+                    ..context()
+                }
+            )
+            .is_err()
+        );
+    }
+
     #[test]
     fn positional_parameters_preserve_remainder_and_never_split_command_boundaries() {
         let cfg = config(vec![alias(

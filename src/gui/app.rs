@@ -1089,6 +1089,7 @@ impl App {
         };
         let old_key = self.sessions[index].conversation_key(old);
         let new_key = self.sessions[index].conversation_key(new);
+        self.rename_activity_conversation(&old_key, &new_key);
         if let Some(window) = self.windows.get_mut(&WindowKey::new(conn, Some(id)))
             && let Some(reply) = &mut window.view.composer.reply_to
             && reply.conversation == old_key
@@ -1134,6 +1135,7 @@ impl App {
     ) {
         let old_key = WindowKey::new(conn, Some(retired));
         let new_key = WindowKey::new(conn, Some(survivor));
+        self.reconcile_activity_conversation(conn, survivor);
         let effective_draft = |key: &WindowKey| {
             self.pending_inputs
                 .iter()
