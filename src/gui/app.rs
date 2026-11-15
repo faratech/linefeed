@@ -568,12 +568,15 @@ impl App {
         self.settings.font_size
     }
 
-    /// Any session connected, connecting or waiting out a reconnect backoff:
-    /// the frame loop must keep polling.
+    /// Network and application background work both need a visible-window
+    /// heartbeat: those workers can finish without producing a native event.
     pub fn wants_polling(&self) -> bool {
         self.sessions.iter().any(|s| {
             s.is_connected() || s.is_connecting() || s.awaiting_reconnect() || s.has_worker()
-        })
+        }) || !self.workspace_restores.is_empty()
+            || (self.settings.resume_workspace && self.workspace.is_enabled())
+            || self.search.has_pending_work()
+            || self.uploads.has_pending_work()
     }
 
     pub fn channel_list_loading(&self) -> bool {
@@ -3626,6 +3629,40 @@ mod tests {
         let mut app = App::with_settings(test_settings(), LayoutFile::default());
         app.start(None);
         app
+    }
+
+    #[test]
+    fn offline_workspace_saving_keeps_the_event_loop_polling() {
+        let mut app = test_app();
+        assert!(!app.wants_polling());
+        let path = std::env::temp_dir()
+            .join(format!(
+                "linefeed-offline-poll-{}",
+                super::super::new_profile_id()
+            ))
+            .join("workspace.json");
+        app.workspace = super::super::workspace::WorkspaceStore::open(path);
+        app.settings.resume_workspace = true;
+        assert!(app.wants_polling());
+        app.settings.resume_workspace = false;
+        assert!(!app.wants_polling());
+    }
+
+    #[test]
+    fn offline_workspace_hydration_keeps_the_event_loop_polling() {
+        let mut app = test_app();
+        assert!(!app.wants_polling());
+        app.workspace_restores.insert(
+            1,
+            (
+                WindowKey::new(app.sessions[0].id, None),
+                super::super::identity::ScrollAnchor::default(),
+                HashSet::new(),
+            ),
+        );
+        assert!(app.wants_polling());
+        app.workspace_restores.clear();
+        assert!(!app.wants_polling());
     }
 
     #[test]

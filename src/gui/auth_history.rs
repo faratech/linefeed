@@ -84,6 +84,10 @@ fn login_service(target: &str, content: &str) -> Option<String> {
 }
 
 fn line_login_service(line: &str, depth: usize) -> Option<String> {
+    line_login_service_with_context(line, depth, false)
+}
+
+fn line_login_service_with_context(line: &str, depth: usize, wire: bool) -> Option<String> {
     if depth > 4 {
         return None;
     }
@@ -94,19 +98,26 @@ fn line_login_service(line: &str, depth: usize) -> Option<String> {
     let (command, args) = line.split_once(char::is_whitespace)?;
     let args = args.trim_start();
     if command.eq_ignore_ascii_case("RAW") || command.eq_ignore_ascii_case("QUOTE") {
-        return line_login_service(args, depth + 1);
+        return line_login_service_with_context(args, depth + 1, true);
     }
     if command.eq_ignore_ascii_case("LABEL") {
-        return line_login_service(args.split_once(char::is_whitespace)?.1, depth + 1);
+        return line_login_service_with_context(
+            args.split_once(char::is_whitespace)?.1,
+            depth + 1,
+            true,
+        );
     }
     let (first, rest) = args.split_once(char::is_whitespace).unwrap_or((args, ""));
     match command.to_ascii_uppercase().as_str() {
-        "MSG" | "PRIVMSG" | "NOTICE" => first
+        // GUI /q opens a query, while a raw IRC Q command addresses the
+        // network service. Preserve both meanings at their actual boundary.
+        "Q" if wire => login_service(command, args),
+        "MSG" | "PRIVMSG" | "NOTICE" | "N" | "QUERY" | "Q" | "SQUERY" => first
             .split(',')
             .find_map(|target| login_service(target, rest)),
         "NS" | "NICKSERV" => login_service("NickServ", args),
         "AS" | "AUTHSERV" => login_service("AuthServ", args),
-        "Q" | "X" => login_service(command, args),
+        "X" => login_service(command, args),
         "AUTH" | "LOGIN" if !rest.is_empty() => Some("authserv".into()),
         "IDENTIFY" | "ID" | "SIDENTIFY" if !args.is_empty() => Some("nickserv".into()),
         _ => None,
@@ -119,7 +130,7 @@ impl Session {
             IrcCommand::Privmsg(target, content) | IrcCommand::Notice(target, content) => target
                 .split(',')
                 .find_map(|target| login_service(target, content)),
-            IrcCommand::Raw(line) => line_login_service(line, 0),
+            IrcCommand::Raw(line) => line_login_service_with_context(line, 0, true),
             _ => None,
         }
     }
@@ -590,6 +601,25 @@ mod tests {
     }
 
     #[test]
+    fn query_and_notice_alias_logins_hold_automatic_history() {
+        for perform in [
+            "/query AuthServ AUTH account example-password",
+            "/q AuthServ AUTH account example-password",
+            "/n AuthServ AUTH account example-password",
+        ] {
+            let (mut app, mut rx) = app(perform);
+            feed(&mut app, ":srv 001 me :Welcome");
+            feed(&mut app, ":me!u@h JOIN #room");
+            assert_eq!(history(&drain(&mut rx)), 0, "{perform}");
+            app.run_timed_tasks();
+            assert_eq!(history(&drain(&mut rx)), 0, "{perform}");
+            feed(&mut app, ":srv 900 me me!u@h account :Logged in");
+            app.run_timed_tasks();
+            assert_eq!(history(&drain(&mut rx)), 1, "{perform}");
+        }
+    }
+
+    #[test]
     fn anonymous_history_and_preregistered_sasl_are_not_delayed() {
         for authenticated in [false, true] {
             let (mut app, mut rx) = app("");
@@ -963,6 +993,8 @@ mod tests {
             "/cs IDENTIFY #room channel-key",
             "/ns SET PASSWORD example-password",
             "/msg alice LOGIN whatever",
+            // /q is the query command, not a service-Q shortcut.
+            "/q AUTH example-password",
         ] {
             assert!(line_login_service(line, 0).is_none(), "{line}");
         }
@@ -971,6 +1003,11 @@ mod tests {
             "/msg NickServ IDENTIFY example-password",
             "/quote PRIVMSG AuthServ :AUTH account example-password",
             "/label x PRIVMSG NickServ :IDENTIFY example-password",
+            "/query AuthServ AUTH account example-password",
+            "/q AuthServ AUTH account example-password",
+            "/n AuthServ AUTH account example-password",
+            "/squery AuthServ AUTH account example-password",
+            "/raw Q AUTH account example-password",
         ] {
             assert!(line_login_service(line, 0).is_some(), "{line}");
         }

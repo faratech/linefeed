@@ -594,11 +594,21 @@ impl Session {
             let advances = previous.as_ref().is_none_or(|previous| {
                 match (position(previous), position(&reference)) {
                     (Some(old), Some(new)) => new >= old,
-                    (None, _) => previous
-                        .server_time
-                        .as_ref()
-                        .zip(reference.server_time.as_ref())
-                        .is_some_and(|(old, new)| new >= old),
+                    (None, Some(_)) => {
+                        // The old read row may have aged out of scrollback on
+                        // a server without server-time. An actual latest-row
+                        // viewport report still establishes forward progress.
+                        self.timeline
+                            .borrow()
+                            .anchor
+                            .as_ref()
+                            .is_some_and(|anchor| anchor.at_bottom)
+                            || previous
+                                .server_time
+                                .as_ref()
+                                .zip(reference.server_time.as_ref())
+                                .is_some_and(|(old, new)| new >= old)
+                    }
                     _ => false,
                 }
             });
@@ -1338,6 +1348,53 @@ mod tests {
         session.window_focused = true;
         session.handle_message_actions();
         assert_eq!(session.timeline.borrow().last_read, Some(newer));
+    }
+
+    #[test]
+    fn reading_latest_advances_after_an_undated_read_row_is_trimmed() {
+        let (mut session, _rx, id) = session();
+        session.add_message_to_channel(
+            "#room",
+            ChatMessage::new_fmt("alice", "already read", "short"),
+        );
+        let old = session.live_message_reference(
+            "#room",
+            &session.conversation_channel(id).unwrap().messages[0],
+        );
+        session
+            .conversations
+            .channel_mut(id)
+            .unwrap()
+            .messages
+            .pop_front();
+        session.add_message_to_channel(
+            "#room",
+            ChatMessage::new_fmt("alice", "new arrival", "short"),
+        );
+        let latest = session.live_message_reference(
+            "#room",
+            session
+                .conversation_channel(id)
+                .unwrap()
+                .messages
+                .back()
+                .unwrap(),
+        );
+        session.conversations.channel_mut(id).unwrap().unread = 1;
+        {
+            let timeline = session.timeline.get_mut();
+            timeline.last_read = Some(old);
+            timeline.visible_read = Some(latest.clone());
+            timeline.anchor = Some(ScrollAnchor {
+                at_bottom: true,
+                ..Default::default()
+            });
+        }
+        session.view_is_active = true;
+        session.window_focused = true;
+        session.handle_message_actions();
+        assert_eq!(session.timeline.borrow().last_read.as_ref(), Some(&latest));
+        assert_eq!(session.conversation_channel(id).unwrap().unread, 0);
     }
     #[test]
     fn restoring_viewport_does_not_acknowledge_new_arrivals() {

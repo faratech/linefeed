@@ -1,5 +1,86 @@
 use super::*;
 
+fn capture_protocol_debug(action: impl FnOnce()) -> String {
+    use std::io::Write;
+    use std::sync::{Arc, Mutex};
+    #[derive(Clone)]
+    struct Writer(Arc<Mutex<Vec<u8>>>);
+    impl Write for Writer {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let output = Arc::new(Mutex::new(Vec::new()));
+    let captured = output.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::DEBUG)
+        .with_ansi(false)
+        .without_time()
+        .with_writer(move || Writer(captured.clone()))
+        .finish();
+    tracing::subscriber::with_default(subscriber, action);
+    String::from_utf8(output.lock().unwrap().clone()).unwrap()
+}
+
+#[test]
+fn generated_upload_tokens_remain_private_in_live_protocol_logs() {
+    let log = capture_protocol_debug(|| {
+        tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
+            let (socket, mut peer) = tokio::io::duplex(4096);
+            peer.write_all(b"@label=lf-upload-job :srv TOKEN GENERATE FILEHOST private-token-value\r\n@batch=token :srv TOKEN GENERATE FILEHOST private-token-chunk\r\n").await.unwrap();
+            peer.shutdown().await.unwrap();
+            let (incoming, mut receiver) = mpsc::channel(10);
+            let mut client = IrcClient::new(ServerConfig::default());
+            client.read_loop(BufReader::new(socket), incoming).await;
+            let rows: Vec<_> = std::iter::from_fn(|| receiver.try_recv().ok()).collect();
+            assert!(rows.iter().any(|row| row.raw.contains("private-token-value")));
+            assert!(rows.iter().any(|row| row.raw.contains("private-token-chunk")));
+        });
+    });
+    assert!(!log.contains("private-token-value"), "{log}");
+    assert!(!log.contains("private-token-chunk"), "{log}");
+}
+
+#[test]
+fn generated_upload_tokens_remain_private_in_handshake_protocol_logs() {
+    let log = capture_protocol_debug(|| {
+        tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
+            let mut wire = b"@label=lf-upload-job :srv TOKEN GENERATE FILEHOST private-handshake-token\r\n".to_vec();
+            let (incoming, mut receiver) = mpsc::channel(10);
+            handle_handshake_line(&mut Vec::new(), &mut wire, &incoming).await.unwrap();
+            assert!(receiver.try_recv().unwrap().raw.contains("private-handshake-token"));
+        });
+    });
+    assert!(!log.contains("private-handshake-token"), "{log}");
+}
+
+#[test]
+fn incoming_trace_scrubbing_keeps_ordinary_protocol_metadata() {
+    for line in [
+        "@time=2026-11-15T00:00:00Z :alice!u@h PRIVMSG #room :hello",
+        ":srv CAP tester ACK :message-tags sasl",
+        ":srv TOKEN SERVICE FILEHOST https://files.example/upload",
+    ] {
+        assert_eq!(redact_incoming_for_log(line), line);
+    }
+    for line in [
+        "@batch=part :srv TOKEN GENERATE FILEHOST private-token",
+        ":srv TOKEN VALIDATE FILEHOST private-token",
+        ":NickServ!service@host NOTICE me :Reset token: private-token",
+        ":srv 781 me private-token :Bouncer resume token",
+        ":srv AUTHENTICATE private-token",
+    ] {
+        assert!(
+            !redact_incoming_for_log(line).contains("private-token"),
+            "{line}"
+        );
+    }
+}
+
 #[test]
 fn client_batches_are_one_atomic_wire_envelope_and_never_log_their_body() {
     let commands = vec![

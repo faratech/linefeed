@@ -291,6 +291,91 @@ fn closed_or_replaced_workspace_owner_discards_late_archive_context() {
 }
 
 #[test]
+fn text_log_reading_anchor_survives_workspace_reload_without_server_message_ids() {
+    use crate::gui::identity::{MessageRef, ScrollAnchor};
+    let root = std::env::temp_dir().join(format!(
+        "linefeed-workspace-text-{}",
+        super::super::new_profile_id()
+    ));
+    let manager = crate::gui::logging::LogManager::with_test_dir(root.clone());
+    let mut original = app();
+    let network = original.sessions[0].logical_network_key().unwrap();
+    let target = original.sessions[0].ensure_target("alice");
+    manager.log_message(
+        &network.storage_key(),
+        "alice",
+        &ChatMessage::new_fmt("alice", "older saved row", "short"),
+    );
+    let loaded = manager.load_history_with_legacy(&network.storage_key(), "", "alice", 100, false);
+    assert_eq!(loaded.len(), 1);
+    assert!(loaded[0].msgid.is_none());
+    let reference = MessageRef {
+        conversation: crate::gui::identity::ConversationKey {
+            network: network.clone(),
+            target: "alice".into(),
+        },
+        archive_id: Some(loaded[0].message_key.clone()),
+        server_msgid: None,
+        server_time: None,
+    };
+    original.sessions[0]
+        .conversation_channel_mut(target)
+        .unwrap()
+        .messages = loaded.into();
+    original.sync_windows();
+    let key = WindowKey::new(original.sessions[0].id, Some(target));
+    original
+        .windows
+        .get_mut(&key)
+        .unwrap()
+        .view
+        .timeline
+        .get_mut()
+        .anchor = Some(ScrollAnchor {
+        message: Some(reference),
+        fraction: 0.25,
+        at_bottom: false,
+    });
+    original.sessions[0].request_manual_disconnect(None);
+    let bytes = serde_json::to_vec(&original.capture_workspace()).unwrap();
+    let mut restored = App::with_settings(original.settings.clone(), LayoutFile::default());
+    restored.workspace.restored = Some(serde_json::from_slice(&bytes).unwrap());
+    restored.start(None);
+    restored.sync_windows();
+    restored.checkpoint_workspace();
+    let target = restored.sessions[0].id_for_target("alice").unwrap();
+    let loaded_again =
+        manager.load_history_with_legacy(&network.storage_key(), "", "alice", 100, false);
+    restored.sessions[0]
+        .conversation_channel_mut(target)
+        .unwrap()
+        .messages = loaded_again.into();
+    let key = WindowKey::new(restored.sessions[0].id, Some(target));
+    let anchor = restored
+        .windows
+        .get(&key)
+        .unwrap()
+        .view
+        .timeline
+        .borrow()
+        .anchor
+        .clone()
+        .unwrap();
+    assert_eq!(anchor.fraction, 0.25);
+    let id = anchor.message.unwrap().archive_id.unwrap();
+    assert!(
+        restored.sessions[0]
+            .conversation_channel(target)
+            .unwrap()
+            .messages
+            .iter()
+            .any(|row| row.message_key == id)
+    );
+    drop(manager);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn bouncer_upstreams_share_a_transport_without_being_duplicate_sessions() {
     use crate::gui::bouncer::{BouncerBinding, BouncerProvider};
     let mut app = App::with_settings(

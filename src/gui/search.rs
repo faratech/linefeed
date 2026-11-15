@@ -13,11 +13,14 @@ pub(crate) struct SearchUi {
     from: String,
     until: String,
     generation: u64,
+    context_generation: u64,
     results: Vec<ArchiveRecord>,
     more: bool,
     pending: bool,
+    context_pending: bool,
     changed: Option<Instant>,
     error: Option<String>,
+    context_error: Option<String>,
     indexing: bool,
     refresh_after_index: bool,
     context: Option<(MessageRef, Vec<ArchiveRecord>)>,
@@ -27,6 +30,9 @@ pub(crate) struct SearchUi {
 impl SearchUi {
     pub(crate) fn visible(&self) -> bool {
         self.open || self.context.is_some()
+    }
+    pub(crate) fn has_pending_work(&self) -> bool {
+        self.pending || self.context_pending || self.changed.is_some()
     }
 }
 
@@ -82,6 +88,7 @@ impl App {
         }
     }
     pub(crate) fn open_search(&mut self, index: usize, text: String, all_networks: bool) {
+        self.archive.client.cancel_context();
         self.claim_global_dialogs(Some(super::windows::WindowKey::new(
             self.sessions[index].id,
             self.sessions[index].current_conversation,
@@ -114,17 +121,36 @@ impl App {
     pub(crate) fn open_archive_context(&mut self, reference: MessageRef) {
         self.search.context = Some((reference.clone(), Vec::new()));
         self.search.context_radius = 50;
-        self.search.error = None;
+        self.search.context_generation = 0;
+        self.search.context_error = None;
+        self.search.context_pending = false;
         if !self.archive.client.is_enabled() {
-            self.search.pending = false;
-            self.search.error =
+            self.search.context_error =
                 Some("The saved-history archive is unavailable for this profile".into());
             return;
         }
-        self.search.generation = self.archive.client.context(reference, 50);
-        self.search.pending = true;
+        self.search.context_generation = self.archive.client.context(reference, 50);
+        self.search.context_pending = true;
+    }
+    fn close_history_search(&mut self) {
+        self.search.open = false;
+        self.search.generation = 0;
+        self.search.pending = false;
+        self.search.changed = None;
+        self.archive.client.cancel_query();
+    }
+    fn close_archive_context(&mut self) {
+        self.search.context = None;
+        self.search.context_generation = 0;
+        self.search.context_pending = false;
+        self.search.context_error = None;
+        self.archive.client.cancel_context();
     }
     fn submit_search(&mut self) {
+        self.search.generation = 0;
+        self.search.pending = false;
+        self.search.changed = None;
+        self.archive.client.cancel_query();
         self.search.error = None;
         if !self.archive.client.is_enabled() {
             self.search.pending = false;
@@ -172,7 +198,7 @@ impl App {
                     generation,
                     records,
                     more,
-                } if generation == self.search.generation => {
+                } if self.search.open && generation == self.search.generation => {
                     if self.search.query.offset == 0 {
                         self.search.results.clear();
                     }
@@ -187,9 +213,11 @@ impl App {
                     generation,
                     reference,
                     records,
-                } if generation == self.search.generation => {
+                } if self.search.context.is_some()
+                    && generation == self.search.context_generation =>
+                {
                     self.search.context = Some((reference, records));
-                    self.search.pending = false;
+                    self.search.context_pending = false;
                 }
                 ArchiveReply::Restored {
                     token,
@@ -202,9 +230,18 @@ impl App {
                 ArchiveReply::Error {
                     generation,
                     message,
-                } if generation == self.search.generation => {
+                } if self.search.open && generation == self.search.generation => {
                     self.search.error = Some(message);
                     self.search.pending = false;
+                }
+                ArchiveReply::ContextError {
+                    generation,
+                    message,
+                } if self.search.context.is_some()
+                    && generation == self.search.context_generation =>
+                {
+                    self.search.context_error = Some(message);
+                    self.search.context_pending = false;
                 }
                 _ => {}
             }
@@ -221,9 +258,9 @@ impl App {
             }
         }
         // An initial query can finish before the background legacy import does.
-        // Refresh its scope once the complete archive is available. Let an open
-        // context finish first so a refresh cannot cancel the user's lookup.
-        if self.search.refresh_after_index && self.search.open && self.search.context.is_none() {
+        // Search and context use independent cancellation lanes, so refreshing
+        // the complete search cannot disturb an open historical lookup.
+        if self.search.refresh_after_index && self.search.open {
             self.search.refresh_after_index = false;
             self.search.query.offset = 0;
             self.submit_search();
@@ -323,9 +360,6 @@ impl App {
                         );
                         ctx.request_repaint_after(Duration::from_millis(100));
                     }
-                    if self.search.refresh_after_index && self.search.context.is_some() {
-                        ui.label("Log import finished. Close historical context to refresh these results.");
-                    }
                     if let Some(error) = &status.error {
                         ui.colored_label(egui::Color32::YELLOW, error);
                     }
@@ -371,19 +405,19 @@ impl App {
                         ui.label(format!("{} results shown", self.search.results.len()));
                         next = ui
                             .add_enabled(
-                                self.search.more && !self.search.pending,
+                                self.search.more
+                                    && !self.search.pending
+                                    && self.search.changed.is_none(),
                                 egui::Button::new("More results"),
                             )
                             .clicked();
                     });
                 });
             self.search.open = open;
-            if !open && self.search.context.is_none() {
-                self.archive.client.cancel_query();
-                self.search.pending = false;
-                self.search.changed = None;
+            if !open {
+                self.close_history_search();
             }
-            if changed {
+            if open && changed {
                 self.search.changed = Some(Instant::now());
                 self.search.query.offset = 0;
             }
@@ -401,7 +435,7 @@ impl App {
             if self.search.changed.is_some() {
                 ctx.request_repaint_after(Duration::from_millis(250));
             }
-            if search {
+            if open && search {
                 self.submit_search();
             }
             if let Some(reference) = reveal {
@@ -427,13 +461,13 @@ impl App {
                         reference.conversation.network.storage_key(),
                         reference.conversation.target
                     ));
-                    if let Some(error) = &self.search.error {
+                    if let Some(error) = &self.search.context_error {
                         ui.colored_label(egui::Color32::RED, error);
                     }
-                    if self.search.pending {
+                    if self.search.context_pending {
                         ui.spinner();
                         ctx.request_repaint_after(Duration::from_millis(50));
-                    } else if records.is_empty() {
+                    } else if records.is_empty() && self.search.context_error.is_none() {
                         ui.label("This message is not available in the saved archive.");
                     }
                     egui::ScrollArea::vertical()
@@ -515,7 +549,7 @@ impl App {
                         });
                     bigger = ui
                         .add_enabled(
-                            self.search.context_radius < 250 && !self.search.pending,
+                            self.search.context_radius < 250 && !self.search.context_pending,
                             egui::Button::new("Show more context"),
                         )
                         .clicked();
@@ -523,23 +557,20 @@ impl App {
             if let Some(target) = reply_to
                 && let Err(error) = self.begin_reply(target)
             {
-                self.search.error = Some(error);
+                self.search.context_error = Some(error);
             }
             if !open {
-                self.search.context = None;
-                if !self.search.open {
-                    self.archive.client.cancel_query();
-                    self.search.pending = false;
-                }
+                self.close_archive_context();
             } else if let Some(target) = reveal_parent {
                 self.open_archive_context(target);
             } else if bigger {
                 self.search.context_radius = (self.search.context_radius + 50).min(250);
-                self.search.generation = self
+                self.search.context_error = None;
+                self.search.context_generation = self
                     .archive
                     .client
                     .context(reference, self.search.context_radius);
-                self.search.pending = true;
+                self.search.context_pending = true;
             }
         }
     }
@@ -565,6 +596,100 @@ fn parse_date(input: &str, end: bool) -> Result<Option<i64>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn app_with_archive() -> (App, std::path::PathBuf) {
+        let mut app = app();
+        let root = std::env::temp_dir().join(format!(
+            "linefeed-search-ui-{}-{}",
+            std::process::id(),
+            super::super::new_profile_id()
+        ));
+        app.archive = super::super::archive::ArchiveService::open(&root);
+        assert!(app.archive.client.flush_barrier(Duration::from_secs(5)));
+        (app, root)
+    }
+
+    fn finish_query(app: &mut App) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while app.search.pending || app.search.context_pending {
+            app.tick_history_services();
+            assert!(Instant::now() < deadline, "Archive query did not complete");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    #[test]
+    fn changing_search_does_not_cancel_the_open_historical_context() {
+        let (mut app, root) = app_with_archive();
+        let row = record();
+        app.archive.client.upsert(row.clone());
+        assert!(app.archive.client.flush_barrier(Duration::from_secs(5)));
+        app.search.open = true;
+        app.open_archive_context(row.reference());
+        app.search.query.text = "old body".into();
+        app.submit_search();
+        finish_query(&mut app);
+        assert_eq!(app.search.results.len(), 1);
+        assert_eq!(
+            app.search.context.as_ref().unwrap().1.len(),
+            1,
+            "The open context must finish independently of the search query"
+        );
+        drop(app);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn opening_historical_context_does_not_cancel_the_pending_search() {
+        let (mut app, root) = app_with_archive();
+        let row = record();
+        app.archive.client.upsert(row.clone());
+        assert!(app.archive.client.flush_barrier(Duration::from_secs(5)));
+        app.search.open = true;
+        app.search.query.text = "old body".into();
+        app.submit_search();
+        app.open_archive_context(row.reference());
+        finish_query(&mut app);
+        assert_eq!(app.search.results.len(), 1);
+        assert_eq!(app.search.context.as_ref().unwrap().1.len(), 1);
+        drop(app);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_late_context_reply_does_not_reopen_a_closed_context_window() {
+        let (mut app, root) = app_with_archive();
+        app.search.open = true;
+        app.open_archive_context(record().reference());
+        assert!(app.archive.client.flush_barrier(Duration::from_secs(5)));
+        app.close_archive_context();
+        app.tick_history_services();
+        assert!(
+            app.search.context.is_none(),
+            "A closed context must stay closed"
+        );
+        drop(app);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn closing_search_keeps_the_pending_context_and_discards_late_search_results() {
+        let (mut app, root) = app_with_archive();
+        let row = record();
+        app.archive.client.upsert(row.clone());
+        assert!(app.archive.client.flush_barrier(Duration::from_secs(5)));
+        app.search.open = true;
+        app.submit_search();
+        app.open_archive_context(row.reference());
+        assert!(app.archive.client.flush_barrier(Duration::from_secs(5)));
+        app.close_history_search();
+        finish_query(&mut app);
+        assert!(!app.search.open);
+        assert!(app.search.results.is_empty());
+        assert_eq!(app.search.context.as_ref().unwrap().1.len(), 1);
+        drop(app);
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     fn app() -> App {
         App::with_settings(
@@ -616,24 +741,21 @@ mod tests {
     fn unavailable_archive_context_finishes_with_an_error() {
         let mut app = app();
         app.open_archive_context(record().reference());
-        assert!(!app.search.pending);
-        assert!(app.search.error.is_some());
+        assert!(!app.search.context_pending);
+        assert!(app.search.context_error.is_some());
     }
 
     #[test]
-    fn completing_log_import_refreshes_the_query_after_context_closes() {
+    fn completing_log_import_refreshes_the_query_without_closing_context() {
         let mut app = app();
         app.search.open = true;
         app.search.indexing = true;
         app.search.query.offset = 100;
         app.search.context = Some((record().reference(), vec![record()]));
         app.tick_history_services();
-        assert!(app.search.refresh_after_index);
-        assert_eq!(app.search.query.offset, 100);
-        app.search.context = None;
-        app.tick_history_services();
         assert!(!app.search.refresh_after_index);
         assert_eq!(app.search.query.offset, 0);
+        assert!(app.search.context.is_some());
     }
 
     #[test]

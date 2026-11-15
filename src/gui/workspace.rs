@@ -125,6 +125,9 @@ pub(crate) struct WorkspaceStore {
 }
 
 impl WorkspaceStore {
+    pub(crate) fn is_enabled(&self) -> bool {
+        self.sender.is_some() && !self.stopped
+    }
     pub(crate) fn open_default() -> Self {
         dirs::config_dir()
             .map(|directory| Self::open(directory.join("linefeed/workspace.json")))

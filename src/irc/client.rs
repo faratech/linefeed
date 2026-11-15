@@ -390,6 +390,52 @@ fn redact_for_log(line: &str) -> std::borrow::Cow<'_, str> {
     }
 }
 
+/// Incoming credentials must be scrubbed before the protocol trace, before
+/// the GUI consumes private token replies or redacts a services echo. Strip
+/// transport metadata only for classification; ordinary lines stay intact.
+fn redact_incoming_for_log(line: &str) -> std::borrow::Cow<'_, str> {
+    use std::borrow::Cow;
+    let mut command = line.trim_end();
+    if command.starts_with('@') {
+        command = command
+            .split_once(char::is_whitespace)
+            .map_or("", |(_, rest)| rest.trim_start());
+    }
+    let mut sender = None;
+    if let Some(prefixed) = command.strip_prefix(':') {
+        if let Some((prefix, rest)) = prefixed.split_once(char::is_whitespace) {
+            sender = prefix.split('!').next();
+            command = rest.trim_start();
+        } else {
+            command = "";
+        }
+    }
+    let mut words = command.split_whitespace();
+    let verb = words.next().unwrap_or("");
+    if verb.eq_ignore_ascii_case("TOKEN")
+        && words.next().is_some_and(|subcommand| {
+            subcommand.eq_ignore_ascii_case("GENERATE")
+                || subcommand.eq_ignore_ascii_case("VALIDATE")
+        })
+    {
+        return Cow::Borrowed("TOKEN <redacted>");
+    }
+    if verb == "781" {
+        return Cow::Borrowed("781 <redacted>");
+    }
+    if ["PRIVMSG", "NOTICE", "SQUERY"]
+        .iter()
+        .any(|command| verb.eq_ignore_ascii_case(command))
+        && sender.is_some_and(is_service_target)
+    {
+        return Cow::Owned(format!("{verb} <redacted>"));
+    }
+    match redact_for_log(command) {
+        Cow::Owned(redacted) => Cow::Owned(redacted),
+        Cow::Borrowed(_) => Cow::Borrowed(line),
+    }
+}
+
 /// Wait for one complete line from the server and leave it in `buf`.
 /// Cancellation-safe: callers race this against NICK write-through and the
 /// step timeout, and dropping it loses nothing because partial bytes stay in
@@ -521,7 +567,7 @@ where
 {
     let trimmed = bytes_to_string_lossy(buf);
     buf.clear();
-    tracing::debug!("< {}", trimmed);
+    tracing::debug!("< {}", redact_incoming_for_log(&trimmed));
     match IrcMessage::parse(&trimmed) {
         Some(msg) => {
             if let IrcCommand::Ping(token) = &msg.command {
@@ -2936,7 +2982,7 @@ impl IrcClient {
                     {
                         let line = bytes_to_string_lossy(&buf);
                         if !line.is_empty() {
-                            tracing::debug!("< {}", line);
+                            tracing::debug!("< {}", redact_incoming_for_log(&line));
                             if let Some(msg) = IrcMessage::parse(&line) {
                                 if self.config.use_tls
                                     && !self.config.accept_invalid_certs

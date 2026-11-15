@@ -359,6 +359,22 @@ fn main() -> eframe::Result<()> {
 }
 
 impl LinefeedApp {
+    /// Update installation control must keep working when eframe only calls
+    /// logic for an occluded/minimized root window.
+    fn poll_update_control(&mut self, ctx: &egui::Context) -> bool {
+        self.app.updater.poll();
+        if std::mem::take(&mut self.app.updater.restart_requested) {
+            let snapshot = self.app.update_session();
+            self.app.updater.prepare_restart(snapshot);
+        }
+        if self.app.updater.closing {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            true
+        } else {
+            false
+        }
+    }
+
     /// While the main window is minimized or occluded, eframe runs a ui pass
     /// only if a detached window is on screen; otherwise just `App::logic`.
     /// Keep every connection drained and its timers, reconnects and lag
@@ -370,7 +386,9 @@ impl LinefeedApp {
         if !hidden {
             return;
         }
-        self.app.updater.poll();
+        if self.poll_update_control(ctx) {
+            return;
+        }
         // Minimize-to-tray: a minimized main window gets no ui pass, so the
         // intercept in `ui` never sees the minimize. Hide it from here.
         #[cfg(windows)]
@@ -433,7 +451,6 @@ impl eframe::App for LinefeedApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         let ctx = &ctx;
-        self.app.updater.poll();
         // UI callback proves eframe's native renderer initialized. This must
         // run before hidden/minimized early returns too.
         if let Some(tx) = self.startup_ack.take() {
@@ -443,12 +460,7 @@ impl eframe::App for LinefeedApp {
                 }
             });
         }
-        if std::mem::take(&mut self.app.updater.restart_requested) {
-            let snapshot = self.app.update_session();
-            self.app.updater.prepare_restart(snapshot);
-        }
-        if self.app.updater.closing {
-            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        if self.poll_update_control(ctx) {
             return;
         }
         // Tray handling (Windows only)
@@ -651,6 +663,28 @@ mod tests {
             .remove(&egui::ViewportId::ROOT)
             .map(|o| o.commands)
             .unwrap_or_default()
+    }
+
+    #[test]
+    fn prepared_update_closes_a_hidden_main_window() {
+        let mut linefeed = hermetic_linefeed();
+        linefeed.app.updater.closing = true;
+        let ctx = egui::Context::default();
+        let mut input = egui::RawInput::default();
+        input.viewports.insert(
+            egui::ViewportId::ROOT,
+            egui::ViewportInfo {
+                minimized: Some(true),
+                ..Default::default()
+            },
+        );
+        let output = ctx.run_logic(&input, |ctx| linefeed.hidden_logic(ctx));
+        assert!(
+            output
+                .viewport_commands
+                .get(&egui::ViewportId::ROOT)
+                .is_some_and(|commands| commands.contains(&egui::ViewportCommand::Close))
+        );
     }
 
     #[test]

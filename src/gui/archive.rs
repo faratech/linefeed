@@ -2,7 +2,7 @@
 //! The journal is authoritative; SQLite is a replaceable search projection.
 use super::ChatMessage;
 use super::identity::{ConversationKey, LogicalNetworkKey, MessageRef};
-use super::logging::{LogSpan, file_generation, line_digest};
+use super::logging::{LogSpan, file_generation, line_digest, line_record_id};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashSet, VecDeque};
@@ -139,6 +139,10 @@ pub(crate) enum ArchiveReply {
         generation: u64,
         message: String,
     },
+    ContextError {
+        generation: u64,
+        message: String,
+    },
 }
 
 #[derive(Serialize, Deserialize)]
@@ -161,6 +165,9 @@ enum JournalEvent {
 }
 
 enum Task {
+    ApplyRedactions,
+    #[cfg(test)]
+    Pause(mpsc::SyncSender<()>, mpsc::Receiver<()>),
     Restore(u64, MessageRef, usize),
     Event(JournalEvent),
     Search(u64, SearchQuery),
@@ -172,12 +179,15 @@ enum Task {
 pub(crate) struct ArchiveClient {
     tx: Option<mpsc::SyncSender<Task>>,
     generation: Arc<AtomicU64>,
+    context_generation: Arc<AtomicU64>,
     status: Arc<Mutex<ArchiveStatus>>,
     stop: Arc<AtomicBool>,
     redactions: Arc<Mutex<HashSet<(ConversationKey, String)>>>,
+    pending_redactions: Arc<Mutex<HashSet<(ConversationKey, String)>>>,
     redacted_ids: Arc<Mutex<HashSet<(ConversationKey, String)>>>,
     available: Arc<AtomicBool>,
     query_failure: Arc<Mutex<Option<ArchiveReply>>>,
+    context_failure: Arc<Mutex<Option<ArchiveReply>>>,
 }
 
 impl ArchiveClient {
@@ -248,14 +258,21 @@ impl ArchiveClient {
     }
     pub(crate) fn redact(&self, conversation: ConversationKey, msgid: String) {
         // Privacy takes effect before the worker queue, including already returned UI rows.
-        self.redactions
-            .lock()
-            .unwrap()
-            .insert((conversation.clone(), msgid.clone()));
-        self.submit(Task::Event(JournalEvent::Redact {
-            conversation,
-            msgid,
-        }));
+        let key = (conversation, msgid);
+        if !self.redactions.lock().unwrap().insert(key.clone()) {
+            return;
+        }
+        // Unlike ordinary history, privacy controls must survive a full queue.
+        // The deduplicated outbox is drained before queued work and flush barriers.
+        self.pending_redactions.lock().unwrap().insert(key);
+        if let Some(tx) = &self.tx
+            && let Err(mpsc::TrySendError::Disconnected(_)) = tx.try_send(Task::ApplyRedactions)
+        {
+            self.available.store(false, Ordering::Release);
+            self.status.lock().unwrap().error = Some(
+                "History archive is unavailable; a message redaction could not be saved".into(),
+            );
+        }
     }
     pub(crate) fn reaction(
         &self,
@@ -281,9 +298,19 @@ impl ArchiveClient {
         generation
     }
     pub(crate) fn context(&self, reference: MessageRef, radius: usize) -> u64 {
-        let generation = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
+        let generation = self.context_generation.fetch_add(1, Ordering::SeqCst) + 1;
         if !self.submit(Task::Context(generation, reference, radius.min(250))) {
-            self.fail_query(generation);
+            let message = self
+                .status
+                .lock()
+                .unwrap()
+                .error
+                .clone()
+                .unwrap_or_else(|| "History archive is unavailable".into());
+            *self.context_failure.lock().unwrap() = Some(ArchiveReply::ContextError {
+                generation,
+                message,
+            });
         }
         generation
     }
@@ -302,6 +329,9 @@ impl ArchiveClient {
     }
     pub(crate) fn cancel_query(&self) {
         self.generation.fetch_add(1, Ordering::SeqCst);
+    }
+    pub(crate) fn cancel_context(&self) {
+        self.context_generation.fetch_add(1, Ordering::SeqCst);
     }
     pub(crate) fn status(&self) -> ArchiveStatus {
         self.status.lock().unwrap().clone()
@@ -358,8 +388,14 @@ impl ArchiveService {
                         Task::Flush(response) => {
                             let _ = response.send(false);
                         }
-                        Task::Search(generation, _) | Task::Context(generation, ..) => {
+                        Task::Search(generation, _) => {
                             let _ = reply_tx.send(ArchiveReply::Error {
+                                generation,
+                                message: "History archive is unavailable".into(),
+                            });
+                        }
+                        Task::Context(generation, ..) => {
+                            let _ = reply_tx.send(ArchiveReply::ContextError {
                                 generation,
                                 message: "History archive is unavailable".into(),
                             });
@@ -378,6 +414,9 @@ impl ArchiveService {
     pub(crate) fn poll(&self) -> Vec<ArchiveReply> {
         let mut replies = Vec::new();
         if let Some(error) = self.client.query_failure.lock().unwrap().take() {
+            replies.push(error);
+        }
+        if let Some(error) = self.client.context_failure.lock().unwrap().take() {
             replies.push(error);
         }
         if let Some(rx) = &self.replies {
@@ -725,7 +764,26 @@ impl<'a> QueryProgress<'a> {
         client: &ArchiveClient,
         generation: Option<u64>,
     ) -> Result<Self, String> {
-        let counter = client.generation.clone();
+        Self::with_counter(db, client, generation, client.generation.clone())
+    }
+    fn context(
+        db: &'a mut Connection,
+        client: &ArchiveClient,
+        generation: u64,
+    ) -> Result<Self, String> {
+        Self::with_counter(
+            db,
+            client,
+            Some(generation),
+            client.context_generation.clone(),
+        )
+    }
+    fn with_counter(
+        db: &'a mut Connection,
+        client: &ArchiveClient,
+        generation: Option<u64>,
+        counter: Arc<AtomicU64>,
+    ) -> Result<Self, String> {
         let stop = client.stop.clone();
         db.progress_handler(
             1000,
@@ -872,7 +930,14 @@ fn process_task(
     reply: &mpsc::Sender<ArchiveReply>,
     client: &ArchiveClient,
 ) -> Result<(), String> {
+    drain_redactions(db, journal, client)?;
     match task {
+        Task::ApplyRedactions => {}
+        #[cfg(test)]
+        Task::Pause(entered, release) => {
+            let _ = entered.send(());
+            let _ = release.recv();
+        }
         Task::Restore(token, reference, radius) => {
             let result = (|| {
                 let progress = QueryProgress::new(db, client, None)?;
@@ -926,8 +991,8 @@ fn process_task(
             }
         }
         Task::Context(generation, reference, radius) => {
-            if client.generation.load(Ordering::SeqCst) == generation {
-                let progress = QueryProgress::new(db, client, Some(generation))?;
+            if client.context_generation.load(Ordering::SeqCst) == generation {
+                let progress = QueryProgress::context(db, client, generation)?;
                 match execute_context(progress.0, &reference, radius) {
                     Ok(records) => {
                         let _ = reply.send(ArchiveReply::Context {
@@ -936,8 +1001,10 @@ fn process_task(
                             records,
                         });
                     }
-                    Err(message) if client.generation.load(Ordering::SeqCst) == generation => {
-                        let _ = reply.send(ArchiveReply::Error {
+                    Err(message)
+                        if client.context_generation.load(Ordering::SeqCst) == generation =>
+                    {
+                        let _ = reply.send(ArchiveReply::ContextError {
                             generation,
                             message,
                         });
@@ -945,6 +1012,37 @@ fn process_task(
                     Err(_) => {}
                 }
             }
+        }
+    }
+    Ok(())
+}
+
+fn drain_redactions(
+    db: &Connection,
+    journal: &mut Option<File>,
+    client: &ArchiveClient,
+) -> Result<(), String> {
+    let pending = std::mem::take(&mut *client.pending_redactions.lock().unwrap());
+    let mut pending = pending.into_iter();
+    while let Some((conversation, msgid)) = pending.next() {
+        let event = JournalEvent::Redact {
+            conversation: conversation.clone(),
+            msgid: msgid.clone(),
+        };
+        let result = (|| {
+            if let Some(file) = journal.as_mut() {
+                serde_json::to_writer(&mut *file, &event).map_err(|e| e.to_string())?;
+                file.write_all(b"\n").map_err(|e| e.to_string())?;
+            }
+            project(db, &event)
+        })();
+        if let Err(error) = result {
+            // Keep failed controls available without holding the GUI-facing
+            // mutex during filesystem or SQLite work.
+            let mut outbox = client.pending_redactions.lock().unwrap();
+            outbox.insert((conversation, msgid));
+            outbox.extend(pending);
+            return Err(error);
         }
     }
     Ok(())
@@ -1115,6 +1213,7 @@ fn run_archive(
                 .and_then(|file| file.sync_all())
                 .map_err(|e| e.to_string())?;
         }
+        drain_redactions(&db, &mut journal, client)?;
         import_legacy(
             &root.join("logs"),
             &mut db,
@@ -1133,6 +1232,7 @@ fn run_archive(
             .map_err(|e| e.to_string())? as usize;
     }
     loop {
+        drain_redactions(&db, &mut journal, client)?;
         let task = if let Some(task) = deferred.pop_front() {
             Some(task)
         } else if client.stop.load(Ordering::SeqCst) {
@@ -1149,6 +1249,7 @@ fn run_archive(
         };
         process_task(task, &mut db, &mut journal, replies, client)?;
     }
+    drain_redactions(&db, &mut journal, client)?;
     if let Some(file) = journal.as_mut() {
         file.flush()
             .and_then(|_| file.sync_data())
@@ -1265,8 +1366,7 @@ fn import_legacy(
                     )
                 {
                     let digest = line_digest(&bytes);
-                    let id =
-                        line_digest(format!("{generation}:{offset}:{len}:{digest}").as_bytes());
+                    let id = line_record_id(&generation, offset, &bytes);
                     let mut record = ArchiveRecord::from_message(conversation.clone(), &message);
                     record.id = id.clone();
                     record.legacy = true;
@@ -1399,6 +1499,122 @@ mod tests {
         assert!(
             matches!(receive(&service),ArchiveReply::Context{records,..}if records.len()==1&&records[0].redacted&&records[0].body.is_empty())
         );
+    }
+
+    #[test]
+    fn redaction_during_queue_saturation_survives_a_restart() {
+        let root = Scratch::new();
+        let service = ArchiveService::open(&root.0);
+        let original = record("#a", "body that must stay redacted", "one");
+        assert!(service.client.upsert(original.clone()));
+        assert!(service.client.flush_barrier(Duration::from_secs(5)));
+
+        let (entered_tx, entered_rx) = mpsc::sync_channel(1);
+        let (release_tx, release_rx) = mpsc::channel();
+        assert!(service.client.submit(Task::Pause(entered_tx, release_rx)));
+        entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        for _ in 0..4096 {
+            assert!(
+                service
+                    .client
+                    .submit(Task::Search(u64::MAX, SearchQuery::default()))
+            );
+        }
+        service
+            .client
+            .redact(original.conversation.clone(), "one".into());
+        release_tx.send(()).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !service.client.flush_barrier(Duration::from_secs(1)) {
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+        drop(service);
+
+        let reopened = ArchiveService::open(&root.0);
+        assert!(reopened.client.flush_barrier(Duration::from_secs(5)));
+        reopened.client.context(original.reference(), 0);
+        assert!(
+            matches!(receive(&reopened), ArchiveReply::Context { records, .. }
+            if records.len() == 1 && records[0].redacted && records[0].body.is_empty())
+        );
+    }
+
+    #[test]
+    fn searches_and_contexts_have_independent_work_and_error_lanes() {
+        let service = ArchiveService::memory();
+        let row = record("#a", "matching row", "one");
+        service.client.upsert(row.clone());
+        assert!(service.client.flush_barrier(Duration::from_secs(5)));
+        let (entered_tx, entered_rx) = mpsc::sync_channel(1);
+        let (release_tx, release_rx) = mpsc::channel();
+        service.client.submit(Task::Pause(entered_tx, release_rx));
+        entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let search_generation = service.client.search(SearchQuery::default());
+        let context_generation = service.client.context(row.reference(), 0);
+        release_tx.send(()).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let mut search = false;
+        let mut context = false;
+        while !(search && context) {
+            for reply in service.poll() {
+                match reply {
+                    ArchiveReply::Search {
+                        generation,
+                        records,
+                        ..
+                    } if generation == search_generation => {
+                        assert_eq!(records.len(), 1);
+                        search = true;
+                    }
+                    ArchiveReply::Context {
+                        generation,
+                        records,
+                        ..
+                    } if generation == context_generation => {
+                        assert_eq!(records.len(), 1);
+                        context = true;
+                    }
+                    _ => panic!("unexpected reply"),
+                }
+            }
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+
+        let generation = service.client.context(row.reference(), 0);
+        service.client.cancel_query();
+        assert!(
+            matches!(receive(&service), ArchiveReply::Context {generation:found,..} if generation == found)
+        );
+        let generation = service.client.search(SearchQuery::default());
+        service.client.cancel_context();
+        assert!(
+            matches!(receive(&service), ArchiveReply::Search {generation:found,..} if generation == found)
+        );
+
+        let (tx, _rx) = mpsc::sync_channel(0);
+        let full = ArchiveService {
+            client: ArchiveClient {
+                tx: Some(tx),
+                available: Arc::new(AtomicBool::new(true)),
+                ..Default::default()
+            },
+            replies: None,
+            worker: None,
+        };
+        let search = full.client.search(SearchQuery::default());
+        let context = full.client.context(row.reference(), 0);
+        let replies = full.poll();
+        assert_eq!(replies.len(), 2);
+        assert!(
+            replies.iter().any(
+                |reply| matches!(reply,ArchiveReply::Error{generation,..}if *generation==search)
+            )
+        );
+        assert!(replies.iter().any(
+            |reply| matches!(reply,ArchiveReply::ContextError{generation,..}if *generation==context)
+        ));
     }
     #[test]
     fn duplicate_msgid_and_echo_updates_keep_one_record() {
@@ -1873,7 +2089,9 @@ mod tests {
         let generation = service
             .client
             .context(record("#a", "x", "x").reference(), 5);
-        assert!(matches!(receive(&service),ArchiveReply::Error {generation:g,..}if g==generation));
+        assert!(
+            matches!(receive(&service),ArchiveReply::ContextError {generation:g,..}if g==generation)
+        );
         let (tx, _rx) = mpsc::sync_channel(0);
         let full = ArchiveService {
             client: ArchiveClient {
@@ -1887,6 +2105,8 @@ mod tests {
         let generation = full.client.search(SearchQuery::default());
         assert!(matches!(receive(&full),ArchiveReply::Error{generation:g,..}if g==generation));
         let generation = full.client.context(record("#a", "x", "x").reference(), 5);
-        assert!(matches!(receive(&full),ArchiveReply::Error{generation:g,..}if g==generation));
+        assert!(
+            matches!(receive(&full),ArchiveReply::ContextError{generation:g,..}if g==generation)
+        );
     }
 }

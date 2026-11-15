@@ -41,6 +41,17 @@ pub(crate) fn line_digest(bytes: &[u8]) -> String {
         .collect()
 }
 
+pub(crate) fn line_record_id(generation: &str, offset: u64, bytes: &[u8]) -> String {
+    line_digest(
+        format!(
+            "{generation}:{offset}:{}:{}",
+            bytes.len(),
+            line_digest(bytes)
+        )
+        .as_bytes(),
+    )
+}
+
 pub(crate) fn file_generation(file: &File) -> std::io::Result<String> {
     #[cfg(unix)]
     {
@@ -429,38 +440,18 @@ impl LogManager {
             Ok(size) => size,
             Err(_) => return Vec::new(),
         };
-
-        // For small files, just read the whole thing
-        if file_size < 65536 {
-            if file.seek(SeekFrom::Start(0)).is_err() {
-                return Vec::new();
-            }
-            let mut raw = String::with_capacity(file_size as usize);
-            // Decode lossily like the large-file branch below: BufRead::lines
-            // yields Err on the first non-UTF-8 byte and would silently
-            // truncate history at that point (irssi logs carry raw wire bytes).
-            if file.read_to_string(&mut raw).is_err() {
-                let mut bytes = Vec::with_capacity(file_size as usize);
-                if file.seek(SeekFrom::Start(0)).is_err() || file.read_to_end(&mut bytes).is_err() {
-                    return Vec::new();
-                }
-                raw = String::from_utf8_lossy(&bytes).into_owned();
-            }
-            let lines: Vec<&str> = raw.lines().collect();
-            let start = lines.len().saturating_sub(max_lines);
-            let mut messages: Vec<ChatMessage> = lines[start..]
-                .iter()
-                .filter_map(|line| parse_log_line(line))
-                .collect();
-            redact_sensitive_history(channel, &mut messages);
-            return messages;
-        }
-
-        // For larger files, read backwards in chunks to find the last N lines
-        let lines = read_last_n_lines(&mut file, file_size, max_lines);
+        let generation = file_generation(&file).ok();
+        let lines = read_last_n_physical_lines(&mut file, file_size, max_lines);
         let mut messages: Vec<ChatMessage> = lines
             .iter()
-            .filter_map(|line| parse_log_line(line))
+            .filter_map(|(offset, bytes)| {
+                let text = String::from_utf8_lossy(bytes);
+                let mut message = parse_log_line(text.trim_end_matches(['\r', '\n']))?;
+                if let Some(generation) = &generation {
+                    message.message_key = line_record_id(generation, *offset, bytes);
+                }
+                Some(message)
+            })
             .collect();
         redact_sensitive_history(channel, &mut messages);
         messages
@@ -761,8 +752,13 @@ pub(super) fn parse_log_line(line: &str) -> Option<ChatMessage> {
     }
 }
 
-/// Read the last N lines from a file by reading backwards in chunks
-fn read_last_n_lines(file: &mut File, file_size: u64, max_lines: usize) -> Vec<String> {
+/// Keep physical offsets and original bytes so log-row identities survive
+/// reloads, tail-window shifts, CRLF and lossy decoding of old wire bytes.
+fn read_last_n_physical_lines(
+    file: &mut File,
+    file_size: u64,
+    max_lines: usize,
+) -> Vec<(u64, Vec<u8>)> {
     const CHUNK_SIZE: u64 = 8192;
     // Chunks are collected newest-first and concatenated once at the end;
     // prepending per chunk would re-copy the accumulated buffer every
@@ -797,11 +793,32 @@ fn read_last_n_lines(file: &mut File, file_size: u64, max_lines: usize) -> Vec<S
         remaining_bytes.extend_from_slice(chunk);
     }
 
-    // Decode once (not per chunk), then return only the last `max_lines` lines.
-    let text = String::from_utf8_lossy(&remaining_bytes);
-    let lines: Vec<&str> = text.lines().collect();
+    let mut offset = pos;
+    let lines: Vec<_> = remaining_bytes
+        .split_inclusive(|byte| *byte == b'\n')
+        .map(|bytes| {
+            let start = offset;
+            offset += bytes.len() as u64;
+            (start, bytes)
+        })
+        .collect();
     let start = lines.len().saturating_sub(max_lines);
-    lines[start..].iter().map(|s| s.to_string()).collect()
+    lines[start..]
+        .iter()
+        .map(|(offset, bytes)| (*offset, bytes.to_vec()))
+        .collect()
+}
+
+#[cfg(test)]
+fn read_last_n_lines(file: &mut File, file_size: u64, max_lines: usize) -> Vec<String> {
+    read_last_n_physical_lines(file, file_size, max_lines)
+        .into_iter()
+        .map(|(_, bytes)| {
+            String::from_utf8_lossy(&bytes)
+                .trim_end_matches(['\r', '\n'])
+                .to_owned()
+        })
+        .collect()
 }
 
 /// Get current date/time as a string for session markers
@@ -1302,6 +1319,42 @@ mod tests {
 
         drop(manager);
         fs::remove_dir_all(dir).expect("remove temporary log directory");
+    }
+
+    #[test]
+    fn loaded_log_rows_keep_stable_distinct_keys_when_reloaded_and_appended() {
+        for large in [false, true] {
+            let (manager, dir) = test_manager("stable-loaded-keys");
+            let network = "tls:irc.example:6697";
+            let path = manager.log_path(network, "#room");
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            let mut bytes = if large {
+                b"ignored padding\n".repeat(5000)
+            } else {
+                Vec::new()
+            };
+            bytes.extend_from_slice(b"[12:00] <alice> repeated\n[12:00] <alice> repeated\n");
+            fs::write(&path, bytes).unwrap();
+
+            let first = manager.load_history_with_legacy(network, "", "#room", 2, false);
+            assert_eq!(first.len(), 2);
+            assert_ne!(first[0].message_key, first[1].message_key);
+            let again = manager.load_history_with_legacy(network, "", "#room", 2, false);
+            assert_eq!(first[0].message_key, again[0].message_key);
+            assert_eq!(first[1].message_key, again[1].message_key);
+
+            manager.log_message(
+                network,
+                "#room",
+                &msg("[12:01]", "alice", "later", false, false),
+            );
+            let after_append = manager.load_history_with_legacy(network, "", "#room", 2, false);
+            assert_eq!(after_append[0].content, "repeated");
+            assert_eq!(first[1].message_key, after_append[0].message_key);
+            assert_eq!(after_append[1].content, "later");
+            drop(manager);
+            fs::remove_dir_all(dir).unwrap();
+        }
     }
 
     #[cfg(target_os = "linux")]

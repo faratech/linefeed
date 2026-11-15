@@ -93,6 +93,7 @@ pub(crate) struct UploadDiscovery {
     credentials_stale: bool,
     confirmed_account: Option<String>,
     requests: VecDeque<(String, Option<String>, Option<String>)>,
+    unlabeled_token_timed_out: bool,
 }
 #[derive(Clone)]
 enum UploadAuth {
@@ -156,6 +157,7 @@ pub(crate) struct UploadManager {
     tx: mpsc::Sender<Event>,
     rx: mpsc::Receiver<Event>,
     notice: Option<String>,
+    pending_pickers: usize,
 }
 impl Default for UploadManager {
     fn default() -> Self {
@@ -166,6 +168,7 @@ impl Default for UploadManager {
             tx,
             rx,
             notice: None,
+            pending_pickers: 0,
         }
     }
 }
@@ -465,7 +468,10 @@ impl Session {
             .push_back((request.0, request.1, None));
     }
     pub(crate) fn request_upload_token(&mut self, id: String) -> bool {
-        if self.upload_discovery.pending.is_some() || !self.is_connected() {
+        if self.upload_discovery.pending.is_some()
+            || self.upload_discovery.unlabeled_token_timed_out
+            || !self.is_connected()
+        {
             return false;
         }
         let label = self
@@ -656,7 +662,11 @@ impl Session {
             .as_ref()
             .is_some_and(|(_, _, _, at)| at.elapsed() > Duration::from_secs(20))
         {
-            let (id, _, _, _) = self.upload_discovery.pending.take().unwrap();
+            let (id, _, label, _) = self.upload_discovery.pending.take().unwrap();
+            // An unlabelled response can only be matched in FIFO order. Keep
+            // its tombstone to consume a late reply, and do not issue another
+            // automatic request whose fresh token could be mistaken for it.
+            self.upload_discovery.unlabeled_token_timed_out |= label.is_none();
             self.events.push(SessionEvent::UploadTokenReady {
                 job_id: id,
                 token: None,
@@ -666,6 +676,13 @@ impl Session {
 }
 
 impl UploadManager {
+    pub(crate) fn has_pending_work(&self) -> bool {
+        self.pending_pickers > 0
+            || self
+                .jobs
+                .iter()
+                .any(|job| matches!(job.state, State::Queued | State::Token | State::Uploading))
+    }
     fn enqueue(&mut self, origin: Origin, provider: Provider, input: Input) {
         if self
             .jobs
@@ -708,7 +725,8 @@ impl UploadManager {
             self.jobs.remove(position);
         }
     }
-    fn picker(&self, origin: Origin, provider: Provider, clipboard: bool) {
+    fn picker(&mut self, origin: Origin, provider: Provider, clipboard: bool) {
+        self.pending_pickers += 1;
         let tx = self.tx.clone();
         std::thread::spawn(move || {
             let result = if clipboard {
@@ -839,6 +857,7 @@ impl App {
         for event in self.uploads.rx.try_iter().collect::<Vec<_>>() {
             match event {
                 Event::Picked(picked) => {
+                    self.uploads.pending_pickers = self.uploads.pending_pickers.saturating_sub(1);
                     let PickedFiles {
                         origin,
                         provider,
@@ -930,6 +949,15 @@ impl App {
                 continue;
             };
             if matches!(job.provider.auth, UploadAuth::TokenService) {
+                if self.sessions[index]
+                    .upload_discovery
+                    .unlabeled_token_timed_out
+                {
+                    job.state = State::Failed(
+                        "The previous upload token request timed out without a response label; reconnect before uploading again".into(),
+                    );
+                    continue;
+                }
                 if token_connections.contains(&job.origin.window.conn) {
                     continue;
                 }
@@ -1660,6 +1688,150 @@ mod tests {
         app.tick_uploads();
         assert_eq!(app.windows.get(&key).unwrap().view.input_text, "keep this");
         assert_eq!(app.uploads.jobs[0].state, State::Cancelled);
+    }
+
+    #[test]
+    fn unlabeled_token_timeout_requires_reconnect_before_later_uploads() {
+        let (mut app, key, mut outgoing) = upload_app();
+        let nonce = app.windows.get(&key).unwrap().view.composer.nonce.clone();
+        app.handle_upload_request(
+            0,
+            key.conversation,
+            nonce.clone(),
+            UploadSource::Files(vec![PathBuf::from("not-opened-first.txt")]),
+        );
+        app.uploads.jobs[0].provider.auth = UploadAuth::TokenService;
+        app.tick_uploads();
+        assert_eq!(app.uploads.jobs[0].state, State::Token);
+        assert_eq!(
+            outgoing.try_recv().unwrap().to_string(),
+            "TOKEN GENERATE FILEHOST"
+        );
+        app.sessions[0].upload_discovery.pending.as_mut().unwrap().3 =
+            Instant::now() - Duration::from_secs(21);
+        app.sessions[0].expire_upload_token();
+        app.process_events();
+        assert!(matches!(app.uploads.jobs[0].state, State::Failed(_)));
+
+        app.handle_upload_request(
+            0,
+            key.conversation,
+            nonce,
+            UploadSource::Files(vec![PathBuf::from("not-opened-second.txt")]),
+        );
+        app.uploads.jobs[1].provider.auth = UploadAuth::TokenService;
+        app.tick_uploads();
+        assert!(
+            matches!(&app.uploads.jobs[1].state, State::Failed(error) if error.to_lowercase().contains("reconnect")),
+            "A timed-out unlabeled response cannot safely be correlated to a later upload: {:?}",
+            app.uploads.jobs[1].state
+        );
+        assert!(
+            outgoing.try_recv().is_err(),
+            "Do not send an ambiguous second request"
+        );
+        assert!(app.sessions[0].complete_upload_token(
+            "FILEHOST",
+            "late-private-token".into(),
+            None
+        ));
+        app.process_events();
+        assert!(matches!(app.uploads.jobs[1].state, State::Failed(_)));
+        assert!(app.windows.get(&key).unwrap().view.input_text.is_empty());
+    }
+
+    #[test]
+    fn labeled_token_timeout_allows_a_distinct_request_and_ignores_the_late_token() {
+        let (mut app, _key, mut outgoing) = upload_app();
+        let session = &mut app.sessions[0];
+        session.enabled_caps.insert("labeled-response".into());
+        assert!(session.request_upload_token("old".into()));
+        session.upload_discovery.pending.as_mut().unwrap().3 =
+            Instant::now() - Duration::from_secs(21);
+        session.expire_upload_token();
+        session.events.clear();
+        assert!(session.request_upload_token("new".into()));
+        assert!(session.complete_upload_token(
+            "FILEHOST",
+            "old-private-token".into(),
+            Some("lf-upload-old".into())
+        ));
+        assert_eq!(session.upload_discovery.pending.as_ref().unwrap().0, "new");
+        assert!(session.complete_upload_token(
+            "FILEHOST",
+            "new-private-token".into(),
+            Some("lf-upload-new".into())
+        ));
+        let ready: Vec<_> = session
+            .events
+            .iter()
+            .filter_map(|event| {
+                if let SessionEvent::UploadTokenReady { job_id, token } = event {
+                    Some((job_id.as_str(), token.as_deref()))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        assert_eq!(
+            ready,
+            [
+                ("old", Some("old-private-token")),
+                ("new", Some("new-private-token"))
+            ]
+        );
+        assert!(outgoing.try_recv().is_ok());
+        assert!(outgoing.try_recv().is_ok());
+        assert!(outgoing.try_recv().is_err());
+    }
+
+    #[test]
+    fn a_picker_completion_keeps_polling_until_the_gui_drains_it() {
+        let (mut app, key, _outgoing) = upload_app();
+        let origin = Origin {
+            window: key,
+            network: app.sessions[0].logical_network_key().unwrap(),
+            nonce: app.windows.get(&key).unwrap().view.composer.nonce.clone(),
+            generation: app.sessions[0].connection.generation(),
+        };
+        let provider = app.sessions[0].upload_provider().unwrap();
+        app.uploads.open = false;
+        app.uploads.pending_pickers = 1;
+        app.sessions[0].test_set_disconnected();
+        app.uploads
+            .tx
+            .send(Event::Picked(Box::new(PickedFiles {
+                origin,
+                provider,
+                result: Ok(Vec::new()),
+            })))
+            .unwrap();
+        assert!(app.uploads.has_pending_work());
+        assert!(app.wants_polling());
+        app.tick_uploads();
+        assert_eq!(app.uploads.pending_pickers, 0);
+        assert!(!app.uploads.has_pending_work());
+        assert!(!app.wants_polling());
+    }
+
+    #[test]
+    fn an_upload_keeps_polling_after_the_transfer_panel_is_closed() {
+        let (mut app, key, _outgoing) = upload_app();
+        let nonce = app.windows.get(&key).unwrap().view.composer.nonce.clone();
+        app.handle_upload_request(
+            0,
+            key.conversation,
+            nonce,
+            UploadSource::Files(vec![PathBuf::from("not-opened.txt")]),
+        );
+        app.uploads.open = false;
+        app.sessions[0].test_set_disconnected();
+        assert!(app.uploads.has_pending_work());
+        assert!(app.wants_polling());
+        let id = app.uploads.jobs[0].id.clone();
+        app.uploads.cancel(&id);
+        assert!(!app.uploads.has_pending_work());
+        assert!(!app.wants_polling());
     }
     #[test]
     fn download_locations_resolve_safely_without_forwarding_credentials() {
