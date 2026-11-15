@@ -42,6 +42,18 @@ fn channel_list_refresh_request(min_users: u32, elist: &str) -> (IrcCommand, boo
     (request, apply_client_filter)
 }
 
+/// Helpers must wrap inside the visible scroll area even when a preceding
+/// control has expanded the content UI's minimum width.
+fn settings_help(ui: &mut egui::Ui, text: &str) -> egui::Response {
+    let visible_width = (ui.clip_rect().right() - ui.next_widget_position().x).max(1.0);
+    ui.allocate_ui_with_layout(
+        Vec2::new(ui.available_width().min(visible_width), 0.0),
+        egui::Layout::top_down(egui::Align::Min),
+        |ui| ui.add(egui::Label::new(RichText::new(text).small().color(Color32::GRAY)).wrap()),
+    )
+    .inner
+}
+
 impl Session {
     /// Restore every Connect-dialog form field from persisted settings,
     /// discarding scratch edits made since the dialog opened (#208).
@@ -58,12 +70,14 @@ impl Session {
         self.set_invisible = persisted.set_invisible;
         self.auto_reconnect = persisted.auto_reconnect;
         self.auto_perform = persisted.auto_perform.clone();
+        self.upload_settings = persisted.upload_settings.clone();
         self.pre_away_message = persisted.pre_away_message.clone();
         self.persistence_profile = persisted.persistence_profile.clone();
         self.sasl_username = persisted.sasl_username.clone();
         self.sasl_password = persisted.sasl_password.clone();
         self.sasl_mechanism = persisted.sasl_mechanism;
         self.sasl_required = persisted.sasl_required;
+        self.bouncer = persisted.bouncer.clone();
         self.tls_client_cert_path = persisted.tls_client_cert_path.clone();
         self.tls_client_key_path = persisted.tls_client_key_path.clone();
         self.connection_error = None;
@@ -80,6 +94,7 @@ impl Session {
             return None;
         }
         let favorite = ServerFavorite {
+            upload_settings: self.upload_settings.clone(),
             name: name.to_string(),
             host: self.server_host.clone(),
             port: self.server_port.clone(),
@@ -92,6 +107,7 @@ impl Session {
             sasl_password: self.sasl_password.clone(),
             sasl_mechanism: self.sasl_mechanism,
             sasl_required: self.sasl_required,
+            bouncer: self.bouncer.clone(),
             tls_client_cert_path: self.tls_client_cert_path.clone(),
             tls_client_key_path: self.tls_client_key_path.clone(),
             username: self.username.clone(),
@@ -164,369 +180,323 @@ impl Session {
         }
     }
 
-    /// The Connect dialog. Returns true when Cancel was pressed: the App
-    /// then restores the form from its persisted settings.
-    pub fn show_connect_window(
+    /// The complete connection editor, shared by startup, Connect and Settings.
+    /// Connecting is an explicit App-level action; editing or saving never
+    /// changes the live connection.
+    fn settings_tab_connection(
         &mut self,
-        ctx: &egui::Context,
+        ui: &mut egui::Ui,
         favorites: &mut Vec<ServerFavorite>,
         favorites_ui: &mut FavoritesUi,
     ) -> bool {
-        let mut cancelled = false;
-        egui::Window::new("Connect to Server")
-            // Dialogs stay above the chat windows they belong to.
-            .order(egui::Order::Foreground)
-            .id(egui::Id::unique(("connect_dialog", self.id)))
-            .collapsible(false)
-            .resizable(true)
-            .default_width(450.0)
-            .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
-            .show(ctx, |ui| {
-                // ===== Network Presets Section =====
-                egui::CollapsingHeader::new("Quick Connect (Network Presets)")
-                    .default_open(favorites.is_empty())
-                    .show(ui, |ui| {
-                        ui.horizontal_wrapped(|ui| {
-                            for (name, host, port, tls) in NETWORK_PRESETS {
-                                if ui.small_button(*name).clicked() {
-                                    self.apply_unprofiled_endpoint(host, port, *tls);
-                                }
-                            }
-                        });
-                        ui.add_space(4.0);
-                        ui.label(RichText::new("Click a network to fill in server details, then click Connect below.").small().color(Color32::GRAY));
-                    });
-
-                ui.add_space(4.0);
-
-                // ===== Server Favorites Section =====
-                egui::CollapsingHeader::new("Server Favorites")
-                    .default_open(!favorites.is_empty())
-                    .show(ui, |ui| {
-                        if favorites.is_empty() {
-                            ui.label("No saved favorites. Fill in connection details and click 'Save as Favorite'.");
-                        } else {
-                            // Favorites list with selection
-                            ScrollArea::vertical()
-                                .max_height(120.0)
-                                .show(ui, |ui| {
-                                    let mut clicked_idx = None;
-                                    let mut connect_idx = None;
-                                    let mut toggled_auto = false;
-                                    for (idx, fav) in favorites.iter_mut().enumerate() {
-                                        let is_selected = favorites_ui.selected == Some(idx);
-                                        let text = format!("{} ({}:{})", fav.name, fav.host, fav.port);
-                                        let response = ui
-                                            .horizontal(|ui| {
-                                                toggled_auto |= ui
-                                                    .checkbox(&mut fav.auto_connect, "")
-                                                    .on_hover_text("Connect to this network when Linefeed starts")
-                                                    .changed();
-                                                ui.selectable_label(is_selected, &text)
-                                            })
-                                            .inner;
-                                        if response.clicked() {
-                                            clicked_idx = Some(idx);
-                                        }
-                                        if response.double_clicked() {
-                                            // Load and connect on double-click
-                                            clicked_idx = Some(idx);
-                                            connect_idx = Some(idx);
-                                        }
-                                    }
-                                    if let Some(idx) = clicked_idx {
-                                        favorites_ui.selected = Some(idx);
-                                    }
-                                    if toggled_auto {
-                                        self.save_config();
-                                    }
-                                    if let Some(idx) = connect_idx
-                                        && let Some(fav) = favorites.get(idx).cloned() {
-                                            self.load_favorite(&fav);
-                                            if self.start_session_from_form() {
-                                                self.save_settings();
-                                                self.show_connect_dialog = false;
-                                            }
-                                        }
-                                });
-
-                            ui.horizontal(|ui| {
-                                // Load button
-                                let has_selection = favorites_ui.selected.is_some();
-                                if ui.add_enabled(has_selection, egui::Button::new("Load")).clicked()
-                                    && let Some(idx) = favorites_ui.selected
-                                        && let Some(fav) = favorites.get(idx).cloned() {
-                                            self.load_favorite(&fav);
-                                        }
-
-                                // Delete button
-                                if ui.add_enabled(has_selection, egui::Button::new("Delete")).clicked()
-                                    && let Some(idx) = favorites_ui.selected {
-                                        favorites_ui.selected = None;
-                                        if remove_favorite(favorites, idx) {
-                                            // Only the list changed (#316).
-                                            self.save_config();
-                                        }
-                                    }
-
-                                // Connect button
-                                if ui.add_enabled(has_selection, egui::Button::new("Connect")).clicked()
-                                    && let Some(idx) = favorites_ui.selected
-                                                && let Some(fav) = favorites.get(idx).cloned() {
-                                                    self.load_favorite(&fav);
-                                                    if self.start_session_from_form() {
-                                                        self.save_settings();
-                                                        self.show_connect_dialog = false;
-                                                    }
-                                                }
-                            });
+        let mut connect_requested = false;
+        // ===== Network Presets Section =====
+        egui::CollapsingHeader::new("Quick Connect (Network Presets)")
+            .default_open(favorites.is_empty())
+            .show(ui, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    for (name, host, port, tls) in NETWORK_PRESETS {
+                        if ui.small_button(*name).clicked() {
+                            self.apply_unprofiled_endpoint(host, port, *tls);
                         }
-                    });
-
-                ui.separator();
-
-                // ===== Server Details =====
-                let mut endpoint_edited = false;
-                ui.horizontal(|ui| {
-                    ui.label("Server:");
-                    endpoint_edited |= ui
-                        .add(TextEdit::singleline(&mut self.server_host).desired_width(200.0))
-                        .changed();
-                });
-
-                ui.horizontal(|ui| {
-                    ui.label("Port:");
-                    endpoint_edited |= ui
-                        .add(TextEdit::singleline(&mut self.server_port).desired_width(80.0))
-                        .changed();
-                    endpoint_edited |= ui.checkbox(&mut self.use_tls, "Use TLS").changed();
-                });
-                if endpoint_edited {
-                    self.note_unprofiled_endpoint_edit();
-                }
-                if let Some(error) = self.connection_error() {
-                    ui.label(RichText::new(error).color(Color32::RED));
-                }
-
-                if self.use_tls {
-                    ui.horizontal(|ui| {
-                        ui.add_space(50.0);
-                        ui.checkbox(&mut self.accept_invalid_certs, "Accept invalid certs (insecure)");
-                    });
-                }
-
-                ui.separator();
-
-                ui.horizontal(|ui| {
-                    ui.label("Nickname:");
-                    ui.add(TextEdit::singleline(&mut self.nickname).desired_width(150.0));
-                });
-
-                ui.horizontal(|ui| {
-                    ui.label("Username:");
-                    ui.add(TextEdit::singleline(&mut self.username).desired_width(150.0));
-                });
-
-                ui.horizontal(|ui| {
-                    ui.label("Real name:");
-                    ui.add(TextEdit::singleline(&mut self.realname).desired_width(200.0));
-                });
-
-                ui.horizontal(|ui| {
-                    ui.label("Password:");
-                    ui.add(TextEdit::singleline(&mut self.password).password(true).desired_width(150.0));
-                    ui.label("(optional)");
-                });
-
-                ui.separator();
-                ui.heading("SASL Authentication");
-                ui.add_space(4.0);
-
-                ui.horizontal(|ui| {
-                    ui.label("SASL User:");
-                    ui.add(TextEdit::singleline(&mut self.sasl_username).desired_width(150.0));
-                });
-
-                ui.horizontal(|ui| {
-                    ui.label("SASL Pass:");
-                    ui.add(TextEdit::singleline(&mut self.sasl_password).password(true).desired_width(150.0));
-                });
-
-                ui.horizontal(|ui| {
-                    ui.label("Mechanism:");
-                    egui::ComboBox::from_id_salt("sasl_mechanism")
-                        .selected_text(match self.sasl_mechanism {
-                            SaslMechanism::Auto => "Auto",
-                            SaslMechanism::Plain => "PLAIN",
-                            SaslMechanism::External => "EXTERNAL",
-                            SaslMechanism::ScramSha256 => "SCRAM-SHA-256",
-                        })
-                        .show_ui(ui, |ui| {
-                            ui.selectable_value(&mut self.sasl_mechanism, SaslMechanism::Auto, "Auto");
-                            ui.selectable_value(&mut self.sasl_mechanism, SaslMechanism::Plain, "PLAIN");
-                            ui.selectable_value(&mut self.sasl_mechanism, SaslMechanism::External, "EXTERNAL");
-                            ui.selectable_value(&mut self.sasl_mechanism, SaslMechanism::ScramSha256, "SCRAM-SHA-256");
-                        });
-                    ui.checkbox(&mut self.sasl_required, "Require SASL");
-                });
-
-                ui.horizontal(|ui| {
-                    ui.label("Client cert:");
-                    ui.add(TextEdit::singleline(&mut self.tls_client_cert_path).desired_width(260.0).hint_text("combined PEM or certificate PEM"));
-                });
-                ui.horizontal(|ui| {
-                    ui.label("Client key:");
-                    ui.add(TextEdit::singleline(&mut self.tls_client_key_path).desired_width(260.0).hint_text("optional; defaults to cert PEM"));
-                });
-
-                if !self.sasl_username.is_empty() || !self.sasl_password.is_empty() {
-                    ui.label(RichText::new("Auto prefers SCRAM-SHA-256 when advertised, then PLAIN.").small().color(Color32::GRAY));
-                }
-
-                ui.separator();
-                ui.heading("On Connect");
-                ui.add_space(4.0);
-
-                ui.horizontal(|ui| {
-                    ui.label("Auto-join:");
-                    ui.add(
-                        TextEdit::singleline(&mut self.auto_join_channels)
-                            .desired_width(200.0)
-                            .hint_text("#chan1, #chan2")
-                    );
-                });
-
-                ui.horizontal(|ui| {
-                    ui.checkbox(&mut self.set_invisible, "Set invisible (+i)");
-                });
-                ui.horizontal(|ui| {
-                    ui.label("Pre-away:");
-                    ui.add(
-                        TextEdit::singleline(&mut self.pre_away_message)
-                            .desired_width(200.0)
-                            .hint_text("optional IRCv3 status"),
-                    );
-                });
-                ui.horizontal(|ui| {
-                    ui.label("Persistence profile:");
-                    ui.add(
-                        TextEdit::singleline(&mut self.persistence_profile)
-                            .desired_width(160.0)
-                            .hint_text("optional Nefarious profile"),
-                    );
-                });
-                ui.checkbox(&mut self.auto_reconnect, "Auto-reconnect on disconnect");
-
-                ui.separator();
-
-                // ===== Save as Favorite =====
-                if favorites_ui.show_save_dialog {
-                    ui.horizontal(|ui| {
-                        ui.label("Name:");
-                        ui.add(TextEdit::singleline(&mut favorites_ui.new_name).desired_width(150.0));
-                        if ui.button("Save").clicked()
-                            && let Some(mut favorite) =
-                                self.form_as_favorite(&favorites_ui.new_name)
-                        {
-                            if favorites.iter().any(|f| f.id == favorite.id) {
-                                // Saved twice: ids must stay distinct.
-                                favorite.id = super::new_profile_id();
-                                self.form_profile = Some(favorite.id.clone());
-                            }
-                            favorites.push(favorite);
-                            favorites_ui.selected = Some(favorites.len() - 1);
-                            // Only the list changed (#316).
-                            self.save_config();
-                            favorites_ui.new_name.clear();
-                            favorites_ui.show_save_dialog = false;
-                        }
-                        if ui.button("Cancel").clicked() {
-                            favorites_ui.new_name.clear();
-                            favorites_ui.show_save_dialog = false;
-                        }
-                    });
-                } else {
-                    if ui.button("Save as Favorite").clicked() {
-                        // Pre-fill with server name if empty
-                        if favorites_ui.new_name.is_empty() {
-                            favorites_ui.new_name = self.server_host.clone();
-                        }
-                        favorites_ui.show_save_dialog = true;
-                    }
-                }
-
-                ui.separator();
-
-                // ===== Connect/Cancel Buttons =====
-                ui.horizontal(|ui| {
-                    if ui.button("Connect").clicked() && self.start_session_from_form() {
-                        self.save_settings();
-                        self.show_connect_dialog = false;
-                    }
-                    if ui.button("Cancel").clicked() {
-                        cancelled = true;
                     }
                 });
+                ui.add_space(4.0);
+                settings_help(
+                    ui,
+                    "Click a network to fill in server details, then click Connect below.",
+                );
             });
-        cancelled
-    }
 
-    fn settings_tab_connection(&mut self, ui: &mut egui::Ui) {
-        ui.heading("Server Defaults");
         ui.add_space(4.0);
 
-        let old_endpoint = (
-            self.server_host.clone(),
-            self.server_port.clone(),
-            self.use_tls,
-        );
-        egui::Grid::new("connection_grid")
-            .num_columns(2)
-            .spacing([10.0, 6.0])
+        // ===== Server Favorites Section =====
+        egui::CollapsingHeader::new("Server Favorites")
+            .default_open(!favorites.is_empty())
             .show(ui, |ui| {
-                ui.label("Server:");
-                ui.add(TextEdit::singleline(&mut self.server_host).desired_width(200.0));
-                ui.end_row();
+                if favorites.is_empty() {
+                    ui.label("No saved favorites. Fill in connection details and click 'Save as Favorite'.");
+                } else {
+                    // Favorites list with selection
+                    ScrollArea::vertical()
+                        .max_height(120.0)
+                        .show(ui, |ui| {
+                            let mut clicked_idx = None;
+                            let mut connect_idx = None;
+                            let mut toggled_auto = false;
+                            for (idx, fav) in favorites.iter_mut().enumerate() {
+                                let is_selected = favorites_ui.selected == Some(idx);
+                                let text = format!("{} ({}:{})", fav.name, fav.host, fav.port);
+                                let response = ui
+                                    .horizontal(|ui| {
+                                        toggled_auto |= ui
+                                            .checkbox(&mut fav.auto_connect, "")
+                                            .on_hover_text("Connect to this network when Linefeed starts")
+                                            .changed();
+                                        ui.selectable_label(is_selected, &text)
+                                    })
+                                    .inner;
+                                if response.clicked() {
+                                    clicked_idx = Some(idx);
+                                }
+                                if response.double_clicked() {
+                                    // Load and connect on double-click
+                                    clicked_idx = Some(idx);
+                                    connect_idx = Some(idx);
+                                }
+                            }
+                            if let Some(idx) = clicked_idx {
+                                favorites_ui.selected = Some(idx);
+                            }
+                            if toggled_auto {
+                                self.save_config();
+                            }
+                            if let Some(idx) = connect_idx
+                                && let Some(fav) = favorites.get(idx).cloned() {
+                                    self.load_favorite(&fav);
+                                    favorites_ui.editing_profile = self.form_profile.clone();
+                                    connect_requested = true;
+                                }
+                        });
 
-                ui.label("Port:");
-                ui.add(TextEdit::singleline(&mut self.server_port).desired_width(80.0));
-                ui.end_row();
+                    ui.horizontal_wrapped(|ui| {
+                        // Load button
+                        let has_selection = favorites_ui.selected.is_some();
+                        if ui.add_enabled(has_selection, egui::Button::new("Load")).clicked()
+                            && let Some(idx) = favorites_ui.selected
+                                && let Some(fav) = favorites.get(idx).cloned() {
+                                    self.load_favorite(&fav);
+                                    favorites_ui.editing_profile = self.form_profile.clone();
+                                }
+
+                        // Delete button
+                        if ui.add_enabled(has_selection, egui::Button::new("Delete")).clicked()
+                            && let Some(idx) = favorites_ui.selected {
+                                favorites_ui.selected = None;
+                                if remove_favorite(favorites, idx) {
+                                    // Only the list changed (#316).
+                                    self.save_config();
+                                }
+                            }
+
+                        // Connect button
+                        if ui.add_enabled(has_selection, egui::Button::new("Connect")).clicked()
+                            && let Some(idx) = favorites_ui.selected
+                                        && let Some(fav) = favorites.get(idx).cloned() {
+                                            self.load_favorite(&fav);
+                                            favorites_ui.editing_profile = self.form_profile.clone();
+                                            connect_requested = true;
+                                        }
+                    });
+                }
             });
 
-        ui.checkbox(&mut self.use_tls, "Use TLS by default");
-        if old_endpoint
-            != (
-                self.server_host.clone(),
-                self.server_port.clone(),
-                self.use_tls,
-            )
-        {
+        ui.separator();
+
+        // ===== Server Details =====
+        let mut endpoint_edited = false;
+        ui.horizontal_wrapped(|ui| {
+            ui.label("Server:");
+            endpoint_edited |= ui
+                .add(TextEdit::singleline(&mut self.server_host).desired_width(200.0))
+                .changed();
+        });
+
+        ui.horizontal_wrapped(|ui| {
+            ui.label("Port:");
+            endpoint_edited |= ui
+                .add(TextEdit::singleline(&mut self.server_port).desired_width(80.0))
+                .changed();
+            endpoint_edited |= ui.checkbox(&mut self.use_tls, "Use TLS").changed();
+        });
+        if endpoint_edited {
             self.note_unprofiled_endpoint_edit();
         }
         if let Some(error) = self.connection_error() {
             ui.label(RichText::new(error).color(Color32::RED));
         }
 
-        ui.add_space(8.0);
-        ui.heading("Identity");
+        if self.use_tls {
+            ui.horizontal_wrapped(|ui| {
+                ui.add_space(50.0);
+                ui.checkbox(
+                    &mut self.accept_invalid_certs,
+                    "Accept invalid certs (insecure)",
+                );
+            });
+        }
+
+        ui.separator();
+
+        ui.horizontal_wrapped(|ui| {
+            ui.label("Nickname:");
+            ui.add(TextEdit::singleline(&mut self.nickname).desired_width(150.0));
+        });
+
+        ui.horizontal_wrapped(|ui| {
+            ui.label("Username:");
+            ui.add(TextEdit::singleline(&mut self.username).desired_width(150.0));
+        });
+
+        ui.horizontal_wrapped(|ui| {
+            ui.label("Real name:");
+            ui.add(TextEdit::singleline(&mut self.realname).desired_width(200.0));
+        });
+
+        ui.horizontal_wrapped(|ui| {
+            ui.label("Password:");
+            ui.add(
+                TextEdit::singleline(&mut self.password)
+                    .password(true)
+                    .desired_width(150.0),
+            );
+            ui.label("(optional)");
+        });
+
+        ui.separator();
+        ui.heading("SASL Authentication");
         ui.add_space(4.0);
 
-        egui::Grid::new("identity_grid")
-            .num_columns(2)
-            .spacing([10.0, 6.0])
-            .show(ui, |ui| {
-                ui.label("Nickname:");
-                ui.add(TextEdit::singleline(&mut self.nickname).desired_width(150.0));
-                ui.end_row();
+        ui.horizontal_wrapped(|ui| {
+            ui.label("SASL User:");
+            ui.add(TextEdit::singleline(&mut self.sasl_username).desired_width(150.0));
+        });
 
-                ui.label("Username:");
-                ui.add(TextEdit::singleline(&mut self.username).desired_width(150.0));
-                ui.end_row();
+        ui.horizontal_wrapped(|ui| {
+            ui.label("SASL Pass:");
+            ui.add(
+                TextEdit::singleline(&mut self.sasl_password)
+                    .password(true)
+                    .desired_width(150.0),
+            );
+        });
 
-                ui.label("Real name:");
-                ui.add(TextEdit::singleline(&mut self.realname).desired_width(200.0));
-                ui.end_row();
+        ui.horizontal_wrapped(|ui| {
+            ui.label("Mechanism:");
+            egui::ComboBox::from_id_salt("sasl_mechanism")
+                .selected_text(match self.sasl_mechanism {
+                    SaslMechanism::Auto => "Auto",
+                    SaslMechanism::Plain => "PLAIN",
+                    SaslMechanism::External => "EXTERNAL",
+                    SaslMechanism::ScramSha256 => "SCRAM-SHA-256",
+                })
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut self.sasl_mechanism, SaslMechanism::Auto, "Auto");
+                    ui.selectable_value(&mut self.sasl_mechanism, SaslMechanism::Plain, "PLAIN");
+                    ui.selectable_value(
+                        &mut self.sasl_mechanism,
+                        SaslMechanism::External,
+                        "EXTERNAL",
+                    );
+                    ui.selectable_value(
+                        &mut self.sasl_mechanism,
+                        SaslMechanism::ScramSha256,
+                        "SCRAM-SHA-256",
+                    );
+                });
+            ui.checkbox(&mut self.sasl_required, "Require SASL");
+        });
+
+        ui.horizontal_wrapped(|ui| {
+            ui.label("Client cert:");
+            ui.add(
+                TextEdit::singleline(&mut self.tls_client_cert_path)
+                    .desired_width(260.0)
+                    .hint_text("combined PEM or certificate PEM"),
+            );
+        });
+        ui.horizontal_wrapped(|ui| {
+            ui.label("Client key:");
+            ui.add(
+                TextEdit::singleline(&mut self.tls_client_key_path)
+                    .desired_width(260.0)
+                    .hint_text("optional; defaults to cert PEM"),
+            );
+        });
+
+        if !self.sasl_username.is_empty() || !self.sasl_password.is_empty() {
+            ui.label(
+                RichText::new("Auto prefers SCRAM-SHA-256 when advertised, then PLAIN.")
+                    .small()
+                    .color(Color32::GRAY),
+            );
+        }
+
+        ui.separator();
+        connect_requested |= self.draw_bouncer_editor(ui);
+        self.draw_on_connect_settings(ui);
+        self.draw_upload_settings(ui);
+
+        ui.separator();
+
+        if let Some(id) = favorites_ui.editing_profile.clone()
+            && let Some(favorite) = favorites.iter().find(|favorite| favorite.id == id)
+        {
+            let name = favorite.name.clone();
+            if ui.button(format!("Update favorite: {name}")).clicked() {
+                self.update_favorite(favorites, &id);
+            }
+        }
+
+        // ===== Save as Favorite =====
+        if favorites_ui.show_save_dialog {
+            ui.horizontal_wrapped(|ui| {
+                ui.label("Name:");
+                ui.add(TextEdit::singleline(&mut favorites_ui.new_name).desired_width(150.0));
+                if ui.button("Save").clicked()
+                    && let Some(mut favorite) = self.form_as_favorite(&favorites_ui.new_name)
+                {
+                    if favorites.iter().any(|f| f.id == favorite.id) {
+                        // Saved twice: ids must stay distinct.
+                        favorite.id = super::new_profile_id();
+                        self.form_profile = Some(favorite.id.clone());
+                    }
+                    favorites_ui.editing_profile = Some(favorite.id.clone());
+                    favorites.push(favorite);
+                    favorites_ui.selected = Some(favorites.len() - 1);
+                    // Only the list changed (#316).
+                    self.save_config();
+                    favorites_ui.new_name.clear();
+                    favorites_ui.show_save_dialog = false;
+                }
+                if ui.button("Cancel favorite").clicked() {
+                    favorites_ui.new_name.clear();
+                    favorites_ui.show_save_dialog = false;
+                }
             });
+        } else {
+            if ui.button("Save as Favorite").clicked() {
+                // Pre-fill with server name if empty
+                if favorites_ui.new_name.is_empty() {
+                    favorites_ui.new_name = self.server_host.clone();
+                }
+                favorites_ui.show_save_dialog = true;
+            }
+        }
+        connect_requested
+    }
+
+    /// Replace only the favorite the form was explicitly loaded from, keeping
+    /// its identity and startup preference. This never adopts Quick Connect defaults.
+    fn update_favorite(&mut self, favorites: &mut [ServerFavorite], id: &str) -> bool {
+        let Some(index) = favorites.iter().position(|favorite| favorite.id == id) else {
+            return false;
+        };
+        let previous = &favorites[index];
+        let (id, name, auto_connect) = (
+            previous.id.clone(),
+            previous.name.clone(),
+            previous.auto_connect,
+        );
+        let Some(mut favorite) = self.form_as_favorite(&name) else {
+            return false;
+        };
+        favorite.id = id.clone();
+        favorite.auto_connect = auto_connect;
+        favorites[index] = favorite;
+        self.form_profile = Some(id);
+        self.save_config();
+        true
     }
 
     fn settings_tab_display(&mut self, ui: &mut egui::Ui, font_size: &mut f32) {
@@ -613,11 +583,11 @@ impl Session {
         );
     }
 
-    fn settings_tab_automation(&mut self, ui: &mut egui::Ui) {
+    fn draw_on_connect_settings(&mut self, ui: &mut egui::Ui) {
         ui.heading("On Connect");
         ui.add_space(4.0);
 
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             ui.label("Auto-join:");
             ui.add(
                 TextEdit::singleline(&mut self.auto_join_channels)
@@ -628,11 +598,11 @@ impl Session {
 
         ui.checkbox(&mut self.set_invisible, "Set invisible (+i)");
 
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             ui.label("Pre-connect away:");
             ui.add(TextEdit::singleline(&mut self.pre_away_message).desired_width(220.0));
         });
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             ui.label("Persistence profile:");
             ui.add(TextEdit::singleline(&mut self.persistence_profile).desired_width(180.0));
         });
@@ -645,26 +615,6 @@ impl Session {
                 .desired_rows(4)
                 .hint_text("/msg NickServ identify pass\n/join #secret key"),
         );
-
-        ui.add_space(8.0);
-        ui.heading("Ignore List");
-        ui.add_space(4.0);
-
-        if self.ignore_list.is_empty() {
-            ui.label(
-                RichText::new("No users ignored")
-                    .italics()
-                    .color(Color32::GRAY),
-            );
-            ui.label("Use /ignore <nick|mask> to add.");
-        } else {
-            let ignore_display = self.ignore_list.join(", ");
-            ui.horizontal_wrapped(|ui| {
-                ui.label("Ignored:");
-                ui.label(RichText::new(&ignore_display).color(Color32::GRAY));
-            });
-            ui.label("Use /unignore <nick> to remove.");
-        }
     }
 
     fn settings_tab_behavior(
@@ -700,6 +650,21 @@ impl Session {
             "Desktop notifications for highlights/PMs",
         );
 
+        ui.checkbox(&mut self.attention.sound, "Notification sound");
+        ui.checkbox(&mut self.attention.show_typing, "Show typing indicators");
+        ui.checkbox(&mut self.attention.share_typing, "Share my typing status");
+        if let Some(target) = self.current_target_name().map(str::to_owned) {
+            let key = self.conversation_key(&target);
+            ui.collapsing(format!("Notifications for {target}"),|ui| {
+                use super::attention::{AlertLevel,AlertSound};
+                let rule=self.attention.rule_mut(key);
+                egui::ComboBox::from_id_salt("conversation_alert_level").selected_text(format!("{:?}",rule.level)).show_ui(ui,|ui|{for (value,label) in [(AlertLevel::Inherit,"Use global defaults"),(AlertLevel::Muted,"Muted"),(AlertLevel::Mentions,"Mentions only"),(AlertLevel::All,"All messages")]{ui.selectable_value(&mut rule.level,value,label);}});
+                egui::ComboBox::from_id_salt("conversation_alert_sound").selected_text(format!("Sound: {:?}",rule.sound)).show_ui(ui,|ui|{for(value,label)in[(AlertSound::Inherit,"Inherit sound"),(AlertSound::Off,"Sound off"),(AlertSound::Default,"Default sound")]{ui.selectable_value(&mut rule.sound,value,label);}});
+                let mut custom=rule.highlight_terms.is_some();if ui.checkbox(&mut custom,"Override extra highlight words").changed(){rule.highlight_terms=if custom{Some(Vec::new())}else{None};}
+                if let Some(terms)=&mut rule.highlight_terms{let mut text=terms.join(", ");if ui.text_edit_singleline(&mut text).changed(){*terms=text.split(',').map(str::trim).filter(|term|!term.is_empty()).map(str::to_owned).collect();}}
+                ui.label(egui::RichText::new("Muted conversations still keep unread counts and Activity entries.").small()).on_hover_text("Your nickname is always a mention. The global notification switch controls all desktop notifications and sounds.");
+            });
+        }
         let tray_response = ui.checkbox(minimize_to_tray, "Minimize to system tray");
         if *minimize_to_tray {
             tray_response.on_hover_text("System tray support requires platform-specific setup");
@@ -793,11 +758,29 @@ impl Session {
             );
             self.list_min_users = min_users.max(0) as u32;
         });
-        ui.label(
-            RichText::new("Filter /list to channels with at least this many users (0 = all)")
-                .small()
-                .color(Color32::GRAY),
+        settings_help(
+            ui,
+            "Filter /list to channels with at least this many users (0 = all)",
         );
+        ui.add_space(8.0);
+        ui.heading("Ignore List");
+        ui.add_space(4.0);
+
+        if self.ignore_list.is_empty() {
+            ui.label(
+                RichText::new("No users ignored")
+                    .italics()
+                    .color(Color32::GRAY),
+            );
+            ui.label("Use /ignore <nick|mask> to add.");
+        } else {
+            let ignore_display = self.ignore_list.join(", ");
+            ui.horizontal_wrapped(|ui| {
+                ui.label("Ignored:");
+                ui.label(RichText::new(&ignore_display).color(Color32::GRAY));
+            });
+            ui.label("Use /unignore <nick> to remove.");
+        }
     }
 
     /// Recompute the channel-list view (filtered + sorted row indices) only when
@@ -1516,28 +1499,30 @@ pub(crate) fn remove_favorite(favorites: &mut Vec<ServerFavorite>, idx: usize) -
 }
 
 impl App {
-    /// The Settings window. Connection, Display, Automation and Behavior
-    /// edit the active session (its connect form and its copy of the
-    /// behaviour settings), which the App adopts and mirrors into every
-    /// session; About and the App-only switches edit the App directly.
+    /// One settings window owns both connection setup and global preferences.
+    /// Form edits stay in the pinned session until an explicit save/connect.
     pub(crate) fn show_settings_window(&mut self, ctx: &egui::Context) {
-        // The network the window was opened for, even if another window
-        // became active meanwhile.
         let active = self.settings_index();
-        let mut close = false;
+        let mut save = false;
+        let mut cancel = false;
+        let mut connect = false;
+        let network = self.network_label(&self.sessions[active]);
+        #[cfg(test)]
+        self.settings_action_rects.clear();
+        let available = (ctx.content_rect().size() - Vec2::splat(16.0)).max(Vec2::splat(100.0));
         egui::Window::new("Settings")
-            // Dialogs stay above the chat windows they belong to.
             .order(egui::Order::Foreground)
             .collapsible(false)
             .resizable(true)
-            .default_size([380.0, 320.0])
+            .default_size(Vec2::new(520.0, 560.0).min(available))
+            .max_size(available)
             .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
             .show(ctx, |ui| {
-                ui.horizontal(|ui| {
-                    for (index, label) in
-                        ["Connection", "Display", "Automation", "Behavior", "About"]
-                            .into_iter()
-                            .enumerate()
+                ui.label(RichText::new(format!("Connection: {network}")).strong());
+                ui.horizontal_wrapped(|ui| {
+                    for (index, label) in ["Connection", "Display", "Behavior", "About"]
+                        .into_iter()
+                        .enumerate()
                     {
                         if ui
                             .selectable_label(self.settings_tab == index, label)
@@ -1548,55 +1533,178 @@ impl App {
                     }
                 });
                 ui.separator();
-
-                let tab = self.settings_tab;
-                if tab == 4 {
-                    self.settings_tab_about(ui);
-                } else {
-                    let App {
-                        sessions, settings, ..
-                    } = &mut *self;
-                    let session = &mut sessions[active];
-                    match tab {
-                        0 => session.settings_tab_connection(ui),
-                        1 => session.settings_tab_display(ui, &mut settings.font_size),
-                        2 => session.settings_tab_automation(ui),
-                        3 => session.settings_tab_behavior(
-                            ui,
-                            &mut settings.notifications_enabled,
-                            &mut settings.minimize_to_tray,
-                        ),
-                        _ => {}
-                    }
+                if let Some(error) = self.sessions[active].connection_error() {
+                    ui.colored_label(Color32::RED, error);
                 }
-
+                let roomy = ctx.content_rect().height() > 450.0;
+                let footer_height = if roomy {
+                    if self.settings_tab == 0 { 110.0 } else { 65.0 }
+                } else { 58.0 };
+                let content_height = (ui.available_height() - footer_height)
+                    .min(ctx.content_rect().height() - footer_height - 120.0)
+                    .max(if roomy { 40.0 } else { 24.0 });
+                ScrollArea::vertical()
+                    .id_salt((
+                        "settings_content",
+                        self.sessions[active].id,
+                        self.settings_tab,
+                    ))
+                    .max_height(content_height)
+                    .min_scrolled_height(if roomy { 40.0 } else { 24.0 })
+                    .show(ui, |ui| {
+                        let tab = self.settings_tab;
+                        if tab == 3 {
+                            self.settings_tab_about(ui);
+                        } else {
+                            let App {
+                                sessions,
+                                settings,
+                                favorites_ui,
+                                ..
+                            } = &mut *self;
+                            let session = &mut sessions[active];
+                            match tab {
+                                0 => {
+                                    connect |= session.settings_tab_connection(
+                                        ui,
+                                        &mut settings.server_favorites,
+                                        favorites_ui,
+                                    )
+                                }
+                                1 => session.settings_tab_display(ui, &mut settings.font_size),
+                                2 => session.settings_tab_behavior(
+                                    ui,
+                                    &mut settings.notifications_enabled,
+                                    &mut settings.minimize_to_tray,
+                                ),
+                                _ => {}
+                            }
+                        }
+                        if tab == 2 {ui.checkbox(&mut self.settings.resume_workspace,"Restore workspace and reconnect on startup");self.draw_automation_editor(ui, active);}
+                    });
                 ui.separator();
-                if ui.button("Close").clicked() {
-                    close = true;
+                if roomy && self.settings_tab == 0 {
+                    ui.label(
+                        RichText::new(
+                            "Save stores connection defaults without reconnecting. Favorites have their own save buttons.",
+                        )
+                        .small()
+                        .color(Color32::GRAY),
+                    );
                 }
+                if roomy {
+                    ui.label(RichText::new("Global preferences apply immediately. Cancel discards connection edits.")
+                        .small().color(Color32::GRAY));
+                }
+                ui.horizontal_wrapped(|ui| {
+                    if self.settings_tab == 0 {
+                        let session = &self.sessions[active];
+                        let label = if session.is_connected()
+                            || session.is_connecting()
+                            || session.has_worker()
+                        {
+                            "Reconnect"
+                        } else {
+                            "Connect"
+                        };
+                        let response = ui.button(label);
+                        connect |= response.clicked();
+                        #[cfg(test)]
+                        self.settings_action_rects.insert("connect", (response.rect, ui.clip_rect()));
+                    }
+                    let response = ui.button("Save & Close");
+                    save = response.clicked();
+                    #[cfg(test)]
+                    self.settings_action_rects.insert("save", (response.rect, ui.clip_rect()));
+                    let response = ui.button("Cancel");
+                    cancel = response.clicked();
+                    #[cfg(test)]
+                    self.settings_action_rects.insert("cancel", (response.rect, ui.clip_rect()));
+                });
             });
-        // Behaviour edits made on the active session apply everywhere while
-        // the window is open.
+        // Global preferences remain live across sessions. They never adopt the
+        // Connection tab's scratch form during an unrelated save.
         self.sessions[active].export_config(&mut self.settings);
-        if close {
+        if cancel {
+            self.cancel_settings_window();
+        } else if connect {
+            self.connect_settings_form();
+        } else if save {
             self.close_settings_window();
         }
     }
 
-    /// Close Settings only when the connection form validates; on failure
-    /// keep the window open on the Connection tab so the error is visible
-    /// and editable (#207). Returns whether the window was closed.
+    /// Save a validated form without changing the running endpoint.
     pub(crate) fn close_settings_window(&mut self) -> bool {
         let active = self.settings_index();
-        if self.sessions[active].validate_connection_form() {
-            self.save_settings_from(active);
-            self.show_settings = false;
-            self.settings_session = None;
-            true
-        } else {
+        if !self.sessions[active].validate_connection_form() {
             self.settings_tab = 0;
-            false
+            return false;
         }
+        self.save_settings_from(active);
+        self.finish_settings_edit(active);
+        true
+    }
+
+    fn finish_settings_edit(&mut self, index: usize) {
+        self.sessions[index].show_connect_dialog = false;
+        self.show_settings = false;
+        self.settings_session = None;
+        self.settings_form_before = None;
+        self.favorites_ui = FavoritesUi::default();
+    }
+
+    /// A reconnect is explicit and validates before retiring any connection.
+    /// In particular, a duplicate endpoint must leave the current socket alive.
+    pub(crate) fn connect_settings_form(&mut self) -> bool {
+        let index = self.settings_index();
+        let endpoint = match self.sessions[index].session_from_form() {
+            Ok(config) => config.logical_network_key(),
+            Err(_) => {
+                self.sessions[index].validate_connection_form();
+                self.settings_tab = 0;
+                return false;
+            }
+        };
+        let duplicate = self.sessions.iter().enumerate().any(|(other, session)| {
+            other != index
+                && (session.is_connected()
+                    || session.is_connecting()
+                    || session.has_worker()
+                    || session.has_pending_connect()
+                    || session.awaiting_reconnect())
+                && (session.logical_network_key().as_ref() == Some(&endpoint)
+                    || session
+                        .connection
+                        .staged_config()
+                        .is_some_and(|config| config.logical_network_key() == endpoint))
+        });
+        if duplicate {
+            self.sessions[index].connection_error = Some(
+                "This server already has an open connection. Select its status window to use it."
+                    .into(),
+            );
+            self.settings_tab = 0;
+            return false;
+        }
+        if !self.sessions[index].start_session_from_form() {
+            self.settings_tab = 0;
+            return false;
+        }
+        self.save_settings_from(index);
+        self.finish_settings_edit(index);
+        true
+    }
+
+    pub(crate) fn cancel_settings_window(&mut self) {
+        let index = self.settings_index();
+        self.sessions[index].export_config(&mut self.settings);
+        self.cancel_connect(index);
+        self.finish_settings_edit(index);
+        // Global preferences and explicit favorites edits survive Cancel;
+        // only the connection form is restored to its opening state.
+        self.save_settings();
+        self.drop_cancelled_new_sessions();
     }
 
     fn settings_tab_about(&mut self, ui: &mut egui::Ui) {
@@ -2101,5 +2209,300 @@ mod tests {
         let saved = app.settings_file.as_ref().expect("file created");
         assert!(!saved.automatic_updates);
         assert!(saved.password.is_empty());
+    }
+
+    fn registered_editor() -> (App, tokio::sync::mpsc::UnboundedReceiver<IrcCommand>) {
+        let mut app = test_app(Settings {
+            server_host: "live.example".into(),
+            nickname: "me".into(),
+            logging_enabled: false,
+            ..Settings::default()
+        });
+        assert!(app.sessions[0].start_session_from_form());
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        app.sessions[0].test_set_registered(tx);
+        app.sessions[0].show_connect_dialog = false;
+        app.open_settings(app.sessions[0].id);
+        (app, rx)
+    }
+
+    #[test]
+    fn saving_connection_edits_does_not_change_the_live_connection() {
+        let (mut app, mut outgoing) = registered_editor();
+        app.sessions[0].server_host = "saved.example".into();
+        app.sessions[0].sasl_username = "account".into();
+        app.sessions[0].sasl_password = "new-secret".into();
+        assert!(app.close_settings_window());
+        assert!(app.sessions[0].is_connected());
+        assert_eq!(
+            app.sessions[0].active_server_config().unwrap().host,
+            "live.example"
+        );
+        let saved = app.settings_file.as_ref().unwrap();
+        assert_eq!(saved.server_host, "saved.example");
+        assert_eq!(saved.sasl_username, "account");
+        assert_eq!(saved.sasl_password, "new-secret");
+        assert!(outgoing.try_recv().is_err());
+    }
+
+    #[test]
+    fn reconnect_validates_before_retiring_the_live_connection() {
+        let (mut app, mut outgoing) = registered_editor();
+        app.sessions[0].server_port = "invalid".into();
+        assert!(!app.connect_settings_form());
+        assert!(app.show_settings);
+        assert!(app.sessions[0].is_connected());
+        assert!(outgoing.try_recv().is_err());
+        app.sessions[0].server_port = "6697".into();
+        assert!(app.connect_settings_form());
+        assert!(!app.show_settings);
+        assert!(app.sessions[0].is_closing());
+        assert!(matches!(outgoing.try_recv().unwrap(), IrcCommand::Quit(_)));
+        assert!(app.sessions[0].has_pending_connect());
+    }
+
+    #[test]
+    fn a_duplicate_connect_leaves_the_current_connection_running() {
+        let (mut app, mut outgoing) = registered_editor();
+        let second = app.add_session();
+        app.sessions[second].apply_unprofiled_endpoint("other.example", "6697", true);
+        assert!(app.sessions[second].start_session_from_form());
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        app.sessions[second].test_set_registered(tx);
+        app.sessions[0].apply_unprofiled_endpoint("OTHER.example", "6697", true);
+        assert!(!app.connect_settings_form());
+        assert!(app.sessions[0].is_connected());
+        assert_eq!(
+            app.sessions[0].active_server_config().unwrap().host,
+            "live.example"
+        );
+        assert!(outgoing.try_recv().is_err());
+        assert!(
+            app.sessions[0]
+                .connection_error()
+                .unwrap()
+                .contains("already")
+        );
+    }
+
+    #[test]
+    fn a_staged_duplicate_also_leaves_the_current_connection_running() {
+        let (mut app, mut outgoing) = registered_editor();
+        let second = app.add_session();
+        app.sessions[second].apply_unprofiled_endpoint("other.example", "6697", true);
+        assert!(app.sessions[second].start_session_from_form());
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        app.sessions[second].test_set_registered(tx);
+        app.sessions[second].apply_unprofiled_endpoint("next.example", "6697", true);
+        assert!(app.sessions[second].switch_session_from_form("Switching"));
+        app.sessions[0].apply_unprofiled_endpoint("next.example", "6697", true);
+        assert!(!app.connect_settings_form());
+        assert!(app.sessions[0].is_connected());
+        assert!(outgoing.try_recv().is_err());
+    }
+
+    #[test]
+    fn cancel_restores_this_sessions_profile_and_keeps_global_preferences() {
+        let (mut app, mut outgoing) = registered_editor();
+        let favorite = ServerFavorite {
+            id: "favorite-id".into(),
+            name: "Favorite".into(),
+            host: "favorite.example".into(),
+            port: "6697".into(),
+            nickname: "me".into(),
+            sasl_username: "original".into(),
+            sasl_password: "original-secret".into(),
+            ..ServerFavorite::default()
+        };
+        // Reopen with this profile as the form's original state.
+        app.show_settings = false;
+        app.sessions[0].load_favorite(&favorite);
+        app.open_settings(app.sessions[0].id);
+        app.sessions[0].apply_unprofiled_endpoint("scratch.example", "6697", true);
+        app.sessions[0].hide_join_part = true;
+        app.cancel_settings_window();
+        assert!(!app.show_settings);
+        assert_eq!(app.sessions[0].server_host, "favorite.example");
+        assert_eq!(app.sessions[0].sasl_password, "original-secret");
+        assert_eq!(app.sessions[0].form_profile.as_deref(), Some("favorite-id"));
+        assert!(app.settings.hide_join_part);
+        assert_eq!(app.settings.server_host, "live.example");
+        assert!(app.sessions[0].is_connected());
+        assert!(outgoing.try_recv().is_err());
+    }
+
+    #[test]
+    fn updating_a_favorite_preserves_identity_without_saving_form_defaults() {
+        let mut app = test_app(Settings {
+            server_host: "defaults.example".into(),
+            nickname: "me".into(),
+            logging_enabled: false,
+            server_favorites: vec![ServerFavorite {
+                id: "stable-id".into(),
+                name: "Profile".into(),
+                host: "old.example".into(),
+                port: "6697".into(),
+                nickname: "me".into(),
+                auto_connect: true,
+                password: "old-password".into(),
+                ..ServerFavorite::default()
+            }],
+            ..Settings::default()
+        });
+        app.sessions[0].load_favorite(&app.settings.server_favorites[0]);
+        app.sessions[0].apply_unprofiled_endpoint("new.example", "6697", true);
+        assert!(app.sessions[0].update_favorite(&mut app.settings.server_favorites, "stable-id"));
+        app.process_events();
+        let saved = app.settings_file.as_ref().unwrap();
+        assert_eq!(saved.server_host, "defaults.example");
+        let favorite = &saved.server_favorites[0];
+        assert_eq!(favorite.id, "stable-id");
+        assert!(favorite.auto_connect);
+        assert_eq!(favorite.host, "new.example");
+        assert!(favorite.password.is_empty());
+        assert_eq!(app.sessions[0].form_profile.as_deref(), Some("stable-id"));
+    }
+
+    #[test]
+    fn the_connection_editor_exposes_authentication_and_automation_while_connected() {
+        let (mut app, mut outgoing) = registered_editor();
+        let ctx = egui::Context::default();
+        let mut output = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1200.0, 2400.0),
+                )),
+                ..Default::default()
+            },
+            |ui| {
+                let App {
+                    sessions,
+                    settings,
+                    favorites_ui,
+                    ..
+                } = &mut app;
+                assert!(!sessions[0].settings_tab_connection(
+                    ui,
+                    &mut settings.server_favorites,
+                    favorites_ui
+                ));
+            },
+        );
+        output.textures_delta.clear();
+        fn collect(shape: &egui::Shape, texts: &mut Vec<String>) {
+            match shape {
+                egui::Shape::Text(text) => texts.push(text.galley.text().to_string()),
+                egui::Shape::Vec(shapes) => {
+                    for shape in shapes {
+                        collect(shape, texts);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let mut texts = Vec::new();
+        for shape in &output.shapes {
+            collect(&shape.shape, &mut texts);
+        }
+        for required in [
+            "SASL Authentication",
+            "SASL User:",
+            "SASL Pass:",
+            "Client cert:",
+            "Client key:",
+            "On Connect",
+            "Auto-join:",
+            "Auto-perform (one command per line):",
+        ] {
+            assert!(
+                texts.iter().any(|text| text == required),
+                "missing {required}: {texts:?}"
+            );
+        }
+        assert!(app.sessions[0].is_connected());
+        assert!(outgoing.try_recv().is_err());
+    }
+
+    #[test]
+    fn settings_footer_buttons_fit_and_work_in_compact_viewports() {
+        for (size, connected) in [
+            (egui::vec2(640.0, 480.0), false),
+            (egui::vec2(320.0, 240.0), false),
+            (egui::vec2(640.0, 480.0), true),
+            (egui::vec2(320.0, 240.0), true),
+        ] {
+            for action in ["save", "cancel"] {
+                let mut app = test_app(Settings {
+                    server_host: "irc.example".into(),
+                    nickname: "me".into(),
+                    logging_enabled: false,
+                    ..Settings::default()
+                });
+                let (outgoing, _commands) = tokio::sync::mpsc::unbounded_channel();
+                if connected {
+                    app.sessions[0].test_set_registered(outgoing);
+                }
+                app.open_settings(app.sessions[0].id);
+                if action == "cancel" {
+                    app.sessions[0].server_port = "invalid".into();
+                    assert!(!app.sessions[0].validate_connection_form());
+                }
+                let ctx = egui::Context::default();
+                let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, size);
+                let frame = |app: &mut App, events: Vec<egui::Event>| {
+                    let mut output = ctx.run_ui(
+                        egui::RawInput {
+                            screen_rect: Some(screen),
+                            events,
+                            ..Default::default()
+                        },
+                        |ui| {
+                            if app.show_settings {
+                                app.show_settings_window(ui.ctx());
+                            }
+                        },
+                    );
+                    output.textures_delta.clear();
+                };
+                // New egui windows need an initial sizing pass before placement settles.
+                for _ in 0..3 {
+                    frame(&mut app, Vec::new());
+                }
+                for required in ["connect", "save", "cancel"] {
+                    let (rect, clip) = app.settings_action_rects[required];
+                    assert!(
+                        screen.contains_rect(rect),
+                        "{size:?}: {required} {rect:?} outside viewport {screen:?}"
+                    );
+                    assert!(
+                        clip.contains_rect(rect),
+                        "{size:?}: {required} {rect:?} clipped by {clip:?}"
+                    );
+                }
+                let point = app.settings_action_rects[action].0.center();
+                app.sessions[0].nickname = "edited".into();
+                for pressed in [true, false] {
+                    frame(
+                        &mut app,
+                        vec![
+                            egui::Event::PointerMoved(point),
+                            egui::Event::PointerButton {
+                                pos: point,
+                                button: egui::PointerButton::Primary,
+                                pressed,
+                                modifiers: egui::Modifiers::NONE,
+                            },
+                        ],
+                    );
+                }
+                assert!(
+                    !app.show_settings,
+                    "{size:?}: {action} could not be clicked"
+                );
+                let expected = if action == "save" { "edited" } else { "me" };
+                assert_eq!(app.settings_file.as_ref().unwrap().nickname, expected);
+            }
+        }
     }
 }

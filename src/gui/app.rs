@@ -45,18 +45,38 @@ pub(crate) struct FavoritesUi {
     pub selected: Option<usize>,
     pub new_name: String,
     pub show_save_dialog: bool,
+    /// Favorite explicitly loaded into the editor. Kept separately from the
+    /// credential-scoping form_profile, which endpoint edits must clear.
+    pub editing_profile: Option<String>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 enum WindowShortcut {
     Cycle { reverse: bool },
     Close,
     ToggleMaximized,
     Select(usize),
+    Action(super::actions::ActionId),
 }
 
 pub struct App {
+    pub(crate) uploads: super::uploads::UploadManager,
+    pub(crate) workspace: super::workspace::WorkspaceStore,
+    pending_workspace_views: Vec<(
+        ConnId,
+        Option<ConversationId>,
+        super::workspace::WorkspaceViewState,
+    )>,
+    workspace_restores: HashMap<u64, (WindowKey, super::identity::ScrollAnchor, HashSet<String>)>,
+    next_workspace_restore: u64,
+    pub(crate) archive: super::archive::ArchiveService,
+    pub(crate) search: super::search::SearchUi,
+    pub(crate) automation: super::automation::AutomationUi,
+    pub(crate) window_switcher: super::actions::WindowSwitcher,
     pub(crate) sessions: Vec<Session>,
+    pub(crate) activity: super::attention::ActivityState,
+    pub(crate) ui_ctx: Option<egui::Context>,
+    attention_notification: Option<super::attention::AttentionEvent>,
     next_conn: ConnId,
     /// Canonical persisted settings. Behaviour settings are mirrored into
     /// every session (`Session::apply_config`); the server fields are the
@@ -67,6 +87,9 @@ pub struct App {
     pub(crate) favorites_ui: FavoritesUi,
     pub(crate) show_settings: bool,
     pub(crate) settings_tab: usize,
+    /// Full button and clip rectangles for viewport acceptance tests.
+    #[cfg(test)]
+    pub(crate) settings_action_rects: HashMap<&'static str, (egui::Rect, egui::Rect)>,
     last_activity: Instant,
     /// Rate-limit clock for best-effort notifications (highlights, kicks,
     /// invites); a flood inside the interval is dropped.
@@ -134,9 +157,15 @@ pub struct App {
     /// The window to return to if a "New connection" status window is
     /// dismissed without connecting.
     focus_before_new: Option<WindowKey>,
+    /// Only explicitly canceled pristine sessions may be discarded. A saved
+    /// idle connection must not disappear when a different editor is canceled.
+    cancelled_new_sessions: HashSet<ConnId>,
     /// The session the open Settings window edits, fixed when it opened so
     /// switching windows meanwhile cannot move its edits to another network.
     pub(crate) settings_session: Option<ConnId>,
+    /// Connection form at editor opening, so Cancel restores this session's
+    /// profile and credentials rather than another network's defaults.
+    pub(crate) settings_form_before: Option<(ConnId, Settings, Option<String>)>,
     /// The window icon, built once for every detached window.
     icon: Option<std::sync::Arc<egui::IconData>>,
     /// The window that was active before an update restart.
@@ -164,6 +193,170 @@ pub struct App {
 }
 
 impl App {
+    pub(crate) fn queue_attention_notification(
+        &mut self,
+        event: super::attention::AttentionEvent,
+        title: &str,
+        body: &str,
+        force: bool,
+    ) {
+        self.attention_notification = Some(event);
+        self.notify(title, body, force);
+        self.attention_notification = None;
+    }
+    pub(crate) fn redact_activity(&mut self, reference: &super::identity::MessageRef) {
+        let matches = |candidate: &super::identity::MessageRef| {
+            candidate.conversation.network == reference.conversation.network
+                && (candidate
+                    .archive_id
+                    .as_ref()
+                    .is_some_and(|id| reference.archive_id.as_ref() == Some(id))
+                    || (candidate.conversation == reference.conversation
+                        && candidate
+                            .server_msgid
+                            .as_ref()
+                            .is_some_and(|id| reference.server_msgid.as_ref() == Some(id))))
+        };
+        for item in &mut self.activity.items {
+            if matches(&item.reference) {
+                item.preview = "<message redacted>".into();
+            }
+        }
+        if let Some(held) = &mut self.deferred_notification {
+            let before = held.contexts.len();
+            held.contexts.retain(|context| {
+                context
+                    .as_ref()
+                    .is_none_or(|(event, _, _)| !matches(&event.reference))
+            });
+            if held.contexts.len() != before {
+                held.count = held.contexts.len();
+                if let Some(Some((_, title, body))) = held.contexts.last() {
+                    held.title = title.clone();
+                    held.body = body.clone();
+                } else {
+                    held.title.clear();
+                    held.body.clear();
+                }
+            }
+        }
+        if self
+            .deferred_notification
+            .as_ref()
+            .is_some_and(|held| held.count == 0)
+        {
+            self.deferred_notification = None;
+        }
+    }
+    pub(crate) fn begin_reply(
+        &mut self,
+        reference: super::identity::MessageRef,
+    ) -> Result<(), String> {
+        if reference
+            .server_msgid
+            .as_ref()
+            .is_none_or(|id| id.is_empty())
+        {
+            return Err("This message has no server ID and cannot be replied to".into());
+        }
+        let index = self
+            .sessions
+            .iter()
+            .position(|session| {
+                session.is_connected()
+                    && session.logical_network_key().as_ref()
+                        == Some(&reference.conversation.network)
+            })
+            .ok_or("Connect to this network before replying")?;
+        if !self.sessions[index].enabled_caps.contains("message-tags") {
+            return Err("This server does not support message replies".into());
+        }
+        let conversation = self.sessions[index]
+            .id_for_target(&reference.conversation.target)
+            .ok_or("Open this conversation before replying")?;
+        if self.sessions[index].is_channel_name(&reference.conversation.target)
+            && !self.sessions[index]
+                .conversation_channel(conversation)
+                .is_some_and(|channel| channel.joined)
+        {
+            return Err("Join this channel before replying".into());
+        }
+        let key = WindowKey::new(self.sessions[index].id, Some(conversation));
+        if self.windows.get(&key).is_none() {
+            return Err("Open this conversation before replying".into());
+        }
+        self.user_activate(key);
+        if let Some(window) = self.windows.get_mut(&key) {
+            window.view.composer.reply_to = Some(reference);
+            window.view.input_focus_request = true;
+        }
+        if let Some(ctx) = &self.ui_ctx {
+            self.focus_active_viewport(ctx);
+            ctx.request_repaint();
+        }
+        Ok(())
+    }
+    pub(crate) fn navigate_message(&mut self, reference: super::identity::MessageRef) {
+        let found = self
+            .sessions
+            .iter()
+            .enumerate()
+            .find_map(|(index, session)| {
+                if session.logical_network_key().as_ref() != Some(&reference.conversation.network) {
+                    return None;
+                }
+                let id = session.id_for_target(&reference.conversation.target);
+                let found = id.and_then(|id| {
+                    session.conversation_channel(id).and_then(|channel| {
+                        channel
+                            .messages
+                            .iter()
+                            .find(|message| {
+                                reference.archive_id.as_deref()
+                                    == Some(message.message_key.as_str())
+                                    || reference
+                                        .server_msgid
+                                        .as_ref()
+                                        .is_some_and(|id| message.msgid.as_ref() == Some(id))
+                            })
+                            .map(|message| (id, message.message_key.clone()))
+                    })
+                });
+                let found = found.or_else(|| {
+                    reference.archive_id.as_ref().and_then(|archive_id| {
+                        session.conversations.iter().find_map(|(target, channel)| {
+                            channel
+                                .messages
+                                .iter()
+                                .find(|message| &message.message_key == archive_id)
+                                .and_then(|message| {
+                                    session
+                                        .id_for_target(target)
+                                        .map(|id| (id, message.message_key.clone()))
+                                })
+                        })
+                    })
+                });
+                found.map(|(id, message)| (index, id, message))
+            });
+        if let Some((index, id, message)) = found {
+            let key = WindowKey::new(self.sessions[index].id, Some(id));
+            self.user_activate(key);
+            if let Some(window) = self.windows.get_mut(&key) {
+                let timeline = window.view.timeline.get_mut();
+                timeline.reveal = Some(message);
+                timeline.restore_pending = false;
+                timeline.restored_hold = false;
+                timeline.hydrating = false;
+            }
+            if let Some(ctx) = &self.ui_ctx {
+                self.focus_active_viewport(ctx);
+                ctx.request_repaint();
+            }
+        } else {
+            self.open_archive_context(reference);
+        }
+    }
     /// The production constructor: persisted settings and layout.
     pub fn load() -> Self {
         let (settings, writable) = match Settings::try_load() {
@@ -181,8 +374,16 @@ impl App {
         };
         let needs_ids = settings.server_favorites.iter().any(|f| f.id.is_empty());
         let mut app = Self::with_settings(settings, LayoutFile::load());
+        app.workspace = super::workspace::WorkspaceStore::open_default();
+        if let Some(directory) = dirs::config_dir() {
+            app.automation = super::automation::AutomationUi::load_from(
+                directory.join("linefeed/automation.json"),
+            );
+        }
         app.persist_layout = true;
         app.settings_writable = writable;
+        #[cfg(not(test))]
+        app.install_archive();
         if needs_ids {
             // Profile ids must be stable before layout or auto-connect state
             // refers to them. Saving only adds the new field.
@@ -215,7 +416,19 @@ impl App {
         }
         ChatMessage::configure_default_timestamp_format(&settings.timestamp_format);
         Self {
+            workspace: super::workspace::WorkspaceStore::default(),
+            pending_workspace_views: Vec::new(),
+            workspace_restores: HashMap::new(),
+            next_workspace_restore: 1,
+            automation: super::automation::AutomationUi::default(),
+            window_switcher: super::actions::WindowSwitcher::default(),
             sessions: Vec::new(),
+            activity: Default::default(),
+            ui_ctx: None,
+            attention_notification: None,
+            archive: Default::default(),
+            uploads: Default::default(),
+            search: Default::default(),
             next_conn: 1,
             settings,
             updater: crate::updater::Controller::default(),
@@ -223,6 +436,8 @@ impl App {
             favorites_ui: FavoritesUi::default(),
             show_settings: false,
             settings_tab: 0,
+            #[cfg(test)]
+            settings_action_rects: HashMap::new(),
             last_activity: Instant::now(),
             last_notification_time: None,
             last_forced_notification_time: None,
@@ -251,7 +466,9 @@ impl App {
             started: Instant::now(),
             user_activated: false,
             focus_before_new: None,
+            cancelled_new_sessions: HashSet::new(),
             settings_session: None,
+            settings_form_before: None,
             icon: None,
             restore_after_update: None,
             pending_focus: None,
@@ -269,7 +486,13 @@ impl App {
     pub fn start(&mut self, snapshot: Option<UpdateSession>) {
         if let Some(snapshot) = snapshot {
             self.restore_update_session(snapshot);
-        } else {
+            self.workspace.restored = None;
+        } else if self.settings.resume_workspace
+            && let Some(snapshot) = self.workspace.restored.take()
+        {
+            self.restore_workspace(snapshot);
+        }
+        {
             let auto: Vec<ServerFavorite> = self
                 .settings
                 .server_favorites
@@ -278,6 +501,16 @@ impl App {
                 .cloned()
                 .collect();
             for favorite in auto {
+                let mut candidate = Session::with_settings(self.settings.clone());
+                candidate.load_favorite(&favorite);
+                if let Ok(config) = candidate.session_from_form()
+                    && self.sessions.iter().any(|session| {
+                        session.logical_network_key().as_ref()
+                            == Some(&config.logical_network_key())
+                    })
+                {
+                    continue;
+                }
                 let index = self.add_session();
                 let session = &mut self.sessions[index];
                 session.load_favorite(&favorite);
@@ -295,7 +528,13 @@ impl App {
     /// A new idle session started from the Quick Connect defaults.
     pub(crate) fn add_session(&mut self) -> usize {
         let mut session = Session::with_settings(self.settings.clone());
+        session.set_automation(self.automation.config.clone());
         session.id = self.next_conn;
+        session.archive_client = self
+            .archive
+            .client
+            .is_enabled()
+            .then(|| self.archive.client.clone());
         self.next_conn += 1;
         session.window_focused = self.focused;
         session.last_activity = self.last_activity;
@@ -363,6 +602,11 @@ impl App {
 
     /// Stable network identity for layout.json.
     fn network_identity(session: &Session) -> String {
+        if session.membership_managed_by_bouncer()
+            && let Some(network) = session.logical_network_key()
+        {
+            return network.storage_key();
+        }
         if let Some(id) = &session.profile_id {
             return format!("profile:{id}");
         }
@@ -387,6 +631,7 @@ impl App {
     /// form only when that form validates, so scratch or invalid form edits
     /// are never persisted by an unrelated save (#316).
     pub(crate) fn save_settings_from(&mut self, index: usize) {
+        self.sessions[index].commit_upload_settings();
         let session = &self.sessions[index];
         session.export_config(&mut self.settings);
         if session.session_from_form().is_ok() {
@@ -439,11 +684,13 @@ impl App {
     /// The full frame: pump every session, run timers and lifecycles, then
     /// draw the toolbar, switchbar, windows, detached windows and dialogs.
     pub fn ui(&mut self, root_ui: &mut egui::Ui) {
+        self.ui_ctx = Some(root_ui.ctx().clone());
         let ctx = root_ui.ctx().clone();
         self.observe_root_input(&ctx);
         self.tick(&ctx, true);
         self.handle_shortcuts(&ctx);
         self.show_dialogs(&ctx);
+        self.show_window_switcher(&ctx);
 
         egui::Panel::top("toolbar").show(root_ui, |ui| self.draw_toolbar(ui));
         egui::Panel::top("switchbar").show(root_ui, |ui| self.draw_switchbar(ui));
@@ -513,6 +760,7 @@ impl App {
     /// Unless the main window went to the tray, detached windows are still
     /// on screen, and one of them may have focus.
     pub fn background_tick(&mut self, ctx: &egui::Context) {
+        self.ui_ctx = Some(ctx.clone());
         let detached_live = !self.tray_hidden && self.has_detached();
         if !detached_live {
             self.focused_detached = None;
@@ -530,6 +778,19 @@ impl App {
     fn observe_root_input(&mut self, ctx: &egui::Context) {
         let root_focused = ctx.input(|i| i.focused);
         self.focused = root_focused || self.focused_detached.is_some();
+        // Embedded viewport fallback shares root input. Keyboard events still
+        // belong to the child composer which owns egui's focus.
+        let embedded_child_keyboard = self.windows.windows.iter().any(|window| {
+            window.detached
+                && window.view.input_had_focus
+                && ctx.memory(|memory| {
+                    memory.has_focus(egui::Id::unique((
+                        "composer",
+                        window.key.conn,
+                        window.key.conversation,
+                    )))
+                })
+        });
         let (activity, acted_here) = ctx.input(|i| {
             let pressed = i.pointer.any_pressed()
                 || i.events
@@ -548,6 +809,7 @@ impl App {
         // (a click on a particular window or switchbar entry overrides this
         // later in the frame).
         if acted_here
+            && (!embedded_child_keyboard || ctx.input(|input| input.pointer.any_pressed()))
             && self
                 .windows
                 .active
@@ -575,6 +837,25 @@ impl App {
             // A message counts as seen only in the active window of a
             // focused OS window.
             // Regaining focus marks the selected tab seen (#305).
+            let active_view = self
+                .windows
+                .active
+                .filter(|key| key.conn == session.id)
+                .and_then(|key| self.windows.get(&key));
+            let reading = active_view
+                .filter(|window| {
+                    !window.view.timeline.borrow().restore_pending
+                        && !window.view.timeline.borrow().restored_hold
+                        && window
+                            .view
+                            .timeline
+                            .borrow()
+                            .anchor
+                            .as_ref()
+                            .is_some_and(|anchor| anchor.at_bottom)
+                })
+                .and_then(|window| window.key.conversation);
+            session.reading_conversation = reading;
             session.set_window_focused(
                 visible && self.focused && active_conn.is_none_or(|c| c == session.id),
             );
@@ -591,10 +872,14 @@ impl App {
             self.had_messages_this_frame |= session.had_messages_this_frame;
             session.run_timed_tasks();
         }
+        self.tick_history_services();
+        self.tick_uploads();
         self.run_lifecycles(ctx);
         self.process_events();
         self.flush_deferred_notification();
         self.sync_windows();
+        self.checkpoint_workspace();
+        self.route_connection_editor();
         self.update_global_dialog_owner();
     }
 
@@ -604,6 +889,25 @@ impl App {
             // nick state on the same network. Sessions earlier in this pass
             // have already started their workers, so the first one wins.
             let id = self.sessions[index].id;
+            self.sessions[index].blocked_networks = self
+                .sessions
+                .iter()
+                .filter(|session| {
+                    session.id != id
+                        && (session.is_connected()
+                            || session.is_connecting()
+                            || session.has_worker()
+                            || session.has_pending_connect()
+                            || session.awaiting_reconnect())
+                })
+                .flat_map(|session| {
+                    session
+                        .active_session
+                        .iter()
+                        .chain(session.connection.staged_config())
+                        .map(|config| config.logical_network_key())
+                })
+                .collect();
             let blocked: Vec<_> = self
                 .sessions
                 .iter()
@@ -612,7 +916,11 @@ impl App {
                 })
                 .filter_map(|s| s.active_endpoint_key())
                 .collect();
-            self.sessions[index].blocked_endpoints = blocked;
+            self.sessions[index].blocked_endpoints = if self.sessions[index].bouncer.is_none() {
+                blocked
+            } else {
+                Vec::new()
+            };
             self.sessions[index].process_connection_lifecycle(ctx);
         }
 
@@ -630,6 +938,12 @@ impl App {
         for id in removed {
             self.closing_sessions.remove(&id);
             self.last_current.remove(&id);
+            if self.settings_session == Some(id) {
+                self.show_settings = false;
+                self.settings_session = None;
+                self.settings_form_before = None;
+                self.favorites_ui = FavoritesUi::default();
+            }
         }
         if self.sessions.len() != before && self.sessions.is_empty() {
             let index = self.add_session();
@@ -642,14 +956,50 @@ impl App {
             let events = std::mem::take(&mut self.sessions[index].events);
             for event in events {
                 match event {
-                    SessionEvent::Notify { title, body, force } => {
-                        self.notify(&title, &body, force);
+                    SessionEvent::SearchRequested {
+                        query,
+                        all_networks,
+                        conversation,
+                    } => {
+                        let before = self.sessions[index].current_conversation;
+                        self.sessions[index].current_conversation = conversation;
+                        self.open_search(index, query, all_networks);
+                        self.sessions[index].current_conversation = before;
                     }
+                    SessionEvent::Notify {
+                        title,
+                        body,
+                        force,
+                        attention,
+                    } => {
+                        if let Some(event) = attention {
+                            self.handle_attention(event, &title, &body, force);
+                        } else {
+                            self.notify(&title, &body, force);
+                        }
+                    }
+                    SessionEvent::RevealMessage(reference) => {
+                        self.claim_global_dialogs(Some(WindowKey::new(
+                            self.sessions[index].id,
+                            self.sessions[index].current_conversation,
+                        )));
+                        self.navigate_message(reference);
+                    }
+                    SessionEvent::MessageRedacted(reference) => self.redact_activity(&reference),
                     SessionEvent::OpenSettings => {
                         let conn = self.sessions[index].id;
                         self.open_settings(conn);
                     }
-                    SessionEvent::SaveSettings => self.save_settings_from(index),
+                    SessionEvent::UploadRequested {
+                        conversation,
+                        source,
+                        composer_nonce,
+                    } => {
+                        self.handle_upload_request(index, conversation, composer_nonce, source);
+                    }
+                    SessionEvent::UploadTokenReady { job_id, token } => {
+                        self.accept_upload_token(&job_id, token)
+                    }
                     SessionEvent::SaveConfig => {
                         self.sessions[index].export_config(&mut self.settings);
                         self.save_settings();
@@ -695,6 +1045,23 @@ impl App {
                         self.present_fingerprint = None;
                     }
                     SessionEvent::DuplicateEndpoint => self.focus_duplicate_of(index),
+                    SessionEvent::NewBouncerNetwork(config) => {
+                        let config = *config;
+                        let network = config.logical_network_key();
+                        if let Some(session) = self.sessions.iter().find(|session| {
+                            session.logical_network_key().as_ref() == Some(&network)
+                        }) {
+                            let key = WindowKey::new(session.id, None);
+                            self.activate(key);
+                        } else {
+                            let added = self.add_session();
+                            self.sessions[added].activate_session(config.clone());
+                            self.sessions[added].load_connection_form(&config);
+                            self.sessions[added].show_connect_dialog = false;
+                            self.sessions[added].queue_current_connection(0);
+                            self.activate(WindowKey::new(self.sessions[added].id, None));
+                        }
+                    }
                     SessionEvent::NewServer {
                         host,
                         port,
@@ -717,6 +1084,29 @@ impl App {
         let Some(index) = self.session_index(conn) else {
             return;
         };
+        let old_key = self.sessions[index].conversation_key(old);
+        let new_key = self.sessions[index].conversation_key(new);
+        if let Some(window) = self.windows.get_mut(&WindowKey::new(conn, Some(id)))
+            && let Some(reply) = &mut window.view.composer.reply_to
+            && reply.conversation == old_key
+        {
+            reply.conversation = new_key.clone();
+        }
+        if !self
+            .settings
+            .attention
+            .rules
+            .iter()
+            .any(|rule| rule.conversation == new_key)
+            && let Some(rule) = self
+                .settings
+                .attention
+                .rules
+                .iter_mut()
+                .find(|rule| rule.conversation == old_key)
+        {
+            rule.conversation = new_key;
+        }
         let network = Self::network_identity(&self.sessions[index]);
         let old_persist = PersistKey {
             network: network.clone(),
@@ -852,14 +1242,14 @@ impl App {
     /// another session is live on: bring that session's status window
     /// forward.
     fn focus_duplicate_of(&mut self, index: usize) {
-        let Some(endpoint) = self.sessions[index].active_endpoint_key() else {
+        let Some(endpoint) = self.sessions[index].logical_network_key() else {
             return;
         };
         let id = self.sessions[index].id;
         if let Some(other) = self
             .sessions
             .iter()
-            .find(|s| s.id != id && s.active_endpoint_key().as_ref() == Some(&endpoint))
+            .find(|s| s.id != id && s.logical_network_key().as_ref() == Some(&endpoint))
         {
             let key = WindowKey::new(other.id, None);
             self.activate(key);
@@ -912,6 +1302,7 @@ impl App {
         self.sessions[index].show_connect_dialog = true;
         let key = WindowKey::new(self.sessions[index].id, None);
         self.user_activate(key);
+        self.open_connection_settings(self.sessions[index].id);
     }
 
     /// `/server -m`: connect to an endpoint in a new status window.
@@ -926,6 +1317,9 @@ impl App {
             session.show_connect_dialog = true;
         }
         self.activate(WindowKey::new(conn, None));
+        if self.sessions[index].show_connect_dialog {
+            self.open_connection_settings(conn);
+        }
     }
 
     /// Show a desktop notification, unless notifications are off or one of
@@ -956,6 +1350,16 @@ impl App {
                 held.title = title.to_string();
                 held.body = body.to_string();
                 held.count += 1;
+                let context = self
+                    .attention_notification
+                    .clone()
+                    .map(|event| (event, title.to_string(), body.to_string()));
+                if held.contexts.len() < 1000 {
+                    held.contexts.push(context);
+                } else if let Some(last) = held.contexts.last_mut() {
+                    *last = context;
+                    held.count = held.contexts.len();
+                }
                 return;
             }
             self.last_forced_notification_time = Some(Instant::now());
@@ -989,9 +1393,30 @@ impl App {
         {
             return;
         }
-        let Some(held) = self.deferred_notification.take() else {
+        let Some(mut held) = self.deferred_notification.take() else {
             return;
         };
+        if held.contexts.len() == held.count {
+            held.contexts.retain(|context| {
+                context
+                    .as_ref()
+                    .is_none_or(|(event, _, _)| self.settings.attention.eligible(event))
+            });
+            held.count = held.contexts.len();
+            if held.count == 0 {
+                return;
+            }
+            if let Some(Some((_, title, body))) = held.contexts.last() {
+                held.title = title.clone();
+                held.body = body.clone();
+            }
+        }
+        let prior = self.attention_notification.take();
+        self.attention_notification = held
+            .contexts
+            .iter()
+            .rev()
+            .find_map(|context| context.as_ref().map(|(event, _, _)| event.clone()));
         let (title, body) = if held.count > 1 {
             (
                 format!("{} new private messages", held.count),
@@ -1002,11 +1427,19 @@ impl App {
         };
         self.last_forced_notification_time = Some(Instant::now());
         self.dispatch_notification(&title, &body);
+        self.attention_notification = prior;
     }
 
     /// Hand a notification that passed the policy to the OS. Tests record it
     /// instead of spawning helpers.
     fn dispatch_notification(&mut self, title: &str, body: &str) {
+        if self
+            .attention_notification
+            .as_ref()
+            .is_some_and(|event| self.settings.attention.sound_for(event))
+        {
+            super::message_ui::play_notification_sound();
+        }
         #[cfg(test)]
         self.dispatched_notifications
             .push((title.to_string(), body.to_string()));
@@ -1179,11 +1612,20 @@ impl App {
     /// unread count) and bring it forward.
     /// `activate` for a window the user picked.
     pub(crate) fn user_activate(&mut self, key: WindowKey) {
+        self.window_switcher.recent.retain(|old| *old != key);
+        self.window_switcher.recent.insert(0, key);
+        self.window_switcher.recent.truncate(256);
         self.user_activated = true;
         self.activate(key);
     }
 
     pub(crate) fn activate(&mut self, key: WindowKey) {
+        if let Some(previous) = self.windows.active.filter(|previous| *previous != key)
+            && let Some(window) = self.windows.get_mut(&previous)
+        {
+            let timeline = window.view.timeline.get_mut();
+            timeline.entry_read_boundary = timeline.last_read.clone();
+        }
         let Some(index) = self.session_index(key.conn) else {
             return;
         };
@@ -1219,6 +1661,13 @@ impl App {
     }
 
     fn finish_frame(&mut self) {
+        if self
+            .activity
+            .owner
+            .is_some_and(|key| self.windows.get(&key).is_none())
+        {
+            self.activity.owner = None;
+        }
         if self.windows.dirty {
             self.windows.dirty = false;
             self.layout_dirty_since.get_or_insert_with(Instant::now);
@@ -1251,6 +1700,7 @@ impl App {
         // Only the active session's Connect dialog is ever shown.
         let active = self.sessions.get(self.active_index());
         self.show_settings
+            || self.window_switcher.open
             || self.confirm_disconnect.is_some()
             || self.sessions.iter().any(|s| s.show_channel_list)
             || active
@@ -1271,17 +1721,6 @@ impl App {
         }
         ctx.input_mut(|i| {
             let mut shortcuts = Vec::new();
-            let digits = [
-                egui::Key::Num1,
-                egui::Key::Num2,
-                egui::Key::Num3,
-                egui::Key::Num4,
-                egui::Key::Num5,
-                egui::Key::Num6,
-                egui::Key::Num7,
-                egui::Key::Num8,
-                egui::Key::Num9,
-            ];
             // A modifier may already have been released by the end of this
             // input batch. Its state on each key event is authoritative.
             i.events.retain(|event| {
@@ -1289,23 +1728,42 @@ impl App {
                     key,
                     pressed: true,
                     modifiers,
+                    repeat,
                     ..
                 } = event
                 else {
                     return true;
                 };
-                let shortcut = match key {
-                    egui::Key::Tab if modifiers.ctrl => Some(WindowShortcut::Cycle {
-                        reverse: modifiers.shift,
-                    }),
-                    egui::Key::W if modifiers.ctrl => Some(WindowShortcut::Close),
-                    egui::Key::M if modifiers.ctrl => Some(WindowShortcut::ToggleMaximized),
-                    _ if modifiers.alt => digits
-                        .iter()
-                        .position(|digit| digit == key)
-                        .map(WindowShortcut::Select),
-                    _ => None,
-                };
+                let binding = self
+                    .automation
+                    .config
+                    .shortcuts
+                    .iter()
+                    .find(|binding| binding.chord.matches(*key, *modifiers));
+                if binding.is_some_and(|binding| *repeat && !binding.action.repeatable()) {
+                    return false;
+                }
+                let shortcut = binding.and_then(|binding| {
+                    use super::actions::ActionId;
+                    if binding.action.composer_only()
+                        && !self
+                            .windows
+                            .active
+                            .and_then(|key| self.windows.get(&key))
+                            .is_some_and(|window| window.view.input_had_focus)
+                    {
+                        return None;
+                    }
+                    Some(match &binding.action {
+                        ActionId::CycleWindow { reverse } => {
+                            WindowShortcut::Cycle { reverse: *reverse }
+                        }
+                        ActionId::CloseWindow => WindowShortcut::Close,
+                        ActionId::ToggleMaximized => WindowShortcut::ToggleMaximized,
+                        ActionId::SelectOrdinal { index } => WindowShortcut::Select(*index),
+                        action => WindowShortcut::Action(action.clone()),
+                    })
+                });
                 if let Some(shortcut) = shortcut {
                     shortcuts.push(shortcut);
                     false
@@ -1318,6 +1776,10 @@ impl App {
     }
 
     fn apply_shortcuts(&mut self, ctx: &egui::Context, shortcuts: Vec<WindowShortcut>) {
+        let context = self
+            .windows
+            .active
+            .map(|window| super::actions::ActionContext { window });
         for shortcut in shortcuts {
             match shortcut {
                 WindowShortcut::Cycle { reverse } => {
@@ -1336,11 +1798,38 @@ impl App {
                         self.focus_active_viewport(ctx);
                     }
                 }
+                WindowShortcut::Action(action) => {
+                    if let Some(context) = context {
+                        self.dispatch_action(ctx, action, context);
+                    }
+                }
             }
         }
     }
 
-    fn focus_active_viewport(&self, ctx: &egui::Context) {
+    pub(crate) fn apply_format_action(&mut self, key: WindowKey, action: super::actions::ActionId) {
+        use super::actions::ActionId;
+        let Some(index) = self.session_index(key.conn) else {
+            return;
+        };
+        if action == ActionId::FormatColor {
+            self.color_target = Some(key);
+            self.sessions[index].show_color_picker = true;
+            self.sessions[index].color_picker_fg = true;
+        } else if let Some(window) = self.windows.get_mut(&key) {
+            let character = match action {
+                ActionId::FormatBold => '\x02',
+                ActionId::FormatUnderline => '\x1f',
+                ActionId::FormatItalic => '\x1d',
+                ActionId::FormatReset => '\x0f',
+                _ => return,
+            };
+            window.view.insert_composer_text(&character.to_string());
+            window.view.input_focus_request = true;
+        }
+    }
+
+    pub(crate) fn focus_active_viewport(&self, ctx: &egui::Context) {
         let Some(key) = &self.windows.active else {
             return;
         };
@@ -1376,7 +1865,7 @@ impl App {
         self.user_activate(order[next]);
     }
 
-    fn toggle_maximized(&mut self) {
+    pub(crate) fn toggle_maximized(&mut self) {
         self.windows.mode = match self.windows.mode {
             LayoutMode::Maximized => LayoutMode::Floating,
             LayoutMode::Floating => LayoutMode::Maximized,
@@ -1453,35 +1942,34 @@ impl App {
         }
     }
 
-    /// The application's own dialogs: Connect (for the active session),
-    /// Settings, and the confirmation before disconnecting a server.
+    /// Settings also owns connection setup; no separate Connect window is drawn.
     fn show_global_dialogs(&mut self, ctx: &egui::Context) {
-        let active = self.active_index();
-        {
-            let App {
-                sessions,
-                settings,
-                favorites_ui,
-                ..
-            } = self;
-            let session = &mut sessions[active];
-            if session.show_connect_dialog
-                && !session.is_connected()
-                && !session.is_connecting()
-                && session.show_connect_window(ctx, &mut settings.server_favorites, favorites_ui)
-            {
-                self.cancel_connect(active);
-            }
-        }
-        self.drop_cancelled_new_sessions();
-
+        self.draw_activity(ctx, self.global_dialog_owner);
+        self.route_connection_editor();
+        self.show_history_windows(ctx);
+        self.show_uploads(ctx);
         if self.show_settings {
             self.show_settings_window(ctx);
-            // Live edits apply to every session while the dialog is open.
+            // Live global edits still apply to every session.
             self.push_config();
         }
         if let Some(conn) = self.confirm_disconnect {
             self.show_confirm_disconnect(ctx, conn);
+        }
+    }
+
+    /// Legacy session requests (startup or failed registration) open the same
+    /// Connection tab that the toolbar and New connection use.
+    fn route_connection_editor(&mut self) {
+        let Some(session) = self.sessions.get(self.active_index()) else {
+            return;
+        };
+        if session.show_connect_dialog
+            && !session.is_connected()
+            && !session.is_connecting()
+            && !self.show_settings
+        {
+            self.open_connection_settings(session.id);
         }
     }
 
@@ -1492,11 +1980,24 @@ impl App {
             .filter(|key| self.windows.get(key).is_some_and(|w| w.detached))
     }
 
+    /// An explicit request keeps its source even if another panel is already
+    /// open or focus bookkeeping still names a different native window.
+    pub(super) fn claim_global_dialogs(&mut self, source: Option<WindowKey>) {
+        self.global_dialog_owner = source.filter(|source| {
+            self.windows
+                .get(source)
+                .is_some_and(|window| window.detached)
+        });
+        self.global_dialogs_were_open = true;
+    }
+
     /// When the application's dialogs open, note the detached window they
     /// belong to: the status window being closed, or the window the user
     /// is working in.
     fn update_global_dialog_owner(&mut self) {
-        let open = self.show_settings
+        let open = self.uploads.open
+            || self.search.visible()
+            || self.show_settings
             || self.confirm_disconnect.is_some()
             || self
                 .sessions
@@ -1558,7 +2059,7 @@ impl App {
                 if let Some(code) = self.sessions[index].show_color_picker_window(ctx)
                     && let Some(window) = self.windows.get_mut(target)
                 {
-                    window.view.input_text.push_str(&code);
+                    window.view.insert_composer_text(&code);
                 }
             } else {
                 self.color_target = None;
@@ -1566,12 +2067,43 @@ impl App {
         }
     }
 
-    /// Open Settings for the network `conn`: its Connection and Automation
-    /// tabs edit that session's form until the window closes.
+    /// Open Settings for the network `conn`: Connection edits that session's
+    /// form until the window closes; the other preferences are global.
     pub(crate) fn open_settings(&mut self, conn: ConnId) {
         if !self.show_settings {
-            self.settings_session = Some(conn);
+            self.begin_settings_edit(conn);
         }
+        self.show_settings = true;
+    }
+
+    fn begin_settings_edit(&mut self, conn: ConnId) {
+        self.global_dialog_owner = self
+            .windows
+            .active
+            .filter(|key| self.windows.get(key).is_some_and(|window| window.detached));
+        self.settings_session = Some(conn);
+        self.settings_form_before = self.session_index(conn).map(|index| {
+            let session = &self.sessions[index];
+            let mut form = Settings::default();
+            session.export_form(&mut form);
+            session.export_config(&mut form);
+            (conn, form, session.form_profile.clone())
+        });
+        self.favorites_ui = FavoritesUi {
+            editing_profile: self
+                .session_index(conn)
+                .and_then(|index| self.sessions[index].form_profile.clone()),
+            ..FavoritesUi::default()
+        };
+    }
+
+    /// Connect always chooses this session's complete Connection tab, even if
+    /// Settings was already showing another tab or network.
+    fn open_connection_settings(&mut self, conn: ConnId) {
+        if !self.show_settings || self.settings_session != Some(conn) {
+            self.begin_settings_edit(conn);
+        }
+        self.settings_tab = 0;
         self.show_settings = true;
     }
 
@@ -1587,7 +2119,22 @@ impl App {
     /// list may no longer index (#268). The canonical settings are what was
     /// last persisted.
     pub(crate) fn cancel_connect(&mut self, index: usize) {
-        self.sessions[index].cancel_connect_dialog(&self.settings);
+        let conn = self.sessions[index].id;
+        if self.sessions.len() > 1 && self.sessions[index].is_pristine() {
+            self.cancelled_new_sessions.insert(conn);
+        }
+        if let Some((owner, form, profile)) = self.settings_form_before.take()
+            && owner == conn
+        {
+            self.sessions[index].cancel_connect_dialog(&form);
+            self.sessions[index].form_profile = profile;
+        } else {
+            self.sessions[index].cancel_connect_dialog(&self.settings);
+        }
+        if self.settings_session == Some(conn) {
+            self.show_settings = false;
+            self.settings_session = None;
+        }
         self.favorites_ui = FavoritesUi::default();
     }
 
@@ -1601,15 +2148,18 @@ impl App {
 
     /// A status window opened with "New connection" whose Connect dialog was
     /// cancelled is discarded, as long as another session remains.
-    fn drop_cancelled_new_sessions(&mut self) {
+    pub(crate) fn drop_cancelled_new_sessions(&mut self) {
         if self.sessions.len() < 2 {
             return;
         }
         let pristine: Vec<ConnId> = self
-            .sessions
-            .iter()
-            .filter(|s| s.is_pristine() && !s.show_connect_dialog)
-            .map(|s| s.id)
+            .cancelled_new_sessions
+            .drain()
+            .filter(|conn| {
+                self.sessions.iter().any(|session| {
+                    session.id == *conn && session.is_pristine() && !session.show_connect_dialog
+                })
+            })
             .collect();
         for conn in pristine {
             if self.sessions.len() > 1 {
@@ -1663,59 +2213,77 @@ impl App {
     // ----- toolbar and switchbar ------------------------------------------
 
     fn draw_toolbar(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             ui.heading("Linefeed");
+            if ui
+                .small_button("Search")
+                .on_hover_text("Search saved history (Ctrl+F)")
+                .clicked()
+            {
+                self.open_search(self.active_index(), String::new(), false);
+            }
+            if ui.small_button("Files").clicked() {
+                self.uploads.open = true;
+            }
             ui.separator();
             let active = self.active_index();
             let label = self.network_label(&self.sessions[active]);
             self.sessions[active].draw_status_summary(ui, &label);
-
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui.button("Settings").clicked() {
-                    let conn = self.sessions[self.active_index()].id;
-                    self.open_settings(conn);
+        });
+        ui.horizontal_wrapped(|ui| {
+            let count = self.activity.items.iter().filter(|item| !item.read).count();
+            let activity_label = if count == 0 {
+                "Activity".into()
+            } else {
+                format!("Activity ({count})")
+            };
+            if ui.button(activity_label).clicked() {
+                self.toggle_activity(None);
+            }
+            if ui.button("Settings").clicked() {
+                let conn = self.sessions[self.active_index()].id;
+                self.open_settings(conn);
+            }
+            ui.menu_button("Window", |ui| {
+                if ui.button("Tile").clicked() {
+                    self.tile_request = Some(TileRequest::Tile);
+                    self.windows.mode = LayoutMode::Floating;
+                    ui.close();
                 }
-                ui.menu_button("Window", |ui| {
-                    if ui.button("Tile").clicked() {
-                        self.tile_request = Some(TileRequest::Tile);
-                        self.windows.mode = LayoutMode::Floating;
-                        ui.close();
-                    }
-                    if ui.button("Cascade").clicked() {
-                        self.tile_request = Some(TileRequest::Cascade);
-                        self.windows.mode = LayoutMode::Floating;
-                        ui.close();
-                    }
-                    let label = match self.windows.mode {
-                        LayoutMode::Maximized => "Restore windows (Ctrl+M)",
-                        LayoutMode::Floating => "Maximize (Ctrl+M)",
-                    };
-                    if ui.button(label).clicked() {
-                        self.toggle_maximized();
-                        ui.close();
-                    }
-                    ui.separator();
-                    if ui.button("New connection...").clicked() {
-                        self.new_connection();
-                        ui.close();
-                    }
-                });
+                if ui.button("Cascade").clicked() {
+                    self.tile_request = Some(TileRequest::Cascade);
+                    self.windows.mode = LayoutMode::Floating;
+                    ui.close();
+                }
+                let label = match self.windows.mode {
+                    LayoutMode::Maximized => "Restore windows (Ctrl+M)",
+                    LayoutMode::Floating => "Maximize (Ctrl+M)",
+                };
+                if ui.button(label).clicked() {
+                    self.toggle_maximized();
+                    ui.close();
+                }
                 ui.separator();
-                let active = self.active_index();
-                let session = &mut self.sessions[active];
-                if !session.is_connected() && !session.is_connecting() {
-                    if ui.button("Connect").clicked() {
-                        session.show_connect_dialog = true;
-                    }
-                } else if session.is_connected() && ui.button("Disconnect").clicked() {
-                    let quit = self.quit_reason();
-                    self.sessions[active].request_manual_disconnect(Some(quit));
-                }
-                let session = &mut self.sessions[active];
-                if session.is_connected() {
-                    session.draw_join_box(ui);
+                if ui.button("New connection...").clicked() {
+                    self.new_connection();
+                    ui.close();
                 }
             });
+            ui.separator();
+            let active = self.active_index();
+            if !self.sessions[active].is_connected() && !self.sessions[active].is_connecting() {
+                if ui.button("Connect").clicked() {
+                    self.sessions[active].show_connect_dialog = true;
+                    self.open_connection_settings(self.sessions[active].id);
+                }
+            } else if self.sessions[active].is_connected() && ui.button("Disconnect").clicked() {
+                let quit = self.quit_reason();
+                self.sessions[active].request_manual_disconnect(Some(quit));
+            }
+            let session = &mut self.sessions[active];
+            if session.is_connected() {
+                session.draw_join_box(ui);
+            }
         });
     }
 
@@ -1791,6 +2359,9 @@ impl App {
         if let Some(window) = self.windows.get_mut(key) {
             window.detached = !window.detached;
             if !window.detached {
+                if self.activity.owner == Some(*key) {
+                    self.activity.owner = None;
+                }
                 self.spawn_geometry.remove(key);
             }
             self.windows.dirty = true;
@@ -2099,6 +2670,9 @@ impl App {
                     ui.horizontal(|ui| {
                         ui.label(RichText::new(self.window_title(&key)).strong());
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui.small_button("Activity").clicked() {
+                                self.toggle_activity(Some(key));
+                            }
                             if ui
                                 .small_button("Reattach")
                                 .on_hover_text("Put back inside the main window")
@@ -2109,9 +2683,15 @@ impl App {
                         });
                     });
                 });
+                if let Some(index) = self.session_index(key.conn) {
+                    ui.horizontal_wrapped(|ui| {
+                        self.sessions[index].draw_account_security_status(ui)
+                    });
+                }
                 egui::CentralPanel::default().show(ui, |ui| {
                     self.draw_window_contents(ui, &key);
                 });
+                self.draw_activity(ui.ctx(), Some(key));
                 self.show_detached_window_dialogs(ui.ctx(), &key);
                 crate::opener::dispatch_pending_urls(ui.ctx());
                 (
@@ -2218,6 +2798,7 @@ impl App {
         {
             return;
         }
+        let view_is_active = self.windows.active == Some(*key);
         let App {
             sessions, windows, ..
         } = self;
@@ -2233,12 +2814,17 @@ impl App {
                     s.show_channel_list,
                     s.show_channel_info,
                 );
+                s.view_is_active = view_is_active;
                 s.draw_target(ui);
+                s.handle_message_actions();
                 (
                     !before.0 && s.show_color_picker,
                     (!before.1 && s.show_channel_list) || (!before.2 && s.show_channel_info),
                 )
             });
+        if view_is_active {
+            self.mark_activity_seen(*key);
+        }
         if picker {
             self.color_target = Some(*key);
         }
@@ -2295,6 +2881,396 @@ impl App {
 
     // ----- update restart -------------------------------------------------
 
+    pub(crate) fn capture_workspace(&mut self) -> super::workspace::WorkspaceSnapshot {
+        use super::workspace::{WorkspaceSession, WorkspaceSnapshot, WorkspaceView};
+        let mut snapshot = self.update_session();
+        let active = snapshot
+            .active_position()
+            .min(self.sessions.len().saturating_sub(1));
+        let mut snapshots = snapshot.take_others();
+        snapshots.insert(active.min(snapshots.len()), snapshot);
+        let active_conn = self.sessions.get(active).map(|session| session.id);
+        let mut active_position = 0;
+        let mut entries = Vec::new();
+        for (index, mut state) in snapshots.into_iter().enumerate() {
+            let Some(session) = self.sessions.get(index) else {
+                continue;
+            };
+            if self.closing_sessions.contains(&session.id) {
+                continue;
+            }
+            let Some(config) = state.session.as_ref() else {
+                continue;
+            };
+            let expected_network = config.logical_network_key();
+            let mut views = Vec::new();
+            if !session.update_changes_endpoint() {
+                for window in self
+                    .windows
+                    .windows
+                    .iter()
+                    .filter(|window| window.key.conn == session.id)
+                {
+                    let target = match window.key.conversation {
+                        Some(id) => match session.target_name(id) {
+                            Some(name) => Some(name.to_owned()),
+                            None => continue,
+                        },
+                        None => None,
+                    };
+                    let mut view = window.view.workspace_state();
+                    if session.draft_for_owner_is_sensitive(window.key.conversation, &view.draft) {
+                        view.draft.clear();
+                        view.reply_to = None;
+                    }
+                    views.push(WorkspaceView {
+                        target,
+                        state: view,
+                    });
+                }
+                for (conn, target, pending) in &self.pending_workspace_views {
+                    if *conn != session.id
+                        || target.is_some_and(|id| session.target_name(id).is_none())
+                    {
+                        continue;
+                    }
+                    let name = target.and_then(|id| session.target_name(id).map(str::to_owned));
+                    let mut pending = pending.clone();
+                    if session.draft_for_owner_is_sensitive(*target, &pending.draft) {
+                        pending.draft.clear();
+                        pending.reply_to = None;
+                    }
+                    if let Some(view) = views.iter_mut().find(|view| view.target == name) {
+                        view.state = pending;
+                    } else {
+                        views.push(WorkspaceView {
+                            target: name,
+                            state: pending,
+                        });
+                    }
+                }
+                for (conn, target, draft) in &self.pending_inputs {
+                    if *conn != session.id
+                        || target.is_some_and(|id| session.target_name(id).is_none())
+                    {
+                        continue;
+                    }
+                    let name = target.and_then(|id| session.target_name(id).map(str::to_owned));
+                    let sensitive = session.draft_for_owner_is_sensitive(*target, draft);
+                    let draft = if sensitive {
+                        String::new()
+                    } else {
+                        draft.clone()
+                    };
+                    if let Some(view) = views.iter_mut().find(|view| view.target == name) {
+                        view.state.draft = draft;
+                        if sensitive {
+                            view.state.reply_to = None;
+                        }
+                    } else {
+                        views.push(WorkspaceView {
+                            target: name,
+                            state: super::workspace::WorkspaceViewState {
+                                draft,
+                                ..Default::default()
+                            },
+                        });
+                    }
+                }
+            }
+            state.set_input(String::new());
+            state.set_drafts(Vec::new());
+            if active_conn == Some(session.id) {
+                active_position = entries.len();
+            }
+            entries.push(WorkspaceSession {
+                expected_network,
+                state,
+                views,
+                case_mapping: session.network_support.case_mapping,
+            });
+        }
+        let mut snapshot = WorkspaceSnapshot::new(entries, active_position);
+        snapshot.activity = self.activity_records();
+        snapshot
+    }
+
+    fn restore_workspace(&mut self, snapshot: super::workspace::WorkspaceSnapshot) {
+        let active = snapshot.active_session;
+        let activity = snapshot.activity;
+        let mut hydrate = Vec::new();
+        for mut entry in snapshot.sessions {
+            // Refresh changed passwords only for the same committed network
+            // and services identity; a profile edit cannot cross-bind drafts.
+            if let Some(saved) = entry.state.session.as_mut()
+                && let Some(favorite) = saved.profile_id.as_ref().and_then(|id| {
+                    self.settings
+                        .server_favorites
+                        .iter()
+                        .find(|favorite| &favorite.id == id)
+                })
+            {
+                let mut current = Session::with_settings(self.settings.clone());
+                current.load_favorite(favorite);
+                if let Ok(config) = current.session_from_form()
+                    && config.logical_network_key() == entry.expected_network
+                    && config.services_identity_key() == saved.services_identity_key()
+                {
+                    saved.server.password = config.server.password;
+                    saved.server.sasl_password = config.server.sasl_password;
+                    saved.server.sasl_required = config.server.sasl_required;
+                    saved.server.accept_invalid_certs = config.server.accept_invalid_certs;
+                    saved.server.tls_client_key_path = config.server.tls_client_key_path;
+                }
+            }
+            let index = self.add_session();
+            let session = &mut self.sessions[index];
+            session.network_support.case_mapping = entry.case_mapping;
+            session.restore_update_session(entry.state);
+            session.input_text.clear();
+            let conn = session.id;
+            for mut view in entry.views {
+                let target = match view.target {
+                    Some(target) => match session.id_for_target(&target) {
+                        Some(id) => Some(id),
+                        None => continue,
+                    },
+                    None => None,
+                };
+                let anchor =
+                    view.state
+                        .viewport
+                        .as_ref()
+                        .filter(|anchor| !anchor.at_bottom && anchor.message.is_some())
+                        .cloned()
+                        .or_else(|| {
+                            view.state.last_read.clone().map(|message| {
+                                super::identity::ScrollAnchor {
+                                    message: Some(message),
+                                    fraction: 0.0,
+                                    at_bottom: true,
+                                }
+                            })
+                        });
+                if let Some(anchor) = anchor {
+                    if view.state.viewport.is_none() {
+                        view.state.viewport = Some(anchor.clone());
+                    }
+                    hydrate.push((WindowKey::new(conn, target), anchor));
+                }
+                self.pending_workspace_views
+                    .push((conn, target, view.state));
+            }
+        }
+        if let Some(session) = self.sessions.get(active) {
+            self.restore_after_update =
+                Some(WindowKey::new(session.id, session.current_conversation));
+        }
+        self.restore_activity(activity);
+        for (key, anchor) in hydrate {
+            self.queue_workspace_restore(key, anchor);
+        }
+    }
+
+    fn queue_workspace_restore(&mut self, key: WindowKey, anchor: super::identity::ScrollAnchor) {
+        let Some(reference) = &anchor.message else {
+            return;
+        };
+        let Some(index) = self.session_index(key.conn) else {
+            return;
+        };
+        if self.sessions[index].logical_network_key().as_ref()
+            != Some(&reference.conversation.network)
+        {
+            return;
+        }
+        let Some(id) = key.conversation else {
+            return;
+        };
+        let Some(channel) = self.sessions[index].conversation_channel(id) else {
+            return;
+        };
+        let initial = channel
+            .messages
+            .iter()
+            .map(|row| row.message_key.clone())
+            .collect();
+        let token = self.next_workspace_restore;
+        self.next_workspace_restore = token
+            .checked_add(1)
+            .expect("workspace restore IDs exhausted");
+        let radius = (self.sessions[index].max_scrollback.saturating_sub(1) / 4).min(125);
+        if self
+            .archive
+            .client
+            .restore_context(token, reference.clone(), radius)
+        {
+            self.workspace_restores
+                .insert(token, (key, anchor, initial));
+            if let Some(window) = self.windows.get_mut(&key) {
+                window.view.set_workspace_hydrating(true);
+            }
+        }
+    }
+
+    pub(crate) fn handle_workspace_archive_reply(
+        &mut self,
+        token: u64,
+        reference: super::identity::MessageRef,
+        records: Vec<super::archive::ArchiveRecord>,
+    ) {
+        let Some((key, anchor, initial)) = self.workspace_restores.remove(&token) else {
+            return;
+        };
+        if anchor.message.as_ref() != Some(&reference) {
+            return;
+        }
+        let Some(index) = self.session_index(key.conn) else {
+            return;
+        };
+        let Some(id) = key.conversation else {
+            return;
+        };
+        if self.sessions[index].logical_network_key().as_ref()
+            != Some(&reference.conversation.network)
+            || self.sessions[index].target_name(id).is_none()
+        {
+            return;
+        }
+        if let Some(window) = self.windows.get_mut(&key) {
+            window.view.set_workspace_hydrating(false);
+            if !window.view.timeline.borrow().restore_pending {
+                return;
+            }
+        }
+        let format = self.sessions[index].timestamp_format.clone();
+        let mut context = Vec::new();
+        for record in records
+            .into_iter()
+            .filter(|record| record.conversation == reference.conversation)
+        {
+            let body = if record.redacted {
+                "<message redacted>"
+            } else {
+                &record.body
+            };
+            let mut message = if record.system {
+                ChatMessage::system_fmt(body, &format)
+            } else if record.action {
+                ChatMessage::action_fmt(&record.sender, body, &format)
+            } else {
+                ChatMessage::new_fmt(&record.sender, body, &format)
+            }
+            .without_logging();
+            message.timestamp = record.display_time;
+            message.message_key = record.id;
+            message.msgid = record.msgid;
+            message.server_time = record.server_time;
+            message.account = record.account;
+            message.reply_to = record.reply_to;
+            message.reactions = record.reactions;
+            context.push(message);
+        }
+        let maximum = self.sessions[index].max_scrollback;
+        let Some(channel) = self.sessions[index].conversation_channel_mut(id) else {
+            return;
+        };
+        let mut matched = vec![false; context.len()];
+        let mut preserve_live = HashSet::new();
+        let mut retained = Vec::new();
+        for existing in channel.messages.drain(..) {
+            let duplicate = context.iter().enumerate().position(|(at, restored)| {
+                !matched[at]
+                    && (existing.message_key == restored.message_key
+                        || existing
+                            .msgid
+                            .as_ref()
+                            .is_some_and(|msgid| restored.msgid.as_ref() == Some(msgid))
+                        || (initial.contains(&existing.message_key)
+                            && !existing.pending_echo
+                            && existing.server_time.is_none()
+                            && existing.msgid.is_none()
+                            && existing.sender == restored.sender
+                            && existing.content == restored.content
+                            && existing.timestamp == restored.timestamp))
+            });
+            if let Some(at) = duplicate {
+                matched[at] = true;
+                if !initial.contains(&existing.message_key) {
+                    preserve_live.insert(at);
+                    retained.push(existing);
+                }
+            } else {
+                retained.push(existing);
+            }
+        }
+        context = context
+            .into_iter()
+            .enumerate()
+            .filter_map(|(at, row)| (!preserve_live.contains(&at)).then_some(row))
+            .collect();
+        // Keep the requested context and the newest arrivals. The bounded
+        // archive remains available for rows outside this in-memory window.
+        let remaining = maximum.saturating_sub(context.len());
+        if retained.len() > remaining {
+            retained.drain(..retained.len() - remaining);
+        }
+        let mut messages: std::collections::VecDeque<_> = context.into_iter().collect();
+        Session::merge_catch_up_history(&mut messages, retained.into_iter().collect());
+        channel.messages = messages;
+        channel.history_loaded = true;
+        if let Some(target) = self.sessions[index].target_name(id).map(str::to_owned) {
+            self.sessions[index].refresh_reply_previews(&target);
+        }
+        if let Some(window) = self.windows.get_mut(&key) {
+            let mut timeline = window.view.timeline.borrow_mut();
+            timeline.anchor = Some(anchor);
+            timeline.restore_pending = true;
+        }
+    }
+
+    pub(crate) fn handle_workspace_archive_error(&mut self, token: u64, message: String) {
+        let Some((key, _, _)) = self.workspace_restores.remove(&token) else {
+            return;
+        };
+        if let Some(window) = self.windows.get_mut(&key) {
+            window.view.set_workspace_hydrating(false);
+        }
+        if let Some(index) = self.session_index(key.conn) {
+            self.sessions[index].add_server_message(ChatMessage::system(&format!(
+                "Reading position could not be restored: {message}"
+            )));
+        }
+    }
+
+    fn checkpoint_workspace(&mut self) {
+        if let Some(error) = self.workspace.take_error()
+            && let Some(session) = self.sessions.first_mut()
+        {
+            session.add_server_message(ChatMessage::system(&error));
+        }
+        let pending = std::mem::take(&mut self.pending_workspace_views);
+        for (conn, conversation, state) in pending {
+            if let Some(window) = self.windows.get_mut(&WindowKey::new(conn, conversation)) {
+                window.view.restore_workspace_state(state);
+                let hydrating = self
+                    .workspace_restores
+                    .values()
+                    .any(|(key, _, _)| *key == WindowKey::new(conn, conversation));
+                window.view.set_workspace_hydrating(hydrating);
+            } else if self.session_index(conn).is_some_and(|index| {
+                conversation.is_none_or(|id| self.sessions[index].target_name(id).is_some())
+            }) {
+                self.pending_workspace_views
+                    .push((conn, conversation, state));
+            }
+        }
+        if self.settings.resume_workspace && self.workspace.checkpoint_due() {
+            let snapshot = self.capture_workspace();
+            self.workspace.save(snapshot);
+        }
+    }
+
     /// Snapshot every session for an update restart. The active session is
     /// the top-level snapshot, which is all an older binary reads; the
     /// others follow in `others`.
@@ -2325,6 +3301,16 @@ impl App {
                     draft.clone_from(input);
                 } else {
                     drafts.push((*pending_target, input.clone()));
+                }
+            }
+            // Classify each draft in its owning conversation, including queued inputs.
+            // A retired owner must never fall through to the status window.
+            drafts.retain(|(owner, _)| {
+                owner.is_none_or(|id| self.sessions[index].target_name(id).is_some())
+            });
+            for (owner, draft) in &mut drafts {
+                if self.sessions[index].draft_for_owner_is_sensitive(*owner, draft) {
+                    draft.clear();
                 }
             }
             if self.sessions[index].update_changes_endpoint() {
@@ -2399,6 +3385,15 @@ impl App {
 
     /// Before an update restart or exit: save, and send QUIT everywhere.
     pub fn prepare_update_shutdown(&mut self) {
+        let _ = self.archive.client.flush_barrier(Duration::from_secs(2));
+        if self.settings.resume_workspace {
+            let snapshot = self.capture_workspace();
+            if !self.workspace.finish(snapshot) {
+                tracing::warn!(
+                    "The latest workspace checkpoint could not be written before shutdown"
+                );
+            }
+        }
         if self.persist_layout {
             self.layout_file().save();
         }
@@ -2447,6 +3442,7 @@ fn same_endpoint(a: (&str, &str, bool), b: (&str, &str, bool)) -> bool {
 /// A forced (private message) notification held back by the rate limiter.
 #[derive(Default)]
 struct DeferredNotification {
+    contexts: Vec<Option<(super::attention::AttentionEvent, String, String)>>,
     title: String,
     body: String,
     count: usize,
@@ -2567,6 +3563,8 @@ pub(crate) fn with_window_view<R>(
 
 fn swap_view(session: &mut Session, view: &mut TargetView) {
     std::mem::swap(&mut session.input_text, &mut view.input_text);
+    std::mem::swap(&mut session.composer, &mut view.composer);
+    std::mem::swap(&mut session.timeline, &mut view.timeline);
     // The sent-line history travels with the input line: each window
     // recalls only what was sent from that window.
     std::mem::swap(&mut session.command_history, &mut view.command_history);
@@ -2590,6 +3588,10 @@ fn clamp_settings(settings: &mut Settings) {
     settings.reconnect_delay_secs = settings.reconnect_delay_secs.max(1);
     settings.max_reconnect_attempts = settings.max_reconnect_attempts.max(1);
 }
+
+#[cfg(test)]
+#[path = "workspace_app_tests.rs"]
+mod workspace_resume_tests;
 
 #[cfg(test)]
 mod tests {
@@ -2645,6 +3647,12 @@ mod tests {
     fn connect(app: &mut App, index: usize) -> mpsc::UnboundedReceiver<IrcCommand> {
         let (tx, rx) = mpsc::unbounded_channel();
         let session = &mut app.sessions[index];
+        if session.active_session.is_none() {
+            let config = session
+                .session_from_form()
+                .expect("registered fixture needs a valid endpoint");
+            session.activate_session(config);
+        }
         session.test_set_registered(tx);
         rx
     }
@@ -2655,6 +3663,7 @@ mod tests {
 
     fn drain(rx: &mut mpsc::UnboundedReceiver<IrcCommand>) -> Vec<String> {
         std::iter::from_fn(|| rx.try_recv().ok())
+            .flat_map(super::super::flatten_test_commands)
             .map(|c| c.to_string())
             .collect()
     }
@@ -2871,7 +3880,10 @@ mod tests {
                 },
                 |ui| {
                     assert!(ui.ctx().input(|input| input.modifiers.is_none()));
-                    assert_eq!(app.take_shortcuts(ui.ctx()), [expected]);
+                    assert_eq!(
+                        app.take_shortcuts(ui.ctx()).as_slice(),
+                        std::slice::from_ref(&expected)
+                    );
                     assert!(!ui.ctx().input(|input| input.key_pressed(key)));
                 },
             );
@@ -3262,6 +4274,97 @@ mod tests {
         );
     }
 
+    #[test]
+    fn detached_search_and_files_requests_claim_their_source_when_another_panel_is_open() {
+        for files in [false, true] {
+            let (mut app, _rx_a, _rx_b) = two_networks();
+            let source = target_key(&app, app.sessions[1].id, "#debian");
+            app.windows.get_mut(&source).unwrap().detached = true;
+            let attached = target_key(&app, app.sessions[0].id, "#rust");
+            app.activate(attached);
+            app.search.open = true;
+            app.global_dialogs_were_open = true;
+            app.global_dialog_owner = None;
+            app.sessions[1].events.push(if files {
+                SessionEvent::UploadRequested {
+                    conversation: source.conversation,
+                    source: super::super::uploads::UploadSource::Files(Vec::new()),
+                    composer_nonce: app
+                        .windows
+                        .get(&source)
+                        .unwrap()
+                        .view
+                        .composer
+                        .nonce
+                        .clone(),
+                }
+            } else {
+                SessionEvent::SearchRequested {
+                    query: "needle".into(),
+                    all_networks: false,
+                    conversation: source.conversation,
+                }
+            });
+            app.process_events();
+            app.update_global_dialog_owner();
+            assert_eq!(app.global_dialog_window(), Some(source));
+            assert_eq!(app.windows.active, Some(attached));
+
+            // This is the dialog draw path used when only detached native
+            // windows remain visible and the root window is minimized.
+            let ctx = egui::Context::default();
+            let mut output = None;
+            for _ in 0..2 {
+                let mut frame = ctx.run_ui(
+                    egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            egui::vec2(900.0, 700.0),
+                        )),
+                        ..Default::default()
+                    },
+                    |ui| app.show_detached_window_dialogs(ui.ctx(), &source),
+                );
+                frame.textures_delta.clear();
+                output = Some(frame);
+            }
+            let text = texts(output.as_ref().unwrap());
+            assert!(text.iter().any(|text| text
+                == if files {
+                    "File transfers"
+                } else {
+                    "History search"
+                }));
+        }
+    }
+
+    #[test]
+    fn an_attached_search_request_reclaims_panels_from_an_old_detached_owner() {
+        let (mut app, _rx_a, _rx_b) = two_networks();
+        let detached = target_key(&app, app.sessions[1].id, "#debian");
+        app.windows.get_mut(&detached).unwrap().detached = true;
+        let attached = target_key(&app, app.sessions[0].id, "#rust");
+        app.activate(detached);
+        app.search.open = true;
+        app.global_dialog_owner = Some(detached);
+        app.global_dialogs_were_open = true;
+        app.sessions[0].events.push(SessionEvent::SearchRequested {
+            query: "needle".into(),
+            all_networks: false,
+            conversation: attached.conversation,
+        });
+        app.process_events();
+        app.update_global_dialog_owner();
+        assert_eq!(app.global_dialog_window(), None);
+
+        // Configurable Search actions call open_search directly, bypassing
+        // SessionEvent; they use the same explicit conversation scope.
+        app.global_dialog_owner = Some(detached);
+        app.open_search(0, String::new(), true);
+        app.update_global_dialog_owner();
+        assert_eq!(app.global_dialog_window(), None);
+    }
+
     fn texts(output: &egui::FullOutput) -> Vec<String> {
         let mut out = Vec::new();
         for clipped in &output.shapes {
@@ -3285,6 +4388,8 @@ mod tests {
     ) {
         let mut app = test_app();
         let second = app.add_session();
+        app.sessions[0].server_host = "a.example".into();
+        app.sessions[second].server_host = "b.example".into();
         let rx_a = connect(&mut app, 0);
         let rx_b = connect(&mut app, second);
         feed(&mut app, 0, ":me!u@h JOIN #rust");
@@ -3454,14 +4559,6 @@ mod tests {
     #[test]
     fn restored_draft_lands_in_its_own_window_even_if_selection_moved() {
         let (mut app, _rx_a, _rx_b) = two_networks();
-        for session in &mut app.sessions {
-            session.test_set_disconnected();
-        }
-        app.sessions[0].apply_unprofiled_endpoint("a.example", "6697", true);
-        assert!(app.sessions[0].start_session_from_form());
-        app.sessions[1].apply_unprofiled_endpoint("b.example", "6697", true);
-        assert!(app.sessions[1].start_session_from_form());
-        let _live_receivers: Vec<_> = (0..2).map(|index| connect(&mut app, index)).collect();
         let debian = target_key(&app, app.sessions[1].id, "#debian");
         app.activate(debian);
         app.windows.get_mut(&debian).unwrap().view.input_text = "unsent".into();
@@ -3710,12 +4807,18 @@ mod tests {
     }
 
     #[test]
-    fn a_hidden_connect_dialog_does_not_block_shortcuts() {
+    fn the_unified_connection_editor_stays_visible_when_selection_changes() {
         let (mut app, _rx_a, _rx_b) = two_networks();
         app.new_connection();
+        let edited = app.settings_session;
         assert!(app.dialog_blocks_shortcuts());
-        // The user goes back to another window without dismissing it.
         app.user_activate(target_key(&app, app.sessions[0].id, "#rust"));
+        // Settings is one visible, pinned editor rather than an active-only
+        // Connect popup, so shortcuts stay blocked until it is dismissed.
+        assert!(app.show_settings);
+        assert_eq!(app.settings_session, edited);
+        assert!(app.dialog_blocks_shortcuts());
+        app.cancel_settings_window();
         assert!(!app.dialog_blocks_shortcuts());
     }
 
@@ -4019,14 +5122,6 @@ mod tests {
     #[test]
     fn update_snapshot_carries_every_session_and_restores_them() {
         let (mut app, _rx_a, _rx_b) = two_networks();
-        for session in &mut app.sessions {
-            session.test_set_disconnected();
-        }
-        app.sessions[0].apply_unprofiled_endpoint("a.example", "6697", true);
-        assert!(app.sessions[0].start_session_from_form());
-        app.sessions[1].apply_unprofiled_endpoint("b.example", "6697", true);
-        assert!(app.sessions[1].start_session_from_form());
-        let _live_receivers: Vec<_> = (0..2).map(|index| connect(&mut app, index)).collect();
         let debian = target_key(&app, app.sessions[1].id, "#debian");
         app.activate(debian);
         app.windows.get_mut(&debian).unwrap().view.input_text = "unsent".into();
@@ -4059,13 +5154,6 @@ mod tests {
     #[test]
     fn update_snapshot_restores_every_windows_draft_including_pending_input() {
         let (mut app, _rx_a, _rx_b) = two_networks();
-        let mut _live_receivers = Vec::new();
-        for (index, host) in [(0, "a.example"), (1, "b.example")] {
-            app.sessions[index].test_set_disconnected();
-            app.sessions[index].apply_unprofiled_endpoint(host, "6697", true);
-            assert!(app.sessions[index].start_session_from_form());
-            _live_receivers.push(connect(&mut app, index));
-        }
         feed(&mut app, 0, ":me!u@h JOIN #same");
         feed(&mut app, 1, ":me!u@h JOIN #same");
         app.sessions[0].open_query("alice");
@@ -5209,7 +6297,7 @@ mod tests {
         let shown = minimized(&mut app, vec![]);
         assert!(app.show_settings, "/settings was not run");
         assert_eq!(app.global_dialog_window(), Some(debian));
-        assert!(shown.iter().any(|t| t == "Automation"), "{shown:?}");
+        assert!(shown.iter().any(|t| t == "Behavior"), "{shown:?}");
     }
 
     #[test]
@@ -5316,6 +6404,7 @@ mod tests {
         app.toggle_detached(&debian);
         app.activate(debian);
         let ctx = egui::Context::default();
+        frame(&mut app, &ctx); // Establish an actual at-bottom viewport report.
 
         let (tx, rx) = mpsc::channel(8);
         app.sessions[1].test_set_incoming(rx);
@@ -5539,5 +6628,356 @@ mod tests {
         }
         let a_lines = lines_a.recv_timeout(Duration::from_secs(5)).unwrap();
         assert!(a_lines.iter().any(|l| l == "QUIT :bye"), "{a_lines:?}");
+    }
+
+    #[test]
+    fn startup_and_connect_use_the_single_settings_connection_editor() {
+        let mut app = test_app();
+        let ctx = egui::Context::default();
+        frame(&mut app, &ctx);
+        let rendered = texts(&frame(&mut app, &ctx));
+        assert!(app.show_settings);
+        assert_eq!(app.settings_tab, 0);
+        assert_eq!(app.settings_session, Some(app.sessions[0].id));
+        assert!(
+            rendered.iter().any(|text| text == "Settings"),
+            "{rendered:?}"
+        );
+        assert!(!rendered.iter().any(|text| text == "Connect to Server"));
+        assert!(
+            rendered.iter().any(|text| text == "Save & Close"),
+            "{rendered:?}"
+        );
+
+        app.settings_tab = 3;
+        app.open_connection_settings(app.sessions[0].id);
+        assert_eq!(app.settings_tab, 0);
+        app.new_connection();
+        assert_eq!(app.settings_index(), 1);
+        assert_eq!(app.settings_tab, 0);
+    }
+
+    #[test]
+    fn canceling_another_new_connection_keeps_a_saved_idle_connection() {
+        let (mut app, _rx_a, _rx_b) = two_networks();
+        app.new_connection();
+        let saved = app.sessions.last().unwrap().id;
+        assert!(app.close_settings_window());
+        assert!(app.session_index(saved).is_some());
+        app.new_connection();
+        app.cancel_settings_window();
+        assert_eq!(app.sessions.len(), 3);
+        assert!(app.session_index(saved).is_some());
+        assert!(!app.show_settings);
+    }
+
+    #[test]
+    fn an_existing_editor_stays_pinned_when_another_idle_window_is_selected() {
+        let mut app = test_app();
+        let first = app.sessions[0].id;
+        app.open_settings(first);
+        let second = app.add_session();
+        app.sync_windows();
+        app.user_activate(WindowKey::new(app.sessions[second].id, None));
+        app.route_connection_editor();
+        assert_eq!(app.settings_session, Some(first));
+    }
+}
+
+#[cfg(test)]
+mod automation_shortcut_tests {
+    use super::super::actions::{ActionContext, ActionId, KeyChord, ShortcutBinding};
+    use super::*;
+    fn app() -> (App, WindowKey, WindowKey) {
+        let mut app = App::with_settings(
+            Settings {
+                logging_enabled: false,
+                ..Settings::default()
+            },
+            LayoutFile::default(),
+        );
+        let index = app.add_session();
+        app.sessions[index].show_connect_dialog = false;
+        let first = app.sessions[index].ensure_history_target("#alpha");
+        let second = app.sessions[index].ensure_history_target("#beta");
+        let first = WindowKey::new(app.sessions[index].id, Some(first));
+        let second = WindowKey::new(app.sessions[index].id, Some(second));
+        app.sync_windows();
+        app.user_activate(first);
+        (app, first, second)
+    }
+    fn key(key: egui::Key, modifiers: egui::Modifiers) -> egui::Event {
+        egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers,
+        }
+    }
+    #[test]
+    fn remapping_replaces_builtin_shortcut_and_consumes_only_new_chord() {
+        let (mut app, _, _) = app();
+        app.automation.editing.shortcuts = vec![ShortcutBinding {
+            chord: KeyChord::new("Q", true, false, false),
+            action: ActionId::CloseWindow,
+        }];
+        app.automation.commit().unwrap();
+        let context = egui::Context::default();
+        let mut output = context.run_ui(
+            egui::RawInput {
+                events: vec![
+                    key(egui::Key::W, egui::Modifiers::CTRL),
+                    key(egui::Key::Q, egui::Modifiers::CTRL),
+                ],
+                ..Default::default()
+            },
+            |ui| {
+                assert_eq!(app.take_shortcuts(ui.ctx()), [WindowShortcut::Close]);
+                assert!(ui.ctx().input(|input| input.key_pressed(egui::Key::W)));
+                assert!(!ui.ctx().input(|input| input.key_pressed(egui::Key::Q)));
+            },
+        );
+        output.textures_delta.clear();
+    }
+    #[test]
+    fn switcher_query_and_enter_same_frame_activate_matching_stable_id() {
+        let (mut app, first, second) = app();
+        app.windows.get_mut(&first).unwrap().view.input_text = "draft stays".into();
+        let context = egui::Context::default();
+        app.dispatch_action(
+            &context,
+            ActionId::WindowSwitcher,
+            ActionContext { window: first },
+        );
+        let mut output = context.run_ui(egui::RawInput::default(), |ui| {
+            app.show_window_switcher(ui.ctx())
+        });
+        output.textures_delta.clear();
+        let mut output = context.run_ui(
+            egui::RawInput {
+                events: vec![
+                    egui::Event::Text("beta".into()),
+                    key(egui::Key::Enter, egui::Modifiers::NONE),
+                ],
+                ..Default::default()
+            },
+            |ui| app.show_window_switcher(ui.ctx()),
+        );
+        output.textures_delta.clear();
+        assert_eq!(app.windows.active, Some(second));
+        assert!(!app.window_switcher.open);
+        assert_eq!(
+            app.windows.get(&first).unwrap().view.input_text,
+            "draft stays"
+        );
+    }
+    #[test]
+    fn muted_conversation_cancels_its_already_queued_notification() {
+        let mut app = App::with_settings(
+            Settings {
+                logging_enabled: false,
+                logging_load_history: false,
+                ..Settings::default()
+            },
+            LayoutFile::default(),
+        );
+        let event = super::super::attention::AttentionEvent {
+            reference: super::super::identity::MessageRef {
+                conversation: super::super::identity::ConversationKey {
+                    network: super::super::identity::LogicalNetworkKey::Direct {
+                        endpoint: super::super::identity::TransportEndpointKey::new(
+                            "irc.example",
+                            6697,
+                            true,
+                        ),
+                    },
+                    target: "alice".into(),
+                },
+                archive_id: Some("row".into()),
+                server_msgid: None,
+                server_time: None,
+            },
+            private: true,
+            mention: false,
+        };
+        app.handle_attention(event.clone(), "PM from alice", "one", true);
+        app.handle_attention(event.clone(), "PM from alice", "two", true);
+        assert_eq!(app.dispatched_notifications.len(), 1);
+        app.settings
+            .attention
+            .rule_mut(event.reference.conversation)
+            .level = super::super::attention::AlertLevel::Muted;
+        app.last_forced_notification_time = Some(Instant::now() - MIN_NOTIFICATION_INTERVAL);
+        app.flush_deferred_notification();
+        assert_eq!(app.dispatched_notifications.len(), 1);
+        assert!(app.deferred_notification.is_none());
+    }
+}
+
+#[cfg(test)]
+mod message_navigation_tests {
+    use super::*;
+    #[test]
+    fn archived_reply_preserves_draft_and_rejects_closed_or_wrong_network_destinations() {
+        let mut app = App::with_settings(
+            Settings {
+                nickname: "me".into(),
+                logging_enabled: false,
+                logging_load_history: false,
+                ..Settings::default()
+            },
+            LayoutFile::default(),
+        );
+        let index = app.add_session();
+        app.sessions[index].show_connect_dialog = false;
+        assert!(app.sessions[index].start_session_from_form());
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        app.sessions[index].test_set_registered(tx);
+        app.sessions[index]
+            .enabled_caps
+            .insert("message-tags".into());
+        let id = app.sessions[index].ensure_history_target("#room");
+        app.sessions[index]
+            .conversations
+            .channel_mut(id)
+            .unwrap()
+            .joined = true;
+        app.sync_windows();
+        let key = WindowKey::new(app.sessions[index].id, Some(id));
+        app.windows.get_mut(&key).unwrap().view.input_text = "keep my draft".into();
+        let reference = super::super::identity::MessageRef {
+            conversation: app.sessions[index].conversation_key("#room"),
+            archive_id: Some("archived".into()),
+            server_msgid: Some("parent".into()),
+            server_time: None,
+        };
+        assert!(app.begin_reply(reference.clone()).is_ok());
+        let view = &app.windows.get(&key).unwrap().view;
+        assert_eq!(view.input_text, "keep my draft");
+        assert_eq!(view.composer.reply_to, Some(reference.clone()));
+        let mut closed = reference.clone();
+        closed.conversation.target = "#closed".into();
+        assert!(app.begin_reply(closed).is_err());
+        let mut wrong = reference;
+        wrong.conversation.network = super::super::identity::LogicalNetworkKey::Direct {
+            endpoint: super::super::identity::TransportEndpointKey::new(
+                "other.example",
+                6697,
+                true,
+            ),
+        };
+        assert!(app.begin_reply(wrong).is_err());
+        assert_eq!(
+            app.windows.get(&key).unwrap().view.input_text,
+            "keep my draft"
+        );
+    }
+}
+
+#[cfg(test)]
+mod automation_privacy_tests {
+    use super::super::automation::{AliasDef, AutomationConfig};
+    use super::*;
+    fn fixture() -> (App, usize, ConversationId, ConversationId) {
+        let mut app = App::with_settings(
+            Settings {
+                server_host: "irc.example".into(),
+                nickname: "me".into(),
+                logging_enabled: false,
+                logging_load_history: false,
+                ..Settings::default()
+            },
+            LayoutFile::default(),
+        );
+        let index = app.add_session();
+        let session = &mut app.sessions[index];
+        let config = session.session_from_form().unwrap();
+        session.activate_session(config);
+        session.show_connect_dialog = false;
+        let room = session.ensure_history_target("#room");
+        let service = session.ensure_history_target("NickServ");
+        session.select_conversation(Some(room));
+        let mut config = AutomationConfig::default();
+        config.aliases = vec![
+            AliasDef {
+                id: "target".into(),
+                name: "relay".into(),
+                scope: None,
+                steps: vec!["/msg $target $*".into()],
+            },
+            AliasDef {
+                id: "required".into(),
+                name: "needed".into(),
+                scope: None,
+                steps: vec!["/msg NickServ IDENTIFY $1".into()],
+            },
+        ];
+        session.set_automation(std::sync::Arc::new(config));
+        app.sync_windows();
+        (app, index, room, service)
+    }
+    #[test]
+    fn workspace_and_updater_filter_drafts_in_each_owning_target_and_preserve_benign_drafts() {
+        for secret in [
+            "IDENTIFY scratch-secret",
+            "/relay IDENTIFY scratch-secret",
+            "/needed",
+        ] {
+            let (mut app, index, room, service) = fixture();
+            let conn = app.sessions[index].id;
+            app.windows
+                .get_mut(&WindowKey::new(conn, Some(room)))
+                .unwrap()
+                .view
+                .input_text = "benign draft".into();
+            app.windows
+                .get_mut(&WindowKey::new(conn, Some(service)))
+                .unwrap()
+                .view
+                .input_text = secret.into();
+            let workspace = serde_json::to_string(&app.capture_workspace()).unwrap();
+            assert!(!workspace.contains(secret), "workspace retained {secret}");
+            assert!(workspace.contains("benign draft"));
+            let update = serde_json::to_string(&app.update_session()).unwrap();
+            assert!(!update.contains(secret), "updater retained {secret}");
+            assert!(update.contains("benign draft"));
+            assert_eq!(app.sessions[index].current_conversation, Some(room));
+        }
+    }
+    #[test]
+    fn pending_draft_privacy_uses_original_owner_and_drops_retired_owner() {
+        let (mut app, index, room, service) = fixture();
+        let conn = app.sessions[index].id;
+        app.pending_workspace_views.push((
+            conn,
+            Some(service),
+            super::super::workspace::WorkspaceViewState {
+                draft: "/relay IDENTIFY queued-secret".into(),
+                ..Default::default()
+            },
+        ));
+        app.pending_inputs
+            .push((conn, Some(service), "/needed".into()));
+        let retired = app.sessions[index].ensure_history_target("#retired");
+        app.sessions[index].remove_channel("#retired");
+        app.pending_inputs
+            .push((conn, Some(retired), "retired-owner-secret".into()));
+        let workspace = serde_json::to_string(&app.capture_workspace()).unwrap();
+        assert!(!workspace.contains("queued-secret"));
+        assert!(!workspace.contains("/needed"));
+        assert!(!workspace.contains("retired-owner-secret"));
+        let update = serde_json::to_string(&app.update_session()).unwrap();
+        assert!(!update.contains("queued-secret"));
+        assert!(!update.contains("/needed"));
+        assert!(!update.contains("retired-owner-secret"));
+        assert_eq!(app.sessions[index].current_conversation, Some(room));
+    }
+    #[test]
+    fn session_snapshot_and_command_history_keep_global_bare_credential_filter() {
+        let (mut app, index, _, _) = fixture();
+        app.sessions[index].input_text = "identify scratch-secret".into();
+        assert!(app.sessions[index].update_session().input().is_empty());
+        assert!(app.sessions[index].draft_is_sensitive("ID scratch-secret"));
     }
 }

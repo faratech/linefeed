@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-Linefeed is a cross-platform IRC client written in Rust using egui/eframe for the GUI. It supports Windows (ARM64, x64, x86), Linux (ARM64, x64), and macOS (universal) with TLS encryption via native-tls (SChannel on Windows, OpenSSL on Linux, Security.framework on macOS), IRCv3 CAP negotiation, and SASL PLAIN authentication. Licensed CC BY 4.0.
+Linefeed is a cross-platform IRC client written in Rust using egui/eframe for the GUI. It supports Windows (ARM64, x64, x86), Linux (ARM64, x64), and macOS (universal) with TLS encryption via native-tls (SChannel on Windows, OpenSSL on Linux, Security.framework on macOS), IRCv3 CAP negotiation, and SASL authentication. Licensed CC BY 4.0.
 
 ## Build Commands
 
@@ -124,13 +124,14 @@ src/
 │   ├── app.rs           # App: sessions, settings, notifications, toolbar/switchbar, windows, detached viewports
 │   ├── mod.rs           # Session: protocol state, message routing, numeric handlers, conversation selection
 │   ├── connection.rs    # Private connection phases, worker/transport ownership, cancellation and reconnect
+│   ├── auth_history.rs  # Defer automatic history until configured services login is confirmed
 │   ├── conversations.rs # Stable process-local ConversationIds, target-name indexes and collision merges
 │   ├── windows.rs       # WindowManager: placement, tile/cascade, layout.json
 │   ├── snap.rs          # Snap layouts: window captions, layout flyout/bar, edge snaps, Snap Assist
 │   ├── view.rs          # Drawing one window: topic, user list, scrollback, input line
 │   ├── types.rs         # Settings, ChatMessage, Channel, NetworkSupport, UserMode, BanEntry, TabCompletion
 │   ├── commands.rs      # process_command() - all /slash commands (~5100 lines)
-│   ├── dialogs.rs       # Connect (per session), Settings (App), Channel List, Channel Info windows
+│   ├── dialogs.rs       # Unified Settings/Connection editor, Channel List and Channel Info windows
 │   ├── formatting.rs    # IRC formatting parsing, nick colors, text rendering
 │   ├── helpers.rs       # is_channel(), nick_to_mask(), current_time_formatted(), days_to_ymd()
 │   └── logging.rs       # LogManager: persistent chat history in irssi format
@@ -178,17 +179,24 @@ identity. Closing and reopening the same name must not revive stale UI work.
 - **systray.rs**: Windows-only tray icon, minimize-to-tray, taskbar flash, balloon notifications, single-instance activation (finds the main window by its exact title, which no detached window may use)
 - **gui/app.rs**: multi-session frame (pump, timers, lifecycles, `SessionEvent`s), window activation and close semantics, switchbar/shortcuts, floating and detached windows, settings persistence, notifications, update-restart snapshot of every session
 - **gui/mod.rs**: `handle_incoming_message()` routes by IrcCommand type, `handle_numeric()` for server replies, lag meter, auto-away
+- **gui/auth_history.rs**: Holds automatic history by conversation ID while a queued services login is pending; confirms via account signals or a correlated self-WHOIS after a services reply. Free-form NOTICE text and attempt timeouts never unlock history. Manual WHOIS exchanges remain separate from internal probes.
 - **gui/connection.rs**: explicit connection transitions, exclusive worker/transport ownership, attempt generations, bounded cancellation/QUIT retirement, auto-reconnect and derived lifecycle queries
 - **gui/conversations.rs**: conversation identity, current wire/display names, casemapped lookup, rename/collision resolution and revision tracking
 - **gui/windows.rs**: window set derived from conversation IDs, placement memory, tile/cascade geometry, layout.json name-based compatibility boundary (kept apart from settings.json)
 - **gui/snap.rs**: the floating windows' own captions (drag to move, maximize, close) and Windows 11 style snap layouts: flyout on the maximize button, layout bar when dragged to the top, halves/quarters at the edges, Snap Assist for the zones left
 - **commands.rs**: All /slash commands including service shortcuts (/ns, /cs), /monitor, /slap
-- **dialogs.rs**: Modal windows with tabbed Settings (Connection, Display, Automation, Behavior, About)
+- **dialogs.rs**: One Settings window (Connection, Display, Behavior, About). Startup, Connect and New connection open the complete Connection tab for a pinned session, including favorites, SASL/client certificates and on-connect automation. Save & Close validates and persists without changing a live connection; Connect/Reconnect explicitly stages validated details after checking endpoint reservations. Cancel restores that session's opening form/profile and discards a canceled pristine new connection. Global preferences remain live; explicit favorite updates preserve profile identity and never adopt scratch Quick Connect defaults.
 - **formatting.rs**: `parse_irc_colors()` for IRC formatting controls, `render_irc_text()` with egui
 - **types.rs**: All data structures, Settings load/save, Channel user management with server-aware mode sorting and casemapping-aware keys
-- **logging.rs**: irssi-compatible log format, history loading on join, log rotation detection (same-file)
+- **logging.rs**: irssi-compatible text logs and exact physical spans for archive deduplication; history loading and rotation detection
+- **gui/archive.rs**, **search.rs**: authoritative structured JSONL history, rebuildable SQLite FTS index, background import/search/context, scoped permanent redaction
+- **gui/identity.rs**, **workspace.rs**: persistent logical network/message identity and private background workspace snapshots; never persist runtime connection/conversation IDs
+- **gui/message_ui.rs**, **attention.rs**: validated atomic chat sends, reply/reaction/typing state, read anchors, per-conversation notification rules and activity references
+- **gui/automation.rs**, **actions.rs**: bounded parameterized command plans, private alias configuration, configurable actions and window switcher
+- **gui/bouncer.rs**, **irc/bouncer.rs**: soju discovery/bind and ZNC upstream routing/playback; logical upstream identity is separate from transport endpoint
+- **gui/uploads.rs**: HTTPS FILEHOST discovery/custom providers, scoped token flow, background picker/encoding/streaming/cancellation; completion appends only to the originating draft
 - **numerics.rs**: Named constants for IRC numerics including IRCv3 (Monitor, SASL, WHOIS extensions)
-- **client.rs**: CAP negotiation (with flood budgets), SASL PLAIN, TLS with optional invalid cert acceptance, overall registration deadline, prompt cancellation of connect/handshake/reads
+- **client.rs**: CAP negotiation (with flood budgets), SASL Auto/PLAIN/EXTERNAL/SCRAM-SHA-256, TLS with optional invalid cert acceptance, overall registration deadline, prompt cancellation of connect/handshake/reads
 
 ## Security-Sensitive Areas
 
@@ -200,21 +208,25 @@ byte/token/line budgets against hostile servers. Preserve these invariants
 when touching connection, logging, or command-history code. With several
 sessions: a new session (`/server -m`, "New connection") never inherits
 another's credentials, and settings saves never persist an unvalidated or
-scratch connect form (`SaveSettings` vs `SaveConfig`/`SaveAutoPerform`,
-#316).
+scratch connect form (only explicit validated Settings save/connect adopts the
+form; `SaveConfig` and `SaveAutoPerform` keep their narrower scopes, #316).
 
 ## Features
 
-- **Authentication**: SASL PLAIN with graceful fallback, server password, NickServ auto-identify via auto-perform
+- **Authentication**: SASL Auto/PLAIN/EXTERNAL/SCRAM-SHA-256 with optional required authentication, TLS client certificates, server password, and services login via auto-perform
 - **Channel support**: Server-advertised channel prefixes, keys (+k), modes display, topic info, ban list, channel info dialog
 - **CTCP**: VERSION, TIME, PING, FINGER, CLIENTINFO (configurable replies)
 - **Display**: Configurable timestamps, IRC formatting including reverse video, hide join/part/quit, scrollback limit, highlight words
-- **Logging**: Persistent chat history with configurable line count, irssi-compatible format
+- **Logging**: Search all saved history by network/conversation/sender/date, historical context, compatible text logs plus structured archive and rebuildable index
 - **Away**: Manual /away, /back, auto-away on idle with configurable timeout
 - **Privacy**: CTCP reply toggle, ignore list with wildcard masks
-- **UI**: Tab completion, command history, lag meter, desktop notifications
-- **Connection**: Several servers at once, safe reconnect/server switching, auto-reconnect with exponential backoff, configurable delay/max attempts, auto-connect network profiles
+- **UI**: Multiline composer, quoted replies, grouped reactions, optional typing, account/TLS badges, activity center, per-conversation notification rules, unread navigation, aliases, configurable shortcuts and window switcher
+- **Workspace**: Normal restarts restore committed sessions, tabs, drafts, selection and reading anchors; reconnect only sessions previously connected
+- **Sharing**: Attach, clipboard images/files and drop via advertised/custom HTTPS FILEHOST; progress/cancel and URL insertion, never automatic sending
+- **Connection**: Several servers/upstreams at once, soju/ZNC profiles and playback, safe reconnect/server switching, auto-reconnect with exponential backoff, configurable delay/max attempts, auto-connect network profiles
 - **Windows**: mIRC-style maximized or floating (tile/cascade) windows, switchbar grouped by network, detach any window into its own OS window, layout persisted in layout.json
 - **Platform**: System tray on Windows (minimize to tray, taskbar flash on notification), desktop notifications on supported platforms
 
 **build.rs:** Compiles Windows resources (icon, version info) using llvm-mingw windres.
+
+New archive, workspace, automation and upload services must stay disabled in `App::with_settings` tests. Enable production persistence only in `App::load`; use in-memory or scratch services in tests. Row measurement must not send actions or advance read state. Background upload results are scoped to logical network, connection generation, window ID and composer nonce.

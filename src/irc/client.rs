@@ -427,6 +427,17 @@ where
 /// which may be a credential) and an empty string is returned, which the
 /// writers send as a no-op (#285).
 fn outbound_line(cmd: &IrcCommand) -> String {
+    if let IrcCommand::ClientBatch(commands) | IrcCommand::ClientChat { commands, .. } = cmd {
+        let mut wire = String::new();
+        for command in commands {
+            let line = outbound_line(command);
+            if line.is_empty() {
+                return String::new();
+            }
+            wire.push_str(&line);
+        }
+        return wire;
+    }
     match cmd.to_wire_line() {
         Some(line) => line + "\r\n",
         None => {
@@ -434,6 +445,49 @@ fn outbound_line(cmd: &IrcCommand) -> String {
             String::new()
         }
     }
+}
+
+fn outbound_log_summary(command: &IrcCommand, line: &str) -> String {
+    if let IrcCommand::ClientBatch(commands) | IrcCommand::ClientChat { commands, .. } = command {
+        format!("<client batch: {} lines>", commands.len())
+    } else {
+        redact_for_log(line).into_owned()
+    }
+}
+
+fn command_closes_connection(command: &IrcCommand) -> bool {
+    match command {
+        IrcCommand::Quit(_) => true,
+        IrcCommand::ClientBatch(commands) | IrcCommand::ClientChat { commands, .. } => {
+            commands.iter().any(command_closes_connection)
+        }
+        _ => false,
+    }
+}
+
+type EventCallback = std::sync::Arc<dyn Fn(ClientEvent) + Send + Sync>;
+
+async fn write_outbound_command<W: tokio::io::AsyncWrite + Unpin>(
+    writer: &mut W,
+    command: &IrcCommand,
+    events: Option<&EventCallback>,
+) -> std::io::Result<bool> {
+    let line = outbound_line(command);
+    if line.is_empty() {
+        if matches!(command, IrcCommand::ClientChat { .. }) {
+            return Err(std::io::Error::other("Invalid accepted chat envelope"));
+        }
+        return Ok(false);
+    }
+    tracing::debug!("> {}", outbound_log_summary(command, &line));
+    writer.write_all(line.as_bytes()).await?;
+    if let IrcCommand::ClientChat { id, .. } = command {
+        writer.flush().await?;
+        if let Some(events) = events {
+            events(ClientEvent::ChatWritten { id: id.clone() });
+        }
+    }
+    Ok(command_closes_connection(command))
 }
 
 /// Build the PONG answering a server PING. The token is server-controlled and
@@ -974,10 +1028,62 @@ pub struct ServerConfig {
     pub sasl_mechanism: SaslMechanism,
     #[serde(default)]
     pub sasl_required: bool,
+    #[serde(default)]
+    pub(crate) bouncer: Option<crate::irc::bouncer::BouncerBinding>,
     pub tls_client_cert_path: Option<String>,
     pub tls_client_key_path: Option<String>,
     pub pre_away_message: Option<String>,
     pub persistence_profile: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum TlsStatus {
+    #[default]
+    Plaintext,
+    Negotiating,
+    Verified,
+    Unverified,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) enum AuthenticationStatus {
+    #[default]
+    Disconnected,
+    Connecting,
+    Authenticating,
+    Connected,
+    Authenticated,
+    LoggedIn {
+        account: String,
+    },
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct ConnectionStatus {
+    pub tls: TlsStatus,
+    pub authentication: AuthenticationStatus,
+    pub sasl_mechanism: Option<SaslMechanism>,
+    pub effective_host: Option<String>,
+    pub effective_port: Option<u16>,
+    pub effective_use_tls: Option<bool>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) enum ClientEvent {
+    Tls(TlsStatus),
+    Authentication(AuthenticationStatus),
+    Registered,
+    BouncerReady,
+    SaslSucceeded(SaslMechanism),
+    Endpoint {
+        host: String,
+        port: u16,
+        use_tls: bool,
+    },
+    ChatWritten {
+        id: String,
+    },
+    Fatal(String),
 }
 
 fn default_realname() -> String {
@@ -999,6 +1105,7 @@ impl Default for ServerConfig {
             sasl_password: None,
             sasl_mechanism: SaslMechanism::Auto,
             sasl_required: false,
+            bouncer: None,
             tls_client_cert_path: None,
             tls_client_key_path: None,
             pre_away_message: None,
@@ -1018,6 +1125,7 @@ pub struct IrcClient {
     /// UI can repaint immediately instead of waiting for its poll timer.
     /// Kept as a plain callback so this layer stays GUI-toolkit agnostic.
     wake_ui: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
+    events: Option<std::sync::Arc<dyn Fn(ClientEvent) + Send + Sync>>,
 }
 
 /// Capabilities whose semantics Linefeed implements safely. Keep this list
@@ -1060,6 +1168,19 @@ pub const DESIRED_CAPS: &[&str] = &[
 ];
 
 impl IrcClient {
+    pub(crate) fn set_event_callback(
+        &mut self,
+        callback: std::sync::Arc<dyn Fn(ClientEvent) + Send + Sync>,
+    ) {
+        self.events = Some(callback);
+    }
+
+    fn emit_event(&self, event: ClientEvent) {
+        if let Some(callback) = &self.events {
+            callback(event);
+        }
+        self.wake_ui();
+    }
     /// Register a callback invoked each time a server message has been
     /// queued for the GUI (see the `wake_ui` field). The GUI uses it to
     /// repaint on arrival rather than on its idle poll timer.
@@ -1073,13 +1194,26 @@ impl IrcClient {
         }
     }
 
-    pub fn new(config: ServerConfig) -> Self {
+    pub fn new(mut config: ServerConfig) -> Self {
+        if let Some(binding) = &config.bouncer {
+            let username = binding.wire_username();
+            config.username = username.clone();
+            if config.sasl_password.is_some() {
+                config.sasl_username = Some(username);
+            } else if let Some(password) = config.password.take() {
+                config.password = Some(format!("{username}:{password}"));
+            }
+            if binding.provider == crate::irc::bouncer::BouncerProvider::Soju {
+                config.sasl_required = true;
+            }
+        }
         Self {
             config,
             tx: None,
             connect_timeout: TCP_CONNECT_TIMEOUT,
             tls_handshake_timeout: TLS_HANDSHAKE_TIMEOUT,
             wake_ui: None,
+            events: None,
         }
     }
 
@@ -1157,6 +1291,9 @@ impl IrcClient {
         mut outgoing_rx: mpsc::UnboundedReceiver<IrcCommand>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let mut pending_commands = VecDeque::new();
+        if let Some(binding) = &self.config.bouncer {
+            binding.validate()?;
+        }
         Self::validate_registration_fields(
             &self.config.nick,
             &self.config.username,
@@ -1223,6 +1360,11 @@ impl IrcClient {
             return Err("Persistence profile must be 1-32 letters, digits, '_' or '-'".into());
         }
         let addr = format_server_addr(&self.config.host, self.config.port);
+        self.emit_event(ClientEvent::Endpoint {
+            host: self.config.host.clone(),
+            port: self.config.port,
+            use_tls: self.config.use_tls,
+        });
         tracing::info!("Connecting to {} (TLS: {})", addr, self.config.use_tls);
 
         // Send connecting message (non-blocking)
@@ -1452,6 +1594,7 @@ impl IrcClient {
         mut outgoing_rx: mpsc::UnboundedReceiver<IrcCommand>,
         mut pending_commands: VecDeque<IrcCommand>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.emit_event(ClientEvent::Tls(TlsStatus::Negotiating));
         // Set up native TLS
         let mut tls_builder = native_tls::TlsConnector::builder();
 
@@ -1518,6 +1661,11 @@ impl IrcClient {
         };
 
         tracing::info!("TLS handshake complete");
+        self.emit_event(ClientEvent::Tls(if self.config.accept_invalid_certs {
+            TlsStatus::Unverified
+        } else {
+            TlsStatus::Verified
+        }));
         let _ = incoming_tx.try_send(IrcMessage {
             tags: None,
             prefix: None,
@@ -1603,15 +1751,21 @@ impl IrcClient {
         self.tx = Some(send_tx);
 
         // Spawn writer task
+        let writer_events = self.events.clone();
+        let writer_wake = self.wake_ui.clone();
         let mut writer_handle = tokio::spawn(async move {
             use tokio::time::{Duration, timeout};
             while let Some(cmd) = pending_commands.pop_front() {
-                let should_close = matches!(cmd, IrcCommand::Quit(_));
-                let line = outbound_line(&cmd);
-                tracing::debug!("> {}", redact_for_log(&line));
-                if let Err(e) = writer.write_all(line.as_bytes()).await {
-                    tracing::error!("Write error: {}", e);
-                    return;
+                let should_close =
+                    match write_outbound_command(&mut writer, &cmd, writer_events.as_ref()).await {
+                        Ok(close) => close,
+                        Err(error) => {
+                            tracing::error!("Write error: {error}");
+                            return;
+                        }
+                    };
+                if let Some(wake) = &writer_wake {
+                    wake();
                 }
                 if should_close {
                     let _ = writer.flush().await;
@@ -1625,29 +1779,22 @@ impl IrcClient {
             loop {
                 tokio::select! {
                     Some(cmd) = outgoing_rx.recv() => {
-                        let should_close = matches!(cmd, IrcCommand::Quit(_));
-                        let line = outbound_line(&cmd);
-                        tracing::debug!("> {}", redact_for_log(&line));
-                        if let Err(e) = writer.write_all(line.as_bytes()).await {
-                            tracing::error!("Write error: {}", e);
-                            break;
-                        }
+                        let should_close = match write_outbound_command(&mut writer, &cmd, writer_events.as_ref()).await {
+                            Ok(close) => close,
+                            Err(error) => { tracing::error!("Write error: {error}"); break; }
+                        };
+                        if let Some(wake) = &writer_wake { wake(); }
                         if should_close {
                             let _ = writer.flush().await;
                             break;
                         }
                         // Drain any queued commands before flushing (batch writes)
                         while let Ok(Some(cmd)) = timeout(Duration::from_micros(100), outgoing_rx.recv()).await {
-                            let should_close = matches!(cmd, IrcCommand::Quit(_));
-                            let line = outbound_line(&cmd);
-                            tracing::debug!("> {}", redact_for_log(&line));
-                            if let Err(e) = writer.write_all(line.as_bytes()).await {
-                                // Exit the whole task, matching the outer loop: a
-                                // plain `break` would only leave this drain loop and
-                                // keep consuming (and dropping) queued commands.
-                                tracing::error!("Write error: {}", e);
-                                return;
-                            }
+                            let should_close = match write_outbound_command(&mut writer, &cmd, writer_events.as_ref()).await {
+                                Ok(close) => close,
+                                Err(error) => { tracing::error!("Write error: {error}"); return; }
+                            };
+                            if let Some(wake) = &writer_wake { wake(); }
                             if should_close {
                                 let _ = writer.flush().await;
                                 return;
@@ -1794,6 +1941,8 @@ impl IrcClient {
                 .await?;
         }
 
+        self.emit_event(ClientEvent::Registered);
+
         Ok(())
     }
 
@@ -1820,6 +1969,16 @@ impl IrcClient {
             else {
                 continue;
             };
+            if let IrcCommand::StandardReply { kind, command, .. } = &msg.command
+                && kind.eq_ignore_ascii_case("FAIL")
+                && command.eq_ignore_ascii_case("BOUNCER")
+                && self.config.bouncer.is_some()
+            {
+                self.emit_event(ClientEvent::Fatal(
+                    "The bouncer rejected the selected network".into(),
+                ));
+                return Err("The bouncer rejected the selected network".into());
+            }
             if matches!(msg.command, IrcCommand::Numeric(RPL_WELCOME, _)) {
                 return Ok(());
             }
@@ -1953,6 +2112,33 @@ impl IrcClient {
         for cap in DESIRED_CAPS {
             if available_tokens.contains_key(*cap) {
                 caps_to_request.push(cap);
+            }
+        }
+        if let Some(binding) = &config.bouncer {
+            match binding.provider {
+                crate::irc::bouncer::BouncerProvider::Soju => {
+                    if !available_tokens.contains_key("soju.im/bouncer-networks") {
+                        self.emit_event(ClientEvent::Fatal(
+                            "This server does not offer soju network binding".into(),
+                        ));
+                        return Err("This server does not offer soju network binding".into());
+                    }
+                    caps_to_request.push("soju.im/bouncer-networks");
+                    if available_tokens.contains_key("soju.im/bouncer-networks-notify") {
+                        caps_to_request.push("soju.im/bouncer-networks-notify");
+                    }
+                }
+                crate::irc::bouncer::BouncerProvider::Znc => {
+                    if available_tokens.contains_key("znc.in/self-message") {
+                        caps_to_request.push("znc.in/self-message");
+                    }
+                    if available_tokens.contains_key("znc.in/playback")
+                        && available_tokens.contains_key("batch")
+                        && !available_tokens.contains_key("draft/chathistory")
+                    {
+                        caps_to_request.push("znc.in/playback");
+                    }
+                }
             }
         }
 
@@ -2199,6 +2385,39 @@ impl IrcClient {
         if config.sasl_required && !sasl_authenticated {
             return Err("Required SASL authentication did not succeed".into());
         }
+        if config
+            .bouncer
+            .as_ref()
+            .is_some_and(|binding| binding.provider == crate::irc::bouncer::BouncerProvider::Soju)
+            && !acked_tokens.contains("soju.im/bouncer-networks")
+        {
+            self.emit_event(ClientEvent::Fatal(
+                "The bouncer refused network binding capabilities".into(),
+            ));
+            return Err("The bouncer refused network binding capabilities".into());
+        }
+        if let Some(binding) = &config.bouncer
+            && binding.provider == crate::irc::bouncer::BouncerProvider::Soju
+            && !binding.network.is_empty()
+        {
+            if welcome_received || !acked_tokens.contains("soju.im/bouncer-networks") {
+                self.emit_event(ClientEvent::Fatal(
+                    "The bouncer completed registration before network binding".into(),
+                ));
+                return Err("Network binding was not negotiated before registration".into());
+            }
+            writer
+                .write_all(format!("BOUNCER BIND {}\r\n", binding.network).as_bytes())
+                .await?;
+            writer.flush().await?;
+        }
+        if config
+            .bouncer
+            .as_ref()
+            .is_some_and(|binding| binding.provider == crate::irc::bouncer::BouncerProvider::Soju)
+        {
+            self.emit_event(ClientEvent::BouncerReady);
+        }
         // Registration tail, unified for both exits: the capability notice
         // and the pre-away AWAY always run (AWAY is an ordinary command and
         // stays valid post-001); PERSISTENCE needs the SASL account
@@ -2281,6 +2500,9 @@ impl IrcClient {
         W: tokio::io::AsyncWrite + Unpin,
         R: tokio::io::AsyncBufRead + Unpin,
     {
+        self.emit_event(ClientEvent::Authentication(
+            AuthenticationStatus::Authenticating,
+        ));
         for mechanism in mechanisms {
             let name = mechanism.wire_name().expect("Auto is never attempted");
             let _ = incoming_tx.try_send(IrcMessage {
@@ -2296,7 +2518,13 @@ impl IrcClient {
                 .do_sasl_attempt(writer, reader, incoming_tx, nick_rx, buf, *mechanism)
                 .await?
             {
-                SaslAttemptOutcome::Success => return Ok((false, true)),
+                SaslAttemptOutcome::Success => {
+                    self.emit_event(ClientEvent::SaslSucceeded(*mechanism));
+                    self.emit_event(ClientEvent::Authentication(
+                        AuthenticationStatus::Authenticated,
+                    ));
+                    return Ok((false, true));
+                }
                 SaslAttemptOutcome::Welcome => return Ok((true, false)),
                 SaslAttemptOutcome::Failed => continue,
             }
@@ -2362,7 +2590,13 @@ impl IrcClient {
             SaslMechanism::External => {
                 // Empty authzid asks services to use the identity from the TLS
                 // client certificate.
-                Self::write_sasl_payload(writer, b"").await?;
+                let identity = self
+                    .config
+                    .bouncer
+                    .as_ref()
+                    .map(|binding| binding.account.as_bytes())
+                    .unwrap_or(b"");
+                Self::write_sasl_payload(writer, identity).await?;
             }
             SaslMechanism::ScramSha256 => {
                 let user = self.config.sasl_username.as_deref().unwrap_or_default();
@@ -2549,7 +2783,34 @@ impl IrcClient {
                 ) => return Ok(SaslServerEvent::Failed),
                 // 908 advertises the mechanisms supported by the server. It
                 // can accompany a failed attempt and is not itself terminal.
-                IrcCommand::Numeric(RPL_LOGGEDIN | RPL_SASLMECHS, _) => continue,
+                IrcCommand::Numeric(RPL_LOGGEDIN, params) => {
+                    if let Some(account) = params
+                        .get(2)
+                        .filter(|account| !account.is_empty() && account.as_str() != "*")
+                    {
+                        if self
+                            .config
+                            .bouncer
+                            .as_ref()
+                            .is_some_and(|binding| !binding.account.eq_ignore_ascii_case(account))
+                        {
+                            self.emit_event(ClientEvent::Fatal(
+                                "The bouncer authenticated a different account than this profile"
+                                    .into(),
+                            ));
+                            return Err(
+                                "Bouncer account does not match the profile identity".into()
+                            );
+                        }
+                        self.emit_event(ClientEvent::Authentication(
+                            AuthenticationStatus::LoggedIn {
+                                account: account.clone(),
+                            },
+                        ));
+                    }
+                    continue;
+                }
+                IrcCommand::Numeric(RPL_SASLMECHS, _) => continue,
                 _ => continue,
             }
         }
@@ -2736,6 +2997,10 @@ impl IrcClient {
         tracing::info!("Read loop exited");
     }
 }
+
+#[cfg(test)]
+#[path = "client_identity_tests.rs"]
+mod identity_tests;
 
 #[cfg(test)]
 mod tests {

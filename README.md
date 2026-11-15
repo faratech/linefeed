@@ -24,12 +24,16 @@ InspIRCd, UnrealIRCd, Solanum, Ergo, Bahamut, ircu, Hybrid, and Plexus features.
 - Closing a window parts its channel or closes its query; closing a status window disconnects that server (after asking)
 - Server favorites are network profiles that can connect automatically at startup
 - Window placement is remembered between runs
+- Normal restarts restore the previous workspace: channels, queries, drafts, reply context and reading position; previously connected sessions reconnect automatically
 
 ### Connection
 - IRCv3 CAP negotiation with timeout fallback
 - Auto-reconnect with exponential backoff
 - Safe reconnect and server switching without racing the old connection
+- One Settings window includes connection profiles, SASL/certificates, bouncer routing, upload providers and on-connect automation
 - Server favorites with quick-connect
+- soju network discovery/binding and ZNC routing, with independent histories for upstream networks sharing a bouncer address
+- Server-confirmed account status and actual TLS/certificate-verification indicators
 - Server password support
 - Accept invalid TLS certificates (optional)
 - IRCv3 STS plaintext upgrade and persistent per-host strict-TLS policy
@@ -48,6 +52,10 @@ InspIRCd, UnrealIRCd, Solanum, Ergo, Bahamut, ircu, Hybrid, and Plexus features.
 - Private messages (queries)
 - IRCv3 multiline send/replay, echo reconciliation, replies, reactions, and typing tags
 - Message redaction, read markers, and stable message IDs
+- Message Reply/React actions, quoted previews, original-message navigation and grouped reactions
+- Multiline composer: Enter sends; Shift+Enter inserts a newline
+- Incoming typing indicators enabled by default; sending typing indicators is opt-in
+- File picker, clipboard images/files and drag-and-drop HTTPS FILEHOST uploads with progress and cancellation; completed links are added to the originating draft
 - CTCP support (VERSION, TIME, PING, FINGER, CLIENTINFO)
 - IRC formatting rendering, including mIRC colors and reverse video
 - Outbound message splitting at IRC line-length limits
@@ -57,6 +65,10 @@ InspIRCd, UnrealIRCd, Solanum, Ergo, Bahamut, ircu, Hybrid, and Plexus features.
 
 ### User Experience
 - Automatic GitHub Release updates, installed on exit, with checks and restart controls in About
+- Search saved history across networks and conversations, with sender/date filters and clickable historical context
+- Activity center for mentions and private messages, next-unread navigation and last-read dividers
+- Per-conversation mute/highlight/sound rules
+- Searchable window switcher and configurable keyboard shortcuts
 - Tab completion for nicks and commands
 - Command history (up/down arrows)
 - Configurable timestamps
@@ -76,6 +88,7 @@ InspIRCd, UnrealIRCd, Solanum, Ergo, Bahamut, ircu, Hybrid, and Plexus features.
 - Auto-perform commands after connect
 - Auto-away on idle with configurable timeout
 - NickServ auto-identify via auto-perform
+- User-defined global/network aliases and bounded command macros; expanded login aliases preserve authentication-before-history ordering
 
 ### Logging
 - Persistent chat history in irssi-compatible format
@@ -286,7 +299,7 @@ client release; `/raw` remains available when exact wire syntax is needed.
 | `/verify <account> <code>` | Verify an account when supported by server policy |
 | `/token servicelist\|generate\|validate ...` | Use Nefarious external-service auth tokens |
 
-The Connect and Automation settings include pre-connect away status and a
+The Connection tab includes pre-connect away status and a
 Nefarious persistence profile. These are sent during registration, before
 `CAP END`, as required by the corresponding drafts.
 
@@ -294,7 +307,8 @@ Nefarious persistence profile. These are sent during registration, before
 | Command | Description |
 |---------|-------------|
 | `/clear` | Clear current window |
-| `/lastlog <pattern>` | Search messages in current window |
+| `/lastlog <pattern>` | Search the latest loaded messages in the current window |
+| `/search [text]` | Open saved-history search for the current conversation |
 | `/settings` | Open settings dialog |
 | `/shelp [topic]` | Request the server's HELP command |
 | `/perform [command]` | View/add auto-perform commands |
@@ -310,6 +324,11 @@ Nefarious persistence profile. These are sent during registration, before
 |----------|--------|
 | `Tab` | Complete nick/command |
 | `Up/Down` | Command history |
+| `Ctrl+F` | Search saved history in this conversation |
+| `Ctrl+Shift+F` | Search saved history across networks |
+| `Ctrl+P` | Open the searchable window switcher |
+| `Alt+A` | Jump to the next unread conversation |
+| `Shift+Enter` | Insert a newline in the composer |
 | `Ctrl+W` | Close the active window |
 | `Ctrl+Tab` | Next window (across networks) |
 | `Ctrl+Shift+Tab` | Previous window |
@@ -330,6 +349,14 @@ credentials.
 Chat logs are stored in:
 - **Linux**: `~/.config/linefeed/logs/<network>/<channel>.log`
 - **Windows**: `%APPDATA%\linefeed\logs\<network>\<channel>.log`
+
+Additional private state is stored alongside settings:
+
+- `workspace.json`: the committed connection/workspace snapshot, drafts and reading anchors.
+- `automation.json`: aliases, macros and keyboard bindings.
+- `archive/`: structured message journals and a rebuildable SQLite search index. Existing text logs remain compatible and searchable; older entries without a reliable date are labeled accordingly.
+
+File sharing uses the standard FILEHOST protocol. In Connection settings, select the network-advertised service or configure a custom HTTPS endpoint and its separate credentials. Custom endpoints must support OPTIONS and raw POST with a 201 response and Location header. Uploading does not automatically send a message. Typing, notification, workspace and automation controls are in Behavior; connection/account-specific choices remain in Connection.
 
 ## Architecture
 

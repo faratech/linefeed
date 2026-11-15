@@ -34,6 +34,12 @@ mimalloc = { version = "0.1.52", default-features = false }  # Lower memory allo
 same-file = "1.0.6"  # Detect replaced/rotated log files portably
 ureq = { version = "3.5.0", default-features = false, features = ["native-tls"] }
 semver = "1.0.28"
+rusqlite = { version = "0.42.0", default-features = false, features = ["bundled", "hooks"] }
+rfd = "0.17.2"
+png = "0.18.1"
+mime_guess = "2.0.5"
+arboard = { version = "3.7.0", default-features = false, features = ["image-data"] }
+url = "2.5.8"
 
 # Platform-specific: eframe with x11/wayland only on Linux
 [target.'cfg(target_os = "linux")'.dependencies]

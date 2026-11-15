@@ -1,0 +1,59 @@
+name: Verify client
+
+on:
+  push:
+    branches: [main, 'codex/**']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: verify-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  linux:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Install native dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libssl-dev pkg-config libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-dev libwayland-dev
+      - name: Install Rust
+        run: rustup toolchain install 1.99.1 --profile minimal --component clippy && rustup default 1.99.1
+      - name: Test and lint
+        env:
+          XDG_CONFIG_HOME: ${{ runner.temp }}/linefeed-config
+          XDG_DATA_HOME: ${{ runner.temp }}/linefeed-data
+          XDG_CACHE_HOME: ${{ runner.temp }}/linefeed-cache
+        run: |
+          cargo test --locked --all-targets
+          cargo clippy --locked --all-targets -- -D warnings
+          python3 tools/test_build_tools.py
+          python3 tools/test_release_assets.py
+  macos:
+    runs-on: macos-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Install Rust
+        run: |
+          rustup toolchain install 1.99.1 --profile minimal --component clippy
+          rustup default 1.99.1
+          rustup target add x86_64-apple-darwin aarch64-apple-darwin
+      - name: Check both macOS architectures
+        run: |
+          cargo check --locked --all-targets --target x86_64-apple-darwin
+          cargo check --locked --all-targets --target aarch64-apple-darwin
+      - name: Native tests and lint
+        run: |
+          cargo test --locked --all-targets
+          cargo clippy --locked --all-targets -- -D warnings

@@ -6,6 +6,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 
 use super::{ChatMessage, Session, SessionConfig};
+use crate::irc::client::{AuthenticationStatus, ClientEvent, ConnectionStatus};
 use crate::irc::{IrcClient, IrcCommand, IrcMessage};
 
 #[derive(Clone, Default)]
@@ -94,6 +95,7 @@ struct Attempt {
     generation: u64,
     outgoing: Option<mpsc::UnboundedSender<IrcCommand>>,
     incoming: mpsc::Receiver<IrcMessage>,
+    events: Option<std::sync::mpsc::Receiver<ClientEvent>>,
     worker: WorkerThread,
     attempts: u32,
 }
@@ -109,6 +111,7 @@ enum AfterClose {
 struct RetiringAttempt {
     generation: u64,
     incoming: Option<mpsc::Receiver<IrcMessage>>,
+    events: Option<std::sync::mpsc::Receiver<ClientEvent>>,
     worker: WorkerThread,
     drain: bool,
     retired_at: Instant,
@@ -300,6 +303,7 @@ impl ConnectionLifecycle {
                 self.phase = ConnectionPhase::Closing(RetiringAttempt {
                     generation: a.generation,
                     incoming: quit_queued.then_some(a.incoming),
+                    events: a.events,
                     worker: a.worker,
                     drain,
                     retired_at: Instant::now(),
@@ -367,6 +371,7 @@ impl ConnectionLifecycle {
                     self.phase = ConnectionPhase::Closing(RetiringAttempt {
                         generation: a.generation,
                         incoming: None,
+                        events: a.events,
                         worker: a.worker,
                         drain: false,
                         retired_at: Instant::now(),
@@ -385,6 +390,68 @@ impl ConnectionLifecycle {
 }
 
 impl Session {
+    pub(super) fn drain_connection_events(&mut self) {
+        let events: Vec<_> = match &self.connection.phase {
+            ConnectionPhase::Connecting(attempt) | ConnectionPhase::Registered(attempt) => attempt
+                .events
+                .as_ref()
+                .map(|rx| rx.try_iter().collect())
+                .unwrap_or_default(),
+            ConnectionPhase::Closing(attempt) => attempt
+                .events
+                .as_ref()
+                .map(|rx| rx.try_iter().collect())
+                .unwrap_or_default(),
+            _ => Vec::new(),
+        };
+        for event in events {
+            if self.connection.is_closing() && !matches!(event, ClientEvent::ChatWritten { .. }) {
+                continue;
+            }
+            match event {
+                ClientEvent::Tls(tls) => self.connection_status.tls = tls,
+                ClientEvent::Authentication(authentication) => {
+                    if authentication == AuthenticationStatus::Authenticated
+                        && matches!(
+                            self.connection_status.authentication,
+                            AuthenticationStatus::LoggedIn { .. }
+                        )
+                    {
+                        continue;
+                    }
+                    self.connection_status.authentication = authentication;
+                }
+                ClientEvent::Registered => {
+                    if matches!(
+                        self.connection_status.authentication,
+                        AuthenticationStatus::Disconnected
+                            | AuthenticationStatus::Connecting
+                            | AuthenticationStatus::Authenticating
+                    ) {
+                        self.connection_status.authentication = AuthenticationStatus::Connected;
+                    }
+                }
+                ClientEvent::BouncerReady => self.bouncer_ready = true,
+                ClientEvent::SaslSucceeded(mechanism) => {
+                    self.connection_status.sasl_mechanism = Some(mechanism)
+                }
+                ClientEvent::Endpoint {
+                    host,
+                    port,
+                    use_tls,
+                } => {
+                    self.connection_status.effective_host = Some(host);
+                    self.connection_status.effective_port = Some(port);
+                    self.connection_status.effective_use_tls = Some(use_tls);
+                }
+                ClientEvent::ChatWritten { id } => self.chat_written(&id),
+                ClientEvent::Fatal(error) => {
+                    self.request_manual_disconnect(None);
+                    self.add_server_message(ChatMessage::system(&error));
+                }
+            }
+        }
+    }
     pub(crate) fn is_connected(&self) -> bool {
         self.connection.is_connected()
     }
@@ -425,9 +492,11 @@ impl Session {
     }
 
     pub(crate) fn process_connection_lifecycle(&mut self, ctx: &egui::Context) {
+        self.drain_connection_events();
         if self.connection.worker_finished() {
             // Complete the old stream before moving its ownership or endpoint.
             self.pump(None);
+            self.mark_pending_sends_uncertain();
             if self.connection.is_closing() {
                 if let Some(plan) = self.connection.finish_close() {
                     self.activate_session(plan.config.clone());
@@ -531,7 +600,12 @@ impl Session {
             return;
         };
         let config = plan.config.server.clone();
-        if self.blocked_endpoints.contains(&plan.config.endpoint_key()) {
+        if self
+            .blocked_networks
+            .contains(&plan.config.logical_network_key())
+            || (plan.config.server.bouncer.is_none()
+                && self.blocked_endpoints.contains(&plan.config.endpoint_key()))
+        {
             self.add_server_message(ChatMessage::system(&format!(
                 "Already connected to {} in another window",
                 plan.config.endpoint_label()
@@ -540,8 +614,14 @@ impl Session {
             return;
         }
         let (msg_tx, msg_rx) = mpsc::channel::<IrcMessage>(1000);
+        let (event_tx, event_rx) = std::sync::mpsc::channel();
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel::<IrcCommand>();
         self.begin_connection_attempt();
+        self.bouncer_ready = false;
+        self.connection_status = ConnectionStatus {
+            authentication: AuthenticationStatus::Connecting,
+            ..ConnectionStatus::default()
+        };
         let generation = self.connection.next_generation();
         let worker = std::thread::spawn(move || {
             let rt = match tokio::runtime::Builder::new_current_thread()
@@ -565,6 +645,9 @@ impl Session {
             };
             run_worker_runtime(rt, async {
                 let mut client = IrcClient::new(config);
+                client.set_event_callback(std::sync::Arc::new(move |event| {
+                    let _ = event_tx.send(event);
+                }));
                 let wake_ctx = ctx.clone();
                 client.set_wake_callback(std::sync::Arc::new(move || wake_ctx.request_repaint()));
                 if let Err(error) = client.connect(msg_tx.clone(), cmd_rx).await {
@@ -587,6 +670,7 @@ impl Session {
             generation,
             outgoing: Some(cmd_tx),
             incoming: msg_rx,
+            events: Some(event_rx),
             worker: WorkerThread::Native(worker),
             attempts: plan.attempts,
         });
@@ -611,6 +695,7 @@ impl Session {
             generation: self.connection.next_generation(),
             outgoing: Some(tx),
             incoming: rx,
+            events: None,
             worker: WorkerThread::Simulated,
             attempts: 0,
         };
