@@ -150,9 +150,11 @@ impl WorkspaceStore {
         std::thread::spawn(move || {
             let mut previous: Option<Vec<u8>> = None;
             // A failure is retried at every checkpoint but reported once; a
-            // success re-arms the report.
+            // save that actually wrote re-arms the report (skipping a
+            // snapshot identical to the last write proves nothing).
             let mut reported: Option<String> = None;
             while let Ok(WriteRequest::Save(snapshot, acknowledge)) = receiver.recv() {
+                let mut wrote = false;
                 let result = snapshot
                     .bytes()
                     .and_then(|bytes| {
@@ -164,11 +166,13 @@ impl WorkspaceStore {
                         }
                         crate::persistence::write_private_atomic(&path, &bytes)?;
                         previous = Some(bytes);
+                        wrote = true;
                         Ok(())
                     })
                     .map_err(|error| error.to_string());
                 match &result {
-                    Ok(()) => reported = None,
+                    Ok(()) if wrote => reported = None,
+                    Ok(()) => {}
                     Err(error) if reported.as_ref() != Some(error) => {
                         *errors.lock().unwrap() = Some(format!("Workspace was not saved: {error}"));
                         reported = Some(error.clone());
@@ -308,6 +312,26 @@ mod tests {
         break_location();
         assert!(!store.finish(WorkspaceSnapshot::new(Vec::new(), 5)));
         assert!(store.take_error().is_some());
+        std::fs::remove_file(&directory).unwrap();
+    }
+
+    #[test]
+    fn an_unchanged_snapshot_does_not_rearm_a_failure_report() {
+        let directory = path().with_extension("d");
+        let mut store = WorkspaceStore::open(directory.join("workspace.json"));
+        let saved = || WorkspaceSnapshot::new(Vec::new(), 0);
+        let unsaved = || WorkspaceSnapshot::new(Vec::new(), 1);
+        assert!(store.finish(saved()));
+        std::fs::remove_dir_all(&directory).unwrap();
+        std::fs::write(&directory, b"in the way").unwrap();
+
+        assert!(!store.finish(unsaved()));
+        assert!(store.take_error().is_some());
+        // Alternating back to the state already on disk writes nothing, so it
+        // is not a success that makes the same failure news again.
+        assert!(store.finish(saved()));
+        assert!(!store.finish(unsaved()));
+        assert!(store.take_error().is_none());
         std::fs::remove_file(&directory).unwrap();
     }
 
