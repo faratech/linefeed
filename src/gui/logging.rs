@@ -42,14 +42,17 @@ pub(crate) fn line_digest(bytes: &[u8]) -> String {
 }
 
 pub(crate) fn line_record_id(generation: &str, offset: u64, bytes: &[u8]) -> String {
-    line_digest(
-        format!(
-            "{generation}:{offset}:{}:{}",
-            bytes.len(),
-            line_digest(bytes)
-        )
-        .as_bytes(),
-    )
+    physical_line_id(generation, offset, bytes.len() as u64, &line_digest(bytes))
+}
+
+/// The id `line_record_id` gives a line, from the physical span the archive
+/// stores for it. Scrollback rebuilt from a text log keys its rows this way.
+pub(crate) fn span_record_id(span: &LogSpan) -> String {
+    physical_line_id(&span.generation, span.offset, span.len, &span.digest)
+}
+
+fn physical_line_id(generation: &str, offset: u64, len: u64, digest: &str) -> String {
+    line_digest(format!("{generation}:{offset}:{len}:{digest}").as_bytes())
 }
 
 pub(crate) fn file_generation(file: &File) -> std::io::Result<String> {
@@ -1348,6 +1351,24 @@ mod tests {
         assert!(history[0].no_log);
         assert!(!history[0].content.contains("legacy-secret"));
 
+        drop(manager);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_written_span_names_the_row_reloaded_from_that_line() {
+        let (manager, dir) = test_manager("span-record-id");
+        let identity = "tls://irc.example:6697";
+        let first = msg("[09:30]", "alice", "first", false, false);
+        let second = msg("[09:31]", "alice", "second", false, false);
+        manager.log_message(identity, "#room", &first).unwrap();
+        let span = manager.log_message(identity, "#room", &second).unwrap();
+        manager.flush_all();
+        let history = manager.load_history_with_legacy(identity, "", "#room", 20, false);
+        let row = history.iter().find(|m| m.content == "second").unwrap();
+        assert_eq!(row.message_key, span_record_id(&span));
+        let other = history.iter().find(|m| m.content == "first").unwrap();
+        assert_ne!(other.message_key, span_record_id(&span));
         drop(manager);
         fs::remove_dir_all(dir).unwrap();
     }

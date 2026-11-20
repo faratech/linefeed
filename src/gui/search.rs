@@ -46,6 +46,48 @@ impl Session {
             target: self.network_support.canonicalize(target),
         })
     }
+    /// Scrollback rebuilt from the irssi text logs. Lines the archive knows to
+    /// be redacted stay on disk (the logs are never rewritten) but are not shown.
+    pub(crate) fn load_text_history(
+        &self,
+        network: &str,
+        legacy_network: &str,
+        channel_canonical: &str,
+        channel_raw: &str,
+        max_lines: usize,
+        allow_legacy_migration: bool,
+    ) -> Vec<ChatMessage> {
+        let mut history = self.log_manager.load_history_casemapped(
+            network,
+            legacy_network,
+            channel_canonical,
+            channel_raw,
+            max_lines,
+            allow_legacy_migration,
+        );
+        if let Some(client) = &self.archive_client {
+            // Rows are keyed by their physical line; unmatched rows are kept.
+            history.retain(|message| !client.is_line_redacted(&message.message_key));
+        }
+        history
+    }
+    /// Drop rows already shown from a text log once the archive reports their
+    /// line redacted. Such rows carry no server msgid, so REDACT cannot find them.
+    pub(crate) fn drop_redacted_text_history(&mut self) {
+        let Some(client) = &self.archive_client else {
+            return;
+        };
+        let version = client.redacted_lines_version();
+        if version == self.redacted_history_version {
+            return;
+        }
+        self.redacted_history_version = version;
+        for channel in self.conversations.values_mut() {
+            channel
+                .messages
+                .retain(|message| !client.is_line_redacted(&message.message_key));
+        }
+    }
     pub(crate) fn record_archive_message(
         &self,
         target: &str,
@@ -283,6 +325,9 @@ impl App {
                 }
                 _ => {}
             }
+        }
+        for session in &mut self.sessions {
+            session.drop_redacted_text_history();
         }
         // Replies already queued before REDACT and rows retained by an open window
         // must observe the same tombstones as new database queries.
@@ -852,6 +897,98 @@ mod tests {
         app.submit_search();
         finish_query(&mut app);
         assert_eq!(app.search.results.len(), 1);
+        drop(app);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    fn redaction_session(app: &mut App, root: &std::path::Path) -> (String, ConversationKey) {
+        let client = app.archive.client.clone();
+        app.start(None);
+        let session = &mut app.sessions[0];
+        session.server_host = "workspace.example".into();
+        session.nickname = "me".into();
+        assert!(session.start_session_from_form());
+        session.archive_client = Some(client);
+        session.log_manager = super::super::logging::LogManager::with_test_dir(root.join("logs"));
+        let network = session.logical_network_key().unwrap();
+        let key = session.archive_conversation_key("alice").unwrap();
+        (network.storage_key(), key)
+    }
+
+    fn log_and_archive(app: &App, network: &str, key: &ConversationKey, body: &str, msgid: &str) {
+        let session = &app.sessions[0];
+        let mut message = ChatMessage::new_fmt("alice", body, "short");
+        message.msgid = Some(msgid.into());
+        let span = session.log_manager.log_message(network, "alice", &message);
+        session.log_manager.flush_all();
+        let mut row = ArchiveRecord::from_message(key.clone(), &message);
+        row.text_span = span;
+        assert!(app.archive.client.upsert(row));
+    }
+
+    fn reload(app: &App, network: &str) -> Vec<String> {
+        app.sessions[0]
+            .load_text_history(network, "", "alice", "alice", 100, false)
+            .into_iter()
+            .map(|message| message.content)
+            .collect()
+    }
+
+    #[test]
+    fn redacted_messages_do_not_return_from_text_log_history_even_after_restart() {
+        let (mut app, root) = app_with_archive();
+        let (network, key) = redaction_session(&mut app, &root);
+        log_and_archive(&app, &network, &key, "secret body", "m1");
+        log_and_archive(&app, &network, &key, "kept body", "m2");
+        assert!(app.archive.client.flush_barrier(Duration::from_secs(5)));
+        assert_eq!(reload(&app, &network), ["secret body", "kept body"]);
+
+        app.archive.client.redact(key.clone(), "m1".into());
+        assert!(app.archive.client.flush_barrier(Duration::from_secs(5)));
+        assert_eq!(reload(&app, &network), ["kept body"]);
+        // The text log itself is deliberately not rewritten.
+        let log = app.sessions[0].log_manager.test_log_path(&network, "alice");
+        assert!(
+            std::fs::read_to_string(log)
+                .unwrap()
+                .contains("secret body")
+        );
+
+        // A new process learns the redaction from the journal alone.
+        app.archive = super::super::archive::ArchiveService::open(&root);
+        assert!(app.archive.client.flush_barrier(Duration::from_secs(5)));
+        app.sessions[0].archive_client = Some(app.archive.client.clone());
+        assert_eq!(reload(&app, &network), ["kept body"]);
+        drop(app);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn live_redaction_removes_rows_already_loaded_from_the_text_log() {
+        let (mut app, root) = app_with_archive();
+        let (network, key) = redaction_session(&mut app, &root);
+        log_and_archive(&app, &network, &key, "secret body", "m1");
+        log_and_archive(&app, &network, &key, "kept body", "m2");
+        assert!(app.archive.client.flush_barrier(Duration::from_secs(5)));
+        let loaded = app.sessions[0].load_text_history(&network, "", "alice", "alice", 100, false);
+        let id = app.sessions[0].ensure_target("alice");
+        app.sessions[0]
+            .conversation_channel_mut(id)
+            .unwrap()
+            .messages = loaded.into();
+        // The reloaded rows carry no server msgid, so REDACT cannot find them
+        // in the tab; the archive's knowledge must reach the open scrollback.
+        app.archive.client.redact(key, "m1".into());
+        assert!(app.archive.client.flush_barrier(Duration::from_secs(5)));
+        app.tick_history_services();
+        let shown: Vec<_> = app.sessions[0]
+            .conversation_channel(id)
+            .unwrap()
+            .messages
+            .iter()
+            .map(|message| message.content.as_str())
+            .collect();
+        assert_eq!(shown, ["kept body"]);
         drop(app);
         std::fs::remove_dir_all(root).unwrap();
     }

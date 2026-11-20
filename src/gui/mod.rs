@@ -540,6 +540,7 @@ pub struct Session {
     pub(crate) upload_settings: uploads::UploadSettings,
     pub(crate) upload_discovery: uploads::UploadDiscovery,
     pub(crate) archive_client: Option<archive::ArchiveClient>,
+    redacted_history_version: u64,
     automation: std::sync::Arc<automation::AutomationConfig>,
     macro_jobs: VecDeque<automation::MacroJob>,
     next_macro_at: std::time::Instant,
@@ -818,6 +819,7 @@ impl Session {
             automation_send_failed: false,
             account_history: auth_history::AccountHistory::default(),
             archive_client: None,
+            redacted_history_version: 0,
             upload_settings: settings.upload_settings,
             upload_discovery: Default::default(),
             pending_rejoins: RecoveryPolicy::ConfiguredAutoJoin,
@@ -1486,16 +1488,14 @@ impl Session {
             if self.logging_load_history
                 && let Some((network, legacy, allow_legacy)) = self.active_log_context()
             {
-                channel
-                    .messages
-                    .extend(self.log_manager.load_history_casemapped(
-                        &network,
-                        &legacy,
-                        &self.network_support.canonicalize(&name),
-                        &name,
-                        self.logging_history_lines,
-                        allow_legacy,
-                    ));
+                channel.messages.extend(self.load_text_history(
+                    &network,
+                    &legacy,
+                    &self.network_support.canonicalize(&name),
+                    &name,
+                    self.logging_history_lines,
+                    allow_legacy,
+                ));
                 channel.history_loaded = !channel.messages.is_empty();
             }
             self.conversations.insert(name, channel);
@@ -2496,7 +2496,7 @@ impl Session {
             return None;
         }
         let (network, legacy_host, allow_legacy) = self.active_log_context()?;
-        let mut local = self.log_manager.load_history_casemapped(
+        let mut local = self.load_text_history(
             &network,
             &legacy_host,
             &self.network_support.canonicalize(target),
@@ -5416,7 +5416,7 @@ impl Session {
                                 self.active_log_context()
                         {
                             let log_key = self.network_support.canonicalize(channel);
-                            let history = self.log_manager.load_history_casemapped(
+                            let history = self.load_text_history(
                                 &network,
                                 &legacy_host,
                                 &log_key,
@@ -7496,7 +7496,7 @@ impl Session {
                 && let Some((network, legacy_host, allow_legacy)) = self.active_log_context()
             {
                 let log_key = self.network_support.canonicalize(&key);
-                let history = self.log_manager.load_history_casemapped(
+                let history = self.load_text_history(
                     &network,
                     &legacy_host,
                     &log_key,

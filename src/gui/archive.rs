@@ -194,6 +194,10 @@ pub(crate) struct ArchiveClient {
     redactions: Arc<Mutex<HashSet<(ConversationKey, String)>>>,
     pending_redactions: Arc<Mutex<HashSet<(ConversationKey, String)>>>,
     redacted_ids: Arc<Mutex<HashSet<(ConversationKey, String)>>>,
+    /// Text-log lines (keyed like scrollback rebuilt from them) whose archive
+    /// record is redacted, so reloaded history can omit them.
+    redacted_lines: Arc<Mutex<HashSet<String>>>,
+    redacted_lines_version: Arc<AtomicU64>,
     available: Arc<AtomicBool>,
     query_failure: Arc<Mutex<Option<ArchiveReply>>>,
     context_failure: Arc<Mutex<Option<ArchiveReply>>>,
@@ -257,6 +261,32 @@ impl ArchiveClient {
         }
         if let Some(msgid) = &reference.server_msgid {
             self.redact(reference.conversation.clone(), msgid.clone());
+        }
+    }
+    pub(crate) fn is_line_redacted(&self, key: &str) -> bool {
+        self.redacted_lines.lock().unwrap().contains(key)
+    }
+    /// Changes whenever a line is added to the redacted set.
+    pub(crate) fn redacted_lines_version(&self) -> u64 {
+        self.redacted_lines_version.load(Ordering::Acquire)
+    }
+    fn note_redacted_lines(&self, spans: Vec<(String, u64, u64, String)>) {
+        if spans.is_empty() {
+            return;
+        }
+        let mut lines = self.redacted_lines.lock().unwrap();
+        let mut added = false;
+        for (generation, offset, len, digest) in spans {
+            added |= lines.insert(super::logging::span_record_id(&LogSpan {
+                path: String::new(),
+                generation,
+                offset,
+                len,
+                digest,
+            }));
+        }
+        if added {
+            self.redacted_lines_version.fetch_add(1, Ordering::Release);
         }
     }
     pub(crate) fn apply_redactions(&self, record: &mut ArchiveRecord) {
@@ -829,12 +859,29 @@ fn load_record(db: &Connection, id: &str) -> Result<Option<ArchiveRecord>, Strin
         .transpose()
 }
 
+/// Physical text-log position (generation, offset, len, digest) of a line.
+type SpanKey = (String, u64, u64, String);
+
 fn project(db: &Connection, event: &JournalEvent) -> Result<(), String> {
+    project_collecting(db, event).map(|_| ())
+}
+/// Project an event and publish the text-log lines of any record it leaves
+/// redacted, so scrollback rebuilt from those logs can omit them.
+fn project_noting(
+    db: &Connection,
+    event: &JournalEvent,
+    client: &ArchiveClient,
+) -> Result<(), String> {
+    client.note_redacted_lines(project_collecting(db, event)?);
+    Ok(())
+}
+fn project_collecting(db: &Connection, event: &JournalEvent) -> Result<Vec<SpanKey>, String> {
     db.execute_batch("SAVEPOINT archive_project")
         .map_err(|e| e.to_string())?;
     match project_inner(db, event) {
-        Ok(()) => db
+        Ok(spans) => db
             .execute_batch("RELEASE archive_project")
+            .map(|_| spans)
             .map_err(|e| e.to_string()),
         Err(error) => {
             let _ = db.execute_batch("ROLLBACK TO archive_project; RELEASE archive_project");
@@ -842,7 +889,66 @@ fn project(db: &Connection, event: &JournalEvent) -> Result<(), String> {
         }
     }
 }
-fn project_inner(db: &Connection, event: &JournalEvent) -> Result<(), String> {
+/// Every physical text-log copy recorded for one archive record.
+fn physical_spans(
+    db: &Connection,
+    id: &str,
+    own: Option<&LogSpan>,
+) -> Result<Vec<SpanKey>, String> {
+    let mut spans: Vec<SpanKey> = own
+        .map(|span| {
+            (
+                span.generation.clone(),
+                span.offset,
+                span.len,
+                span.digest.clone(),
+            )
+        })
+        .into_iter()
+        .collect();
+    let mut stmt = db
+        .prepare("SELECT generation,offset,len,digest FROM text_copies WHERE id=?1")
+        .map_err(|e| e.to_string())?;
+    let copies = stmt
+        .query_map([id], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, i64>(1)? as u64,
+                r.get::<_, i64>(2)? as u64,
+                r.get::<_, String>(3)?,
+            ))
+        })
+        .map_err(|e| e.to_string())?;
+    for copy in copies {
+        spans.push(copy.map_err(|e| e.to_string())?);
+    }
+    Ok(spans)
+}
+/// Text-log lines of every redacted record, for a freshly replayed projection.
+fn note_all_redacted_lines(db: &Connection, client: &ArchiveClient) -> Result<(), String> {
+    let mut stmt = db
+        .prepare(
+            "SELECT c.generation,c.offset,c.len,c.digest FROM text_copies c
+             JOIN records r ON r.id=c.id WHERE r.deleted=1",
+        )
+        .map_err(|e| e.to_string())?;
+    let spans = stmt
+        .query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, i64>(1)? as u64,
+                r.get::<_, i64>(2)? as u64,
+                r.get::<_, String>(3)?,
+            ))
+        })
+        .map_err(|e| e.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())?;
+    client.note_redacted_lines(spans);
+    Ok(())
+}
+fn project_inner(db: &Connection, event: &JournalEvent) -> Result<Vec<SpanKey>, String> {
+    let mut spans = Vec::new();
     match event {
         JournalEvent::Upsert { record } => {
             let mut record = record.as_ref().clone();
@@ -906,7 +1012,7 @@ fn project_inner(db: &Connection, event: &JournalEvent) -> Result<(), String> {
                     let copy: ArchiveRecord =
                         serde_json::from_str(&data).map_err(|e| e.to_string())?;
                     if record.legacy && !copy.legacy {
-                        return Ok(());
+                        return Ok(Vec::new());
                     }
                     if !record.legacy && copy.legacy {
                         delete_record(db, &id)?;
@@ -978,6 +1084,9 @@ fn project_inner(db: &Connection, event: &JournalEvent) -> Result<(), String> {
                 )
                 .map_err(|e| e.to_string())?;
             }
+            if record.redacted {
+                spans = physical_spans(db, &record.id, record.text_span.as_ref())?;
+            }
         }
         JournalEvent::Redact {
             conversation,
@@ -1012,6 +1121,7 @@ fn project_inner(db: &Connection, event: &JournalEvent) -> Result<(), String> {
                 .map_err(|e| e.to_string())?;
                 db.execute("DELETE FROM record_search WHERE rowid=?1", [rowid])
                     .map_err(|e| e.to_string())?;
+                spans = physical_spans(db, &record.id, record.text_span.as_ref())?;
             }
         }
         JournalEvent::Reaction {
@@ -1029,7 +1139,7 @@ fn project_inner(db: &Connection, event: &JournalEvent) -> Result<(), String> {
             .map_err(|e| e.to_string())?;
         }
     }
-    Ok(())
+    Ok(spans)
 }
 
 fn hydrate_reactions(db: &Connection, record: &mut ArchiveRecord) -> Result<(), String> {
@@ -1275,7 +1385,7 @@ fn process_task(
                     Err(error) => return Err(error.message()),
                 }
             }
-            project(db, &event)?;
+            project_noting(db, &event, client)?;
             // Exact count is refreshed at barriers, avoiding a table scan per incoming row.
         }
         Task::Flush(response) => {
@@ -1348,7 +1458,7 @@ fn drain_redactions(
             if let Some(file) = journal.as_mut() {
                 file.append(&event).map_err(JournalWriteError::message)?;
             }
-            project(db, &event)
+            project_noting(db, &event, client)
         })();
         if let Err(error) = result {
             // Keep failed controls available without holding the GUI-facing
@@ -1522,6 +1632,7 @@ fn run_archive(
             }
         }
         save_journal_manifest(&db, &sources)?;
+        note_all_redacted_lines(&db, client)?;
         let stamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
