@@ -927,7 +927,11 @@ impl Session {
                 continue;
             }
             if let Some(target) = self.target_name(id).map(str::to_owned) {
-                if self.send_command(IrcCommand::Raw(format!("@+typing={state} TAGMSG {target}"))) {
+                let Some(command) = self.typing_command(state, &target) else {
+                    self.message_ui.outgoing.remove(&id);
+                    continue;
+                };
+                if self.send_command(command) {
                     if state == "done" {
                         self.message_ui.outgoing.remove(&id);
                     } else if let Some(outgoing) = self.message_ui.outgoing.get_mut(&id) {
@@ -950,6 +954,15 @@ impl Session {
                 .typing
                 .remove(&(id, self.network_support.canonicalize(sender)));
         }
+    }
+    /// The ambient typing TAGMSG, or `None` when the server's CLIENTTAGDENY
+    /// blocks `+typing`: automatic state is dropped silently instead of
+    /// posting a "not sent" notice on every keystroke.
+    fn typing_command(&self, state: &str, target: &str) -> Option<IrcCommand> {
+        let command = IrcCommand::Raw(format!("@+typing={state} TAGMSG {target}"));
+        self.client_tag_is_denied(&command)
+            .is_none()
+            .then_some(command)
     }
     pub(crate) fn share_typing(&mut self, state: &str, done: bool) {
         if !self.attention.share_typing
@@ -978,7 +991,8 @@ impl Session {
         }
         let state = if done { "done" } else { state };
         if let Some(target) = self.target_name(id).map(str::to_owned)
-            && self.send_command(IrcCommand::Raw(format!("@+typing={state} TAGMSG {target}")))
+            && let Some(command) = self.typing_command(state, &target)
+            && self.send_command(command)
         {
             if done {
                 self.message_ui.outgoing.remove(&id);
@@ -1819,6 +1833,39 @@ mod tests {
             matches!(rx.try_recv(),Ok(IrcCommand::Raw(line))if line=="@+typing=done TAGMSG #room")
         );
         assert!(!session.message_ui.outgoing.contains_key(&id));
+    }
+    #[test]
+    fn denied_typing_tag_is_never_sent_and_never_noisy() {
+        let (mut session, mut rx, id) = session();
+        session.attention.share_typing = true;
+        session.network_support.client_tag_deny = Some("*".into());
+        let before = session.conversations["#room"].messages.len();
+        for ch in "hello".chars() {
+            session.input_text.push(ch);
+            session.share_typing("active", false);
+        }
+        assert!(rx.try_recv().is_err());
+        assert_eq!(session.conversations["#room"].messages.len(), before);
+        assert!(!session.automation_send_failed);
+        assert!(session.message_ui.outgoing.is_empty());
+        // A stale entry from before a deny took effect is dropped silently.
+        session.network_support.client_tag_deny = None;
+        session.share_typing("active", false);
+        assert!(rx.try_recv().is_ok());
+        session.network_support.client_tag_deny = Some("typing".into());
+        let state = session.message_ui.outgoing.get_mut(&id).unwrap();
+        state.last_sent = Instant::now() - Duration::from_secs(4);
+        state.last_edit = Instant::now() - Duration::from_secs(4);
+        session.expire_typing();
+        assert!(rx.try_recv().is_err());
+        assert!(session.message_ui.outgoing.is_empty());
+        assert_eq!(session.conversations["#room"].messages.len(), before);
+        assert!(!session.automation_send_failed);
+        // Exempting +typing re-enables it.
+        session.network_support.client_tag_deny = Some("*,-typing".into());
+        session.share_typing("active", false);
+        assert!(rx.try_recv().is_ok());
+        assert!(session.message_ui.outgoing.contains_key(&id));
     }
     #[test]
     fn accepted_send_becomes_uncertain_after_later_transport_failure_without_retry() {
