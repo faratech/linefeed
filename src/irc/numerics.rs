@@ -126,6 +126,7 @@ pub const ERR_NONICKNAMEGIVEN: u16 = 431;
 pub const ERR_ERRONEUSNICKNAME: u16 = 432;
 pub const ERR_NICKNAMEINUSE: u16 = 433;
 pub const ERR_NICKCOLLISION: u16 = 436;
+pub const ERR_UNAVAILRESOURCE: u16 = 437;
 pub const ERR_NOTONCHANNEL: u16 = 442;
 pub const ERR_USERONCHANNEL: u16 = 443;
 pub const ERR_NOTREGISTERED: u16 = 451;
@@ -134,6 +135,7 @@ pub const ERR_ALREADYREGISTERED: u16 = 462;
 pub const ERR_PASSWDMISMATCH: u16 = 464;
 pub const ERR_YOUREBANNEDCREEP: u16 = 465;
 pub const ERR_KEYSET: u16 = 467;
+pub const ERR_LINKCHANNEL: u16 = 470;
 pub const ERR_CHANNELISFULL: u16 = 471;
 pub const ERR_UNKNOWNMODE: u16 = 472;
 pub const ERR_INVITEONLYCHAN: u16 = 473;
@@ -141,7 +143,10 @@ pub const ERR_BANNEDFROMCHAN: u16 = 474;
 pub const ERR_BADCHANNELKEY: u16 = 475;
 pub const ERR_BADCHANMASK: u16 = 476;
 pub const ERR_NEEDREGGEDNICK: u16 = 477;
+pub const ERR_BADCHANNAME: u16 = 479;
+pub const ERR_SECUREONLYCHAN: u16 = 489;
 pub const ERR_CHANOPRIVSNEEDED: u16 = 482;
+pub const ERR_OPERONLY: u16 = 520;
 
 // SASL authentication (IRCv3)
 pub const RPL_LOGGEDIN: u16 = 900;

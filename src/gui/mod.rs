@@ -6295,7 +6295,6 @@ impl Session {
 
     fn handle_numeric(&mut self, num: u16, params: &[String]) {
         // 470 ERR_LINKCHANNEL <client> <#old> <#new>: the JOIN was forwarded.
-        const ERR_LINKCHANNEL: u16 = 470;
         if num == ERR_LINKCHANNEL
             && let (Some(from), Some(to)) = (params.get(1), params.get(2))
         {
@@ -6305,7 +6304,7 @@ impl Session {
                     .iter()
                     .any(|(name, _)| self.identifiers_equal(name, from))
             });
-            self.forget_rejoin_membership(from);
+            self.abandon_refused_join(from);
             if recovering {
                 self.pending_rejoins
                     .as_mut()
@@ -6317,9 +6316,12 @@ impl Session {
         // map, the key would attach to the tab of whatever later JOIN of that
         // channel (keyless, from an invite or a bouncer) the server confirms.
         // The same goes for the user's request to focus the channel (#290).
+        // 437 also means "nick unavailable" during registration, where
+        // params[1] is a nick, so the later numerics need a channel name.
         if matches!(
             num,
             ERR_NOSUCHCHANNEL
+                | ERR_UNAVAILRESOURCE
                 | ERR_TOOMANYCHANNELS
                 | ERR_CHANNELISFULL
                 | ERR_INVITEONLYCHAN
@@ -6327,15 +6329,14 @@ impl Session {
                 | ERR_BADCHANNELKEY
                 | ERR_BADCHANMASK
                 | ERR_NEEDREGGEDNICK
+                | ERR_BADCHANNAME
+                | ERR_SECUREONLYCHAN
+                | ERR_OPERONLY
         ) && let Some(channel) = params.get(1)
+            && (!matches!(num, ERR_UNAVAILRESOURCE | ERR_OPERONLY | ERR_SECUREONLYCHAN)
+                || self.is_channel_name(channel))
         {
-            if let Some(id) = self.id_for_target(channel) {
-                self.pending_cycles.remove(&id);
-            }
-            self.pending_channel_keys
-                .remove(&self.network_support.canonicalize(channel));
-            self.take_join_focus_request(channel);
-            self.forget_rejoin_membership(channel);
+            self.abandon_refused_join(channel);
         }
         match num {
             RPL_SAVENICK => {
@@ -8431,6 +8432,19 @@ impl Session {
     }
 
     /// Consume the user's request to focus `channel`, if there is one.
+    /// Forget every piece of state the attempt to join `channel` left behind
+    /// once the server refuses or forwards it, so nothing attaches to a later
+    /// JOIN of that channel or is replayed on reconnect (#290).
+    fn abandon_refused_join(&mut self, channel: &str) {
+        if let Some(id) = self.id_for_target(channel) {
+            self.pending_cycles.remove(&id);
+        }
+        self.pending_channel_keys
+            .remove(&self.network_support.canonicalize(channel));
+        self.take_join_focus_request(channel);
+        self.forget_rejoin_membership(channel);
+    }
+
     fn take_join_focus_request(&mut self, channel: &str) -> bool {
         let Some(index) = self
             .join_focus_requests
@@ -10003,6 +10017,79 @@ pub(crate) mod tests {
             app.handle_incoming_message(IrcMessage::parse(":me!u@h JOIN #sec").unwrap());
             assert_eq!(app.conversations["#sec"].key, None, "{refusal}");
         }
+    }
+
+    #[test]
+    fn every_join_refusal_leaves_no_ghost_join_state() {
+        for refusal in [
+            ERR_UNAVAILRESOURCE,
+            ERR_BADCHANNAME,
+            ERR_SECUREONLYCHAN,
+            ERR_OPERONLY,
+            ERR_NOSUCHCHANNEL,
+        ] {
+            let (mut app, mut rx) = test_app_connected();
+            app.set_session_nick("me".to_string(), true);
+            app.process_command("/join #sec hunter2");
+            assert_eq!(drain_commands(&mut rx).len(), 1);
+            assert!(!app.join_focus_requests.is_empty());
+
+            app.handle_numeric(refusal, &["me".into(), "#sec".into(), "Cannot join".into()]);
+
+            assert!(app.pending_channel_keys.is_empty(), "{refusal}: key kept");
+            assert!(app.join_focus_requests.is_empty(), "{refusal}: focus kept");
+            assert!(
+                app.pending_rejoins.as_ref().is_none_or(|rows| rows.is_empty()),
+                "{refusal}: rejoin membership kept"
+            );
+            assert!(app.update_session().tabs.is_empty(), "{refusal}: snapshot");
+            app.handle_incoming_message(IrcMessage::parse(":me!u@h JOIN #sec").unwrap());
+            assert_eq!(app.conversations["#sec"].key, None, "{refusal}");
+        }
+    }
+
+    #[test]
+    fn a_nick_unavailable_437_does_not_touch_pending_joins() {
+        let (mut app, mut rx) = test_app_connected();
+        app.set_session_nick("me".to_string(), true);
+        app.process_command("/join #sec hunter2");
+        assert_eq!(drain_commands(&mut rx).len(), 1);
+
+        app.handle_numeric(
+            ERR_UNAVAILRESOURCE,
+            &["*".into(), "me".into(), "Nick/channel is temporarily unavailable".into()],
+        );
+
+        assert!(!app.pending_channel_keys.is_empty());
+        assert!(!app.join_focus_requests.is_empty());
+        assert_eq!(
+            app.pending_rejoins.as_ref().map(Vec::len),
+            Some(1),
+            "the pending JOIN is still outstanding"
+        );
+    }
+
+    #[test]
+    fn a_forwarded_join_does_not_leave_the_original_channels_key() {
+        let (mut app, mut rx) = test_app_connected();
+        app.set_session_nick("me".to_string(), true);
+        app.process_command("/join #old hunter2");
+        assert_eq!(drain_commands(&mut rx).len(), 1);
+
+        app.handle_numeric(
+            ERR_LINKCHANNEL,
+            &["me".into(), "#old".into(), "#new".into(), "Forwarding".into()],
+        );
+
+        assert!(app.pending_channel_keys.is_empty(), "#old key kept");
+        assert_eq!(
+            app.pending_rejoins.as_ref().unwrap().as_slice(),
+            [("#new".to_string(), None)]
+        );
+        assert_eq!(app.join_focus_requests.len(), 1);
+        assert!(app.identifiers_equal(&app.join_focus_requests[0], "#new"));
+        app.handle_incoming_message(IrcMessage::parse(":me!u@h JOIN #old").unwrap());
+        assert_eq!(app.conversations["#old"].key, None);
     }
 
     #[test]
