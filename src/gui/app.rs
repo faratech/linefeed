@@ -2065,7 +2065,27 @@ impl App {
         self.show_settings = true;
     }
 
+    /// Retargeting an open editor to another session ends the first edit as
+    /// Cancel would: its scratch form goes back to the opening snapshot,
+    /// which is otherwise replaced below and lost (#208). The Connect dialog
+    /// flag is kept, so a still-unconnected window reopens its editor.
+    fn cancel_edit_before_retarget(&mut self, next: ConnId) {
+        if !self.show_settings || self.settings_session.is_none_or(|owner| owner == next) {
+            return;
+        }
+        if let Some((owner, form, profile)) = self.settings_form_before.take()
+            && let Some(index) = self.session_index(owner)
+        {
+            let session = &mut self.sessions[index];
+            let show_connect_dialog = session.show_connect_dialog;
+            session.cancel_connect_dialog(&form);
+            session.show_connect_dialog = show_connect_dialog;
+            session.form_profile = profile;
+        }
+    }
+
     fn begin_settings_edit(&mut self, conn: ConnId) {
+        self.cancel_edit_before_retarget(conn);
         self.global_dialog_owner = self
             .windows
             .active
@@ -6795,6 +6815,45 @@ mod tests {
         assert_eq!(app.sessions.len(), 3);
         assert!(app.session_index(saved).is_some());
         assert!(!app.show_settings);
+    }
+
+    #[test]
+    fn retargeting_the_editor_cancels_the_first_sessions_edit() {
+        let (mut app, _rx_a, _rx_b) = two_networks();
+        let (first, second) = (app.sessions[0].id, app.sessions[1].id);
+        let host = app.sessions[0].server_host.clone();
+        let password = app.sessions[0].password.clone();
+        app.open_settings(first);
+        app.sessions[0].server_host = "scratch.example".into();
+        app.sessions[0].password.clear();
+
+        // Connect on the other network while the editor is still open.
+        app.open_connection_settings(second);
+        assert_eq!(app.settings_session, Some(second));
+        app.cancel_settings_window();
+
+        assert_eq!(app.sessions[0].server_host, host);
+        assert_eq!(app.sessions[0].password, password);
+        // Reopening the first editor starts from the restored form.
+        app.open_settings(first);
+        app.cancel_settings_window();
+        assert_eq!(app.sessions[0].server_host, host);
+    }
+
+    #[test]
+    fn stacking_new_connections_discards_the_first_ones_typed_host() {
+        let mut app = test_app();
+        app.new_connection();
+        let first = app.sessions.last().unwrap().id;
+        let pristine_host = app.sessions.last().unwrap().server_host.clone();
+        app.sessions.last_mut().unwrap().server_host = "typed.example".into();
+
+        app.new_connection();
+        app.cancel_settings_window();
+
+        let index = app.session_index(first).expect("first connection stays");
+        assert_eq!(app.sessions[index].server_host, pristine_host);
+        assert!(app.settings_form_before.is_none());
     }
 
     #[test]
