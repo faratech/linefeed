@@ -247,7 +247,7 @@ fn service_token_current(token: &str) -> bool {
 }
 /// Whether a network-advertised FILEHOST may receive the IRC account's
 /// credentials: the IRC server's own host, a subdomain of it, or a subdomain
-/// of its parent domain (irc.example.org -> files.example.org). A public
+/// of its parent domain (irc.example.org -> example.org, files.example.org). A public
 /// suffix is never a shared parent, and IP endpoints only match themselves.
 fn filehost_host_trusted(url: &url::Url, server_host: &str) -> bool {
     use url::Host;
@@ -283,7 +283,7 @@ fn filehost_host_trusted(url: &url::Url, server_host: &str) -> bool {
             labels[0],
             "co" | "com" | "org" | "net" | "gov" | "edu" | "ac" | "or" | "ne" | "go" | "mil"
         );
-    labels.len() >= 2 && !public_suffix && host.ends_with(&format!(".{parent}"))
+    labels.len() >= 2 && !public_suffix && (host == parent || host.ends_with(&format!(".{parent}")))
 }
 fn io_http_error(error: ureq::Error, withheld: bool) -> String {
     match error {
@@ -1800,12 +1800,14 @@ mod tests {
             "irc.example.org"
         ));
         assert!(!trusted("https://files.attacker.net/up", "irc.example.org"));
-        assert!(!trusted("https://example.org/up", "irc.example.org"));
+        // The network's own apex domain is part of the network.
+        assert!(trusted("https://example.org/up", "irc.example.org"));
         // A bare two-label server has no parent domain to share.
         assert!(trusted("https://files.irc.example/up", "irc.example"));
         assert!(!trusted("https://files.example/up", "irc.example"));
         // A public suffix is not a shared domain.
         assert!(!trusted("https://files.other.co.uk/up", "irc.co.uk"));
+        assert!(!trusted("https://co.uk/up", "irc.co.uk"));
         assert!(trusted(
             "https://files.example.co.uk/up",
             "irc.example.co.uk"
