@@ -8470,7 +8470,10 @@ mod tests {
         app.open_settings(conn);
         app.settings_tab = 1;
         let ctx = egui::Context::default();
-        settled(&mut app, &ctx, 1360.0);
+        // The window fades in; draw until it is fully opaque.
+        for _ in 0..40 {
+            paint(&mut app, &ctx, 1360.0, Vec::new());
+        }
         (app, ctx)
     }
 
@@ -8674,6 +8677,36 @@ mod tests {
                 "{choice:?}, main window: {unreadable:?}"
             );
         }
+    }
+
+    #[test]
+    fn text_in_a_single_line_field_is_centred_in_the_taller_field() {
+        use super::super::theme::{self, DisplayPrefs};
+        let (mut app, ctx) = display_settings();
+        theme::apply(&ctx, &DisplayPrefs::default());
+        app.settings_tab = 0;
+        let painted = settled(&mut app, &ctx, 1360.0);
+        let host = app.sessions[0].server_host.clone();
+        let text = painted
+            .texts
+            .iter()
+            .find(|(text, rect, _)| *text == host && rect.top() > 60.0 && rect.left() > 300.0)
+            .expect("the server field shows the host")
+            .1;
+        let field = painted
+            .fills
+            .iter()
+            .rev()
+            .find(|(rect, fill)| {
+                *fill == theme::palette(&ctx).bg && rect.contains_rect(text) && rect.width() < 400.0
+            })
+            .expect("the field behind the host")
+            .0;
+        assert_eq!(field.height(), 44.0);
+        assert!(
+            (text.center().y - field.center().y).abs() < 2.0,
+            "{text:?} in {field:?}"
+        );
     }
 
     /// The colour of the topmost opaque fill painted behind `rect`.

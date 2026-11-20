@@ -21,9 +21,12 @@ channel and private-message query, in the style of mIRC.
 
 ## Window layout
 
-The switchbar under the toolbar lists every window, grouped by network:
-unread channels in green, unread queries in orange, status windows with
-new server messages in yellow. Click a window to make it active.
+The sidebar at the left lists every window, grouped by network. The active
+window is filled; a window with unread messages is shown in bold with its
+count, and with `@` and the count in orange when you were mentioned. Click
+a window to make it active. In a window narrower than 720 px the sidebar is
+replaced by a button at the start of the top bar that names the active
+window and opens the same list.
 
 - **Maximized** (the default): only the active window is shown and it
   fills the main window, as in earlier versions.
@@ -53,11 +56,11 @@ In a chat area taller than it is wide, the layouts are turned on their
 side. Clicking the maximize button, or double-clicking a caption,
 maximizes that window.
 `Ctrl+Tab` / `Ctrl+Shift+Tab` and `Alt+1`..`Alt+9` move between windows in
-switchbar order across all networks.
+sidebar order across all networks.
 
 ## Detached windows
 
-Right-click a window on the switchbar (or use **Detach** on a maximized
+Right-click a window in the sidebar (or use **Detach** on a maximized
 window, or `/window detach`) to move it into its own OS window, for example
 onto another monitor. The detached window has its own topic, user list and
 input line; **Reattach** (or `/window attach`) puts it back.
@@ -75,8 +78,8 @@ Connect and the question before disconnecting a server. So they are seen
 even while the main window is minimized.
 
 In floating mode, child windows keep their place relative to the chat area:
-when the main window is resized, or the switchbar wraps onto another line,
-they move and resize with it instead of ending up under the switchbar or
+when the main window is resized, or the top bar wraps onto another line,
+they move and resize with it instead of ending up under the top bar or
 off-screen.
 
 ## Closing windows

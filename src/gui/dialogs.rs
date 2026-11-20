@@ -307,14 +307,22 @@ impl Session {
         ui.horizontal_wrapped(|ui| {
             ui.label("Server:");
             endpoint_edited |= ui
-                .add(TextEdit::singleline(&mut self.server_host).desired_width(200.0))
+                .add(
+                    TextEdit::singleline(&mut self.server_host)
+                        .align(egui::Align2::LEFT_CENTER)
+                        .desired_width(200.0),
+                )
                 .changed();
         });
 
         ui.horizontal_wrapped(|ui| {
             ui.label("Port:");
             endpoint_edited |= ui
-                .add(TextEdit::singleline(&mut self.server_port).desired_width(80.0))
+                .add(
+                    TextEdit::singleline(&mut self.server_port)
+                        .align(egui::Align2::LEFT_CENTER)
+                        .desired_width(80.0),
+                )
                 .changed();
             endpoint_edited |= ui.checkbox(&mut self.use_tls, "Use TLS").changed();
         });
@@ -339,23 +347,36 @@ impl Session {
 
         ui.horizontal_wrapped(|ui| {
             ui.label("Nickname:");
-            ui.add(TextEdit::singleline(&mut self.nickname).desired_width(150.0));
+            ui.add(
+                TextEdit::singleline(&mut self.nickname)
+                    .align(egui::Align2::LEFT_CENTER)
+                    .desired_width(150.0),
+            );
         });
 
         ui.horizontal_wrapped(|ui| {
             ui.label("Username:");
-            ui.add(TextEdit::singleline(&mut self.username).desired_width(150.0));
+            ui.add(
+                TextEdit::singleline(&mut self.username)
+                    .align(egui::Align2::LEFT_CENTER)
+                    .desired_width(150.0),
+            );
         });
 
         ui.horizontal_wrapped(|ui| {
             ui.label("Real name:");
-            ui.add(TextEdit::singleline(&mut self.realname).desired_width(200.0));
+            ui.add(
+                TextEdit::singleline(&mut self.realname)
+                    .align(egui::Align2::LEFT_CENTER)
+                    .desired_width(200.0),
+            );
         });
 
         ui.horizontal_wrapped(|ui| {
             ui.label("Password:");
             ui.add(
                 TextEdit::singleline(&mut self.password)
+                    .align(egui::Align2::LEFT_CENTER)
                     .password(true)
                     .desired_width(150.0),
             );
@@ -368,13 +389,18 @@ impl Session {
 
         ui.horizontal_wrapped(|ui| {
             ui.label("SASL User:");
-            ui.add(TextEdit::singleline(&mut self.sasl_username).desired_width(150.0));
+            ui.add(
+                TextEdit::singleline(&mut self.sasl_username)
+                    .align(egui::Align2::LEFT_CENTER)
+                    .desired_width(150.0),
+            );
         });
 
         ui.horizontal_wrapped(|ui| {
             ui.label("SASL Pass:");
             ui.add(
                 TextEdit::singleline(&mut self.sasl_password)
+                    .align(egui::Align2::LEFT_CENTER)
                     .password(true)
                     .desired_width(150.0),
             );
@@ -410,6 +436,7 @@ impl Session {
             ui.label("Client cert:");
             ui.add(
                 TextEdit::singleline(&mut self.tls_client_cert_path)
+                    .align(egui::Align2::LEFT_CENTER)
                     .desired_width(260.0)
                     .hint_text("PEM: certificate(s), or combined with a PKCS#8 key"),
             );
@@ -418,6 +445,7 @@ impl Session {
             ui.label("Client key:");
             ui.add(
                 TextEdit::singleline(&mut self.tls_client_key_path)
+                    .align(egui::Align2::LEFT_CENTER)
                     .desired_width(260.0)
                     .hint_text("optional PKCS#8 PEM; defaults to cert file"),
             );
@@ -451,7 +479,11 @@ impl Session {
         if favorites_ui.show_save_dialog {
             ui.horizontal_wrapped(|ui| {
                 ui.label("Name:");
-                ui.add(TextEdit::singleline(&mut favorites_ui.new_name).desired_width(150.0));
+                ui.add(
+                    TextEdit::singleline(&mut favorites_ui.new_name)
+                        .align(egui::Align2::LEFT_CENTER)
+                        .desired_width(150.0),
+                );
                 if ui.button("Save").clicked()
                     && let Some(mut favorite) = self.form_as_favorite(&favorites_ui.new_name)
                 {
@@ -535,6 +567,7 @@ impl Session {
             ui.add(
                 egui::Slider::new(&mut display.font_size, 10.0..=24.0)
                     .step_by(1.0)
+                    .fixed_decimals(0)
                     .suffix(" px"),
             );
         });
@@ -615,6 +648,7 @@ impl Session {
         ui.label("Extra highlight words (comma-separated):");
         ui.add(
             TextEdit::singleline(&mut self.highlight_words)
+                .align(egui::Align2::LEFT_CENTER)
                 .desired_width(300.0)
                 .hint_text("urgent, alert, your-other-nick"),
         );
@@ -674,6 +708,7 @@ impl Session {
             ui.label("Auto-join:");
             ui.add(
                 TextEdit::singleline(&mut self.auto_join_channels)
+                    .align(egui::Align2::LEFT_CENTER)
                     .desired_width(200.0)
                     .hint_text("#chan1, #chan2"),
             );
@@ -683,11 +718,19 @@ impl Session {
 
         ui.horizontal_wrapped(|ui| {
             ui.label("Pre-connect away:");
-            ui.add(TextEdit::singleline(&mut self.pre_away_message).desired_width(220.0));
+            ui.add(
+                TextEdit::singleline(&mut self.pre_away_message)
+                    .align(egui::Align2::LEFT_CENTER)
+                    .desired_width(220.0),
+            );
         });
         ui.horizontal_wrapped(|ui| {
             ui.label("Persistence profile:");
-            ui.add(TextEdit::singleline(&mut self.persistence_profile).desired_width(180.0));
+            ui.add(
+                TextEdit::singleline(&mut self.persistence_profile)
+                    .align(egui::Align2::LEFT_CENTER)
+                    .desired_width(180.0),
+            );
         });
 
         ui.add_space(8.0);
@@ -779,7 +822,11 @@ impl Session {
             ui.horizontal(|ui| {
                 ui.add_space(20.0);
                 ui.label("Message:");
-                ui.add(TextEdit::singleline(&mut self.auto_away_message).desired_width(180.0));
+                ui.add(
+                    TextEdit::singleline(&mut self.auto_away_message)
+                        .align(egui::Align2::LEFT_CENTER)
+                        .desired_width(180.0),
+                );
             });
         }
 
@@ -812,6 +859,7 @@ impl Session {
             ui.label("Quit:");
             ui.add(
                 TextEdit::singleline(&mut self.quit_message)
+                    .align(egui::Align2::LEFT_CENTER)
                     .desired_width(200.0)
                     .hint_text("Linefeed"),
             );
@@ -820,6 +868,7 @@ impl Session {
             ui.label("Part:");
             ui.add(
                 TextEdit::singleline(&mut self.part_message)
+                    .align(egui::Align2::LEFT_CENTER)
                     .desired_width(200.0)
                     .hint_text("Leaving"),
             );
@@ -938,7 +987,9 @@ impl Session {
                 ui.horizontal(|ui| {
                     ui.label("Filter:");
                     ui.add(
-                        TextEdit::singleline(&mut self.channel_list_filter).desired_width(150.0),
+                        TextEdit::singleline(&mut self.channel_list_filter)
+                            .align(egui::Align2::LEFT_CENTER)
+                            .desired_width(150.0),
                     );
                     ui.add_space(8.0);
                     ui.label(format!(

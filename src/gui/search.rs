@@ -403,6 +403,7 @@ impl App {
                         changed |= ui
                             .add(
                                 egui::TextEdit::singleline(&mut self.search.query.sender)
+                                    .align(egui::Align2::LEFT_CENTER)
                                     .desired_width(110.0),
                             )
                             .changed();
@@ -410,6 +411,7 @@ impl App {
                         changed |= ui
                             .add(
                                 egui::TextEdit::singleline(&mut self.search.from)
+                                    .align(egui::Align2::LEFT_CENTER)
                                     .desired_width(95.0)
                                     .hint_text("YYYY-MM-DD"),
                             )
@@ -418,6 +420,7 @@ impl App {
                         changed |= ui
                             .add(
                                 egui::TextEdit::singleline(&mut self.search.until)
+                                    .align(egui::Align2::LEFT_CENTER)
                                     .desired_width(95.0)
                                     .hint_text("YYYY-MM-DD"),
                             )
@@ -428,6 +431,7 @@ impl App {
                         changed |= ui
                             .add(
                                 egui::TextEdit::singleline(&mut self.search.query.network_pattern)
+                                    .align(egui::Align2::LEFT_CENTER)
                                     .desired_width(150.0)
                                     .hint_text("host, account or network ID"),
                             )
@@ -438,6 +442,7 @@ impl App {
                                 egui::TextEdit::singleline(
                                     self.search.query.target.get_or_insert_with(String::new),
                                 )
+                                .align(egui::Align2::LEFT_CENTER)
                                 .desired_width(120.0)
                                 .hint_text("#channel or nick"),
                             )

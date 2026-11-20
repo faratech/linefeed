@@ -120,7 +120,10 @@ src/
 │   ├── conversations.rs # Stable process-local ConversationIds, target-name indexes and collision merges
 │   ├── windows.rs       # WindowManager: placement, tile/cascade, layout.json
 │   ├── snap.rs          # Snap layouts: window captions, layout flyout/bar, edge snaps, Snap Assist
-│   ├── view.rs          # Drawing one window: topic, user list, scrollback, input line
+│   ├── theme.rs         # Palette (dark/light), Metrics, DisplayPrefs; apply() sets egui visuals, spacing and text sizes
+│   ├── fonts.rs         # System font loading: proportional, semibold, monospace, symbol and emoji faces
+│   ├── widgets.rs       # Shared pieces: list_row, badge, badge_button, truncated, section_label, dot, strong
+│   ├── view.rs          # Drawing one window: header row, grouped people list, scrollback, composer
 │   ├── types.rs         # Settings, ChatMessage, Channel, NetworkSupport, UserMode, BanEntry, TabCompletion
 │   ├── commands.rs      # process_command() - all /slash commands (~5100 lines)
 │   ├── dialogs.rs       # Unified Settings/Connection editor, Channel List and Channel Info windows
@@ -178,7 +181,8 @@ identity. Closing and reopening the same name must not revive stale UI work.
 - **gui/snap.rs**: the floating windows' own captions (drag to move, maximize, close) and Windows 11 style snap layouts: flyout on the maximize button, layout bar when dragged to the top, halves/quarters at the edges, Snap Assist for the zones left
 - **commands.rs**: All /slash commands including service shortcuts (/ns, /cs), /monitor, /slap
 - **dialogs.rs**: One Settings window (Connection, Display, Behavior, About). Startup, Connect and New connection open the complete Connection tab for a pinned session, including favorites, SASL/client certificates and on-connect automation. Save & Close validates and persists without changing a live connection; Connect/Reconnect explicitly stages validated details after checking endpoint reservations. Cancel restores that session's opening form/profile and discards a canceled pristine new connection. Global preferences remain live; explicit favorite updates preserve profile identity and never adopt scratch Quick Connect defaults.
-- **formatting.rs**: `parse_irc_colors()` for IRC formatting controls, `render_irc_text()` with egui
+- **formatting.rs**: `parse_irc_colors()` for IRC formatting controls, `render_segments()` with egui (IRC colours are nudged to read on the row's ground), `with_mentions()`
+- **theme.rs**, **fonts.rs**, **widgets.rs**: every colour and size comes from `theme::palette(ctx)` / `theme::metrics(ctx)`; control height lives in egui's `spacing.interact_size.y` (`theme::control_height(ui)`). Drawing code never writes a `Color32` literal: only the mIRC colour tables do. This build has no built-in egui fonts, so `fonts::install` loads system faces; the `semibold` family falls back to the proportional face. `gui::tests` paint the main window and Settings in both themes and check every text against the palette's grounds
 - **types.rs**: All data structures, Settings load/save, Channel user management with server-aware mode sorting and casemapping-aware keys
 - **logging.rs**: irssi-compatible text logs and exact physical spans for archive deduplication; history loading and rotation detection
 - **gui/archive.rs**, **search.rs**: authoritative structured JSONL history, rebuildable SQLite FTS index, background import/search/context, scoped permanent redaction
@@ -208,11 +212,11 @@ form; `SaveConfig` and `SaveAutoPerform` keep their narrower scopes, #316).
 - **Authentication**: SASL Auto/PLAIN/EXTERNAL/SCRAM-SHA-256 with optional required authentication, TLS client certificates, server password, and services login via auto-perform
 - **Channel support**: Server-advertised channel prefixes, keys (+k), modes display, topic info, ban list, channel info dialog
 - **CTCP**: VERSION, TIME, PING, FINGER, CLIENTINFO (configurable replies)
-- **Display**: Configurable timestamps, IRC formatting including reverse video, hide join/part/quit, scrollback limit, highlight words
+- **Display**: Dark, light or system theme; comfortable or compact spacing; proportional or monospace message font; text size; timestamps in three formats or hidden; nickname colours; IRC formatting including reverse video, hide join/part/quit, scrollback limit, highlight words; live preview in Settings
 - **Logging**: Search all saved history by network/conversation/sender/date, historical context, compatible text logs plus structured archive and rebuildable index
 - **Away**: Manual /away, /back, auto-away on idle with configurable timeout
 - **Privacy**: CTCP reply toggle, ignore list with wildcard masks
-- **UI**: Multiline composer, quoted replies, grouped reactions, optional typing, account/TLS badges, activity center, per-conversation notification rules, unread navigation, aliases, configurable shortcuts and window switcher
+- **UI**: Top bar (connection button with its menu, status line, search field, Activity, Window, Settings), conversation sidebar that becomes a switcher button below 720 px, one-row window header, message rows in time/nick/text columns (stacked below 520 px) with grouped senders and a filled mention row, "New messages" marker, people list grouped by role, multiline composer, quoted replies, grouped reactions, optional typing, account/TLS badges, activity center, per-conversation notification rules, unread navigation, aliases, configurable shortcuts and window switcher
 - **Workspace**: Normal restarts restore committed sessions, tabs, drafts, selection and reading anchors; reconnect only sessions previously connected
 - **Sharing**: Attach, clipboard images/files and drop via advertised/custom HTTPS FILEHOST; progress/cancel and URL insertion, never automatic sending
 - **Connection**: Several servers/upstreams at once, soju/ZNC profiles and playback, safe reconnect/server switching, auto-reconnect with exponential backoff, configurable delay/max attempts, auto-connect network profiles

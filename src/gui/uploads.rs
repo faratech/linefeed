@@ -434,6 +434,7 @@ impl Session {
                     };
                     ui.add(
                         egui::TextEdit::singleline(&mut self.upload_settings.secret)
+                            .align(egui::Align2::LEFT_CENTER)
                             .password(true)
                             .hint_text(label),
                     );
