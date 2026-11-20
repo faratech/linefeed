@@ -7,9 +7,9 @@ use base64::Engine;
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::{self, File, OpenOptions};
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufRead, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{
     Arc, Mutex,
@@ -553,6 +553,7 @@ impl JournalWriteError {
 
 struct ArchiveJournal {
     file: File,
+    dir: PathBuf,
     name: String,
     digest: Sha256,
     previous: Vec<(String, String)>,
@@ -623,6 +624,46 @@ impl ArchiveJournal {
         result.map_err(|error| JournalWriteError::Failed(error.to_string()))
     }
 
+    /// Rewrite every journal file without the bodies of the targeted records.
+    /// A file that cannot be rewritten is left exactly as it was; the first
+    /// such failure is returned after the remaining files were attempted. A
+    /// failure to continue appending to the rewritten active journal is fatal.
+    fn scrub(&mut self, db: &Connection, targets: &ScrubTargets) -> Result<(), ScrubError> {
+        let mut failure = None;
+        let mut rewritten = false;
+        let names: Vec<String> = self
+            .previous
+            .iter()
+            .map(|(name, _)| name.clone())
+            .chain(std::iter::once(self.name.clone()))
+            .collect();
+        for name in names {
+            let path = self.dir.join(&name);
+            match scrub_journal_file(&path, targets) {
+                Ok(None) => {}
+                Ok(Some(digest)) => {
+                    rewritten = true;
+                    if name == self.name {
+                        // The old descriptor now names the replaced inode.
+                        self.file =
+                            private_append(&path).map_err(|e| ScrubError::Fatal(e.to_string()))?;
+                        self.digest = digest;
+                    } else if let Some(entry) = self.previous.iter_mut().find(|e| e.0 == name) {
+                        entry.1 = hex_digest(&digest);
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!("Could not remove redacted text from {name}: {error}");
+                    failure.get_or_insert(error);
+                }
+            }
+        }
+        if rewritten {
+            self.sync(db).map_err(ScrubError::Fatal)?;
+        }
+        failure.map_or(Ok(()), |error| Err(ScrubError::Failed(error)))
+    }
+
     fn sync(&mut self, db: &Connection) -> Result<(), String> {
         self.file
             .flush()
@@ -639,6 +680,413 @@ impl ArchiveJournal {
                 .collect(),
         ));
         save_journal_manifest(db, &sources)
+    }
+}
+
+enum ScrubError {
+    /// The archive can no longer be trusted to append correctly.
+    Fatal(String),
+    /// Some journal could not be rewritten; it was left untouched.
+    Failed(String),
+}
+
+fn hex_digest(digest: &Sha256) -> String {
+    digest
+        .clone()
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+/// The records whose bodies a journal rewrite removes.
+#[derive(Default)]
+struct ScrubTargets {
+    ids: HashSet<String>,
+    msgids: HashMap<String, Vec<ConversationKey>>,
+}
+impl ScrubTargets {
+    fn matches(&self, record: &ArchiveRecord) -> bool {
+        self.ids.contains(&record.id)
+            || record
+                .msgid
+                .as_ref()
+                .and_then(|msgid| self.msgids.get(msgid))
+                .is_some_and(|conversations| conversations.contains(&record.conversation))
+    }
+    fn is_empty(&self) -> bool {
+        self.ids.is_empty() && self.msgids.is_empty()
+    }
+    /// Also reach journal events written under ids that were merged into a
+    /// targeted record before it acquired its server identity.
+    fn follow_redirects(&mut self, db: &Connection) -> Result<(), String> {
+        let mut frontier: Vec<String> = self.ids.iter().cloned().collect();
+        for _ in 0..32 {
+            let mut next = Vec::new();
+            for survivor in &frontier {
+                let mut stmt = db
+                    .prepare("SELECT id FROM redirects WHERE survivor=?1")
+                    .map_err(|e| e.to_string())?;
+                let merged = stmt
+                    .query_map([survivor], |r| r.get::<_, String>(0))
+                    .map_err(|e| e.to_string())?;
+                for id in merged {
+                    let id = id.map_err(|e| e.to_string())?;
+                    if self.ids.insert(id.clone()) {
+                        next.push(id);
+                    }
+                }
+            }
+            if next.is_empty() {
+                break;
+            }
+            frontier = next;
+        }
+        Ok(())
+    }
+    /// Targets for server redactions just applied. A redaction naming a
+    /// message the archive never stored has nothing in any journal to remove.
+    fn for_redactions(
+        db: &Connection,
+        redactions: &[(ConversationKey, String)],
+    ) -> Result<Self, String> {
+        let mut targets = Self::default();
+        for (conversation, msgid) in redactions {
+            let encoded = serde_json::to_string(conversation).map_err(|e| e.to_string())?;
+            let mut stmt = db
+                .prepare("SELECT id FROM records WHERE conversation=?1 AND msgid=?2")
+                .map_err(|e| e.to_string())?;
+            let ids = stmt
+                .query_map(params![encoded, msgid], |r| r.get::<_, String>(0))
+                .map_err(|e| e.to_string())?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| e.to_string())?;
+            if !ids.is_empty() {
+                targets.ids.extend(ids);
+                targets
+                    .msgids
+                    .entry(msgid.clone())
+                    .or_default()
+                    .push(conversation.clone());
+            }
+        }
+        targets.follow_redirects(db)?;
+        Ok(targets)
+    }
+    /// Targets for every redaction the projection knows about.
+    fn for_all_redactions(db: &Connection) -> Result<Self, String> {
+        let mut targets = Self::default();
+        let mut stmt = db
+            .prepare("SELECT id FROM records WHERE deleted=1")
+            .map_err(|e| e.to_string())?;
+        for id in stmt
+            .query_map([], |r| r.get::<_, String>(0))
+            .map_err(|e| e.to_string())?
+        {
+            targets.ids.insert(id.map_err(|e| e.to_string())?);
+        }
+        let mut stmt = db
+            .prepare("SELECT conversation,msgid FROM tombstones")
+            .map_err(|e| e.to_string())?;
+        let tombstones = stmt
+            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
+            .map_err(|e| e.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())?;
+        for (conversation, msgid) in tombstones {
+            if let Ok(conversation) = serde_json::from_str::<ConversationKey>(&conversation) {
+                targets.msgids.entry(msgid).or_default().push(conversation);
+            }
+        }
+        targets.follow_redirects(db)?;
+        Ok(targets)
+    }
+}
+
+struct HashingWriter<W: Write> {
+    inner: W,
+    digest: Sha256,
+}
+impl<W: Write> Write for HashingWriter<W> {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        let written = self.inner.write(bytes)?;
+        self.digest.update(&bytes[..written]);
+        Ok(written)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+struct ScrubLine {
+    bytes: Vec<u8>,
+    /// Longer than the record limit: `bytes` is only its beginning and the
+    /// rest, up to the newline, is still unread.
+    oversized: bool,
+}
+fn read_scrub_line(reader: &mut impl BufRead, limit: usize) -> std::io::Result<Option<ScrubLine>> {
+    let mut bytes = Vec::new();
+    loop {
+        let available = reader.fill_buf()?;
+        if available.is_empty() {
+            return Ok((!bytes.is_empty()).then_some(ScrubLine {
+                bytes,
+                oversized: false,
+            }));
+        }
+        let take = available
+            .iter()
+            .position(|b| *b == b'\n')
+            .map_or(available.len(), |i| i + 1);
+        if bytes.len().saturating_add(take) > limit {
+            return Ok(Some(ScrubLine {
+                bytes,
+                oversized: true,
+            }));
+        }
+        let ends = available[take - 1] == b'\n';
+        bytes.extend_from_slice(&available[..take]);
+        reader.consume(take);
+        if ends {
+            return Ok(Some(ScrubLine {
+                bytes,
+                oversized: false,
+            }));
+        }
+    }
+}
+fn copy_rest_of_line(reader: &mut impl BufRead, out: &mut dyn Write) -> std::io::Result<()> {
+    loop {
+        let available = reader.fill_buf()?;
+        if available.is_empty() {
+            return Ok(());
+        }
+        let take = available
+            .iter()
+            .position(|b| *b == b'\n')
+            .map_or(available.len(), |i| i + 1);
+        let ends = available[take - 1] == b'\n';
+        out.write_all(&available[..take])?;
+        reader.consume(take);
+        if ends {
+            return Ok(());
+        }
+    }
+}
+
+/// Copy one journal to `out`, replacing each targeted Upsert (single-line or
+/// reassembled from checked chunk frames) with the same record carrying no
+/// body. Every other byte, including lines this build cannot parse, is copied
+/// unchanged. Returns whether anything was replaced; with `stop_at_first` it
+/// returns as soon as the first replacement is found, without finishing `out`.
+fn rewrite_journal(
+    path: &Path,
+    targets: &ScrubTargets,
+    out: &mut dyn Write,
+    stop_at_first: bool,
+) -> Result<bool, String> {
+    struct Run {
+        id: String,
+        parts: usize,
+        total: usize,
+        sha256: String,
+        next: usize,
+        bytes: Vec<u8>,
+        raw: Vec<Vec<u8>>,
+    }
+    fn flush_run(run: &mut Option<Run>, out: &mut dyn Write) -> Result<(), String> {
+        if let Some(run) = run.take() {
+            for line in run.raw {
+                out.write_all(&line).map_err(|e| e.to_string())?;
+            }
+        }
+        Ok(())
+    }
+    fn needs_scrub(targets: &ScrubTargets, record: &ArchiveRecord) -> bool {
+        targets.matches(record) && (!record.body.is_empty() || !record.redacted)
+    }
+    fn scrubbed(record: &ArchiveRecord) -> Result<Vec<u8>, String> {
+        let mut record = record.clone();
+        record.body.clear();
+        record.redacted = true;
+        let mut line = serde_json::to_vec(&JournalEvent::Upsert {
+            record: Box::new(record),
+        })
+        .map_err(|e| e.to_string())?;
+        line.push(b'\n');
+        Ok(line)
+    }
+    let io = |e: std::io::Error| e.to_string();
+    let mut reader = BufReader::new(File::open(path).map_err(io)?);
+    let mut run: Option<Run> = None;
+    let mut changed = false;
+    while let Some(line) = read_scrub_line(&mut reader, MAX_JOURNAL_RECORD).map_err(io)? {
+        let bytes = line.bytes;
+        if line.oversized {
+            flush_run(&mut run, out)?;
+            out.write_all(&bytes).map_err(io)?;
+            copy_rest_of_line(&mut reader, out).map_err(io)?;
+            continue;
+        }
+        match serde_json::from_slice::<JournalLine>(&bytes) {
+            Ok(JournalLine::Event(event)) => {
+                flush_run(&mut run, out)?;
+                match &event {
+                    JournalEvent::Upsert { record } if needs_scrub(targets, record) => {
+                        changed = true;
+                        if stop_at_first {
+                            return Ok(true);
+                        }
+                        out.write_all(&scrubbed(record)?).map_err(io)?;
+                    }
+                    _ => out.write_all(&bytes).map_err(io)?,
+                }
+            }
+            Ok(JournalLine::Frame(JournalFrame::Chunk {
+                version,
+                id,
+                index,
+                parts,
+                total,
+                sha256,
+                data,
+            })) => {
+                // The same frame checks replay applies; anything that fails
+                // them is not a record and is carried over untouched.
+                let valid = version == 1
+                    && total > MAX_ARCHIVE_LINE
+                    && total <= MAX_JOURNAL_RECORD
+                    && parts == total.div_ceil(JOURNAL_CHUNK_BYTES)
+                    && index < parts
+                    && id.len() == 32
+                    && id.bytes().all(|b| b.is_ascii_hexdigit())
+                    && sha256.len() == 64
+                    && sha256.bytes().all(|b| b.is_ascii_hexdigit())
+                    && data.len() <= JOURNAL_CHUNK_BYTES.div_ceil(3) * 4;
+                let decoded = valid
+                    .then(|| base64::engine::general_purpose::STANDARD.decode(&data).ok())
+                    .flatten()
+                    .filter(|decoded| {
+                        decoded.len()
+                            == (total - index * JOURNAL_CHUNK_BYTES).min(JOURNAL_CHUNK_BYTES)
+                    });
+                let Some(decoded) = decoded else {
+                    flush_run(&mut run, out)?;
+                    out.write_all(&bytes).map_err(io)?;
+                    continue;
+                };
+                if index == 0 {
+                    flush_run(&mut run, out)?;
+                    run = Some(Run {
+                        id: id.clone(),
+                        parts,
+                        total,
+                        sha256: sha256.clone(),
+                        next: 0,
+                        bytes: Vec::new(),
+                        raw: Vec::new(),
+                    });
+                }
+                let continues = run.as_ref().is_some_and(|run| {
+                    run.id == id
+                        && run.parts == parts
+                        && run.total == total
+                        && run.sha256 == sha256
+                        && run.next == index
+                });
+                if !continues {
+                    flush_run(&mut run, out)?;
+                    out.write_all(&bytes).map_err(io)?;
+                    continue;
+                }
+                let current = run.as_mut().expect("run continues");
+                current.bytes.extend_from_slice(&decoded);
+                current.raw.push(bytes);
+                current.next += 1;
+                if current.next == parts {
+                    let complete = run.take().expect("run completes");
+                    if complete.bytes.len() == total
+                        && line_digest(&complete.bytes) == sha256
+                        && let Ok(JournalEvent::Upsert { record }) =
+                            serde_json::from_slice::<JournalEvent>(&complete.bytes)
+                        && needs_scrub(targets, &record)
+                    {
+                        changed = true;
+                        if stop_at_first {
+                            return Ok(true);
+                        }
+                        out.write_all(&scrubbed(&record)?).map_err(io)?;
+                    } else {
+                        for line in complete.raw {
+                            out.write_all(&line).map_err(io)?;
+                        }
+                    }
+                }
+            }
+            Err(_) => {
+                flush_run(&mut run, out)?;
+                out.write_all(&bytes).map_err(io)?;
+            }
+        }
+    }
+    flush_run(&mut run, out)?;
+    Ok(changed)
+}
+
+/// Atomically replace one journal with its scrubbed copy. Returns the digest
+/// state of the new content, or `None` when nothing in the file was targeted.
+/// The original is only replaced by a complete, synced temporary file; on any
+/// error it is untouched and the temporary file is removed.
+fn scrub_journal_file(path: &Path, targets: &ScrubTargets) -> Result<Option<Sha256>, String> {
+    if targets.is_empty() || !rewrite_journal(path, targets, &mut std::io::sink(), true)? {
+        return Ok(None);
+    }
+    let temporary = path.with_extension("jsonl.scrub");
+    let result = (|| -> Result<Sha256, String> {
+        let mut options = OpenOptions::new();
+        options.create(true).write(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let file = options.open(&temporary).map_err(|e| e.to_string())?;
+        let mut out = HashingWriter {
+            inner: BufWriter::new(file),
+            digest: Sha256::new(),
+        };
+        rewrite_journal(path, targets, &mut out, false)?;
+        let HashingWriter { inner, digest } = out;
+        let file = inner.into_inner().map_err(|e| e.to_string())?;
+        file.sync_all().map_err(|e| e.to_string())?;
+        drop(file);
+        fs::rename(&temporary, path).map_err(|e| e.to_string())?;
+        #[cfg(unix)]
+        if let Some(dir) = path.parent() {
+            File::open(dir)
+                .and_then(|dir| dir.sync_all())
+                .map_err(|e| e.to_string())?;
+        }
+        Ok(digest)
+    })();
+    match result {
+        Ok(digest) => Ok(Some(digest)),
+        Err(error) => {
+            let _ = fs::remove_file(&temporary);
+            Err(error)
+        }
+    }
+}
+
+/// Interrupted rewrites leave a temporary copy beside the intact original.
+/// Only `.jsonl` files are journals, so it is never replayed; remove it.
+fn remove_stale_scrub_files(dir: &Path) {
+    if let Ok(entries) = fs::read_dir(dir) {
+        for path in entries.filter_map(Result::ok).map(|entry| entry.path()) {
+            if path.extension().is_some_and(|ext| ext == "scrub") {
+                let _ = fs::remove_file(path);
+            }
+        }
     }
 }
 
@@ -816,7 +1264,7 @@ fn initialize(db: &Connection) -> rusqlite::Result<()> {
           DROP TABLE IF EXISTS tombstones; DROP TABLE IF EXISTS reactions; DROP TABLE IF EXISTS redirects;
           DROP TABLE IF EXISTS sources; DROP TABLE IF EXISTS legacy_sources; DROP TABLE IF EXISTS text_copies; DROP TABLE IF EXISTS journal_manifest;")?;
     }
-    db.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;
+    db.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA secure_delete=ON;
         CREATE TABLE IF NOT EXISTS records(seq INTEGER PRIMARY KEY AUTOINCREMENT,id TEXT NOT NULL UNIQUE,
           conversation TEXT NOT NULL, network TEXT NOT NULL, target TEXT NOT NULL, sender_fold TEXT NOT NULL,
           body_fold TEXT NOT NULL, occurred INTEGER, msgid TEXT, data TEXT NOT NULL, deleted INTEGER NOT NULL DEFAULT 0);
@@ -1374,7 +1822,8 @@ fn process_task(
             };
             let _ = reply.send(response);
         }
-        Task::Event(event) => {
+        Task::Event(mut event) => {
+            withhold_redacted_body(db, &mut event)?;
             if let Some(file) = journal {
                 match file.append(&event) {
                     Ok(()) => {}
@@ -1449,6 +1898,8 @@ fn drain_redactions(
 ) -> Result<(), String> {
     let pending = std::mem::take(&mut *client.pending_redactions.lock().unwrap());
     let mut pending = pending.into_iter();
+    let mut applied = Vec::new();
+    let mut failure = None;
     while let Some((conversation, msgid)) = pending.next() {
         let event = JournalEvent::Redact {
             conversation: conversation.clone(),
@@ -1460,14 +1911,115 @@ fn drain_redactions(
             }
             project_noting(db, &event, client)
         })();
-        if let Err(error) = result {
-            // Keep failed controls available without holding the GUI-facing
-            // mutex during filesystem or SQLite work.
-            let mut outbox = client.pending_redactions.lock().unwrap();
-            outbox.insert((conversation, msgid));
-            outbox.extend(pending);
-            return Err(error);
+        match result {
+            Ok(()) => applied.push((conversation, msgid)),
+            Err(error) => {
+                // Keep failed controls available without holding the GUI-facing
+                // mutex during filesystem or SQLite work.
+                let mut outbox = client.pending_redactions.lock().unwrap();
+                outbox.insert((conversation, msgid));
+                outbox.extend(pending.by_ref());
+                failure = Some(error);
+                break;
+            }
         }
+    }
+    // The tombstones are journaled and projected, so the earlier bodies can go.
+    if !applied.is_empty() {
+        if let Some(file) = journal.as_mut() {
+            let targets = ScrubTargets::for_redactions(db, &applied)?;
+            scrub_journals(db, file, client, &targets)?;
+        }
+        // Forget pages and write-ahead frames that still hold the old bodies.
+        let _ = db.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()));
+    }
+    failure.map_or(Ok(()), Err)
+}
+
+const SCRUBBED_MARKER: i64 = 2;
+
+/// Remove targeted bodies from every journal. Only a failure that leaves the
+/// journal unusable is an error; otherwise the unscrubbed files are intact,
+/// the user is told, and the next start retries every known redaction.
+fn scrub_journals(
+    db: &Connection,
+    file: &mut ArchiveJournal,
+    client: &ArchiveClient,
+    targets: &ScrubTargets,
+) -> Result<(), String> {
+    match file.scrub(db, targets) {
+        Ok(()) => Ok(()),
+        Err(ScrubError::Failed(error)) => {
+            client.status.lock().unwrap().error = Some(format!(
+                "A redacted message could not be erased from the history journal ({error}); it will be retried at the next start"
+            ));
+            db.execute(
+                "DELETE FROM journal_manifest WHERE id=?1",
+                [SCRUBBED_MARKER],
+            )
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+        }
+        Err(ScrubError::Fatal(error)) => Err(error),
+    }
+}
+
+/// Journals written before redactions were erased, or by a run that failed to
+/// erase one, still hold bodies. Once per projection, scrub all known redactions.
+fn scrub_known_redactions(
+    db: &Connection,
+    journal: &mut Option<ArchiveJournal>,
+    client: &ArchiveClient,
+) -> Result<(), String> {
+    let Some(file) = journal.as_mut() else {
+        return Ok(());
+    };
+    let done: bool = db
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM journal_manifest WHERE id=?1)",
+            [SCRUBBED_MARKER],
+            |r| r.get(0),
+        )
+        .map_err(|e| e.to_string())?;
+    if done {
+        return Ok(());
+    }
+    let targets = ScrubTargets::for_all_redactions(db)?;
+    let before = client.status.lock().unwrap().error.clone();
+    scrub_journals(db, file, client, &targets)?;
+    if client.status.lock().unwrap().error == before {
+        db.execute(
+            "INSERT OR REPLACE INTO journal_manifest VALUES(?1,'scrubbed')",
+            [SCRUBBED_MARKER],
+        )
+        .map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+/// A message arriving after its redaction must never be journaled with its body.
+fn withhold_redacted_body(db: &Connection, event: &mut JournalEvent) -> Result<(), String> {
+    let JournalEvent::Upsert { record } = event else {
+        return Ok(());
+    };
+    if record.body.is_empty() {
+        return Ok(());
+    }
+    let tombstoned: bool = if let Some(msgid) = &record.msgid {
+        let conversation =
+            serde_json::to_string(&record.conversation).map_err(|e| e.to_string())?;
+        db.query_row(
+            "SELECT EXISTS(SELECT 1 FROM tombstones WHERE conversation=?1 AND msgid=?2)",
+            params![conversation, msgid],
+            |r| r.get(0),
+        )
+        .map_err(|e| e.to_string())?
+    } else {
+        false
+    };
+    if tombstoned || load_record(db, &record.id)?.is_some_and(|previous| previous.redacted) {
+        record.body.clear();
+        record.redacted = true;
     }
     Ok(())
 }
@@ -1579,6 +2131,7 @@ fn run_archive(
     let mut deferred = VecDeque::new();
     if let Some(root) = &root {
         let dir = root.join("archive");
+        remove_stale_scrub_files(&dir);
         let mut journals: Vec<_> = fs::read_dir(&dir)
             .map_err(|e| e.to_string())?
             .filter_map(Result::ok)
@@ -1648,6 +2201,7 @@ fn run_archive(
         }
         journal = Some(ArchiveJournal {
             file: options.open(path).map_err(|e| e.to_string())?,
+            dir: dir.clone(),
             name,
             digest: Sha256::new(),
             previous: sources,
@@ -1663,6 +2217,7 @@ fn run_archive(
                 .map_err(|e| e.to_string())?;
         }
         drain_redactions(&db, &mut journal, client)?;
+        scrub_known_redactions(&db, &mut journal, client)?;
         import_legacy(
             &root.join("logs"),
             &mut db,
@@ -2076,6 +2631,392 @@ mod tests {
             matches!(receive(&reopened), ArchiveReply::Context { records, .. }
             if records.len() == 1 && records[0].redacted && records[0].body.is_empty())
         );
+    }
+
+    fn journal_files(root: &Scratch) -> Vec<PathBuf> {
+        let mut files: Vec<_> = fs::read_dir(root.0.join("archive"))
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| path.extension().is_some_and(|ext| ext == "jsonl"))
+            .collect();
+        files.sort();
+        files
+    }
+    fn journal_bytes(root: &Scratch) -> Vec<u8> {
+        journal_files(root)
+            .iter()
+            .flat_map(|path| fs::read(path).unwrap())
+            .collect()
+    }
+    fn contains(haystack: &[u8], needle: &str) -> bool {
+        haystack
+            .windows(needle.len())
+            .any(|window| window == needle.as_bytes())
+    }
+    fn synced(service: &ArchiveService) {
+        assert!(service.client.flush_barrier(Duration::from_secs(5)));
+    }
+    fn context_of(service: &ArchiveService, row: &ArchiveRecord) -> Vec<ArchiveRecord> {
+        service.client.context(row.reference(), 0);
+        match receive(service) {
+            ArchiveReply::Context { records, .. } => records,
+            _ => panic!("context failed"),
+        }
+    }
+
+    #[test]
+    fn redaction_removes_the_body_from_every_journal_file_and_keeps_the_tombstone() {
+        let root = Scratch::new();
+        let old_secret = record("#a", "hunter2-old-marker", "one");
+        let survivor = record("#a", "survivor-marker", "two");
+        let first = ArchiveService::open(&root.0);
+        assert!(first.client.upsert(old_secret.clone()));
+        assert!(first.client.upsert(survivor.clone()));
+        synced(&first);
+        drop(first);
+
+        let second = ArchiveService::open(&root.0);
+        let new_secret = record("#a", "hunter2-new-marker", "three");
+        assert!(second.client.upsert(new_secret.clone()));
+        synced(&second);
+        assert!(contains(&journal_bytes(&root), "hunter2-old-marker"));
+        assert!(contains(&journal_bytes(&root), "hunter2-new-marker"));
+        assert_eq!(journal_files(&root).len(), 2);
+
+        second
+            .client
+            .redact(old_secret.conversation.clone(), "one".into());
+        second
+            .client
+            .redact(new_secret.conversation.clone(), "three".into());
+        synced(&second);
+        let bytes = journal_bytes(&root);
+        assert!(!contains(&bytes, "hunter2-old-marker"));
+        assert!(!contains(&bytes, "hunter2-new-marker"));
+        assert!(contains(&bytes, "survivor-marker"));
+        assert_eq!(
+            bytes
+                .windows(b"\"event\":\"redact\"".len())
+                .filter(|window| *window == b"\"event\":\"redact\"")
+                .count(),
+            2,
+            "the tombstones must stay in the journal"
+        );
+
+        // Appending after the active journal was rewritten must still work.
+        assert!(
+            second
+                .client
+                .upsert(record("#a", "after-scrub-marker", "four"))
+        );
+        synced(&second);
+        drop(second);
+
+        let reopened = ArchiveService::open(&root.0);
+        synced(&reopened);
+        for row in [&old_secret, &new_secret] {
+            let found = context_of(&reopened, row);
+            assert_eq!(found.len(), 1);
+            assert!(found[0].redacted && found[0].body.is_empty());
+        }
+        reopened.client.search(SearchQuery::default());
+        match receive(&reopened) {
+            ArchiveReply::Search { records, .. } => {
+                let mut bodies: Vec<_> = records.iter().map(|r| r.body.as_str()).collect();
+                bodies.sort_unstable();
+                assert_eq!(bodies, ["after-scrub-marker", "survivor-marker"]);
+            }
+            _ => panic!("search failed"),
+        }
+        let bytes = journal_bytes(&root);
+        assert!(contains(&bytes, "after-scrub-marker"));
+        assert!(!contains(&bytes, "hunter2"));
+    }
+
+    #[test]
+    fn redaction_removes_a_chunked_large_body_and_leaves_other_large_records_intact() {
+        let root = Scratch::new();
+        let service = ArchiveService::open(&root.0);
+        let big = |marker: &str| format!("{marker}{}", "x".repeat(MAX_ARCHIVE_LINE + 4096));
+        let secret = record("#a", &big("hunter2-big-marker"), "one");
+        let other = record("#a", &big("keep-big-marker"), "two");
+        assert!(service.client.upsert(secret.clone()));
+        assert!(service.client.upsert(other.clone()));
+        synced(&service);
+        let before = journal_bytes(&root);
+        assert!(contains(&before, "\"event\":\"chunk\""));
+        service
+            .client
+            .redact(secret.conversation.clone(), "one".into());
+        synced(&service);
+        let after = journal_bytes(&root);
+        assert!(
+            after.len() < before.len() / 2 + 4096,
+            "the secret's chunks must be replaced by a small redacted record"
+        );
+        drop(service);
+
+        let reopened = ArchiveService::open(&root.0);
+        synced(&reopened);
+        let redacted = context_of(&reopened, &secret);
+        assert!(redacted.len() == 1 && redacted[0].redacted && redacted[0].body.is_empty());
+        let kept = context_of(&reopened, &other);
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].body, other.body);
+    }
+
+    #[test]
+    fn a_message_arriving_after_its_redaction_is_never_journaled_with_its_body() {
+        let root = Scratch::new();
+        let service = ArchiveService::open(&root.0);
+        let late = record("#a", "hunter2-late-marker", "one");
+        service
+            .client
+            .redact(late.conversation.clone(), "one".into());
+        synced(&service);
+        assert!(service.client.upsert(late.clone()));
+        synced(&service);
+        assert!(!contains(&journal_bytes(&root), "hunter2-late-marker"));
+        drop(service);
+        let reopened = ArchiveService::open(&root.0);
+        synced(&reopened);
+        let found = context_of(&reopened, &late);
+        assert!(found.len() == 1 && found[0].redacted && found[0].body.is_empty());
+    }
+
+    fn write_journal(path: &Path, events: &[JournalEvent]) {
+        let mut journal = ArchiveJournal {
+            file: private_append(path).unwrap(),
+            dir: path.parent().unwrap().to_path_buf(),
+            name: path.file_name().unwrap().to_string_lossy().into_owned(),
+            digest: Sha256::new(),
+            previous: Vec::new(),
+        };
+        for event in events {
+            journal.append(event).ok().unwrap();
+        }
+    }
+    fn upsert(row: &ArchiveRecord) -> JournalEvent {
+        JournalEvent::Upsert {
+            record: Box::new(row.clone()),
+        }
+    }
+    fn lines(bytes: &[u8]) -> Vec<Vec<u8>> {
+        bytes
+            .split_inclusive(|byte| *byte == b'\n')
+            .map(<[u8]>::to_vec)
+            .collect()
+    }
+    fn is_chunk(line: &[u8]) -> bool {
+        contains(line, "\"event\":\"chunk\"")
+    }
+
+    #[test]
+    fn scrubbing_changes_only_the_targeted_records_and_reports_the_new_digest() {
+        let root = Scratch::new();
+        let path = root.0.join("one.jsonl");
+        let secret = record("#a", "hunter2-unit-marker", "one");
+        let other = record("#a", "other body", "two");
+        let big = record("#a", &"y".repeat(MAX_ARCHIVE_LINE + 100), "three");
+        let big_secret = record("#a", &"z".repeat(MAX_ARCHIVE_LINE + 100), "four");
+        write_journal(
+            &path,
+            &[
+                upsert(&other),
+                upsert(&secret),
+                JournalEvent::Reaction {
+                    conversation: other.conversation.clone(),
+                    msgid: "two".into(),
+                    actor: "bob".into(),
+                    emoji: "+".into(),
+                    present: true,
+                },
+                upsert(&big),
+                upsert(&big_secret),
+                JournalEvent::Redact {
+                    conversation: secret.conversation.clone(),
+                    msgid: "one".into(),
+                },
+            ],
+        );
+        // Lines this build cannot read are not its to alter or drop.
+        let mut original = fs::read(&path).unwrap();
+        original.extend_from_slice(b"not json\n\n{\"event\":\"future\"}\nno trailing newline");
+        fs::write(&path, &original).unwrap();
+        let before = lines(&original);
+
+        let mut targets = ScrubTargets::default();
+        targets.ids.insert(secret.id.clone());
+        targets.ids.insert(big_secret.id.clone());
+        let digest = scrub_journal_file(&path, &targets).unwrap().unwrap();
+        let after_bytes = fs::read(&path).unwrap();
+        assert_eq!(hex_digest(&digest), line_digest(&after_bytes));
+        assert!(!contains(&after_bytes, "hunter2-unit-marker"));
+        let after = lines(&after_bytes);
+
+        // Both secrets collapse to one bodyless line each; everything else is
+        // identical, byte for byte and in order.
+        let chunks_before: Vec<_> = before.iter().filter(|l| is_chunk(l)).collect();
+        let chunks_after: Vec<_> = after.iter().filter(|l| is_chunk(l)).collect();
+        assert!(chunks_after.len() < chunks_before.len());
+        assert!(
+            chunks_before.starts_with(&chunks_after),
+            "unrelated chunks changed"
+        );
+        let untouched = |lines: &[Vec<u8>]| -> Vec<Vec<u8>> {
+            lines
+                .iter()
+                .filter(|line| {
+                    !is_chunk(line)
+                        && !contains(line, "hunter2-unit-marker")
+                        && !contains(line, "\"redacted\":true")
+                })
+                .cloned()
+                .collect()
+        };
+        assert_eq!(untouched(&before), untouched(&after));
+        let rewritten: Vec<ArchiveRecord> = after
+            .iter()
+            .filter_map(|line| match serde_json::from_slice(line) {
+                Ok(JournalLine::Event(JournalEvent::Upsert { record })) if record.redacted => {
+                    Some(*record)
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(rewritten.len(), 2);
+        assert!(rewritten.iter().all(|row| row.body.is_empty()));
+        assert!(
+            rewritten
+                .iter()
+                .any(|row| row.msgid.as_deref() == Some("one"))
+        );
+        assert!(
+            rewritten
+                .iter()
+                .any(|row| row.msgid.as_deref() == Some("four"))
+        );
+
+        // Nothing left to remove: a second pass leaves the file alone.
+        assert!(scrub_journal_file(&path, &targets).unwrap().is_none());
+        assert_eq!(fs::read(&path).unwrap(), after_bytes);
+        assert!(!path.with_extension("jsonl.scrub").exists());
+    }
+
+    #[test]
+    fn a_failed_rewrite_leaves_the_journal_untouched_and_the_archive_running() {
+        let root = Scratch::new();
+        let service = ArchiveService::open(&root.0);
+        let secret = record("#a", "hunter2-failure-marker", "one");
+        assert!(service.client.upsert(secret.clone()));
+        synced(&service);
+        let journal = journal_files(&root).remove(0);
+        let before = fs::read(&journal).unwrap();
+        // A directory where the temporary copy belongs makes the rewrite fail.
+        fs::create_dir(journal.with_extension("jsonl.scrub")).unwrap();
+        service
+            .client
+            .redact(secret.conversation.clone(), "one".into());
+        synced(&service);
+        let after = fs::read(&journal).unwrap();
+        assert!(after.starts_with(&before));
+        assert!(contains(&after, "hunter2-failure-marker"));
+        assert!(contains(&after, "\"event\":\"redact\""));
+        assert!(
+            service
+                .client
+                .status()
+                .error
+                .is_some_and(|error| error.contains("could not be erased"))
+        );
+        // The archive still works, and still hides the message.
+        assert!(service.client.upsert(record("#a", "later body", "two")));
+        synced(&service);
+        service.client.search(SearchQuery::default());
+        assert!(matches!(
+            receive(&service),
+            ArchiveReply::Search { records, .. }
+                if records.len() == 1 && records[0].body == "later body"
+        ));
+        drop(service);
+
+        // The next start retries and, with the obstruction gone, erases it.
+        fs::remove_dir(journal.with_extension("jsonl.scrub")).unwrap();
+        let reopened = ArchiveService::open(&root.0);
+        synced(&reopened);
+        assert!(!contains(&journal_bytes(&root), "hunter2-failure-marker"));
+        let found = context_of(&reopened, &secret);
+        assert!(found.len() == 1 && found[0].redacted && found[0].body.is_empty());
+    }
+
+    #[test]
+    fn an_interrupted_rewrite_is_ignored_and_cleaned_up_on_the_next_open() {
+        let root = Scratch::new();
+        let first = ArchiveService::open(&root.0);
+        let kept = record("#a", "kept-marker", "one");
+        assert!(first.client.upsert(kept.clone()));
+        synced(&first);
+        drop(first);
+        let journal = journal_files(&root).remove(0);
+        let original = fs::read(&journal).unwrap();
+        // A crash after writing part of the replacement and before the rename.
+        let stale = journal.with_extension("jsonl.scrub");
+        fs::write(&stale, b"{\"event\":\"upsert\",\"half written").unwrap();
+
+        let reopened = ArchiveService::open(&root.0);
+        synced(&reopened);
+        assert!(!stale.exists());
+        assert_eq!(fs::read(&journal).unwrap(), original);
+        let found = context_of(&reopened, &kept);
+        assert!(found.len() == 1 && found[0].body == "kept-marker");
+    }
+
+    #[test]
+    fn redactions_already_in_old_journals_are_erased_when_the_archive_opens() {
+        let root = Scratch::new();
+        let secret = record("#a", "hunter2-legacy-marker", "one");
+        let dir = root.0.join("archive");
+        fs::create_dir_all(&dir).unwrap();
+        // A journal from before bodies were erased: the redaction sits beside it,
+        // and a later copy of the message arrived after the redaction.
+        write_journal(
+            &dir.join("00000000000000000001-a.jsonl"),
+            &[
+                upsert(&secret),
+                JournalEvent::Redact {
+                    conversation: secret.conversation.clone(),
+                    msgid: "one".into(),
+                },
+            ],
+        );
+        write_journal(
+            &dir.join("00000000000000000002-b.jsonl"),
+            &[upsert(&secret)],
+        );
+        let service = ArchiveService::open(&root.0);
+        synced(&service);
+        assert!(!contains(&journal_bytes(&root), "hunter2-legacy-marker"));
+        let found = context_of(&service, &secret);
+        assert!(found.len() == 1 && found[0].redacted && found[0].body.is_empty());
+    }
+
+    #[test]
+    fn redacted_text_does_not_linger_in_the_search_database() {
+        let root = Scratch::new();
+        let service = ArchiveService::open(&root.0);
+        let secret = record("#a", "hunter2-sqlite-marker", "one");
+        assert!(service.client.upsert(secret.clone()));
+        synced(&service);
+        service
+            .client
+            .redact(secret.conversation.clone(), "one".into());
+        synced(&service);
+        for name in ["index.sqlite3", "index.sqlite3-wal"] {
+            if let Ok(bytes) = fs::read(root.0.join("archive").join(name)) {
+                assert!(!contains(&bytes, "hunter2-sqlite-marker"), "{name}");
+            }
+        }
     }
 
     #[test]
@@ -2553,6 +3494,7 @@ mod tests {
         let path = root.0.join("framed.jsonl");
         let mut journal = ArchiveJournal {
             file: private_append(&path).unwrap(),
+            dir: root.0.clone(),
             name: "framed.jsonl".into(),
             digest: Sha256::new(),
             previous: Vec::new(),
