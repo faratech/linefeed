@@ -657,8 +657,11 @@ impl App {
                 size.x * pivot.x().to_factor(),
                 size.y * pivot.y().to_factor(),
             );
+        // The size is given up front: a new area is otherwise assumed to be
+        // much wider for its first frame and pushed left to stay on screen.
         let shown = egui::Area::new(id)
             .order(Order::Tooltip)
+            .default_size(size)
             .fixed_pos(min)
             .show(ctx, |ui| {
                 frame

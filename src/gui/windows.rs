@@ -213,7 +213,7 @@ pub(crate) struct WindowManager {
     /// Set when placement changed and layout.json should be rewritten.
     pub dirty: bool,
     /// The chat area floating windows were last laid out in. When it
-    /// changes (the main window is resized, the switchbar wraps onto a
+    /// changes (the main window is resized, the top bar wraps onto a
     /// second line) the windows are scaled into the new area.
     pub area: Option<Rect>,
     /// The window set last reconciled by `sync`: an unchanged set makes
@@ -921,7 +921,7 @@ mod tests {
         ]);
         manager.fit_to_area(area());
         manager.tile(area());
-        // The switchbar wraps (the area loses 22 points at the top) and the
+        // The top bar wraps (the area loses 22 points at the top) and the
         // main window is made narrower.
         let smaller = Rect::from_min_max(
             area().min + Vec2::new(0.0, 22.0),

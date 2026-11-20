@@ -84,21 +84,13 @@ impl Session {
         ui.label(RichText::new(tls).small().color(color)).on_hover_text(format!("Effective endpoint: {endpoint}\nUnverified TLS means certificate validation was explicitly bypassed."));
     }
 
-    /// The "#channel [+]" join box.
-    pub(crate) fn draw_join_box(&mut self, ui: &mut egui::Ui) {
-        // Laid out right to left in the toolbar: button first.
-        let clicked = ui.button("Join").clicked();
-        let response = ui.add(
-            TextEdit::singleline(&mut self.join_channel)
-                .hint_text("#channel")
-                .desired_width(110.0),
-        );
-        let entered = response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-        if (clicked || entered) && !self.join_channel.trim().is_empty() {
-            let channel = self.normalize_channel_name(self.join_channel.trim());
-            self.send_join(channel, None);
-            self.join_channel.clear();
+    /// Join the channel typed into the sidebar's join row.
+    pub(crate) fn join_typed_channel(&mut self, text: &str) {
+        if text.trim().is_empty() {
+            return;
         }
+        let channel = self.normalize_channel_name(text.trim());
+        self.send_join(channel, None);
     }
 
     /// Open the Channel Info dialog for `channel`, asking for fresh modes.

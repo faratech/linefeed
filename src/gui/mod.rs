@@ -198,7 +198,7 @@ pub struct UpdateSession {
     /// the top-level (active) session.
     others: Vec<UpdateSession>,
     /// Where the top-level session stood among `others`, so a restart keeps
-    /// the networks in their order (switchbar, Alt+N).
+    /// the networks in their order (sidebar, Alt+N).
     active_position: usize,
 }
 
@@ -572,7 +572,6 @@ pub struct Session {
     pub(crate) attention: attention::AttentionSettings,
     pub(crate) view_is_active: bool,
     pub(crate) reading_conversation: Option<ConversationId>,
-    pub join_channel: String,
 
     /// Identifies this session to the window manager; never reused.
     pub(crate) id: windows::ConnId,
@@ -770,7 +769,7 @@ pub struct Session {
     /// and CASEMAPPING refresh so sender_is_self costs one canonicalize of
     /// the incoming nick (the held-nick side is precomputed).
     self_nick_keys: Vec<String>,
-    /// Memoized switchbar tab order with the fingerprint it was sorted
+    /// Memoized sidebar tab order with the fingerprint it was sorted
     /// under: the order is rebuilt every frame, but the tab set (and the
     /// casemapping that orders it) rarely changes.
     tab_order_cache: std::cell::RefCell<Option<(u64, Vec<Option<ConversationId>>)>>,
@@ -836,7 +835,6 @@ impl Session {
             attention: settings.attention.clone(),
             view_is_active: false,
             reading_conversation: None,
-            join_channel: String::new(),
 
             id: 0,
             profile_id: None,
@@ -9137,7 +9135,7 @@ impl Session {
         total
     }
 
-    /// The switchbar's tab order, borrowing the channel names: this runs
+    /// The sidebar's tab order, borrowing the channel names: this runs
     /// every frame, so it must neither clone every name nor build a
     /// canonical key per name just to compare them.
     fn ordered_tab_names(&self) -> Vec<Option<&str>> {

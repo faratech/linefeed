@@ -73,6 +73,13 @@ pub struct App {
     pub(crate) search: super::search::SearchUi,
     /// What is typed in the top bar's search field.
     toolbar_search: String,
+    /// The network whose "Join a channel" row is a text field right now,
+    /// what is typed in it, and whether it still has to take the focus.
+    join_row: Option<ConnId>,
+    join_text: String,
+    join_focus: bool,
+    /// The active window the conversation list last scrolled to.
+    sidebar_scrolled: Option<WindowKey>,
     pub(crate) automation: super::automation::AutomationUi,
     pub(crate) window_switcher: super::actions::WindowSwitcher,
     pub(crate) sessions: Vec<Session>,
@@ -153,7 +160,7 @@ pub struct App {
     /// When the App started: the persisted active window is only restored
     /// while startup auto-joins are still arriving.
     started: Instant,
-    /// The user has picked a window (click, switchbar, shortcut, typing a
+    /// The user has picked a window (click, sidebar, shortcut, typing a
     /// /query): the persisted active window no longer applies.
     user_activated: bool,
     /// The window to return to if a "New connection" status window is
@@ -422,6 +429,10 @@ impl App {
             uploads: Default::default(),
             search: Default::default(),
             toolbar_search: String::new(),
+            join_row: None,
+            join_text: String::new(),
+            join_focus: false,
+            sidebar_scrolled: None,
             next_conn: 1,
             settings,
             updater: crate::updater::Controller::default(),
@@ -679,7 +690,7 @@ impl App {
     // ----- frame ----------------------------------------------------------
 
     /// The full frame: pump every session, run timers and lifecycles, then
-    /// draw the toolbar, switchbar, windows, detached windows and dialogs.
+    /// draw the top bar, sidebar, windows, detached windows and dialogs.
     pub fn ui(&mut self, root_ui: &mut egui::Ui) {
         self.ui_ctx = Some(root_ui.ctx().clone());
         let ctx = root_ui.ctx().clone();
@@ -690,7 +701,14 @@ impl App {
         self.show_window_switcher(&ctx);
 
         egui::Panel::top("toolbar").show(root_ui, |ui| self.draw_toolbar(ui));
-        egui::Panel::top("switchbar").show(root_ui, |ui| self.draw_switchbar(ui));
+        if !narrow(&ctx) {
+            egui::Panel::left("sidebar")
+                .resizable(true)
+                .default_size(248.0)
+                .min_size(180.0)
+                .max_size(360.0)
+                .show(root_ui, |ui| self.draw_sidebar(ui));
+        }
         let central = egui::CentralPanel::default().show(root_ui, |ui| {
             if self.windows.mode == LayoutMode::Maximized {
                 self.draw_maximized(ui);
@@ -803,7 +821,7 @@ impl App {
         }
         // The user is working in the main window while a detached window is
         // the active one: the window the main window shows becomes active
-        // (a click on a particular window or switchbar entry overrides this
+        // (a click on a particular window or sidebar row overrides this
         // later in the frame).
         if acted_here
             && (!embedded_child_keyboard || ctx.input(|input| input.pointer.any_pressed()))
@@ -1692,7 +1710,7 @@ impl App {
 
     // ----- ordering, shortcuts, closing ----------------------------------
 
-    /// Every window in switchbar order: sessions in creation order, each
+    /// Every window in sidebar order: sessions in creation order, each
     /// with its status window first and then its tabs sorted by name.
     pub(crate) fn ordered_windows(&self) -> Vec<WindowKey> {
         let mut keys = Vec::new();
@@ -2242,7 +2260,7 @@ impl App {
         }
     }
 
-    // ----- toolbar and switchbar ------------------------------------------
+    // ----- top bar and sidebar ---------------------------------------------
 
     /// The connection and its status at the left, search and the window
     /// controls at the right. What does not fit beside them moves down:
@@ -2258,7 +2276,7 @@ impl App {
         fit.rows = rows;
         if rows == ToolbarRows::Wrapped {
             ui.horizontal_wrapped(|ui| {
-                self.draw_connection_button(ui);
+                self.draw_bar_lead(ui);
                 self.draw_status_line(ui);
             });
             let row = ui.spacing().interact_size.y;
@@ -2278,7 +2296,7 @@ impl App {
             }
         } else {
             ui.horizontal(|ui| {
-                fit.connection = self.draw_connection_button(ui).rect.width();
+                fit.connection = self.draw_bar_lead(ui).rect.width();
                 if rows == ToolbarRows::One {
                     fit.status = ui
                         .scope(|ui| self.draw_status_line(ui))
@@ -2310,6 +2328,27 @@ impl App {
         }
     }
 
+    /// What the top bar starts with: the connection button, or in a narrow
+    /// window the switcher that stands in for the sidebar.
+    fn draw_bar_lead(&mut self, ui: &mut egui::Ui) -> egui::Response {
+        if narrow(ui.ctx()) {
+            self.draw_switcher_button(ui)
+        } else {
+            self.draw_connection_button(ui)
+        }
+    }
+
+    /// The colour of a connection's status dot.
+    fn connection_dot(session: &Session, palette: &super::theme::Palette) -> Color32 {
+        if session.is_connected() && session.away_status.is_none() {
+            palette.online
+        } else if session.is_connected() || session.is_connecting() {
+            palette.mention
+        } else {
+            palette.danger
+        }
+    }
+
     /// The active connection as one button: a status dot, the network and
     /// the nickname. Its menu connects or disconnects and shows the account
     /// and transport details.
@@ -2318,15 +2357,6 @@ impl App {
         let active = self.active_index();
         let label = self.network_label(&self.sessions[active]);
         let session = &self.sessions[active];
-        let connected = session.is_connected();
-        let connecting = session.is_connecting();
-        let dot = if connected && session.away_status.is_none() {
-            palette.online
-        } else if connected || connecting {
-            palette.mention
-        } else {
-            palette.danger
-        };
         let font = egui::TextStyle::Button.resolve(ui.style());
         let format = |font_id: egui::FontId, color| egui::TextFormat {
             font_id,
@@ -2334,7 +2364,11 @@ impl App {
             ..Default::default()
         };
         let mut title = egui::text::LayoutJob::default();
-        title.append("● ", 0.0, format(font.clone(), dot));
+        title.append(
+            "● ",
+            0.0,
+            format(font.clone(), Self::connection_dot(session, &palette)),
+        );
         title.append(
             &label,
             0.0,
@@ -2343,7 +2377,7 @@ impl App {
                 palette.text,
             ),
         );
-        if connected {
+        if session.is_connected() {
             title.append(
                 &format!("  {}", session.my_nick),
                 0.0,
@@ -2351,25 +2385,101 @@ impl App {
             );
         }
         title.append("  ▾", 0.0, format(font, palette.muted));
+        ui.menu_button(title, |ui| self.connection_menu(ui))
+            .response
+    }
+
+    /// Connect or disconnect the active connection, open another one, and
+    /// the account and transport details.
+    fn connection_menu(&mut self, ui: &mut egui::Ui) {
+        let active = self.active_index();
+        let connected = self.sessions[active].is_connected();
+        if connected {
+            if ui.button("Disconnect").clicked() {
+                let quit = self.quit_reason();
+                self.sessions[active].request_manual_disconnect(Some(quit));
+                ui.close();
+            }
+        } else if !self.sessions[active].is_connecting() && ui.button("Connect").clicked() {
+            self.sessions[active].show_connect_dialog = true;
+            self.open_connection_settings(self.sessions[active].id);
+            ui.close();
+        }
+        if ui.button("New connection...").clicked() {
+            self.new_connection();
+            ui.close();
+        }
+        if connected {
+            ui.separator();
+            self.sessions[active].draw_account_security_status(ui);
+        }
+    }
+
+    /// In a window too narrow for the sidebar: one button naming the active
+    /// conversation, whose menu lists every conversation and then the
+    /// connection's own entries.
+    fn draw_switcher_button(&mut self, ui: &mut egui::Ui) -> egui::Response {
+        let palette = super::theme::palette(ui.ctx());
+        let active = self.active_index();
+        let label = self.network_label(&self.sessions[active]);
+        let session = &self.sessions[active];
+        let name = self
+            .windows
+            .active
+            .and_then(|key| key.conversation)
+            .and_then(|id| session.target_name(id))
+            .unwrap_or("Status")
+            .to_owned();
+        let (mut unread, mut mentions) = (0, 0);
+        for network in self.sidebar_model() {
+            for row in network.rows.iter().filter(|row| !row.selected) {
+                unread += row.unread;
+                mentions += row.mentions;
+            }
+        }
+        let font = egui::TextStyle::Button.resolve(ui.style());
+        let semibold = egui::FontId::new(font.size, super::fonts::semibold());
+        let format = |font_id: egui::FontId, color| egui::TextFormat {
+            font_id,
+            color,
+            ..Default::default()
+        };
+        let mut title = egui::text::LayoutJob::default();
+        title.append(
+            "● ",
+            0.0,
+            format(font.clone(), Self::connection_dot(session, &palette)),
+        );
+        title.append(&name, 0.0, format(semibold.clone(), palette.text));
+        title.append(
+            &format!(" on {label}"),
+            0.0,
+            format(font.clone(), palette.muted),
+        );
+        if mentions > 0 {
+            title.append(
+                &format!("  @ {mentions}"),
+                0.0,
+                format(semibold, palette.mention),
+            );
+        } else if unread > 0 {
+            title.append(
+                &format!("  {unread}"),
+                0.0,
+                format(semibold, palette.accent),
+            );
+        }
+        title.append("  ▾", 0.0, format(font, palette.muted));
         ui.menu_button(title, |ui| {
-            if connected {
-                if ui.button("Disconnect").clicked() {
-                    let quit = self.quit_reason();
-                    self.sessions[active].request_manual_disconnect(Some(quit));
-                    ui.close();
-                }
-            } else if !connecting && ui.button("Connect").clicked() {
-                self.sessions[active].show_connect_dialog = true;
-                self.open_connection_settings(self.sessions[active].id);
+            ui.set_min_width(240.0);
+            let mut picked = false;
+            egui::ScrollArea::vertical()
+                .max_height(420.0)
+                .show(ui, |ui| picked = self.draw_conversation_rows(ui));
+            ui.separator();
+            self.connection_menu(ui);
+            if picked {
                 ui.close();
-            }
-            if ui.button("New connection...").clicked() {
-                self.new_connection();
-                ui.close();
-            }
-            if connected {
-                ui.separator();
-                self.sessions[active].draw_account_security_status(ui);
             }
         })
         .response
@@ -2462,64 +2572,178 @@ impl App {
             let query = std::mem::take(&mut self.toolbar_search);
             self.open_search(self.active_index(), query.trim().to_owned(), false);
         }
-        // The channel box moves into the sidebar with the conversations.
-        let active = self.active_index();
-        let session = &mut self.sessions[active];
-        if session.is_connected() {
-            session.draw_join_box(ui);
-        }
     }
 
-    fn draw_switchbar(&mut self, ui: &mut egui::Ui) {
+    /// Everything the conversation list shows, gathered before drawing so
+    /// that drawing is free to change the app's own state.
+    fn sidebar_model(&self) -> Vec<SidebarNetwork> {
+        self.sessions
+            .iter()
+            .enumerate()
+            .map(|(index, session)| SidebarNetwork {
+                index,
+                conn: session.id,
+                label: self.network_label(session),
+                connected: session.is_connected(),
+                busy: session.is_connecting() || session.away_status.is_some(),
+                rows: session
+                    .ordered_tabs()
+                    .into_iter()
+                    .filter_map(|target| {
+                        let key = WindowKey::new(session.id, target);
+                        let name = match target {
+                            None => "Status",
+                            Some(id) => session.target_name(id)?,
+                        };
+                        let channel = target.and_then(|id| session.conversation_channel(id));
+                        Some(SidebarRow {
+                            key,
+                            name: name.to_owned(),
+                            unread: match target {
+                                None => session.server_unread,
+                                Some(_) => channel.map_or(0, |channel| channel.unread),
+                            },
+                            mentions: channel.map_or(0, |channel| channel.unread_mentions()),
+                            detached: self.windows.get(&key).is_some_and(|w| w.detached),
+                            selected: self.windows.active.as_ref() == Some(&key),
+                            is_channel: target.is_some() && session.is_channel_name(name),
+                            close_label: match target {
+                                None => "Disconnect and close",
+                                Some(_) if session.tab_close_needs_part(name) => "Part",
+                                Some(_) => "Close",
+                            },
+                        })
+                    })
+                    .collect(),
+            })
+            .collect()
+    }
+
+    /// The conversation list down the left side of the window.
+    fn draw_sidebar(&mut self, ui: &mut egui::Ui) {
+        egui::ScrollArea::vertical()
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                self.draw_conversation_rows(ui);
+            });
+    }
+
+    /// Every network's conversations as rows: the active one filled, unread
+    /// ones emphasised with a count, mentions marked. Returns whether a
+    /// conversation was picked, so a menu showing the rows can close.
+    fn draw_conversation_rows(&mut self, ui: &mut egui::Ui) -> bool {
+        let palette = super::theme::palette(ui.ctx());
         let mut clicked = None;
         let mut close = None;
         let mut toggle_detach = None;
         let mut info = None;
-        ui.horizontal_wrapped(|ui| {
-            for (n, session) in self.sessions.iter().enumerate() {
-                if n > 0 {
-                    ui.separator();
-                }
-                let label = self.network_label(session);
-                ui.label(RichText::new(format!("{label}:")).strong());
-                for target in session.ordered_tabs() {
-                    let key = WindowKey::new(session.id, target);
-                    let detached = self.windows.get(&key).is_some_and(|w| w.detached);
-                    let text = switchbar_text(session, target, detached);
-                    let selected = self.windows.active.as_ref() == Some(&key);
-                    let mut response = ui.selectable_label(selected, text);
-                    if detached {
-                        response = response.on_hover_text("In its own window");
-                    }
-                    if response.clicked() {
-                        clicked = Some(key);
-                    }
-                    response.context_menu(|ui| {
-                        let detach_label = if detached { "Reattach" } else { "Detach" };
-                        if ui.button(detach_label).clicked() {
-                            toggle_detach = Some(key);
-                            ui.close();
+        let mut join = None;
+        for (position, network) in self.sidebar_model().into_iter().enumerate() {
+            if position > 0 {
+                ui.add_space(10.0);
+            }
+            ui.horizontal(|ui| {
+                ui.add_space(10.0);
+                let dot = if !network.connected && !network.busy {
+                    palette.danger
+                } else if network.busy {
+                    palette.mention
+                } else {
+                    palette.online
+                };
+                super::widgets::dot(ui, dot, true);
+                super::widgets::section_label(ui, &network.label);
+            });
+            for row in &network.rows {
+                let mut response = super::widgets::list_row(ui, row.selected, |ui| {
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if row.mentions > 0 {
+                            super::widgets::badge(
+                                ui,
+                                &format!("@ {}", row.mentions),
+                                palette.mention,
+                            );
+                        } else if row.unread > 0 {
+                            super::widgets::badge(ui, &row.unread.to_string(), palette.accent);
                         }
-                        if let Some(name) = target.and_then(|id| session.target_name(id))
-                            && session.is_channel_name(name)
-                            && ui.button("Channel Info").clicked()
-                        {
-                            info = Some(key);
-                            ui.close();
-                        }
-                        let close_label = match target.and_then(|id| session.target_name(id)) {
-                            None => "Disconnect and close",
-                            Some(name) if session.tab_close_needs_part(name) => "Part",
-                            Some(_) => "Close",
-                        };
-                        if ui.button(close_label).clicked() {
-                            close = Some(key);
-                            ui.close();
-                        }
+                        ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                            let mut text = if row.selected || row.unread > 0 {
+                                super::widgets::strong(&row.name).color(palette.text)
+                            } else {
+                                RichText::new(&row.name).color(palette.muted)
+                            };
+                            // Detached windows are set in italics: a marker
+                            // glyph would depend on the fonts installed.
+                            if row.detached {
+                                text = text.italics();
+                            }
+                            super::widgets::truncated(ui, text);
+                        });
                     });
+                });
+                if row.detached {
+                    response = response.on_hover_text("In its own window");
+                }
+                if row.selected && self.sidebar_scrolled != Some(row.key) {
+                    response.scroll_to_me(None);
+                    self.sidebar_scrolled = Some(row.key);
+                }
+                if response.clicked() {
+                    clicked = Some(row.key);
+                }
+                response.context_menu(|ui| {
+                    let detach_label = if row.detached { "Reattach" } else { "Detach" };
+                    if ui.button(detach_label).clicked() {
+                        toggle_detach = Some(row.key);
+                        ui.close();
+                    }
+                    if row.is_channel && ui.button("Channel Info").clicked() {
+                        info = Some(row.key);
+                        ui.close();
+                    }
+                    if ui.button(row.close_label).clicked() {
+                        close = Some(row.key);
+                        ui.close();
+                    }
+                });
+            }
+            if !network.connected {
+                continue;
+            }
+            if self.join_row == Some(network.conn) {
+                let height = super::theme::control_height(ui);
+                let response = ui.add(
+                    egui::TextEdit::singleline(&mut self.join_text)
+                        .hint_text("#channel")
+                        .desired_width(f32::INFINITY)
+                        .min_size(egui::vec2(0.0, height))
+                        .align(egui::Align2::LEFT_CENTER),
+                );
+                if std::mem::take(&mut self.join_focus) {
+                    response.request_focus();
+                } else if response.lost_focus() {
+                    // Enter joins; Escape or a click elsewhere cancels.
+                    if ui.input(|input| input.key_pressed(egui::Key::Enter)) {
+                        join = Some((network.index, std::mem::take(&mut self.join_text)));
+                    }
+                    self.join_row = None;
+                    self.join_text.clear();
+                }
+            } else {
+                let response = super::widgets::list_row(ui, false, |ui| {
+                    ui.label(RichText::new("+").color(palette.muted));
+                    ui.label(RichText::new("Join a channel").color(palette.muted));
+                });
+                if response.clicked() {
+                    self.join_row = Some(network.conn);
+                    self.join_text.clear();
+                    self.join_focus = true;
                 }
             }
-        });
+        }
+        if let Some((index, text)) = join {
+            self.sessions[index].join_typed_channel(&text);
+        }
         if let Some(key) = clicked {
             self.user_activate(key);
             self.focus_detached(ui.ctx(), &key);
@@ -2536,6 +2760,7 @@ impl App {
         if let Some(key) = close {
             self.request_close(key);
         }
+        clicked.is_some()
     }
 
     pub(crate) fn toggle_detached(&mut self, key: &WindowKey) {
@@ -3703,59 +3928,34 @@ fn toolbar_rows(fit: Option<ToolbarFit>, available: f32, spacing: f32) -> Toolba
     }
 }
 
-/// Switchbar button text, coloured like the old sidebar: unread channels
-/// green, unread queries orange, unread status yellow, queries light blue.
-fn switchbar_text(session: &Session, target: Option<ConversationId>, detached: bool) -> RichText {
-    let text = switchbar_label(session, target);
-    // Detached windows are set in italics: a marker glyph would depend on
-    // the fonts installed.
-    if detached { text.italics() } else { text }
+/// Whether the window is too narrow for the sidebar: the top bar then
+/// carries a switcher button instead, and the people list starts hidden.
+pub(crate) fn narrow(ctx: &egui::Context) -> bool {
+    ctx.content_rect().width() < 720.0
 }
 
-fn switchbar_label(session: &Session, target: Option<ConversationId>) -> RichText {
-    let marker = "";
-    match target {
-        None => {
-            let unread = session.server_unread;
-            let label = if unread > 0 {
-                format!("Status ({unread}){marker}")
-            } else {
-                format!("Status{marker}")
-            };
-            if unread > 0 {
-                RichText::new(label)
-                    .strong()
-                    .color(Color32::from_rgb(255, 255, 100))
-            } else {
-                RichText::new(label)
-            }
-        }
-        Some(id) => {
-            let Some(name) = session.target_name(id) else {
-                return RichText::new("");
-            };
-            let unread = session
-                .conversation_channel(id)
-                .map(|c| c.unread)
-                .unwrap_or(0);
-            let is_query = !session.is_channel_name(name);
-            let label = if unread > 0 {
-                format!("{name} ({unread}){marker}")
-            } else {
-                format!("{name}{marker}")
-            };
-            match (unread > 0, is_query) {
-                (true, true) => RichText::new(label)
-                    .strong()
-                    .color(Color32::from_rgb(255, 150, 50)),
-                (true, false) => RichText::new(label)
-                    .strong()
-                    .color(Color32::from_rgb(100, 255, 100)),
-                (false, true) => RichText::new(label).color(Color32::from_rgb(150, 200, 255)),
-                (false, false) => RichText::new(label),
-            }
-        }
-    }
+/// One network's part of the conversation list.
+struct SidebarNetwork {
+    /// Position in `App::sessions`.
+    index: usize,
+    conn: ConnId,
+    label: String,
+    connected: bool,
+    /// Connecting, or connected but away.
+    busy: bool,
+    rows: Vec<SidebarRow>,
+}
+
+/// One conversation in the list.
+struct SidebarRow {
+    key: WindowKey,
+    name: String,
+    unread: usize,
+    mentions: usize,
+    detached: bool,
+    selected: bool,
+    is_channel: bool,
+    close_label: &'static str,
 }
 
 /// Run `f` with `session` pointed at `target` and the window's input line,
@@ -4888,7 +5088,7 @@ mod tests {
     }
 
     #[test]
-    fn switchbar_order_matches_ctrl_tab_order() {
+    fn sidebar_order_matches_ctrl_tab_order() {
         let (mut app, _rx_a, _rx_b) = two_networks();
         feed(&mut app, 0, ":me!u@h JOIN #alpha");
         app.sync_windows();
@@ -6024,7 +6224,7 @@ mod tests {
     }
 
     #[test]
-    fn a_maximized_frame_draws_the_active_window_and_the_switchbar() {
+    fn a_maximized_frame_draws_the_active_window_and_the_sidebar() {
         let (mut app, _rx_a, _rx_b) = two_networks();
         feed(&mut app, 1, ":bob!u@h PRIVMSG #debian :apt is fine");
         let debian = target_key(&app, app.sessions[1].id, "#debian");
@@ -6034,10 +6234,7 @@ mod tests {
         let output = frame(&mut app, &ctx);
         let texts = texts(&output);
         assert!(texts.iter().any(|t| t.contains("apt is fine")), "{texts:?}");
-        assert!(
-            texts.iter().any(|t| t.contains("#rust")),
-            "switchbar missing"
-        );
+        assert!(texts.iter().any(|t| t.contains("#rust")), "sidebar missing");
     }
 
     #[test]
@@ -6081,7 +6278,7 @@ mod tests {
         app.layout_dirty_since = None;
         app.windows.dirty = false;
 
-        // A restored minimized-size window: the toolbar and switchbar leave
+        // A restored minimized-size window: the top bar and sidebar leave
         // the chat area no height.
         for size in [egui::vec2(160.0, 30.0), egui::vec2(1024.0, 60.0)] {
             for _ in 0..3 {
@@ -6678,7 +6875,7 @@ mod tests {
         let ctx = egui::Context::default();
         let mut time = floating_windows(&mut app, &ctx);
         let key = app.windows.active.unwrap();
-        let placed = egui::Rect::from_min_max(egui::pos2(300.0, 200.0), egui::pos2(700.0, 600.0));
+        let placed = egui::Rect::from_min_max(egui::pos2(400.0, 200.0), egui::pos2(800.0, 600.0));
         app.windows.place(&key, placed);
         for _ in 0..3 {
             pointer_frame(&mut app, &ctx, time, vec![]);
@@ -6749,7 +6946,7 @@ mod tests {
         ));
         frame(&mut app, &ctx);
         let area = app.windows.area.unwrap();
-        assert!(area.width() > 900.0, "area not followed while maximized");
+        assert!(area.width() > 700.0, "area not followed while maximized");
         let key = app.windows.active.unwrap();
         let target = snap::SnapTarget::layout(area, 0, 0);
         app.snap_window(&key, target.clone());
@@ -7405,8 +7602,7 @@ mod tests {
             left = rect.right();
         }
         assert!(left > 1360.0 - 32.0, "Settings ends at the right: {left}");
-        // "Join" leaves the bar when the sidebar gets its join row.
-        for gone in ["Linefeed", "Disconnect", "Connect", "Search"] {
+        for gone in ["Linefeed", "Disconnect", "Connect", "Join", "Search"] {
             assert!(!painted.has(gone), "{gone} is no longer on the bar");
         }
     }
@@ -7529,6 +7725,194 @@ mod tests {
         let (_, status, _) = painted.containing("signed in");
         let (settings, _) = painted.text("Settings");
         assert!((settings.center().y - status.center().y).abs() < 8.0);
+    }
+
+    /// The sidebar's row labels, top to bottom.
+    fn sidebar_rows(painted: &Painted) -> Vec<String> {
+        let mut rows: Vec<(f32, String)> = painted
+            .texts
+            .iter()
+            .filter(|(text, rect, _)| {
+                rect.right() <= 248.0
+                    && rect.top() > 30.0
+                    && (text == "Status" || text.starts_with('#'))
+            })
+            .map(|(text, rect, _)| (rect.top(), text.clone()))
+            .collect();
+        rows.sort_by(|a, b| a.0.total_cmp(&b.0));
+        rows.into_iter().map(|(_, text)| text).collect()
+    }
+
+    #[test]
+    fn the_sidebar_lists_every_window_in_ctrl_tab_order() {
+        let (mut app, _rx_a, _rx_b) = two_networks();
+        feed(&mut app, 0, ":me!u@h JOIN #alpha");
+        app.sync_windows();
+        let ctx = egui::Context::default();
+        let painted = settled(&mut app, &ctx, 1360.0);
+        assert_eq!(
+            sidebar_rows(&painted),
+            ["Status", "#alpha", "#rust", "Status", "#debian"]
+        );
+        // Each network is headed by its name.
+        let first = app.network_label(&app.sessions[0]).to_uppercase();
+        let second = app.network_label(&app.sessions[1]).to_uppercase();
+        let (heading_a, _) = painted.text(&first);
+        let (heading_b, _) = painted.text(&second);
+        let (rust, _) = painted.text("#rust");
+        assert!(heading_a.top() < rust.top() && rust.top() < heading_b.top());
+    }
+
+    #[test]
+    fn sidebar_badges_show_unread_counts_and_mark_mentions() {
+        let (mut app, _rx_a, _rx_b) = two_networks();
+        let debian = target_key(&app, app.sessions[1].id, "#debian");
+        app.user_activate(debian);
+        let ctx = egui::Context::default();
+        settled(&mut app, &ctx, 1360.0);
+        for text in ["one", "two", "three"] {
+            feed(&mut app, 0, &format!(":bob!u@h PRIVMSG #rust :{text}"));
+        }
+        let painted = settled(&mut app, &ctx, 1360.0);
+        let (rust, _) = painted.text("#rust");
+        let (count, _) = painted.text("3");
+        assert!(
+            (count.center().y - rust.center().y).abs() < 8.0,
+            "{count:?}"
+        );
+        assert!(count.right() <= 248.0 && count.left() > rust.right());
+        let accent = super::super::theme::palette(&ctx).accent;
+        assert!(
+            painted
+                .fills
+                .iter()
+                .any(|(rect, fill)| *fill == accent && rect.contains_rect(count))
+        );
+
+        feed(&mut app, 0, ":bob!u@h PRIVMSG #rust :me: are you there?");
+        let painted = settled(&mut app, &ctx, 1360.0);
+        let (mention, _) = painted.text("@ 1");
+        let mention_fill = super::super::theme::palette(&ctx).mention;
+        assert!(
+            painted
+                .fills
+                .iter()
+                .any(|(rect, fill)| *fill == mention_fill && rect.contains_rect(mention))
+        );
+        assert!(
+            !painted.has("4"),
+            "a mention badge replaces the plain count"
+        );
+    }
+
+    #[test]
+    fn clicking_a_sidebar_row_activates_its_window() {
+        let (mut app, _rx_a, _rx_b) = two_networks();
+        let rust = target_key(&app, app.sessions[0].id, "#rust");
+        let debian = target_key(&app, app.sessions[1].id, "#debian");
+        app.user_activate(rust);
+        let ctx = egui::Context::default();
+        let painted = settled(&mut app, &ctx, 1360.0);
+        let (row, _) = painted.text("#debian");
+        click(&mut app, &ctx, 1360.0, row.center());
+        assert_eq!(app.windows.active, Some(debian));
+    }
+
+    #[test]
+    fn a_long_channel_name_is_cut_inside_the_sidebar() {
+        let (mut app, _rx_a, _rx_b) = two_networks();
+        let long = format!("#{}", "x".repeat(200));
+        feed(&mut app, 0, &format!(":me!u@h JOIN {long}"));
+        app.sync_windows();
+        let ctx = egui::Context::default();
+        let painted = settled(&mut app, &ctx, 1360.0);
+        let (_, row, _) = painted.containing("#xxxx");
+        assert!(row.right() <= 248.0, "{row:?}");
+        // The panel kept its width: the search field is where it was.
+        let (hint, _) = painted.text("Search history (Ctrl+F)");
+        assert!(hint.left() > 680.0);
+    }
+
+    #[test]
+    fn the_active_row_is_scrolled_into_view() {
+        let (mut app, _rx_a, _rx_b) = two_networks();
+        for n in 0..80 {
+            assert!(app.sessions[0].open_query(&format!("q{n:02}")));
+        }
+        app.sync_windows();
+        let ctx = egui::Context::default();
+        let painted = settled(&mut app, &ctx, 1360.0);
+        assert!(!painted.has("q79"), "the last row starts below the window");
+        let last = target_key(&app, app.sessions[0].id, "q79");
+        app.user_activate(last);
+        // The list scrolls there over a few frames.
+        for _ in 0..60 {
+            paint(&mut app, &ctx, 1360.0, Vec::new());
+        }
+        let painted = settled(&mut app, &ctx, 1360.0);
+        let (row, _) = painted.text("q79");
+        assert!(
+            row.top() > 30.0 && row.bottom() <= 768.0 && row.right() <= 248.0,
+            "{row:?}"
+        );
+    }
+
+    #[test]
+    fn below_720_px_the_sidebar_becomes_a_switcher_button() {
+        let (mut app, _rx_a, _rx_b) = two_networks();
+        let rust = target_key(&app, app.sessions[0].id, "#rust");
+        app.user_activate(rust);
+        let ctx = egui::Context::default();
+        let painted = settled(&mut app, &ctx, 640.0);
+        assert!(
+            !painted.has("Join a channel"),
+            "no sidebar: {:?}",
+            painted.strings()
+        );
+        assert!(!painted.has("#debian"));
+        let label = app.network_label(&app.sessions[0]);
+        let (title, switcher, _) = painted.containing(&format!("#rust on {label}"));
+        assert!(switcher.top() < 60.0, "{title}: {switcher:?}");
+
+        let painted = click(&mut app, &ctx, 640.0, switcher.center());
+        assert!(painted.has("#debian") && painted.has("Join a channel"));
+        assert!(painted.has("Disconnect"));
+        let (row, _) = painted.text("#debian");
+        click(&mut app, &ctx, 640.0, row.center());
+        let debian = target_key(&app, app.sessions[1].id, "#debian");
+        assert_eq!(app.windows.active, Some(debian));
+    }
+
+    #[test]
+    fn join_a_channel_sends_a_join() {
+        let (mut app, mut rx_a, _rx_b) = two_networks();
+        let ctx = egui::Context::default();
+        let painted = settled(&mut app, &ctx, 1360.0);
+        drain(&mut rx_a);
+        let (join, _) = painted.text("Join a channel");
+        click(&mut app, &ctx, 1360.0, join.center());
+        paint(
+            &mut app,
+            &ctx,
+            1360.0,
+            vec![egui::Event::Text("new".into())],
+        );
+        paint(
+            &mut app,
+            &ctx,
+            1360.0,
+            vec![egui::Event::Key {
+                key: egui::Key::Enter,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        );
+        let sent = drain(&mut rx_a);
+        assert!(sent.iter().any(|line| line == "JOIN #new"), "{sent:?}");
+        let painted = settled(&mut app, &ctx, 1360.0);
+        assert!(painted.has("Join a channel"), "the row is back to a button");
     }
 
     fn focus_frame(app: &mut App, ctx: &egui::Context, focused: bool) -> egui::FullOutput {

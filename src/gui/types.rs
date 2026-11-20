@@ -1093,6 +1093,16 @@ pub struct Channel {
 }
 
 impl Channel {
+    /// How many of the unread messages mention the user.
+    pub(crate) fn unread_mentions(&self) -> usize {
+        self.messages
+            .iter()
+            .rev()
+            .take(self.unread)
+            .filter(|message| message.is_highlight)
+            .count()
+    }
+
     pub fn new() -> Self {
         Self {
             topic: None,
@@ -1945,6 +1955,25 @@ pub struct TabCompletion {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unread_mentions_counts_highlights_among_the_unread_tail_only() {
+        let mut channel = Channel::new();
+        for (index, text) in ["a", "b", "c", "d", "e"].into_iter().enumerate() {
+            let mut message = ChatMessage::new_fmt("bob", text, "short");
+            message.is_highlight = index == 0 || index == 4;
+            channel.messages.push_back(message);
+        }
+        channel.unread = 3;
+        assert_eq!(channel.unread_mentions(), 1);
+        channel.unread = 5;
+        assert_eq!(channel.unread_mentions(), 2);
+        channel.unread = 0;
+        assert_eq!(channel.unread_mentions(), 0);
+        // A count larger than the scrollback (trimmed history) is not a panic.
+        channel.unread = 50;
+        assert_eq!(channel.unread_mentions(), 2);
+    }
 
     #[test]
     fn settings_saved_by_0_1_9_load_with_the_new_display_defaults() {

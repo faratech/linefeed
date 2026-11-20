@@ -1,8 +1,5 @@
 //! Small building blocks the redesigned window is drawn from.
 
-// Until the top bar and sidebar are drawn with these.
-#![cfg_attr(not(test), allow(dead_code))]
-
 use egui::Color32;
 
 use super::{fonts, theme};
