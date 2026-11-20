@@ -4258,6 +4258,26 @@ fn draw_new_messages_marker(ui: &mut egui::Ui, palette: &theme::Palette) {
     );
 }
 
+/// How wide a time column must be for this message's timestamp format,
+/// whatever its digits.
+pub(crate) fn time_width_of(ui: &egui::Ui, sample: &ChatMessage) -> f32 {
+    let time = row_time(sample);
+    if time.is_empty() {
+        return 0.0;
+    }
+    let widest: String = time
+        .chars()
+        .map(|c| if c.is_ascii_digit() { '0' } else { c })
+        .collect();
+    let font = egui::TextStyle::Small.resolve(ui.style());
+    ui.painter()
+        .layout_no_wrap(widest, font, Color32::PLACEHOLDER)
+        .size()
+        .x
+        .ceil()
+        + 2.0
+}
+
 /// The time as shown in a row: the stored text without its brackets.
 fn row_time(msg: &ChatMessage) -> &str {
     msg.timestamp.trim_matches(|c| c == '[' || c == ']')
@@ -8944,20 +8964,7 @@ impl Session {
         if self.timestamp_format == "off" {
             return 0.0;
         }
-        let Some(sample) = msgs.back().map(row_time).filter(|time| !time.is_empty()) else {
-            return 0.0;
-        };
-        let widest: String = sample
-            .chars()
-            .map(|c| if c.is_ascii_digit() { '0' } else { c })
-            .collect();
-        let font = egui::TextStyle::Small.resolve(ui.style());
-        ui.painter()
-            .layout_no_wrap(widest, font, Color32::PLACEHOLDER)
-            .size()
-            .x
-            .ceil()
-            + 2.0
+        msgs.back().map_or(0.0, |sample| time_width_of(ui, sample))
     }
 
     /// Draw the active view's message scrollback, virtualized: only the rows

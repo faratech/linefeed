@@ -499,41 +499,91 @@ impl Session {
         true
     }
 
+    /// The Display tab: how the window looks and reads. Every choice
+    /// applies as soon as it is made.
     fn settings_tab_display(
         &mut self,
         ui: &mut egui::Ui,
         display: &mut super::theme::DisplayPrefs,
     ) {
-        ui.heading("Timestamps");
-        ui.add_space(4.0);
+        use super::theme::{Density, MessageFont, ThemeChoice};
+        let before = *display;
 
-        ui.horizontal(|ui| {
-            ui.label("Format:");
-            egui::ComboBox::from_id_salt("timestamp_format")
-                .selected_text(match self.timestamp_format.as_str() {
-                    "short" => "HH:MM",
-                    "long" => "HH:MM:SS",
-                    "full" => "MM-DD HH:MM",
-                    _ => "HH:MM",
-                })
-                .show_ui(ui, |ui| {
-                    ui.selectable_value(&mut self.timestamp_format, "short".to_string(), "HH:MM");
-                    ui.selectable_value(&mut self.timestamp_format, "long".to_string(), "HH:MM:SS");
-                    ui.selectable_value(
-                        &mut self.timestamp_format,
-                        "full".to_string(),
-                        "MM-DD HH:MM",
-                    );
-                });
+        ui.heading("Appearance");
+        ui.add_space(4.0);
+        ui.horizontal_wrapped(|ui| {
+            ui.label("Theme:");
+            for (choice, label) in [
+                (ThemeChoice::Dark, "Dark"),
+                (ThemeChoice::Light, "Light"),
+                (ThemeChoice::System, "Match the system"),
+            ] {
+                ui.radio_value(&mut display.theme, choice, label);
+            }
         });
-        ChatMessage::configure_default_timestamp_format(&self.timestamp_format);
+        ui.horizontal_wrapped(|ui| {
+            ui.label("Text size:");
+            ui.add(
+                egui::Slider::new(&mut display.font_size, 10.0..=24.0)
+                    .step_by(1.0)
+                    .suffix(" px"),
+            );
+        });
+        ui.horizontal_wrapped(|ui| {
+            ui.label("Spacing:");
+            ui.radio_value(&mut display.density, Density::Comfortable, "Comfortable");
+            ui.radio_value(&mut display.density, Density::Compact, "Compact");
+        });
+        ui.horizontal_wrapped(|ui| {
+            ui.label("Message font:");
+            ui.radio_value(
+                &mut display.message_font,
+                MessageFont::Proportional,
+                "Proportional",
+            );
+            ui.radio_value(
+                &mut display.message_font,
+                MessageFont::Monospace,
+                "Monospace",
+            );
+        });
+        if *display != before {
+            super::theme::apply(ui.ctx(), display);
+        }
 
         ui.add_space(8.0);
         ui.heading("Messages");
         ui.add_space(4.0);
-
-        ui.checkbox(&mut self.hide_join_part, "Hide join/part/quit messages");
-
+        ui.horizontal(|ui| {
+            ui.label("Timestamps:");
+            const FORMATS: [(&str, &str); 4] = [
+                ("short", "14:05"),
+                ("long", "14:05:32"),
+                ("full", "11-20 14:05"),
+                ("off", "Hidden"),
+            ];
+            let selected = FORMATS
+                .iter()
+                .find(|(format, _)| *format == self.timestamp_format)
+                .map_or("14:05", |(_, label)| label);
+            egui::ComboBox::from_id_salt("timestamp_format")
+                .selected_text(selected)
+                .show_ui(ui, |ui| {
+                    for (format, label) in FORMATS {
+                        ui.selectable_value(&mut self.timestamp_format, format.to_owned(), label);
+                    }
+                });
+        });
+        // New messages keep getting a time while it is hidden, so it is
+        // there when timestamps are shown again.
+        ChatMessage::configure_default_timestamp_format(&self.timestamp_format);
+        if ui
+            .checkbox(&mut display.color_nicks, "Give each nickname its own color")
+            .changed()
+        {
+            super::theme::apply(ui.ctx(), display);
+        }
+        ui.checkbox(&mut self.hide_join_part, "Hide join, part and quit lines");
         ui.horizontal(|ui| {
             ui.label("Max scrollback:");
             let mut lines = self.max_scrollback as i32;
@@ -547,28 +597,7 @@ impl Session {
         });
 
         ui.add_space(8.0);
-        ui.heading("Font");
-        ui.add_space(4.0);
-
-        ui.horizontal(|ui| {
-            ui.label("Size:");
-            let changed = ui
-                .add(
-                    egui::DragValue::new(&mut display.font_size)
-                        .speed(0.5)
-                        .range(10.0..=24.0),
-                )
-                .changed();
-            if changed {
-                super::theme::apply(ui.ctx(), display);
-            }
-            ui.label("px");
-        });
-        ui.label(
-            RichText::new("Applied immediately and saved for restart")
-                .small()
-                .color(Color32::GRAY),
-        );
+        self.draw_display_preview(ui);
 
         ui.add_space(8.0);
         ui.heading("Highlights");
@@ -583,8 +612,49 @@ impl Session {
         ui.label(
             RichText::new("Your nick is always highlighted")
                 .small()
-                .color(Color32::GRAY),
+                .color(super::theme::palette(ui.ctx()).muted),
         );
+    }
+
+    /// Two sample rows drawn exactly as the chat draws them, so a choice
+    /// can be judged before leaving Settings.
+    fn draw_display_preview(&self, ui: &mut egui::Ui) {
+        let palette = super::theme::palette(ui.ctx());
+        super::widgets::section_label(ui, "Preview");
+        egui::Frame::NONE
+            .fill(palette.bg)
+            .stroke(egui::Stroke::new(1.0, palette.line))
+            .corner_radius(10)
+            .inner_margin(egui::Margin::symmetric(0, 8))
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                let gap = super::theme::metrics(ui.ctx()).row_gap;
+                ui.spacing_mut().item_spacing.y = gap;
+                let samples = [
+                    ("bob", "This is how messages will look."),
+                    ("carol", "Changes here apply as soon as you pick them."),
+                ]
+                .map(|(nick, text)| ChatMessage::new_fmt(nick, text, &self.timestamp_format));
+                let layout = super::RowLayout {
+                    stacked: ui.available_width() < 520.0,
+                    time_width: if self.timestamp_format == "off" {
+                        0.0
+                    } else {
+                        super::time_width_of(ui, &samples[0])
+                    },
+                };
+                for sample in &samples {
+                    let row = super::RowContext {
+                        my_nick: &self.my_nick,
+                        layout,
+                        show_nick: true,
+                        marker: false,
+                    };
+                    ui.scope(|ui| {
+                        super::draw_chat_row(ui, sample, &row);
+                    });
+                }
+            });
     }
 
     fn draw_on_connect_settings(&mut self, ui: &mut egui::Ui) {

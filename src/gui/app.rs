@@ -568,6 +568,18 @@ impl App {
         self.settings.automatic_updates
     }
 
+    /// With "Match the system" chosen, switch between the dark and light
+    /// palettes when the operating system does.
+    fn follow_system_theme(&self, ctx: &egui::Context) {
+        if self.settings.theme != super::theme::ThemeChoice::System {
+            return;
+        }
+        let system_dark = ctx.system_theme() != Some(egui::Theme::Light);
+        if system_dark != super::theme::palette(ctx).dark {
+            self.apply_display(ctx);
+        }
+    }
+
     /// Put the saved display choices (theme, spacing, fonts) into effect.
     pub fn apply_display(&self, ctx: &egui::Context) {
         super::theme::apply(ctx, &self.settings.display());
@@ -694,6 +706,7 @@ impl App {
     pub fn ui(&mut self, root_ui: &mut egui::Ui) {
         self.ui_ctx = Some(root_ui.ctx().clone());
         let ctx = root_ui.ctx().clone();
+        self.follow_system_theme(&ctx);
         self.observe_root_input(&ctx);
         self.tick(&ctx, true);
         self.handle_shortcuts(&ctx);
@@ -8445,6 +8458,157 @@ mod tests {
             "present is a filled dot"
         );
         assert_eq!(me_color, palette.text);
+    }
+
+    /// The app with its Settings window open on the Display tab.
+    fn display_settings() -> (App, egui::Context) {
+        let (mut app, _rx_a, _rx_b) = two_networks();
+        let rust = target_key(&app, app.sessions[0].id, "#rust");
+        app.user_activate(rust);
+        feed(&mut app, 0, ":bob!u@h PRIVMSG #rust :hello marker");
+        let conn = app.sessions[0].id;
+        app.open_settings(conn);
+        app.settings_tab = 1;
+        let ctx = egui::Context::default();
+        settled(&mut app, &ctx, 1360.0);
+        (app, ctx)
+    }
+
+    fn click_text(app: &mut App, ctx: &egui::Context, text: &str) -> Painted {
+        let painted = settled(app, ctx, 1360.0);
+        let (rect, _) = painted.text(text);
+        click(app, ctx, 1360.0, rect.center())
+    }
+
+    #[test]
+    fn choosing_light_applies_it_at_once() {
+        use super::super::theme::{self, Palette, ThemeChoice};
+        let (mut app, ctx) = display_settings();
+        assert_eq!(theme::palette(&ctx).bg, Palette::dark().bg);
+        click_text(&mut app, &ctx, "Light");
+        assert_eq!(app.settings.theme, ThemeChoice::Light);
+        assert_eq!(theme::palette(&ctx).bg, Palette::light().bg);
+        assert!(app.show_settings, "the window stays open");
+    }
+
+    #[test]
+    fn display_choices_are_saved_and_survive_cancel_like_other_global_preferences() {
+        use super::super::theme::{Density, MessageFont, ThemeChoice};
+        let (mut app, ctx) = display_settings();
+        click_text(&mut app, &ctx, "Compact");
+        click_text(&mut app, &ctx, "Monospace");
+        click_text(&mut app, &ctx, "Give each nickname its own color");
+        click_text(&mut app, &ctx, "Match the system");
+        click_text(&mut app, &ctx, "Cancel");
+        assert!(!app.show_settings);
+        assert_eq!(
+            (
+                app.settings.theme,
+                app.settings.density,
+                app.settings.message_font,
+                app.settings.color_nicks
+            ),
+            (
+                ThemeChoice::System,
+                Density::Compact,
+                MessageFont::Monospace,
+                false
+            )
+        );
+        assert_eq!(
+            ctx.global_style().spacing.interact_size.y,
+            32.0,
+            "the compact spacing is in force"
+        );
+    }
+
+    #[test]
+    fn hidden_timestamps_can_be_chosen_and_stop_being_drawn() {
+        let (mut app, ctx) = display_settings();
+        let painted = settled(&mut app, &ctx, 1360.0);
+        assert!(
+            chat_texts(&painted)
+                .iter()
+                .any(|(text, _, _)| is_time(text))
+        );
+        // Open the timestamp choices, then pick "Hidden".
+        let painted = settled(&mut app, &ctx, 1360.0);
+        let combo = painted
+            .texts
+            .iter()
+            .find(|(text, rect, _)| text == "14:05" && rect.top() > 60.0)
+            .expect("the timestamp choice shows an example")
+            .1;
+        click(&mut app, &ctx, 1360.0, combo.center());
+        click_text(&mut app, &ctx, "Hidden");
+        assert_eq!(app.sessions[0].timestamp_format, "off");
+        click_text(&mut app, &ctx, "Save & Close");
+        assert_eq!(app.settings.timestamp_format, "off");
+        let painted = settled(&mut app, &ctx, 1360.0);
+        assert!(
+            !chat_texts(&painted)
+                .iter()
+                .any(|(text, _, _)| is_time(text))
+        );
+        // New messages still get a time, for when it is shown again.
+        feed(&mut app, 0, ":bob!u@h PRIVMSG #rust :later");
+        let message = app.sessions[0].conversations["#rust"]
+            .messages
+            .back()
+            .unwrap();
+        assert!(!message.timestamp.is_empty());
+    }
+
+    #[test]
+    fn the_display_tab_shows_a_live_preview() {
+        let (mut app, ctx) = display_settings();
+        let painted = settled(&mut app, &ctx, 1360.0);
+        for text in [
+            "This is how messages will look.",
+            "Changes here apply as soon as you pick them.",
+        ] {
+            assert!(painted.has(text), "{:?}", painted.strings());
+        }
+        for label in [
+            "Dark",
+            "Light",
+            "Match the system",
+            "Comfortable",
+            "Compact",
+            "Proportional",
+            "Monospace",
+            "Hide join, part and quit lines",
+        ] {
+            assert!(painted.has(label), "{label} is offered");
+        }
+    }
+
+    #[test]
+    fn match_the_system_follows_the_system_theme() {
+        use super::super::theme::{self, ThemeChoice};
+        let (mut app, _rx_a, _rx_b) = two_networks();
+        app.settings.theme = ThemeChoice::System;
+        let ctx = egui::Context::default();
+        let frame_with = |app: &mut App, system: egui::Theme| {
+            let mut output = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(1024.0, 768.0),
+                    )),
+                    system_theme: Some(system),
+                    ..Default::default()
+                },
+                |ui| app.ui(ui),
+            );
+            output.textures_delta.clear();
+        };
+        frame_with(&mut app, egui::Theme::Light);
+        frame_with(&mut app, egui::Theme::Light);
+        assert!(!theme::palette(&ctx).dark);
+        frame_with(&mut app, egui::Theme::Dark);
+        frame_with(&mut app, egui::Theme::Dark);
+        assert!(theme::palette(&ctx).dark);
     }
 
     /// The colour of the topmost opaque fill painted behind `rect`.
