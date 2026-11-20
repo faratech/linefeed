@@ -1291,6 +1291,10 @@ impl App {
     /// A new status window with its Connect dialog. If the dialog is
     /// dismissed without connecting, the window goes and focus returns.
     fn new_connection(&mut self) {
+        // An editor still open for an earlier new connection is canceled (and
+        // that window discarded) first, so focus returns to a window that
+        // stays.
+        self.retire_open_editor(None);
         self.focus_before_new = self.windows.active;
         let index = self.add_session();
         self.sessions[index].show_connect_dialog = true;
@@ -2075,27 +2079,31 @@ impl App {
         self.show_settings = true;
     }
 
-    /// Retargeting an open editor to another session ends the first edit as
-    /// Cancel would: its scratch form goes back to the opening snapshot,
-    /// which is otherwise replaced below and lost (#208). The Connect dialog
-    /// flag is kept, so a still-unconnected window reopens its editor.
-    fn cancel_edit_before_retarget(&mut self, next: ConnId) {
-        if !self.show_settings || self.settings_session.is_none_or(|owner| owner == next) {
+    /// Retargeting an open editor to another session is a Cancel of the
+    /// first: its scratch form goes back to the opening snapshot (#208), the
+    /// favorites selection is dropped and a canceled pristine new connection
+    /// is discarded, rather than the snapshot being replaced and lost. The
+    /// window that was active stays active.
+    fn retire_open_editor(&mut self, next: Option<ConnId>) {
+        if !self.show_settings
+            || self
+                .settings_session
+                .is_none_or(|owner| Some(owner) == next)
+        {
             return;
         }
-        if let Some((owner, form, profile)) = self.settings_form_before.take()
-            && let Some(index) = self.session_index(owner)
+        let active = self.windows.active;
+        self.cancel_settings_window();
+        if let Some(key) = active
+            && self.windows.active != Some(key)
+            && self.session_index(key.conn).is_some()
         {
-            let session = &mut self.sessions[index];
-            let show_connect_dialog = session.show_connect_dialog;
-            session.cancel_connect_dialog(&form);
-            session.show_connect_dialog = show_connect_dialog;
-            session.form_profile = profile;
+            self.activate(key);
         }
     }
 
     fn begin_settings_edit(&mut self, conn: ConnId) {
-        self.cancel_edit_before_retarget(conn);
+        self.retire_open_editor(Some(conn));
         self.global_dialog_owner = self
             .windows
             .active
@@ -7065,19 +7073,48 @@ mod tests {
     }
 
     #[test]
-    fn stacking_new_connections_discards_the_first_ones_typed_host() {
+    fn stacking_new_connections_discards_the_first_pristine_one_like_cancel() {
         let mut app = test_app();
+        let original = app.sessions[0].id;
+        app.sync_windows();
         app.new_connection();
         let first = app.sessions.last().unwrap().id;
-        let pristine_host = app.sessions.last().unwrap().server_host.clone();
         app.sessions.last_mut().unwrap().server_host = "typed.example".into();
 
         app.new_connection();
+        let second = app.sessions.last().unwrap().id;
+        // The first canceled pristine connection is gone, not left idle.
+        assert!(app.session_index(first).is_none());
+        assert_eq!(app.settings_session, Some(second));
+        assert_eq!(app.sessions.len(), 2);
+
         app.cancel_settings_window();
 
-        let index = app.session_index(first).expect("first connection stays");
-        assert_eq!(app.sessions[index].server_host, pristine_host);
+        assert_eq!(app.sessions.len(), 1);
+        assert_eq!(app.sessions[0].id, original);
+        assert_eq!(app.windows.active.map(|key| key.conn), Some(original));
         assert!(app.settings_form_before.is_none());
+        assert!(!app.show_settings);
+    }
+
+    #[test]
+    fn retargeting_from_a_new_connection_discards_it_and_keeps_the_active_window() {
+        let (mut app, _rx_a, _rx_b) = two_networks();
+        let (first, second) = (app.sessions[0].id, app.sessions[1].id);
+        app.sync_windows();
+        app.user_activate(WindowKey::new(second, None));
+        app.new_connection();
+        let fresh = app.sessions.last().unwrap().id;
+        app.sessions.last_mut().unwrap().server_host = "typed.example".into();
+
+        // Toolbar Connect on an existing session while the editor is open.
+        app.user_activate(WindowKey::new(first, None));
+        app.open_connection_settings(first);
+
+        assert!(app.session_index(fresh).is_none(), "stray window dropped");
+        assert_eq!(app.settings_session, Some(first));
+        assert!(app.show_settings);
+        assert_eq!(app.windows.active.map(|key| key.conn), Some(first));
     }
 
     #[test]
