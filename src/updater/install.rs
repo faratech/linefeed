@@ -46,7 +46,62 @@ impl Paths {
     }
 }
 
+/// How private an updater directory must be on Unix.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DirPolicy {
+    /// The per-user state directories: owner-only, always.
+    Private,
+    /// The staging directory beside the executable, which may sit on a
+    /// filesystem that ignores chmod (vfat, exFAT, ntfs3, 9p, drvfs) and
+    /// reports a fixed mode.
+    Staging,
+}
+
+/// Whether a staging directory's mode is acceptable. `before` is the mode it
+/// reported; `chmod` and `after` are the result of asking for 0700 and the
+/// mode seen after that. Anyone-writable is refused outright: that is what
+/// would let another account swap the binary. Read/execute bits for others
+/// are tolerated only when the filesystem demonstrably ignores chmod (the
+/// call is refused as unsupported, or succeeds and changes nothing).
+#[cfg(unix)]
+fn staging_mode_acceptable(
+    before: u32,
+    chmod: Result<(), io::ErrorKind>,
+    after: Option<u32>,
+) -> bool {
+    if before & 0o022 != 0 {
+        return false;
+    }
+    if before & 0o077 == 0 {
+        return true;
+    }
+    match after {
+        Some(mode) if mode & 0o022 != 0 => false,
+        Some(mode) if mode & 0o077 == 0 => true,
+        Some(_) => matches!(
+            chmod,
+            Ok(())
+                | Err(io::ErrorKind::PermissionDenied
+                    | io::ErrorKind::Unsupported
+                    | io::ErrorKind::InvalidInput)
+        ),
+        None => false,
+    }
+}
+
 pub fn ensure_private_dir(path: &Path) -> io::Result<()> {
+    ensure_dir(path, DirPolicy::Private)
+}
+
+/// The staging directory next to the executable. Same checks as
+/// `ensure_private_dir`, except for the mode on filesystems without chmod.
+fn ensure_staging_dir(path: &Path) -> io::Result<()> {
+    ensure_dir(path, DirPolicy::Staging)
+}
+
+fn ensure_dir(path: &Path, policy: DirPolicy) -> io::Result<()> {
+    #[cfg(not(unix))]
+    let _ = policy;
     match platform::private_dir(path) {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
@@ -86,12 +141,33 @@ pub fn ensure_private_dir(path: &Path) -> io::Result<()> {
             #[cfg(unix)]
             {
                 use std::os::unix::fs::{MetadataExt, PermissionsExt};
-                if meta.uid() != unsafe { libc::geteuid() }
-                    || meta.permissions().mode() & 0o077 != 0
-                {
-                    return Err(io::Error::other(
-                        "Update directory is not private to this user",
-                    ));
+                let not_private =
+                    || io::Error::other("Update directory is not private to this user");
+                if meta.uid() != unsafe { libc::geteuid() } {
+                    return Err(not_private());
+                }
+                let before = meta.permissions().mode();
+                if policy == DirPolicy::Private {
+                    if before & 0o077 != 0 {
+                        return Err(not_private());
+                    }
+                } else {
+                    // Only a mode that is open to others for reading is worth
+                    // probing: try to close it, and see whether that took.
+                    let (chmod, after) = if before & 0o022 == 0 && before & 0o077 != 0 {
+                        (
+                            fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+                                .map_err(|e| e.kind()),
+                            fs::symlink_metadata(path)
+                                .ok()
+                                .map(|meta| meta.permissions().mode()),
+                        )
+                    } else {
+                        (Ok(()), Some(before))
+                    };
+                    if !staging_mode_acceptable(before, chmod, after) {
+                        return Err(not_private());
+                    }
                 }
             }
             Ok(())
@@ -297,7 +373,7 @@ impl Transaction {
     }
     pub fn validate(&self) -> io::Result<()> {
         self.validate_paths()?;
-        ensure_private_dir(&self.directory)?;
+        ensure_staging_dir(&self.directory)?;
         if hash(&self.helper())? != self.old_hash {
             return Err(io::Error::other("Update helper changed"));
         }
@@ -2468,6 +2544,86 @@ mod tests {
         symlink(&fixture.tx.directory, &link).unwrap();
         assert!(ensure_private_dir(&link).is_err());
     }
+    #[cfg(unix)]
+    #[test]
+    fn staging_directory_tolerates_read_only_modes_only_where_chmod_is_ignored() {
+        use std::io::ErrorKind::{NotFound, PermissionDenied, Unsupported};
+        // Private stays acceptable without any probing.
+        assert!(staging_mode_acceptable(0o40700, Ok(()), Some(0o40700)));
+        // Group/other writable is never acceptable, whatever chmod said: that
+        // is the binary-swap risk.
+        for before in [0o40777, 0o40775, 0o40757, 0o40722] {
+            assert!(!staging_mode_acceptable(before, Ok(()), Some(before)));
+            assert!(!staging_mode_acceptable(
+                before,
+                Err(PermissionDenied),
+                Some(before)
+            ));
+            assert!(!staging_mode_acceptable(before, Ok(()), Some(0o40700)));
+        }
+        // Read/execute for others on a filesystem that ignores chmod: either
+        // the call is refused as unsupported or it succeeds and changes
+        // nothing.
+        assert!(staging_mode_acceptable(0o40755, Ok(()), Some(0o40755)));
+        assert!(staging_mode_acceptable(
+            0o40755,
+            Err(PermissionDenied),
+            Some(0o40755)
+        ));
+        assert!(staging_mode_acceptable(
+            0o40755,
+            Err(Unsupported),
+            Some(0o40755)
+        ));
+        assert!(staging_mode_acceptable(
+            0o40755,
+            Err(io::ErrorKind::InvalidInput),
+            Some(0o40755)
+        ));
+        // A real filesystem that took the chmod is private afterwards.
+        assert!(staging_mode_acceptable(0o40755, Ok(()), Some(0o40700)));
+        // Any other failure, or a directory we cannot re-stat, is refused.
+        assert!(!staging_mode_acceptable(
+            0o40755,
+            Err(NotFound),
+            Some(0o40755)
+        ));
+        assert!(!staging_mode_acceptable(0o40755, Ok(()), None));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn staged_update_stays_valid_when_the_staging_directory_is_group_readable() {
+        use std::os::unix::fs::PermissionsExt;
+        let fixture = Fixture::new();
+        // chmod works here, so the directory is closed again rather than
+        // merely tolerated.
+        fs::set_permissions(&fixture.tx.directory, fs::Permissions::from_mode(0o755)).unwrap();
+        fixture.tx.validate().unwrap();
+        assert_eq!(
+            fs::metadata(&fixture.tx.directory)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+        // Writable by others is refused outright and left alone.
+        fs::set_permissions(&fixture.tx.directory, fs::Permissions::from_mode(0o770)).unwrap();
+        assert!(fixture.tx.validate().is_err());
+        assert_eq!(
+            fs::metadata(&fixture.tx.directory)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o770
+        );
+        // The per-user state directory is still strict.
+        fs::set_permissions(&fixture.tx.paths.state, fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(ensure_private_dir(&fixture.tx.paths.state).is_err());
+    }
+
     #[cfg(windows)]
     #[test]
     fn unsigned_windows_candidate_is_rejected() {

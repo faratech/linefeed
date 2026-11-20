@@ -458,10 +458,7 @@ impl Drop for ArchiveService {
 fn private_dir(path: &Path) -> std::io::Result<()> {
     fs::create_dir_all(path)?;
     #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
-    }
+    super::logging::tighten_private_dir(path)?;
     Ok(())
 }
 
@@ -1397,11 +1394,7 @@ fn open_projection(root: Option<&Path>) -> Result<Connection, String> {
         // Create privately before SQLite opens the database (and its private WAL).
         let file = private_append(&path).map_err(|e| e.to_string())?;
         #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            file.set_permissions(fs::Permissions::from_mode(0o600))
-                .map_err(|e| e.to_string())?;
-        }
+        super::logging::tighten_private_file(&path, &file).map_err(|e| e.to_string())?;
         drop(file);
         let db = Connection::open(&path).map_err(|e| e.to_string())?;
         let result = initialize(&db).and_then(|_| {

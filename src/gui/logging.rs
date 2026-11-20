@@ -98,15 +98,99 @@ pub struct LogManager {
     writers: std::cell::RefCell<std::collections::HashMap<PathBuf, CachedWriter>>,
 }
 
+/// What an attempt to make a log directory or file owner-only amounted to.
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum PrivateMode {
+    /// The target is owner-only.
+    Private,
+    /// The filesystem demonstrably ignores chmod (vfat, exFAT, some FUSE and
+    /// network mounts): there is no private mode to be had.
+    Unenforceable,
+    /// chmod failed for another reason.
+    Failed,
+}
+
+/// Decide the outcome from what `chmod` returned and the mode a re-stat shows
+/// afterwards. A non-private mode is tolerated only when the filesystem
+/// shows it ignores chmod: the call was refused as unsupported (EPERM,
+/// ENOTSUP, EINVAL), or it succeeded and the mode did not change.
+#[cfg(unix)]
+pub(super) fn private_mode_verdict(
+    chmod: Result<(), std::io::ErrorKind>,
+    mode_after: Option<u32>,
+) -> PrivateMode {
+    use std::io::ErrorKind;
+    match (chmod, mode_after) {
+        (_, Some(mode)) if mode & 0o077 == 0 => PrivateMode::Private,
+        (Ok(()), Some(_)) => PrivateMode::Unenforceable,
+        (
+            Err(ErrorKind::PermissionDenied | ErrorKind::Unsupported | ErrorKind::InvalidInput),
+            _,
+        ) => PrivateMode::Unenforceable,
+        _ => PrivateMode::Failed,
+    }
+}
+
+/// Apply `private_mode_verdict` to a finished chmod and its re-stat. A
+/// filesystem without chmod is accepted with one warning per process;
+/// anything else is the chmod error.
+#[cfg(unix)]
+pub(super) fn settle_private_mode(
+    path: &std::path::Path,
+    chmod: std::io::Result<()>,
+    mode_after: std::io::Result<u32>,
+) -> std::io::Result<()> {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static WARNED: AtomicBool = AtomicBool::new(false);
+    let verdict = private_mode_verdict(
+        chmod.as_ref().map(|_| ()).map_err(std::io::Error::kind),
+        mode_after.as_ref().ok().copied(),
+    );
+    match verdict {
+        PrivateMode::Private => Ok(()),
+        PrivateMode::Unenforceable => {
+            if !WARNED.swap(true, Ordering::Relaxed) {
+                tracing::warn!(
+                    "{} cannot be made private to this user: its filesystem ignores chmod. \
+                     History stays on this filesystem without owner-only permissions.",
+                    path.display()
+                );
+            }
+            Ok(())
+        }
+        PrivateMode::Failed => chmod.and(mode_after.map(|_| ())),
+    }
+}
+
+/// Make a directory owner-only (0700), tolerating filesystems without chmod.
+#[cfg(unix)]
+pub(super) fn tighten_private_dir(path: &std::path::Path) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    settle_private_mode(
+        path,
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700)),
+        fs::metadata(path).map(|meta| meta.permissions().mode()),
+    )
+}
+
+/// Make an open file owner-only (0600), tolerating filesystems without chmod.
+#[cfg(unix)]
+pub(super) fn tighten_private_file(path: &std::path::Path, file: &File) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    settle_private_mode(
+        path,
+        file.set_permissions(fs::Permissions::from_mode(0o600)),
+        file.metadata().map(|meta| meta.permissions().mode()),
+    )
+}
+
 /// Create a log directory and keep it owner-only on Unix (issue #201),
 /// mirroring the settings and updater state directories.
 fn create_private_log_dir(path: &std::path::Path) -> std::io::Result<()> {
     fs::create_dir_all(path)?;
     #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
-    }
+    tighten_private_dir(path)?;
     Ok(())
 }
 
@@ -122,10 +206,7 @@ fn open_private_log_file(path: &std::path::Path) -> std::io::Result<File> {
     }
     let file = options.open(path)?;
     #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        file.set_permissions(fs::Permissions::from_mode(0o600))?;
-    }
+    tighten_private_file(path, &file)?;
     Ok(file)
 }
 
@@ -1379,6 +1460,48 @@ mod tests {
 
         assert!(!manager.writers.borrow().contains_key(&path));
         fs::remove_dir_all(dir).expect("remove temporary log directory");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn private_mode_is_tolerated_only_where_the_filesystem_ignores_chmod() {
+        use std::io::ErrorKind::{self, NotFound, PermissionDenied, Unsupported};
+        let verdict = |chmod: Result<(), ErrorKind>, mode| private_mode_verdict(chmod, mode);
+        // Normal filesystem: chmod worked and the mode is private.
+        assert_eq!(verdict(Ok(()), Some(0o40700)), PrivateMode::Private);
+        // chmod refused as unsupported, mode left open: tolerated.
+        for kind in [PermissionDenied, Unsupported, ErrorKind::InvalidInput] {
+            assert_eq!(
+                verdict(Err(kind), Some(0o40777)),
+                PrivateMode::Unenforceable
+            );
+            assert_eq!(verdict(Err(kind), None), PrivateMode::Unenforceable);
+        }
+        // chmod "succeeded" but the mode did not change: tolerated.
+        assert_eq!(verdict(Ok(()), Some(0o100644)), PrivateMode::Unenforceable);
+        // Already private, whatever chmod said.
+        assert_eq!(
+            verdict(Err(PermissionDenied), Some(0o100600)),
+            PrivateMode::Private
+        );
+        // Any other failure stays fatal, as does a target we cannot re-stat.
+        assert_eq!(verdict(Err(NotFound), Some(0o100644)), PrivateMode::Failed);
+        assert_eq!(verdict(Err(NotFound), None), PrivateMode::Failed);
+        assert_eq!(verdict(Ok(()), None), PrivateMode::Failed);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn settling_the_private_mode_accepts_chmod_less_filesystems_and_reports_other_errors() {
+        let path = std::path::Path::new("/tmp/linefeed-never-created");
+        let refused = || Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
+        // A mount that refuses chmod and reports an open mode: history goes on.
+        assert!(settle_private_mode(path, refused(), Ok(0o40755)).is_ok());
+        assert!(settle_private_mode(path, Ok(()), Ok(0o40755)).is_ok());
+        // Other chmod failures are still reported.
+        let missing = Err(std::io::Error::from(std::io::ErrorKind::NotFound));
+        let error = settle_private_mode(path, missing, Ok(0o40755)).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
     }
 
     #[cfg(unix)]
