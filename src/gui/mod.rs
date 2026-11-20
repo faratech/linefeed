@@ -23,6 +23,7 @@ pub(crate) mod theme;
 mod types;
 mod uploads;
 mod view;
+mod widgets;
 mod windows;
 pub(crate) mod workspace;
 
