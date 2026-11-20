@@ -7865,6 +7865,7 @@ impl Session {
             .unwrap_or(IRC_MAX_LINE_BYTES + 2)
             .saturating_sub(2)
             .max(IRC_MAX_LINE_BYTES);
+        let line_limit = line_limit.saturating_sub(self.relay_prefix_reserve(line_limit));
         let mut chunks = Vec::new();
         for logical_line in normalized.split('\n') {
             let Some(mut line_chunks) = Self::split_irc_text_payload_with_limit(
@@ -7905,7 +7906,10 @@ impl Session {
         if concat_overhead >= IRC_MAX_LINE_BYTES {
             return TextSendOutcome::default();
         }
-        let max_payload = IRC_MAX_LINE_BYTES - concat_overhead;
+        let max_payload = line_limit.saturating_sub(concat_overhead);
+        if max_payload == 0 {
+            return TextSendOutcome::default();
+        }
         let mut lines: Vec<(String, bool)> = Vec::new();
         for logical_line in full_text.split('\n') {
             if logical_line.is_empty() {

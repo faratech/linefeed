@@ -173,6 +173,30 @@ fn split_utf8(text: &str, max: usize) -> Result<Vec<String>, SendError> {
     Ok(parts)
 }
 impl Session {
+    /// Bytes a server adds in front of our relayed PRIVMSG/NOTICE:
+    /// `:nick!user@host `. Receivers get the line truncated to the limit
+    /// when the text fills the client line, so chunks must leave this room.
+    /// Uses our own user@host once learned (own JOIN, CHGHOST), otherwise a
+    /// conservative worst case (USERLEN 10, 63-byte host), capped to a
+    /// quarter of the line so a hostile NICKLEN cannot starve the budget.
+    pub(crate) fn relay_prefix_reserve(&self, line_limit: usize) -> usize {
+        let known = self
+            .known_users
+            .get(&self.network_support.canonicalize(&self.my_nick))
+            .and_then(|user| Some((user.username.as_deref()?, user.hostname.as_deref()?)));
+        let reserve = match known {
+            Some((user, host)) => 1 + self.my_nick.len() + 1 + user.len() + 1 + host.len() + 1,
+            None => {
+                let nick = self
+                    .network_support
+                    .nick_len
+                    .unwrap_or(0)
+                    .max(self.my_nick.len());
+                1 + nick + 1 + 10 + 1 + 63 + 1
+            }
+        };
+        reserve.min(line_limit / 4)
+    }
     pub(crate) fn live_message_reference(&self, target: &str, message: &ChatMessage) -> MessageRef {
         MessageRef {
             conversation: self.conversation_key(target),
@@ -239,7 +263,9 @@ impl Session {
             .as_ref()
             .map(|reply| format!("@+reply={} ", tag(reply)))
             .unwrap_or_default();
-        let max = limit
+        // The wire line must also fit once the server prepends our prefix.
+        let budget = limit.saturating_sub(self.relay_prefix_reserve(limit));
+        let max = budget
             .checked_sub(format!("{command} {target} :").len())
             .ok_or(SendError::TooLong)?;
         let mut parts = Vec::new();
@@ -265,7 +291,7 @@ impl Session {
             let overhead = format!("{command} {target} :").len();
             let mut children = Vec::new();
             for line in full.split('\n') {
-                for (i, part) in split_utf8(line, limit.saturating_sub(overhead))?
+                for (i, part) in split_utf8(line, budget.saturating_sub(overhead))?
                     .into_iter()
                     .enumerate()
                 {
@@ -1123,6 +1149,135 @@ mod tests {
                     && Session::command_fits_limits(command, 510))
         );
         assert_eq!(plan.payloads.concat(), text);
+    }
+    /// Length of the line other users receive for one of our wire commands:
+    /// the server prepends `:nick!user@host ` and the whole line, with its
+    /// CRLF, must still fit 512 bytes. Client-only tags are not relayed here.
+    fn relayed_len(command: &IrcCommand, prefix: &str) -> usize {
+        let line = command.to_string();
+        let line = match line.strip_prefix('@') {
+            Some(tagged) => tagged.split_once(' ').unwrap().1.to_string(),
+            None => line,
+        };
+        format!(":{prefix} {line}\r\n").len()
+    }
+    #[test]
+    fn fallback_chunks_leave_room_for_the_relayed_prefix() {
+        let (mut session, _rx, id) = session();
+        // Unknown own user@host: the conservative worst case applies.
+        let worst = "me!abcdefghij@".to_string() + &"h".repeat(63);
+        let text = "a".repeat(1500);
+        let plan = session
+            .plan_chat_send(&ChatSendRequest {
+                target: id,
+                body: text.clone(),
+                kind: ChatKind::Privmsg,
+                reply_to: None,
+            })
+            .unwrap();
+        assert_eq!(plan.payloads.concat(), text);
+        for command in &plan.wire {
+            assert!(relayed_len(command, &worst) <= 512, "{command}");
+        }
+        // A short single line that used to fill the client line still fits.
+        let plan = session
+            .plan_chat_send(&ChatSendRequest {
+                target: id,
+                body: "b".repeat(480),
+                kind: ChatKind::Privmsg,
+                reply_to: None,
+            })
+            .unwrap();
+        assert!(plan.wire.len() > 1);
+        for command in &plan.wire {
+            assert!(relayed_len(command, &worst) <= 512, "{command}");
+        }
+        // A known, short hostmask reserves only what it needs.
+        session.update_user_identity(
+            "me",
+            Some(Some("~me".into())),
+            Some(Some("h.example".into())),
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        let plan = session
+            .plan_chat_send(&ChatSendRequest {
+                target: id,
+                body: "c".repeat(400),
+                kind: ChatKind::Privmsg,
+                reply_to: None,
+            })
+            .unwrap();
+        assert_eq!(plan.wire.len(), 1);
+        let plan = session
+            .plan_chat_send(&ChatSendRequest {
+                target: id,
+                body: "c".repeat(1500),
+                kind: ChatKind::Notice,
+                reply_to: None,
+            })
+            .unwrap();
+        for command in &plan.wire {
+            assert!(relayed_len(command, "me!~me@h.example") <= 512, "{command}");
+        }
+        // Chunks use the room a known hostmask leaves, not the worst case.
+        assert!(relayed_len(&plan.wire[0], "me!~me@h.example") >= 500);
+    }
+    #[test]
+    fn action_and_multiline_children_leave_room_for_the_relayed_prefix() {
+        let (mut session, _rx, id) = session();
+        let worst = "me!abcdefghij@".to_string() + &"h".repeat(63);
+        let action = "🦀".repeat(300);
+        let plan = session
+            .plan_chat_send(&ChatSendRequest {
+                target: id,
+                body: action.clone(),
+                kind: ChatKind::Action,
+                reply_to: None,
+            })
+            .unwrap();
+        for command in &plan.wire {
+            assert!(relayed_len(command, &worst) <= 512, "{command}");
+        }
+        session.enabled_caps.insert("draft/multiline".into());
+        let text = format!("{}\n{}", "x".repeat(900), "y".repeat(30));
+        let plan = session
+            .plan_chat_send(&ChatSendRequest {
+                target: id,
+                body: text.clone(),
+                kind: ChatKind::Privmsg,
+                reply_to: None,
+            })
+            .unwrap();
+        assert_eq!(plan.payloads, [text]);
+        assert!(plan.wire.len() > 4);
+        for command in &plan.wire {
+            assert!(relayed_len(command, &worst) <= 512, "{command}");
+        }
+    }
+    #[test]
+    fn legacy_text_send_leaves_room_for_the_relayed_prefix() {
+        let (mut session, mut rx, _) = session();
+        let worst = "me!abcdefghij@".to_string() + &"h".repeat(63);
+        assert!(session.send_privmsg_text("#room", &"z".repeat(1200)).complete);
+        let mut seen = 0;
+        while let Ok(sent) = rx.try_recv() {
+            for command in crate::gui::flatten_test_commands(sent) {
+                seen += 1;
+                assert!(relayed_len(&command, &worst) <= 512, "{command}");
+            }
+        }
+        assert!(seen >= 3);
+        session.enabled_caps.insert("draft/multiline".into());
+        assert!(session.send_privmsg_text("#room", &"z".repeat(1200)).complete);
+        while let Ok(sent) = rx.try_recv() {
+            for command in crate::gui::flatten_test_commands(sent) {
+                assert!(relayed_len(&command, &worst) <= 512, "{command}");
+            }
+        }
     }
     #[test]
     fn invalid_last_line_never_enters_queue() {
