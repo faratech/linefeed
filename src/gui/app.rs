@@ -3408,10 +3408,9 @@ impl App {
         if !self.sessions.is_empty() {
             let active = self.active_index();
             let session = &self.sessions[active];
+            // Behaviour settings only: the connect form is a scratch copy
+            // that only an explicit validated Save or Connect adopts (#316).
             session.export_config(&mut self.settings);
-            if session.session_from_form().is_ok() {
-                session.export_form(&mut self.settings);
-            }
         }
         self.store_settings();
         for session in &mut self.sessions {
@@ -5088,6 +5087,69 @@ mod tests {
         // The first session keeps its connection and endpoint.
         assert!(app.sessions[0].is_connected());
         assert_eq!(app.active_index(), 1);
+    }
+
+    fn quick_connect_defaults() -> Settings {
+        let mut settings = test_settings();
+        settings.server_host = "irc.libera.example".into();
+        settings.password = "hunter2".into();
+        settings.sasl_username = "acct".into();
+        settings.sasl_password = "saslpw".into();
+        settings.auto_perform = "/msg NickServ IDENTIFY hunter2".into();
+        settings
+    }
+
+    fn assert_quick_connect_defaults_intact(app: &App) {
+        let saved = app.settings_file.clone().expect("shutdown saved settings");
+        for settings in [&saved, &app.settings] {
+            assert_eq!(settings.server_host, "irc.libera.example");
+            assert_eq!(settings.password, "hunter2");
+            assert_eq!(settings.sasl_username, "acct");
+            assert_eq!(settings.sasl_password, "saslpw");
+            assert_eq!(settings.auto_perform, "/msg NickServ IDENTIFY hunter2");
+        }
+    }
+
+    #[test]
+    fn shutdown_does_not_adopt_a_new_sessions_connect_form() {
+        let mut app = App::with_settings(quick_connect_defaults(), LayoutFile::default());
+        app.start(None);
+        let _rx = connect(&mut app, 0);
+        app.sessions[0].process_command("/server -m irc.oftc.example 6697");
+        app.process_events();
+        assert_eq!(app.active_index(), 1);
+
+        app.prepare_update_shutdown();
+
+        assert_quick_connect_defaults_intact(&app);
+    }
+
+    #[test]
+    fn shutdown_does_not_adopt_a_scratch_settings_edit() {
+        let mut app = App::with_settings(quick_connect_defaults(), LayoutFile::default());
+        app.start(None);
+        let conn = app.sessions[0].id;
+        app.open_settings(conn);
+        app.sessions[0].server_host = "scratch.example".into();
+        app.sessions[0].nickname = "scratchnick".into();
+        app.sessions[0].sasl_username.clear();
+        app.sessions[0].sasl_password.clear();
+
+        app.prepare_update_shutdown();
+
+        assert_quick_connect_defaults_intact(&app);
+        assert_eq!(app.settings.nickname, "me");
+    }
+
+    #[test]
+    fn shutdown_still_flushes_behaviour_settings() {
+        let mut app = App::with_settings(quick_connect_defaults(), LayoutFile::default());
+        app.start(None);
+        app.sessions[0].quit_message = "bye for now".into();
+
+        app.prepare_update_shutdown();
+
+        assert_eq!(app.settings_file.unwrap().quit_message, "bye for now");
     }
 
     #[test]
