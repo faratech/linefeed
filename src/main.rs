@@ -165,7 +165,7 @@ fn enable_efficiency_mode() {
 /// Check if another instance is already running (Windows only)
 /// Returns true if this is the only instance, false if another exists
 #[cfg(windows)]
-fn ensure_single_instance() -> bool {
+fn ensure_single_instance(_wait: std::time::Duration) -> bool {
     use windows::Win32::Foundation::GetLastError;
     use windows::Win32::System::Threading::CreateMutexW;
     use windows::core::w;
@@ -197,9 +197,67 @@ fn ensure_single_instance() -> bool {
     }
 }
 
+/// How long a restart-to-update launch waits for the outgoing instance's
+/// lock: the helper starts the replacement after the old process has exited,
+/// but the kernel may not have released its lock yet. (Windows ignores it.)
+const SUPERVISED_INSTANCE_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Held for the whole process lifetime; the kernel releases it on exit or
+/// crash.
 #[cfg(not(windows))]
-fn ensure_single_instance() -> bool {
-    true // No single-instance check on non-Windows
+static INSTANCE_LOCK: std::sync::OnceLock<std::fs::File> = std::sync::OnceLock::new();
+
+/// Take the exclusive instance lock at `path`, waiting at most `wait`.
+/// `Ok(None)` means another process holds it.
+#[cfg(not(windows))]
+fn acquire_instance_lock(
+    path: &std::path::Path,
+    wait: std::time::Duration,
+) -> std::io::Result<Option<std::fs::File>> {
+    match persistence::exclusive_lock(path, wait) {
+        Ok(file) => Ok(Some(file)),
+        Err(error) if error.kind() == std::io::ErrorKind::TimedOut => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+/// Linux and macOS: hold an exclusive lock on a file in the config directory
+/// so a second instance cannot restore the first one's workspace or overwrite
+/// its settings. Returns false when another instance is running. A lock that
+/// cannot be created at all (read-only home, no config directory) does not
+/// stop the app, like the Windows mutex.
+#[cfg(not(windows))]
+fn ensure_single_instance(wait: std::time::Duration) -> bool {
+    if INSTANCE_LOCK.get().is_some() {
+        return true;
+    }
+    let Some(directory) = dirs::config_dir() else {
+        return true;
+    };
+    match acquire_instance_lock(&directory.join("linefeed").join("instance.lock"), wait) {
+        Ok(Some(file)) => {
+            let _ = INSTANCE_LOCK.set(file);
+            true
+        }
+        Ok(None) => false,
+        Err(error) => {
+            eprintln!("Linefeed could not take its instance lock: {error}");
+            true
+        }
+    }
+}
+
+/// Report a refused second launch. Windows has already activated the running
+/// window and exits quietly; elsewhere there is no window to raise, so say why.
+#[cfg(windows)]
+fn refuse_second_instance() -> eframe::Result<()> {
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn refuse_second_instance() -> eframe::Result<()> {
+    eprintln!("Linefeed is already running");
+    std::process::exit(1)
 }
 
 /// Whether this process can show windows (Windows only). Session 0 and other
@@ -265,8 +323,10 @@ fn main() -> eframe::Result<()> {
     // Second launches activate the running instance before updater recovery
     // can stall on its lock or touch a pending transaction (issue #199).
     let startup_supervised = supervised.is_some();
-    if !single_instance_allows_startup(startup_supervised, ensure_single_instance) {
-        return Ok(());
+    if !single_instance_allows_startup(startup_supervised, || {
+        ensure_single_instance(std::time::Duration::ZERO)
+    }) {
+        return refuse_second_instance();
     }
     let startup = updater::install::startup(supervised)
         .map_err(|e| eframe::Error::AppCreation(Box::new(e)))?;
@@ -281,9 +341,8 @@ fn main() -> eframe::Result<()> {
     let app_shutdown = shutdown.clone();
     // Supervised launches deferred this check until after recovery above;
     // normal launches already passed it before recovery (issue #199).
-    if startup_supervised && !ensure_single_instance() {
-        // Another instance is running, exit silently
-        return Ok(());
+    if startup_supervised && !ensure_single_instance(SUPERVISED_INSTANCE_LOCK_WAIT) {
+        return refuse_second_instance();
     }
 
     // INFO by default: DEBUG logs every raw IRC line to stdout, which both
@@ -850,5 +909,54 @@ mod tests {
         assert!(single_instance_allows_startup(true, || {
             panic!("supervised startup must defer the instance check")
         }));
+    }
+
+    #[cfg(not(windows))]
+    fn lock_path(name: &str) -> std::path::PathBuf {
+        std::env::temp_dir()
+            .join(format!("linefeed-instance-{name}-{}", std::process::id()))
+            .join("instance.lock")
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn a_second_instance_cannot_take_the_instance_lock() {
+        use std::time::Duration;
+        let path = lock_path("exclusion");
+        let first = acquire_instance_lock(&path, Duration::ZERO).unwrap();
+        assert!(first.is_some());
+        // Another handle on the same file stands in for a second process.
+        assert!(
+            acquire_instance_lock(&path, Duration::ZERO)
+                .unwrap()
+                .is_none()
+        );
+        drop(first);
+        assert!(
+            acquire_instance_lock(&path, Duration::ZERO)
+                .unwrap()
+                .is_some()
+        );
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn an_update_restart_waits_for_the_outgoing_instance_to_release_the_lock() {
+        use std::time::{Duration, Instant};
+        let path = lock_path("handoff");
+        let outgoing = acquire_instance_lock(&path, Duration::ZERO)
+            .unwrap()
+            .unwrap();
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(200));
+            drop(outgoing);
+        });
+        let started = Instant::now();
+        let replacement = acquire_instance_lock(&path, Duration::from_secs(5)).unwrap();
+        assert!(replacement.is_some(), "the replacement gets the lock");
+        assert!(started.elapsed() >= Duration::from_millis(150));
+        release.join().unwrap();
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 }
