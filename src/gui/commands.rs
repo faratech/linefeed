@@ -1862,8 +1862,12 @@ impl Session {
                 // reconnect backoff loop (this is the only way to stop the latter).
                 // request_manual_disconnect clears connecting/connection_lost, which
                 // suppresses further reconnect attempts without touching the
-                // persisted auto_reconnect setting.
-                if self.is_connected()
+                // persisted auto_reconnect setting. A connection that is closing
+                // (with a /reconnect, /server or retry staged behind it) is not
+                // idle either: the disconnect cancels what is staged (#368).
+                if self.connection.has_owner()
+                    || self.has_pending_connect()
+                    || self.is_connected()
                     || self.is_connecting()
                     || self.connection_lost()
                     || self.has_transport()
@@ -5199,6 +5203,60 @@ mod tests {
         assert_eq!(saved.auto_join_channels, "#private key");
         assert_eq!(saved.auto_perform, "/ns identify nickserv-pass");
         assert!(saved.accept_invalid_certs);
+    }
+
+    fn not_connected_notes(app: &Session) -> usize {
+        app.server_messages
+            .iter()
+            .filter(|message| message.content == "Not connected")
+            .count()
+    }
+
+    #[test]
+    fn disconnect_while_closing_cancels_the_staged_reconnect() {
+        let (mut app, _rx) = connected_command_app();
+        app.process_command("/reconnect");
+        assert!(app.is_closing());
+        assert!(app.connection.staged_config().is_some());
+
+        app.process_command("/disconnect");
+
+        assert_eq!(not_connected_notes(&app), 0, "a close is still in progress");
+        assert!(
+            app.connection.staged_config().is_none(),
+            "the staged reconnect must be cancelled"
+        );
+        assert!(!app.has_pending_connect());
+        // Once the retiring worker is gone nothing is queued.
+        app.test_finish_close();
+        assert!(!app.is_connecting() && !app.is_connected());
+        assert!(app.is_fully_stopped());
+    }
+
+    #[test]
+    fn disconnect_while_closing_cancels_the_staged_server_switch() {
+        let (mut app, _rx) = connected_command_app();
+        app.process_command("/server irc.other.example 6697");
+        assert!(app.connection.staged_config().is_some());
+
+        app.process_command("/disconnect");
+
+        assert_eq!(not_connected_notes(&app), 0);
+        assert!(app.connection.staged_config().is_none());
+        let before = app.active_server_config().unwrap().host.clone();
+        app.test_finish_close();
+        assert_eq!(app.active_server_config().unwrap().host, before);
+        assert!(app.is_fully_stopped());
+    }
+
+    #[test]
+    fn disconnect_while_idle_still_says_not_connected() {
+        let mut app = Session::with_settings(crate::gui::Settings {
+            logging_enabled: false,
+            ..crate::gui::Settings::default()
+        });
+        app.process_command("/disconnect");
+        assert_eq!(not_connected_notes(&app), 1);
     }
 
     fn perform_lines(app: &Session) -> Vec<String> {
