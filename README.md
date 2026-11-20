@@ -100,7 +100,8 @@ InspIRCd, UnrealIRCd, Solanum, Ergo, Bahamut, ircu, Hybrid, and Plexus features.
 ### Windows-Specific
 - System tray with minimize-to-tray
 - Taskbar flash on notifications
-- Single instance enforcement
+- Single instance enforcement: a second launch brings the running window forward
+  (on Linux and macOS a second launch exits with "Linefeed is already running")
 - Efficiency Mode (EcoQoS) for reduced power usage
 
 ## Installation
