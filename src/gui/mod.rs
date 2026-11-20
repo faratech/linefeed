@@ -5222,9 +5222,26 @@ impl Session {
             }
 
             IrcCommand::Redact(target, msgid, reason) => {
-                let reference = self
-                    .conversations
-                    .get(target)
+                // A peer's DM redaction is relayed with our own nick as the
+                // target, exactly like the PRIVMSG it retracts, while the query
+                // tab is named after the peer. Resolve through the negotiated
+                // casemapping and never create a tab here.
+                let routed = self.strip_status_prefix(target);
+                let name = match msg.get_sender_nick() {
+                    Some(sender)
+                        if !self.is_channel_name(routed)
+                            && self.identifiers_equal(routed, &self.my_nick) =>
+                    {
+                        sender
+                    }
+                    _ => routed.to_string(),
+                };
+                let key = self.channel_key(&name);
+                let target = key.clone().unwrap_or(name);
+                let target = target.as_str();
+                let reference = key
+                    .as_deref()
+                    .and_then(|key| self.conversations.get(key))
                     .and_then(|channel| {
                         channel
                             .messages
@@ -5242,8 +5259,8 @@ impl Session {
                     archive.redact_reference(&reference);
                 }
                 self.events.push(SessionEvent::MessageRedacted(reference));
-                if let Some(key) = self.channel_key(target)
-                    && let Some(channel) = self.conversations.get_mut(&key)
+                if let Some(key) = &key
+                    && let Some(channel) = self.conversations.get_mut(key)
                 {
                     let removed = channel.redact_message(msgid);
                     let reason = reason
@@ -12661,6 +12678,84 @@ pub(crate) mod tests {
                 .messages
                 .iter()
                 .any(|message| message.content == "A message was redacted: cleanup")
+        );
+    }
+
+    fn redacted_reference(app: &Session) -> Option<identity::MessageRef> {
+        app.events.iter().find_map(|event| match event {
+            SessionEvent::MessageRedacted(reference) => Some(reference.clone()),
+            _ => None,
+        })
+    }
+
+    fn session_with_redactable_message(tab: &str) -> Session {
+        let mut app = test_app();
+        app.set_session_nick("me".to_string(), true);
+        let mut channel = Channel::new();
+        channel.messages.push_back(
+            ChatMessage::new_fmt("alice", "remove me", "short").with_irc_metadata(
+                None,
+                Some("gone".into()),
+                None,
+            ),
+        );
+        app.conversations.insert(tab.into(), channel);
+        app
+    }
+
+    #[test]
+    fn peer_redacting_a_dm_removes_it_from_the_query_and_archive_key() {
+        for line in [
+            // The server relays a peer's DM redaction with our nick as target.
+            ":alice!u@h REDACT me gone :oops",
+            // Casemapped nick and target spelling.
+            ":Alice!u@h REDACT ME gone :oops",
+            // Our own echo already names the peer.
+            ":me!u@h REDACT alice gone :oops",
+        ] {
+            let mut app = session_with_redactable_message("alice");
+            app.handle_incoming_message(IrcMessage::parse(line).unwrap());
+
+            let messages = &app.conversations["alice"].messages;
+            assert!(
+                messages.iter().all(|m| m.msgid.as_deref() != Some("gone")),
+                "{line}"
+            );
+            assert!(
+                messages
+                    .iter()
+                    .any(|m| m.content == "A message was redacted: oops"),
+                "{line}"
+            );
+            assert!(!app.conversations.contains_key("me"), "{line}");
+            let reference = redacted_reference(&app).expect(line);
+            assert_eq!(
+                reference.conversation,
+                app.conversation_key("alice"),
+                "{line}"
+            );
+            assert!(reference.archive_id.is_some(), "{line}");
+        }
+
+        // A closed tab still records the redaction under the peer.
+        let mut app = test_app();
+        app.set_session_nick("me".to_string(), true);
+        app.handle_incoming_message(IrcMessage::parse(":alice!u@h REDACT me gone").unwrap());
+        let reference = redacted_reference(&app).unwrap();
+        assert_eq!(reference.conversation, app.conversation_key("alice"));
+        assert!(!app.conversations.contains_key("me"));
+    }
+
+    #[test]
+    fn channel_redaction_resolves_the_tab_through_casemapping() {
+        let mut app = session_with_redactable_message("#room");
+        app.handle_incoming_message(IrcMessage::parse(":alice!u@h REDACT #ROOM gone").unwrap());
+        assert!(redacted_reference(&app).unwrap().archive_id.is_some());
+        assert!(
+            app.conversations["#room"]
+                .messages
+                .iter()
+                .all(|m| m.msgid.as_deref() != Some("gone"))
         );
     }
 
