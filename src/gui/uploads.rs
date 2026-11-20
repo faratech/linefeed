@@ -463,12 +463,20 @@ impl Session {
         }
     }
     pub(crate) fn capture_upload_drop(&mut self, ui: &egui::Ui) {
-        if self.current_conversation.is_none()
-            || !ui.ctx().input(|i| {
-                i.pointer
-                    .latest_pos()
-                    .is_some_and(|pos| ui.max_rect().contains(pos))
-            })
+        if self.current_conversation.is_none() {
+            return;
+        }
+        // Overlapping floating windows are drawn in list order, not z-order,
+        // so the pointer must also be over this window's own layer (a panel
+        // has no area, so nothing above it means it is the target).
+        let ctx = ui.ctx();
+        let Some(pos) = ctx.input(|i| i.pointer.latest_pos()) else {
+            return;
+        };
+        if !ui.max_rect().contains(pos)
+            || ctx
+                .layer_id_at(pos)
+                .is_some_and(|top| top != ui.layer_id())
         {
             return;
         }
@@ -1392,6 +1400,7 @@ fn perform_filehost_request(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::gui::Channel;
 
     fn filehost_fixture(responses: Vec<String>) -> (String, mpsc::Receiver<(String, Vec<u8>)>) {
         use std::io::{BufRead, BufReader, Write};
@@ -2080,5 +2089,145 @@ mod tests {
             reader.read(&mut [0u8; 8]).unwrap_err().kind(),
             std::io::ErrorKind::Interrupted
         );
+    }
+
+    #[derive(Debug)]
+    struct TestFile;
+    impl egui::DroppedFile for TestFile {
+        fn path(&self) -> &std::path::Path {
+            std::path::Path::new("/tmp/dropped.png")
+        }
+        fn bytes(&self) -> Result<Vec<u8>, String> {
+            Ok(Vec::new())
+        }
+    }
+    fn dropped() -> egui::DroppedFileHandle {
+        std::sync::Arc::new(TestFile)
+    }
+    /// Runs one frame with a window per entry (drawn in order, so later ones
+    /// sit on top) and returns the conversation every dropped file was
+    /// routed to. Each window "shows" the conversation named in its entry.
+    fn drop_frame(
+        ctx: &egui::Context,
+        session: &mut Session,
+        windows: &[(&str, egui::Rect, ConversationId)],
+        pointer: Option<egui::Pos2>,
+        drop: bool,
+    ) -> Vec<Option<ConversationId>> {
+        let mut input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(800.0, 600.0),
+            )),
+            ..Default::default()
+        };
+        if let Some(pos) = pointer {
+            input.events.push(egui::Event::PointerMoved(pos));
+        }
+        if drop {
+            input.dropped_files.push(dropped());
+        }
+        let mut output = ctx.run_ui(input, |ui| {
+            for (name, rect, id) in windows {
+                egui::Window::new(*name)
+                    .id(egui::Id::unique(*name))
+                    .title_bar(false)
+                    .fixed_pos(rect.min)
+                    .fixed_size(rect.size())
+                    .show(ui.ctx(), |ui| {
+                        session.current_conversation = Some(*id);
+                        session.capture_upload_drop(ui);
+                        ui.allocate_space(ui.available_size());
+                    });
+            }
+        });
+        output.textures_delta.clear();
+        session
+            .events
+            .drain(..)
+            .filter_map(|event| match event {
+                SessionEvent::UploadRequested { conversation, .. } => Some(conversation),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn dropped_files_go_to_the_topmost_window_under_the_pointer() {
+        let mut session = Session::with_settings(super::super::Settings {
+            logging_enabled: false,
+            logging_load_history: false,
+            ..Default::default()
+        });
+        session.conversations.insert("#a".into(), Channel::new());
+        session.conversations.insert("#b".into(), Channel::new());
+        let a = session.id_for_target("#a").unwrap();
+        let b = session.id_for_target("#b").unwrap();
+        let rect_a = egui::Rect::from_min_size(egui::pos2(20.0, 20.0), egui::vec2(300.0, 300.0));
+        let rect_b = egui::Rect::from_min_size(egui::pos2(180.0, 180.0), egui::vec2(300.0, 300.0));
+        // A is drawn first (earlier in the list) but B is on top.
+        let windows = [("a", rect_a, a), ("b", rect_b, b)];
+        let ctx = egui::Context::default();
+        for _ in 0..3 {
+            drop_frame(&ctx, &mut session, &windows, None, false);
+        }
+        let overlap = egui::pos2(250.0, 250.0);
+        assert_eq!(
+            drop_frame(&ctx, &mut session, &windows, Some(overlap), true),
+            [Some(b)],
+            "a drop over the overlap belongs to the window on top"
+        );
+        // Outside the overlap the window under the pointer still gets it.
+        let only_a = egui::pos2(60.0, 60.0);
+        drop_frame(&ctx, &mut session, &windows, Some(only_a), false);
+        assert_eq!(
+            drop_frame(&ctx, &mut session, &windows, Some(only_a), true),
+            [Some(a)]
+        );
+        // Raising A over B moves the drop target with it.
+        ctx.move_to_top(egui::LayerId::new(
+            egui::Order::Middle,
+            egui::Id::unique("a"),
+        ));
+        drop_frame(&ctx, &mut session, &windows, Some(overlap), false);
+        assert_eq!(
+            drop_frame(&ctx, &mut session, &windows, Some(overlap), true),
+            [Some(a)]
+        );
+    }
+
+    #[test]
+    fn dropped_files_are_still_taken_in_a_maximized_panel() {
+        let mut session = Session::with_settings(super::super::Settings {
+            logging_enabled: false,
+            logging_load_history: false,
+            ..Default::default()
+        });
+        session.conversations.insert("#a".into(), Channel::new());
+        let a = session.id_for_target("#a").unwrap();
+        session.current_conversation = Some(a);
+        let ctx = egui::Context::default();
+        let run = |ctx: &egui::Context, session: &mut Session, drop: bool| {
+            let mut input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(800.0, 600.0),
+                )),
+                ..Default::default()
+            };
+            input
+                .events
+                .push(egui::Event::PointerMoved(egui::pos2(300.0, 300.0)));
+            if drop {
+                input.dropped_files.push(dropped());
+            }
+            let mut output = ctx.run_ui(input, |ui| {
+                egui::CentralPanel::default().show(ui, |ui| session.capture_upload_drop(ui));
+            });
+            output.textures_delta.clear();
+        };
+        run(&ctx, &mut session, false);
+        run(&ctx, &mut session, true);
+        assert_eq!(session.events.len(), 1);
     }
 }
