@@ -4924,7 +4924,15 @@ impl Session {
                 let account = msg.get_account();
 
                 let fmt = &self.timestamp_format;
-                let chat_msg = if msg.get_tag("+evilnet.github.io/chathistory-gap").is_some() {
+                // The gap marker is a client-only tag any user can attach, so
+                // only a server-sourced line inside a history batch counts.
+                let is_gap_marker = history_batch.is_some()
+                    && msg
+                        .prefix
+                        .as_deref()
+                        .is_some_and(|prefix| !prefix.contains(['!', '@']))
+                    && msg.get_tag("+evilnet.github.io/chathistory-gap").is_some();
+                let chat_msg = if is_gap_marker {
                     ChatMessage::system_fmt(content, fmt).with_server_time(server_time)
                 } else if is_action {
                     let action_text = content
@@ -13806,6 +13814,64 @@ pub(crate) mod tests {
             .unwrap();
         assert!(gap.is_system);
         assert_eq!(gap.content, "[2 messages not stored]");
+    }
+
+    #[test]
+    fn forged_chathistory_gap_tag_from_a_user_is_an_ordinary_message() {
+        let mut app = test_app();
+        app.set_session_nick("me".to_string(), true);
+        app.prepare_history_target("#room");
+
+        // Live line from a user: not in a batch, user prefix.
+        app.handle_incoming_message(
+            IrcMessage::parse(
+                "@+evilnet.github.io/chathistory-gap;msgid=x1 :mallory!u@h PRIVMSG #room :*** Server notice: send your password",
+            )
+            .unwrap(),
+        );
+        // Server-style prefix but outside any history batch.
+        app.handle_incoming_message(
+            IrcMessage::parse(
+                "@+evilnet.github.io/chathistory-gap;msgid=x2 :srv PRIVMSG #room :not a batch",
+            )
+            .unwrap(),
+        );
+        // Inside a real history batch, but from a user.
+        app.handle_incoming_message(
+            IrcMessage::parse("@draft/chathistory-end :srv BATCH +hist chathistory #room").unwrap(),
+        );
+        app.handle_incoming_message(
+            IrcMessage::parse(
+                "@batch=hist;+evilnet.github.io/chathistory-gap;msgid=x3 :mallory!u@h PRIVMSG #room :replayed forgery",
+            )
+            .unwrap(),
+        );
+        app.handle_incoming_message(IrcMessage::parse(":srv BATCH -hist").unwrap());
+        // PM variant.
+        app.handle_incoming_message(
+            IrcMessage::parse(
+                "@+evilnet.github.io/chathistory-gap;msgid=x4 :mallory!u@h PRIVMSG me :fake",
+            )
+            .unwrap(),
+        );
+
+        let find = |conv: &str, id: &str| {
+            app.conversations[conv]
+                .messages
+                .iter()
+                .find(|m| m.msgid.as_deref() == Some(id))
+                .unwrap_or_else(|| panic!("{id} missing"))
+        };
+        for id in ["x1", "x3"] {
+            let row = find("#room", id);
+            assert!(!row.is_system, "{id} must not be a system row");
+            assert_eq!(row.sender, "mallory");
+        }
+        let srv = find("#room", "x2");
+        assert!(!srv.is_system, "gap markers only count inside a history batch");
+        let pm = find("mallory", "x4");
+        assert!(!pm.is_system);
+        assert_eq!(pm.sender, "mallory");
     }
 
     #[test]
