@@ -1,7 +1,7 @@
 //! Search and historical-context windows share the asynchronous archive.
 #[cfg(not(test))]
 use super::archive::ArchiveService;
-use super::archive::{ArchiveRecord, ArchiveReply, SearchQuery};
+use super::archive::{ArchiveRecord, ArchiveReply, SearchCursor, SearchQuery};
 use super::identity::{ConversationKey, MessageRef};
 use super::{App, ChatMessage, Session};
 use std::time::{Duration, Instant};
@@ -15,7 +15,10 @@ pub(crate) struct SearchUi {
     generation: u64,
     context_generation: u64,
     results: Vec<ArchiveRecord>,
-    more: bool,
+    /// Where the next page starts; `None` once every match is shown.
+    next: Option<SearchCursor>,
+    /// The request in flight continues the visible results instead of replacing them.
+    appending: bool,
     pending: bool,
     context_pending: bool,
     changed: Option<Instant>,
@@ -146,6 +149,11 @@ impl App {
         self.search.context_error = None;
         self.archive.client.cancel_context();
     }
+    /// "More results" continues after the last row shown; every other request
+    /// (Enter, the Search button, an edited field, the debounce) starts over.
+    fn plan_search_page(&mut self, next: bool) {
+        self.search.query.after = if next { self.search.next } else { None };
+    }
     fn submit_search(&mut self) {
         self.search.generation = 0;
         self.search.pending = false;
@@ -182,6 +190,7 @@ impl App {
             self.search.error = Some("The start date must not be later than the end date".into());
             return;
         }
+        self.search.appending = self.search.query.after.is_some();
         self.search.generation = self.archive.client.search(self.search.query.clone());
         self.search.pending = true;
         self.search.changed = None;
@@ -197,16 +206,27 @@ impl App {
                 ArchiveReply::Search {
                     generation,
                     records,
-                    more,
+                    next,
                 } if self.search.open && generation == self.search.generation => {
-                    if self.search.query.offset == 0 {
+                    if !self.search.appending {
                         self.search.results.clear();
                     }
-                    self.search.results.extend(records);
+                    // Keyset paging cannot repeat rows; the id check is a second
+                    // line of defence for any future change to that guarantee.
+                    for record in records {
+                        if !self
+                            .search
+                            .results
+                            .iter()
+                            .any(|shown| shown.id == record.id)
+                        {
+                            self.search.results.push(record);
+                        }
+                    }
                     if self.search.results.len() > 500 {
                         self.search.results.drain(..self.search.results.len() - 500);
                     }
-                    self.search.more = more;
+                    self.search.next = next;
                     self.search.pending = false;
                 }
                 ArchiveReply::Context {
@@ -262,7 +282,7 @@ impl App {
         // the complete search cannot disturb an open historical lookup.
         if self.search.refresh_after_index && self.search.open {
             self.search.refresh_after_index = false;
-            self.search.query.offset = 0;
+            self.search.query.after = None;
             self.submit_search();
         }
     }
@@ -405,7 +425,7 @@ impl App {
                         ui.label(format!("{} results shown", self.search.results.len()));
                         next = ui
                             .add_enabled(
-                                self.search.more
+                                self.search.next.is_some()
                                     && !self.search.pending
                                     && self.search.changed.is_none(),
                                 egui::Button::new("More results"),
@@ -419,11 +439,6 @@ impl App {
             }
             if open && changed {
                 self.search.changed = Some(Instant::now());
-                self.search.query.offset = 0;
-            }
-            if next {
-                self.search.query.offset += 100;
-                search = true;
             }
             if self
                 .search
@@ -435,7 +450,8 @@ impl App {
             if self.search.changed.is_some() {
                 ctx.request_repaint_after(Duration::from_millis(250));
             }
-            if open && search {
+            if open && (search || next) {
+                self.plan_search_page(next);
                 self.submit_search();
             }
             if let Some(reference) = reveal {
@@ -750,12 +766,50 @@ mod tests {
         let mut app = app();
         app.search.open = true;
         app.search.indexing = true;
-        app.search.query.offset = 100;
+        app.search.query.after = Some((1, 1));
         app.search.context = Some((record().reference(), vec![record()]));
         app.tick_history_services();
         assert!(!app.search.refresh_after_index);
-        assert_eq!(app.search.query.offset, 0);
+        assert_eq!(app.search.query.after, None);
         assert!(app.search.context.is_some());
+    }
+
+    #[test]
+    fn a_fresh_search_after_more_results_replaces_instead_of_repeating_a_page() {
+        let (mut app, root) = app_with_archive();
+        for index in 0..150 {
+            let mut row = record();
+            row.id = format!("row{index}");
+            row.msgid = Some(format!("m{index}"));
+            row.received_at = Some(1_000 + index);
+            app.archive.client.upsert(row);
+        }
+        assert!(app.archive.client.flush_barrier(Duration::from_secs(5)));
+        app.search.open = true;
+        app.search.query.text = "old body".into();
+        app.plan_search_page(false);
+        app.submit_search();
+        finish_query(&mut app);
+        assert_eq!(app.search.results.len(), 100);
+        assert!(app.search.next.is_some());
+        app.plan_search_page(true);
+        app.submit_search();
+        finish_query(&mut app);
+        assert_eq!(app.search.results.len(), 150);
+        assert!(app.search.next.is_none());
+        // Enter or the Search button without paging starts again from the newest rows.
+        app.plan_search_page(false);
+        assert_eq!(app.search.query.after, None);
+        app.submit_search();
+        finish_query(&mut app);
+        let mut ids: Vec<_> = app.search.results.iter().map(|r| r.id.clone()).collect();
+        assert_eq!(ids.len(), 100);
+        assert_eq!(ids[0], "row149");
+        ids.sort();
+        ids.dedup();
+        assert_eq!(ids.len(), 100);
+        drop(app);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

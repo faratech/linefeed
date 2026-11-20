@@ -97,6 +97,10 @@ impl ArchiveRecord {
     }
 }
 
+/// Keyset position of the last row of a result page: the coalesced `occurred`
+/// time and the table rowid, in the order results are sorted.
+pub(crate) type SearchCursor = (i64, i64);
+
 #[derive(Clone, Debug, Default)]
 pub(crate) struct SearchQuery {
     pub network_pattern: String,
@@ -107,7 +111,9 @@ pub(crate) struct SearchQuery {
     pub from: Option<i64>,
     pub until: Option<i64>,
     pub include_undated: bool,
-    pub offset: usize,
+    /// Continue strictly after this position. Unlike an OFFSET, new, redacted
+    /// or removed rows cannot shift where the next page starts.
+    pub after: Option<SearchCursor>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -130,7 +136,8 @@ pub(crate) enum ArchiveReply {
     Search {
         generation: u64,
         records: Vec<ArchiveRecord>,
-        more: bool,
+        /// Cursor for the next page, present only when more rows match.
+        next: Option<SearchCursor>,
     },
     Context {
         generation: u64,
@@ -1101,12 +1108,14 @@ fn execute_search(
     query: &SearchQuery,
     cancel: &ArchiveClient,
     generation: u64,
-) -> Result<(Vec<ArchiveRecord>, bool), String> {
+) -> Result<(Vec<ArchiveRecord>, Option<SearchCursor>), String> {
     let progress = QueryProgress::new(db, cancel, Some(generation))?;
     let db = &*progress.0;
     let text = query.text.to_lowercase();
     let use_fts = text.chars().count() >= 3;
-    let mut sql = String::from("SELECT r.data FROM records r ");
+    let mut sql = String::from(
+        "SELECT r.data,coalesce(r.occurred,-9223372036854775808),r.rowid FROM records r ",
+    );
     if use_fts {
         sql.push_str("JOIN record_search ON record_search.rowid=r.rowid ");
     }
@@ -1118,7 +1127,8 @@ fn execute_search(
     } else {
         sql.push_str("AND (instr(r.body_fold,?7)>0 OR instr(r.sender_fold,?7)>0) ");
     }
-    sql.push_str("AND (?9='' OR instr(lower(r.network),?9)>0) ORDER BY r.occurred DESC,r.rowid DESC LIMIT 101 OFFSET ?8");
+    sql.push_str("AND (?9='' OR instr(lower(r.network),?9)>0) AND (?8 IS NULL OR (coalesce(r.occurred,-9223372036854775808),r.rowid)<(?8,?10))
+       ORDER BY coalesce(r.occurred,-9223372036854775808) DESC,r.rowid DESC LIMIT 101");
     let needle = if use_fts {
         format!("\"{}\"", text.replace('"', "\"\""))
     } else {
@@ -1139,23 +1149,30 @@ fn execute_search(
             query.until,
             query.include_undated,
             needle,
-            query.offset.min(i64::MAX as usize) as i64,
-            query.network_pattern.to_lowercase()
+            query.after.map(|(occurred, _)| occurred),
+            query.network_pattern.to_lowercase(),
+            query.after.map_or(0, |(_, rowid)| rowid)
         ])
         .map_err(|e| e.to_string())?;
     let mut found = Vec::new();
+    let mut cursors = Vec::new();
     while let Some(row) = rows.next().map_err(|e| e.to_string())? {
         if cancel.generation.load(Ordering::SeqCst) != generation {
-            return Ok((Vec::new(), false));
+            return Ok((Vec::new(), None));
         }
         let data: String = row.get(0).map_err(|e| e.to_string())?;
         let mut record = serde_json::from_str(&data).map_err(|e| e.to_string())?;
         hydrate_reactions(db, &mut record)?;
         found.push(record);
+        cursors.push((
+            row.get(1).map_err(|e| e.to_string())?,
+            row.get(2).map_err(|e| e.to_string())?,
+        ));
     }
     let more = found.len() > 100;
     found.truncate(100);
-    Ok((found, more))
+    let next = if more { cursors.get(99).copied() } else { None };
+    Ok((found, next))
 }
 
 fn execute_context(
@@ -1271,11 +1288,11 @@ fn process_task(
         Task::Search(generation, query) => {
             if client.generation.load(Ordering::SeqCst) == generation {
                 match execute_search(db, &query, client, generation) {
-                    Ok((records, more)) => {
+                    Ok((records, next)) => {
                         let _ = reply.send(ArchiveReply::Search {
                             generation,
                             records,
-                            more,
+                            next,
                         });
                     }
                     Err(message) if client.generation.load(Ordering::SeqCst) == generation => {
@@ -1797,6 +1814,97 @@ mod tests {
                 _ => panic!("search failed"),
             }
         }
+    }
+    fn dated(target: &str, body: &str, msgid: &str, at: i64) -> ArchiveRecord {
+        let mut row = record(target, body, msgid);
+        row.received_at = Some(at);
+        row
+    }
+    fn page(
+        service: &ArchiveService,
+        query: SearchQuery,
+    ) -> (Vec<ArchiveRecord>, Option<SearchCursor>) {
+        service.client.search(query);
+        match receive(service) {
+            ArchiveReply::Search { records, next, .. } => (records, next),
+            _ => panic!("search failed"),
+        }
+    }
+    #[test]
+    fn search_paging_is_stable_when_newer_matches_arrive_between_pages() {
+        let service = ArchiveService::memory();
+        for index in 0..150 {
+            service.client.upsert(dated(
+                "#a",
+                "needle",
+                &format!("old{index}"),
+                1_000 + index as i64,
+            ));
+        }
+        assert!(service.client.flush_barrier(Duration::from_secs(5)));
+        let query = SearchQuery {
+            text: "needle".into(),
+            ..Default::default()
+        };
+        let (first, next) = page(&service, query.clone());
+        assert_eq!(first.len(), 100);
+        assert!(next.is_some());
+        for index in 0..5 {
+            service.client.upsert(dated(
+                "#a",
+                "needle",
+                &format!("new{index}"),
+                5_000 + index as i64,
+            ));
+        }
+        assert!(service.client.flush_barrier(Duration::from_secs(5)));
+        let (second, next) = page(
+            &service,
+            SearchQuery {
+                after: next,
+                ..query
+            },
+        );
+        assert!(next.is_none());
+        let mut ids: Vec<_> = first.iter().chain(&second).map(|r| r.id.clone()).collect();
+        let total = ids.len();
+        ids.sort();
+        ids.dedup();
+        assert_eq!(ids.len(), total, "a page repeated rows already shown");
+        assert_eq!(second.len(), 50, "rows were skipped between pages");
+    }
+    #[test]
+    fn search_paging_does_not_skip_rows_when_shown_rows_are_redacted() {
+        let service = ArchiveService::memory();
+        for index in 0..150 {
+            service.client.upsert(dated(
+                "#a",
+                "needle",
+                &format!("m{index}"),
+                1_000 + index as i64,
+            ));
+        }
+        assert!(service.client.flush_barrier(Duration::from_secs(5)));
+        let query = SearchQuery {
+            text: "needle".into(),
+            ..Default::default()
+        };
+        let (first, next) = page(&service, query.clone());
+        for row in first.iter().take(3) {
+            service
+                .client
+                .redact(row.conversation.clone(), row.msgid.clone().unwrap());
+        }
+        assert!(service.client.flush_barrier(Duration::from_secs(5)));
+        let (second, next) = page(
+            &service,
+            SearchQuery {
+                after: next,
+                ..query
+            },
+        );
+        assert!(next.is_none());
+        assert_eq!(second.len(), 50, "redaction shifted the next page");
     }
     #[test]
     fn redaction_before_creation_survives_replay_and_context() {
