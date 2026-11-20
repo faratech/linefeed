@@ -78,6 +78,8 @@ pub(crate) struct Palette {
     /// The fill behind a row that mentions the user.
     pub mention_row: Color32,
     pub online: Color32,
+    /// Errors and a lost connection.
+    pub danger: Color32,
     pub nicks: [Color32; 6],
     pub dark: bool,
 }
@@ -110,6 +112,7 @@ impl Palette {
             mention: rgb(0xF2A65A),
             mention_row: rgb(0x37302A),
             online: rgb(0x5BC98C),
+            danger: rgb(0xF28B82),
             nicks: [
                 rgb(0x7DB7FF),
                 rgb(0x5ED0C0),
@@ -136,6 +139,7 @@ impl Palette {
             mention: rgb(0xA4500B),
             mention_row: rgb(0xF7EBDD),
             online: rgb(0x1E8E5A),
+            danger: rgb(0xB3261E),
             nicks: [
                 rgb(0x1F5FD1),
                 rgb(0x0B7268),
@@ -167,8 +171,6 @@ impl Palette {
 /// Sizes and row options that follow the display preferences.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct Metrics {
-    /// Height of buttons, fields and list rows.
-    pub control_height: f32,
     /// Vertical gap between message rows.
     pub row_gap: f32,
     pub message_font: MessageFont,
@@ -177,12 +179,11 @@ pub(crate) struct Metrics {
 
 impl Metrics {
     fn of(prefs: &DisplayPrefs) -> Self {
-        let (control_height, row_gap) = match prefs.density {
-            Density::Comfortable => (44.0, 6.0),
-            Density::Compact => (32.0, 0.0),
+        let row_gap = match prefs.density {
+            Density::Comfortable => 6.0,
+            Density::Compact => 0.0,
         };
         Self {
-            control_height,
             row_gap,
             message_font: prefs.message_font,
             color_nicks: prefs.color_nicks,
@@ -209,13 +210,18 @@ fn applied(ctx: &egui::Context) -> Applied {
 }
 
 /// The palette in force; dark until [`apply`] has run.
-#[cfg_attr(not(test), allow(dead_code))] // until the drawing code reads it
 pub(crate) fn palette(ctx: &egui::Context) -> Palette {
     applied(ctx).palette
 }
 
+/// Height of buttons, fields and list rows. It lives in egui's own
+/// spacing, which [`apply`] sets, so that egui's widgets and ours agree.
+pub(crate) fn control_height(ui: &egui::Ui) -> f32 {
+    ui.spacing().interact_size.y
+}
+
 /// The sizes in force; comfortable until [`apply`] has run.
-#[cfg_attr(not(test), allow(dead_code))] // until the drawing code reads it
+#[cfg_attr(not(test), allow(dead_code))] // until message rows read it
 pub(crate) fn metrics(ctx: &egui::Context) -> Metrics {
     applied(ctx).metrics
 }
@@ -281,7 +287,10 @@ pub(crate) fn apply(ctx: &egui::Context, prefs: &DisplayPrefs) {
     style.visuals = visuals;
 
     style.spacing.item_spacing = egui::vec2(8.0, 4.0);
-    style.spacing.interact_size.y = metrics.control_height;
+    style.spacing.interact_size.y = match prefs.density {
+        Density::Comfortable => 44.0,
+        Density::Compact => 32.0,
+    };
     style.spacing.button_padding = egui::vec2(12.0, 4.0);
 
     let font_size = prefs.font_size.clamp(10.0, 24.0);
@@ -343,7 +352,7 @@ mod tests {
     fn every_text_role_reads_on_every_ground_it_is_drawn_on() {
         for p in [Palette::dark(), Palette::light()] {
             for ground in [p.bg, p.panel, p.raise, p.mention_row] {
-                for text in [p.text, p.muted, p.faint] {
+                for text in [p.text, p.muted, p.faint, p.danger] {
                     assert!(contrast(text, ground) >= 4.5, "{text:?} on {ground:?}");
                 }
             }
@@ -389,7 +398,6 @@ mod tests {
     fn a_context_nothing_was_applied_to_gets_the_dark_comfortable_defaults() {
         let ctx = egui::Context::default();
         assert_eq!(palette(&ctx).bg, Palette::dark().bg);
-        assert_eq!(metrics(&ctx).control_height, 44.0);
         assert_eq!(metrics(&ctx).row_gap, 6.0);
     }
 

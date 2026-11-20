@@ -71,6 +71,8 @@ pub struct App {
     next_workspace_restore: u64,
     pub(crate) archive: super::archive::ArchiveService,
     pub(crate) search: super::search::SearchUi,
+    /// What is typed in the top bar's search field.
+    toolbar_search: String,
     pub(crate) automation: super::automation::AutomationUi,
     pub(crate) window_switcher: super::actions::WindowSwitcher,
     pub(crate) sessions: Vec<Session>,
@@ -419,6 +421,7 @@ impl App {
             archive: Default::default(),
             uploads: Default::default(),
             search: Default::default(),
+            toolbar_search: String::new(),
             next_conn: 1,
             settings,
             updater: crate::updater::Controller::default(),
@@ -2241,10 +2244,10 @@ impl App {
 
     // ----- toolbar and switchbar ------------------------------------------
 
-    /// Name and connection status at the left, the controls at the right.
-    /// What does not fit beside them moves down: first the status line, and
-    /// in a window too narrow for the controls beside the name, everything
-    /// wraps.
+    /// The connection and its status at the left, search and the window
+    /// controls at the right. What does not fit beside them moves down:
+    /// first the status line, and in a window too narrow for the controls
+    /// beside the connection button, everything wraps.
     fn draw_toolbar(&mut self, ui: &mut egui::Ui) {
         let fit_id = ui.scope_id().with("fit");
         let previous: Option<ToolbarFit> = ui.ctx().data(|data| data.get_temp(fit_id));
@@ -2253,13 +2256,10 @@ impl App {
         let rows = toolbar_rows(previous, available, spacing);
         let mut fit = previous.unwrap_or_default();
         fit.rows = rows;
-        let active = self.active_index();
-        let label = self.network_label(&self.sessions[active]);
         if rows == ToolbarRows::Wrapped {
             ui.horizontal_wrapped(|ui| {
-                ui.heading("Linefeed");
-                ui.separator();
-                self.sessions[active].draw_status_summary(ui, &label);
+                self.draw_connection_button(ui);
+                self.draw_status_line(ui);
             });
             let row = ui.spacing().interact_size.y;
             let controls = ui
@@ -2278,11 +2278,10 @@ impl App {
             }
         } else {
             ui.horizontal(|ui| {
-                fit.heading = ui.heading("Linefeed").rect.width();
+                fit.connection = self.draw_connection_button(ui).rect.width();
                 if rows == ToolbarRows::One {
-                    ui.separator();
                     fit.status = ui
-                        .scope(|ui| self.sessions[active].draw_status_summary(ui, &label))
+                        .scope(|ui| self.draw_status_line(ui))
                         .response
                         .rect
                         .width();
@@ -2295,7 +2294,7 @@ impl App {
             if rows == ToolbarRows::Two {
                 fit.status = ui
                     .horizontal_wrapped(|ui| {
-                        self.sessions[active].draw_status_summary(ui, &label);
+                        self.draw_status_line(ui);
                         ui.min_rect().width()
                     })
                     .inner;
@@ -2311,71 +2310,160 @@ impl App {
         }
     }
 
-    /// The toolbar's controls, in a right-to-left layout: the first one
-    /// drawn sits at the right edge.
-    fn draw_toolbar_controls(&mut self, ui: &mut egui::Ui) {
-        if ui.button("Settings").clicked() {
-            let conn = self.sessions[self.active_index()].id;
-            self.open_settings(conn);
+    /// The active connection as one button: a status dot, the network and
+    /// the nickname. Its menu connects or disconnects and shows the account
+    /// and transport details.
+    fn draw_connection_button(&mut self, ui: &mut egui::Ui) -> egui::Response {
+        let palette = super::theme::palette(ui.ctx());
+        let active = self.active_index();
+        let label = self.network_label(&self.sessions[active]);
+        let session = &self.sessions[active];
+        let connected = session.is_connected();
+        let connecting = session.is_connecting();
+        let dot = if connected && session.away_status.is_none() {
+            palette.online
+        } else if connected || connecting {
+            palette.mention
+        } else {
+            palette.danger
+        };
+        let font = egui::TextStyle::Button.resolve(ui.style());
+        let format = |font_id: egui::FontId, color| egui::TextFormat {
+            font_id,
+            color,
+            ..Default::default()
+        };
+        let mut title = egui::text::LayoutJob::default();
+        title.append("● ", 0.0, format(font.clone(), dot));
+        title.append(
+            &label,
+            0.0,
+            format(
+                egui::FontId::new(font.size, super::fonts::semibold()),
+                palette.text,
+            ),
+        );
+        if connected {
+            title.append(
+                &format!("  {}", session.my_nick),
+                0.0,
+                format(font.clone(), palette.muted),
+            );
         }
-        ui.menu_button("Window", |ui| {
-            if ui.button("Tile").clicked() {
-                self.tile_request = Some(TileRequest::Tile);
-                self.windows.mode = LayoutMode::Floating;
+        title.append("  ▾", 0.0, format(font, palette.muted));
+        ui.menu_button(title, |ui| {
+            if connected {
+                if ui.button("Disconnect").clicked() {
+                    let quit = self.quit_reason();
+                    self.sessions[active].request_manual_disconnect(Some(quit));
+                    ui.close();
+                }
+            } else if !connecting && ui.button("Connect").clicked() {
+                self.sessions[active].show_connect_dialog = true;
+                self.open_connection_settings(self.sessions[active].id);
                 ui.close();
             }
-            if ui.button("Cascade").clicked() {
-                self.tile_request = Some(TileRequest::Cascade);
-                self.windows.mode = LayoutMode::Floating;
-                ui.close();
-            }
-            let label = match self.windows.mode {
-                LayoutMode::Maximized => "Restore windows (Ctrl+M)",
-                LayoutMode::Floating => "Maximize (Ctrl+M)",
-            };
-            if ui.button(label).clicked() {
-                self.toggle_maximized();
-                ui.close();
-            }
-            ui.separator();
             if ui.button("New connection...").clicked() {
                 self.new_connection();
                 ui.close();
             }
-            ui.separator();
-            if ui.button("File sharing…").clicked() {
-                self.claim_global_dialogs(None);
-                self.uploads.open = true;
-                ui.close();
+            if connected {
+                ui.separator();
+                self.sessions[active].draw_account_security_status(ui);
+            }
+        })
+        .response
+    }
+
+    /// One quiet line saying how the active connection stands; an
+    /// unencrypted or unverified link is called out in the mention colour.
+    fn draw_status_line(&self, ui: &mut egui::Ui) {
+        let palette = super::theme::palette(ui.ctx());
+        let active = self.active_index();
+        let label = self.network_label(&self.sessions[active]);
+        let (text, warning) = self.sessions[active].status_line(&label);
+        let color = if warning {
+            palette.mention
+        } else {
+            palette.muted
+        };
+        ui.label(RichText::new(text).small().color(color));
+    }
+
+    /// The top bar's controls, in a right-to-left layout: the first one
+    /// drawn sits at the right edge.
+    fn draw_toolbar_controls(&mut self, ui: &mut egui::Ui) {
+        ui.scope(|ui| {
+            // Flat until hovered: the bar is not a row of boxes.
+            let inactive = &mut ui.visuals_mut().widgets.inactive;
+            inactive.weak_bg_fill = Color32::TRANSPARENT;
+            inactive.bg_stroke = egui::Stroke::NONE;
+            if ui.button("Settings").clicked() {
+                let conn = self.sessions[self.active_index()].id;
+                self.open_settings(conn);
+            }
+            ui.menu_button("Window", |ui| {
+                if ui.button("Tile").clicked() {
+                    self.tile_request = Some(TileRequest::Tile);
+                    self.windows.mode = LayoutMode::Floating;
+                    ui.close();
+                }
+                if ui.button("Cascade").clicked() {
+                    self.tile_request = Some(TileRequest::Cascade);
+                    self.windows.mode = LayoutMode::Floating;
+                    ui.close();
+                }
+                let label = match self.windows.mode {
+                    LayoutMode::Maximized => "Restore windows (Ctrl+M)",
+                    LayoutMode::Floating => "Maximize (Ctrl+M)",
+                };
+                if ui.button(label).clicked() {
+                    self.toggle_maximized();
+                    ui.close();
+                }
+                ui.separator();
+                if ui.button("New connection...").clicked() {
+                    self.new_connection();
+                    ui.close();
+                }
+                ui.separator();
+                if ui.button("File sharing…").clicked() {
+                    self.claim_global_dialogs(None);
+                    self.uploads.open = true;
+                    ui.close();
+                }
+            });
+            let unread = self.activity.items.iter().filter(|item| !item.read).count();
+            let count = (unread > 0).then(|| unread.to_string());
+            let mention = super::theme::palette(ui.ctx()).mention;
+            if super::widgets::badge_button(
+                ui,
+                "Activity",
+                count.as_deref().map(|count| (count, mention)),
+            )
+            .clicked()
+            {
+                self.toggle_activity(None);
             }
         });
-        let count = self.activity.items.iter().filter(|item| !item.read).count();
-        let activity_label = if count == 0 {
-            "Activity".into()
-        } else {
-            format!("Activity ({count})")
-        };
-        if ui.button(activity_label).clicked() {
-            self.toggle_activity(None);
-        }
-        if ui
-            .button("Search")
-            .on_hover_text("Search saved history (Ctrl+F)")
-            .clicked()
+        let height = super::theme::control_height(ui);
+        let width = ui.available_width().clamp(120.0, 280.0);
+        let response = ui.add(
+            egui::TextEdit::singleline(&mut self.toolbar_search)
+                .hint_text("Search history (Ctrl+F)")
+                .desired_width(width)
+                .min_size(egui::vec2(0.0, height))
+                .align(egui::Align2::LEFT_CENTER),
+        );
+        if response.lost_focus()
+            && ui.input(|input| input.key_pressed(egui::Key::Enter))
+            && !self.toolbar_search.trim().is_empty()
         {
-            self.open_search(self.active_index(), String::new(), false);
+            let query = std::mem::take(&mut self.toolbar_search);
+            self.open_search(self.active_index(), query.trim().to_owned(), false);
         }
-        ui.separator();
+        // The channel box moves into the sidebar with the conversations.
         let active = self.active_index();
-        if !self.sessions[active].is_connected() && !self.sessions[active].is_connecting() {
-            if ui.button("Connect").clicked() {
-                self.sessions[active].show_connect_dialog = true;
-                self.open_connection_settings(self.sessions[active].id);
-            }
-        } else if self.sessions[active].is_connected() && ui.button("Disconnect").clicked() {
-            let quit = self.quit_reason();
-            self.sessions[active].request_manual_disconnect(Some(quit));
-        }
         let session = &mut self.sessions[active];
         if session.is_connected() {
             session.draw_join_box(ui);
@@ -3571,11 +3659,11 @@ pub(crate) fn detached_viewport_id(key: &WindowKey) -> egui::ViewportId {
 /// How the toolbar is arranged in the width at hand.
 #[derive(Clone, Copy, Debug, Default, PartialEq, PartialOrd)]
 enum ToolbarRows {
-    /// Too narrow for the controls beside the name: everything wraps.
+    /// Too narrow for the controls beside the connection: everything wraps.
     Wrapped,
-    /// The controls share the name's row; the status line goes below.
+    /// The controls share the connection's row; the status line goes below.
     Two,
-    /// Name and status at the left, controls at the right.
+    /// Connection and status at the left, controls at the right.
     #[default]
     One,
 }
@@ -3584,7 +3672,7 @@ enum ToolbarRows {
 #[derive(Clone, Copy, Debug, Default)]
 struct ToolbarFit {
     rows: ToolbarRows,
-    heading: f32,
+    connection: f32,
     status: f32,
     controls: f32,
 }
@@ -3603,9 +3691,9 @@ fn toolbar_rows(fit: Option<ToolbarFit>, available: f32, spacing: f32) -> Toolba
         let slack = if rows > fit.rows { SLACK } else { 0.0 };
         width + slack <= available
     };
-    // Name, separator, status and controls, with a gap between each.
-    let one_row = fit.heading + fit.status + fit.controls + 4.0 * spacing;
-    let two_rows = fit.heading + fit.controls + spacing;
+    // Connection, status and controls, with room for the gaps between.
+    let one_row = fit.connection + fit.status + fit.controls + 4.0 * spacing;
+    let two_rows = fit.connection + fit.controls + spacing;
     if fits(ToolbarRows::One, one_row) {
         ToolbarRows::One
     } else if fits(ToolbarRows::Two, two_rows) {
@@ -7144,63 +7232,119 @@ mod tests {
         assert_eq!(app.sessions[0].server_unread, 1);
     }
 
-    /// Where each painted text landed after a few frames at this width.
-    fn text_rects_at_width(app: &mut App, width: f32) -> Vec<(String, egui::Rect)> {
-        fn collect(shape: &egui::Shape, out: &mut Vec<(String, egui::Rect)>) {
+    /// What one frame painted: every text with its rectangle and colour,
+    /// and every filled rectangle.
+    struct Painted {
+        texts: Vec<(String, egui::Rect, Color32)>,
+        fills: Vec<(egui::Rect, Color32)>,
+    }
+
+    impl Painted {
+        fn text(&self, text: &str) -> (egui::Rect, Color32) {
+            self.texts
+                .iter()
+                .find(|(painted, _, _)| painted == text)
+                .map(|(_, rect, color)| (*rect, *color))
+                .unwrap_or_else(|| panic!("{text:?} was not painted: {:?}", self.strings()))
+        }
+
+        fn containing(&self, part: &str) -> (String, egui::Rect, Color32) {
+            self.texts
+                .iter()
+                .find(|(painted, _, _)| painted.contains(part))
+                .cloned()
+                .unwrap_or_else(|| panic!("no text with {part:?}: {:?}", self.strings()))
+        }
+
+        fn has(&self, text: &str) -> bool {
+            self.texts.iter().any(|(painted, _, _)| painted == text)
+        }
+
+        fn strings(&self) -> Vec<&str> {
+            self.texts
+                .iter()
+                .map(|(text, _, _)| text.as_str())
+                .collect()
+        }
+    }
+
+    /// Run one frame of the app at this window width and collect what it
+    /// painted.
+    fn paint(app: &mut App, ctx: &egui::Context, width: f32, events: Vec<egui::Event>) -> Painted {
+        fn collect(shape: &egui::Shape, out: &mut Painted) {
             match shape {
-                egui::Shape::Text(text) => out.push((
-                    text.galley.text().to_string(),
-                    egui::Rect::from_min_size(text.pos, text.galley.size()),
-                )),
+                egui::Shape::Text(text) => {
+                    let color = text
+                        .galley
+                        .job
+                        .sections
+                        .first()
+                        .map(|section| section.format.color)
+                        .filter(|color| *color != Color32::PLACEHOLDER)
+                        .unwrap_or(text.fallback_color);
+                    out.texts.push((
+                        text.galley.text().to_string(),
+                        egui::Rect::from_min_size(text.pos, text.galley.size()),
+                        color,
+                    ));
+                }
+                egui::Shape::Rect(rect) => out.fills.push((rect.rect, rect.fill)),
                 egui::Shape::Vec(shapes) => shapes.iter().for_each(|s| collect(s, out)),
                 _ => {}
             }
         }
-        let ctx = egui::Context::default();
-        let mut out = Vec::new();
-        for _ in 0..3 {
-            let mut output = ctx.run_ui(
-                egui::RawInput {
-                    screen_rect: Some(egui::Rect::from_min_size(
-                        egui::Pos2::ZERO,
-                        egui::vec2(width, 768.0),
-                    )),
-                    ..Default::default()
-                },
-                |ui| app.ui(ui),
-            );
-            output.textures_delta.clear();
-            out.clear();
-            for clipped in &output.shapes {
-                collect(&clipped.shape, &mut out);
-            }
+        let mut output = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(width, 768.0),
+                )),
+                events,
+                ..Default::default()
+            },
+            |ui| app.ui(ui),
+        );
+        output.textures_delta.clear();
+        let mut painted = Painted {
+            texts: Vec::new(),
+            fills: Vec::new(),
+        };
+        for clipped in &output.shapes {
+            collect(&clipped.shape, &mut painted);
         }
-        out
+        painted
     }
 
-    fn rect_of(rects: &[(String, egui::Rect)], text: &str) -> egui::Rect {
-        rects
-            .iter()
-            .find(|(painted, _)| painted == text)
-            .unwrap_or_else(|| panic!("{text:?} was not painted"))
-            .1
+    /// `paint` after enough frames for measured layouts to settle.
+    fn settled(app: &mut App, ctx: &egui::Context, width: f32) -> Painted {
+        paint(app, ctx, width, Vec::new());
+        paint(app, ctx, width, Vec::new());
+        paint(app, ctx, width, Vec::new())
     }
 
-    const TOOLBAR_CONTROLS: [&str; 6] = [
-        "Join",
-        "Disconnect",
-        "Search",
-        "Activity",
-        "Window",
-        "Settings",
-    ];
+    fn click(app: &mut App, ctx: &egui::Context, width: f32, pos: egui::Pos2) -> Painted {
+        let button = |pressed| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        paint(
+            app,
+            ctx,
+            width,
+            vec![egui::Event::PointerMoved(pos), button(true)],
+        );
+        paint(app, ctx, width, vec![button(false)]);
+        settled(app, ctx, width)
+    }
 
     #[test]
     fn the_toolbar_arrangement_needs_slack_to_grow_but_none_to_shrink() {
         let fit = |rows| {
             Some(ToolbarFit {
                 rows,
-                heading: 100.0,
+                connection: 100.0,
                 status: 400.0,
                 controls: 600.0,
             })
@@ -7223,7 +7367,7 @@ mod tests {
             toolbar_rows(fit(ToolbarRows::Two), 1156.0, 8.0),
             ToolbarRows::One
         );
-        // Name and controls need 100 + 600 + 8 = 708.
+        // The connection button and the controls need 100 + 600 + 8 = 708.
         assert_eq!(
             toolbar_rows(fit(ToolbarRows::Two), 708.0, 8.0),
             ToolbarRows::Two
@@ -7243,76 +7387,148 @@ mod tests {
     }
 
     #[test]
-    fn a_wide_toolbar_is_one_row_with_the_controls_at_the_right() {
+    fn the_top_bar_puts_connection_left_and_search_activity_window_settings_right() {
         let (mut app, _rx_a, _rx_b) = two_networks();
-        let rects = text_rects_at_width(&mut app, 1600.0);
-        let name = rect_of(&rects, "Linefeed");
-        let status = rect_of(&rects, "Connected · not authenticated");
-        assert!(name.left() < 20.0, "{name:?}");
-        let mut left = status.right();
-        for control in TOOLBAR_CONTROLS {
-            let rect = rect_of(&rects, control);
+        let ctx = egui::Context::default();
+        let painted = settled(&mut app, &ctx, 1360.0);
+        let label = app.network_label(&app.sessions[app.active_index()]);
+        let (_, connection, _) = painted.containing(&label);
+        assert!(connection.left() < 40.0, "{connection:?}");
+        let mut left = 680.0;
+        for text in ["Search history (Ctrl+F)", "Activity", "Window", "Settings"] {
+            let (rect, _) = painted.text(text);
+            assert!(rect.left() > left, "{text} follows in order: {rect:?}");
             assert!(
-                (rect.center().y - status.center().y).abs() < 6.0,
-                "{control} shares the status row: {rect:?} vs {status:?}"
+                (rect.center().y - connection.center().y).abs() < 8.0,
+                "{text} shares the connection's row: {rect:?} vs {connection:?}"
             );
-            assert!(rect.left() > left, "{control} follows in order: {rect:?}");
             left = rect.right();
         }
-        assert!(
-            left > 1600.0 - 24.0,
-            "Settings ends at the right edge: {left}"
-        );
-        assert!(
-            rect_of(&rects, "Join").left() > 800.0,
-            "the controls sit in the right half, not beside the name"
-        );
+        assert!(left > 1360.0 - 32.0, "Settings ends at the right: {left}");
+        // "Join" leaves the bar when the sidebar gets its join row.
+        for gone in ["Linefeed", "Disconnect", "Connect", "Search"] {
+            assert!(!painted.has(gone), "{gone} is no longer on the bar");
+        }
     }
 
     #[test]
-    fn a_default_width_toolbar_keeps_the_controls_right_and_moves_status_below() {
+    fn disconnect_and_new_connection_live_in_the_connection_menu() {
         let (mut app, _rx_a, _rx_b) = two_networks();
-        let rects = text_rects_at_width(&mut app, 1024.0);
-        let name = rect_of(&rects, "Linefeed");
-        let settings = rect_of(&rects, "Settings");
-        let status = rect_of(&rects, "Connected · not authenticated");
-        assert!(settings.right() > 1024.0 - 24.0, "{settings:?}");
-        assert!(
-            (settings.center().y - name.center().y).abs() < 8.0,
-            "the controls share the name's row: {settings:?} vs {name:?}"
-        );
-        assert!(
-            status.top() > settings.bottom() - 2.0,
-            "the status line is the second row: {status:?} vs {settings:?}"
-        );
-        for control in TOOLBAR_CONTROLS {
-            let rect = rect_of(&rects, control);
+        let ctx = egui::Context::default();
+        let painted = settled(&mut app, &ctx, 1360.0);
+        let label = app.network_label(&app.sessions[app.active_index()]);
+        let (_, connection, _) = painted.containing(&label);
+        let painted = click(&mut app, &ctx, 1360.0, connection.center());
+        assert!(painted.has("Disconnect"), "{:?}", painted.strings());
+        assert!(painted.has("New connection..."));
+
+        let (disconnect, _) = painted.text("Disconnect");
+        click(&mut app, &ctx, 1360.0, disconnect.center());
+        let active = app.active_index();
+        assert!(!app.sessions[active].is_connected() || app.sessions[active].is_closing());
+    }
+
+    #[test]
+    fn the_status_line_says_whether_the_connection_is_encrypted_and_signed_in() {
+        use crate::irc::client::{AuthenticationStatus, TlsStatus};
+        let (mut app, _rx_a, _rx_b) = two_networks();
+        let ctx = egui::Context::default();
+        let active = app.active_index();
+        app.sessions[active].connection_status.tls = TlsStatus::Plaintext;
+        let painted = settled(&mut app, &ctx, 1360.0);
+        let (text, _, color) = painted.containing("Not encrypted");
+        assert_eq!(color, super::super::theme::palette(&ctx).mention, "{text}");
+
+        app.sessions[active].connection_status.tls = TlsStatus::Verified;
+        app.sessions[active].connection_status.authentication = AuthenticationStatus::LoggedIn {
+            account: "alice".into(),
+        };
+        app.sessions[active].lag_ms = Some(45);
+        let painted = settled(&mut app, &ctx, 1360.0);
+        let (text, _, color) = painted.containing("Encrypted");
+        assert_eq!(text, "Encrypted · signed in as alice · 45 ms");
+        assert_eq!(color, super::super::theme::palette(&ctx).muted);
+    }
+
+    #[test]
+    fn top_bar_controls_are_as_tall_as_the_spacing_setting_says() {
+        use super::super::theme::{self, Density, DisplayPrefs};
+        let (mut app, _rx_a, _rx_b) = two_networks();
+        let ctx = egui::Context::default();
+        for (density, height) in [(Density::Comfortable, 44.0), (Density::Compact, 32.0)] {
+            theme::apply(
+                &ctx,
+                &DisplayPrefs {
+                    density,
+                    ..DisplayPrefs::default()
+                },
+            );
+            let painted = settled(&mut app, &ctx, 1360.0);
+            let (hint, _) = painted.text("Search history (Ctrl+F)");
+            let field = painted
+                .fills
+                .iter()
+                .find(|(rect, fill)| *fill == theme::palette(&ctx).bg && rect.contains_rect(hint))
+                .unwrap_or_else(|| panic!("no search field behind {hint:?}"))
+                .0;
+            assert_eq!(field.height(), height);
             assert!(
-                rect.left() > name.right() && rect.right() <= 1024.0,
-                "{control}: {rect:?}"
+                field.width() <= 280.0 && field.width() >= 200.0,
+                "{field:?}"
             );
         }
     }
 
     #[test]
-    fn a_narrow_toolbar_wraps_inside_the_window() {
+    fn enter_in_the_search_field_opens_history_search() {
         let (mut app, _rx_a, _rx_b) = two_networks();
-        let rects = text_rects_at_width(&mut app, 640.0);
-        for text in TOOLBAR_CONTROLS
-            .into_iter()
-            .chain(["Linefeed", "Connected · not authenticated"])
-        {
-            let rect = rect_of(&rects, text);
+        let ctx = egui::Context::default();
+        let painted = settled(&mut app, &ctx, 1360.0);
+        let (hint, _) = painted.text("Search history (Ctrl+F)");
+        click(&mut app, &ctx, 1360.0, hint.center());
+        paint(
+            &mut app,
+            &ctx,
+            1360.0,
+            vec![egui::Event::Text("apt".into())],
+        );
+        assert!(!app.search.open);
+        paint(
+            &mut app,
+            &ctx,
+            1360.0,
+            vec![egui::Event::Key {
+                key: egui::Key::Enter,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        );
+        assert!(app.search.open);
+        assert!(app.toolbar_search.is_empty(), "the field is cleared");
+    }
+
+    #[test]
+    fn a_narrow_top_bar_wraps_inside_the_window_and_widens_back_to_one_row() {
+        let (mut app, _rx_a, _rx_b) = two_networks();
+        let ctx = egui::Context::default();
+        let painted = settled(&mut app, &ctx, 640.0);
+        let label = app.network_label(&app.sessions[app.active_index()]);
+        for text in ["Activity", "Window", "Settings"] {
+            let (rect, _) = painted.text(text);
             assert!(
                 rect.left() >= 0.0 && rect.right() <= 640.0,
-                "{text} stays inside a 640 px window: {rect:?}"
+                "{text}: {rect:?}"
             );
         }
-        // Widening again restores the single row.
-        let rects = text_rects_at_width(&mut app, 1600.0);
-        let status = rect_of(&rects, "Connected · not authenticated");
-        let settings = rect_of(&rects, "Settings");
-        assert!((settings.center().y - status.center().y).abs() < 6.0);
+        let (_, connection, _) = painted.containing(&label);
+        assert!(connection.right() <= 640.0, "{connection:?}");
+
+        let painted = settled(&mut app, &ctx, 1600.0);
+        let (_, status, _) = painted.containing("signed in");
+        let (settings, _) = painted.text("Settings");
+        assert!((settings.center().y - status.center().y).abs() < 8.0);
     }
 
     fn focus_frame(app: &mut App, ctx: &egui::Context, focused: bool) -> egui::FullOutput {

@@ -32,6 +32,55 @@ pub(crate) fn badge(ui: &mut egui::Ui, text: &str, fill: Color32) -> egui::Respo
     response
 }
 
+/// A flat text button as tall as a control, optionally with a count badge
+/// after its label.
+pub(crate) fn badge_button(
+    ui: &mut egui::Ui,
+    label: &str,
+    count: Option<(&str, Color32)>,
+) -> egui::Response {
+    let palette = theme::palette(ui.ctx());
+    let height = theme::control_height(ui);
+    let text = ui.painter().layout_no_wrap(
+        label.to_owned(),
+        egui::TextStyle::Button.resolve(ui.style()),
+        palette.text,
+    );
+    let small = egui::TextStyle::Small.resolve(ui.style()).size;
+    let pill = count.map(|(count, fill)| {
+        let galley = ui.painter().layout_no_wrap(
+            count.to_owned(),
+            egui::FontId::new(small, fonts::semibold()),
+            palette.on_accent,
+        );
+        let width = (galley.size().x + 12.0).max(22.0);
+        (galley, fill, width)
+    });
+    let padding = 12.0;
+    let width =
+        padding * 2.0 + text.size().x + pill.as_ref().map_or(0.0, |(_, _, width)| 8.0 + width);
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(width, height), egui::Sense::click());
+    if response.hovered() {
+        ui.painter().rect_filled(rect, 10.0, palette.raise);
+    }
+    let text_pos = egui::pos2(rect.left() + padding, rect.center().y - text.size().y / 2.0);
+    let text_width = text.size().x;
+    ui.painter().galley(text_pos, text, palette.text);
+    if let Some((galley, fill, pill_width)) = pill {
+        let pill_rect = egui::Rect::from_min_size(
+            egui::pos2(text_pos.x + text_width + 8.0, rect.center().y - 11.0),
+            egui::vec2(pill_width, 22.0),
+        );
+        ui.painter().rect_filled(pill_rect, 11.0, fill);
+        ui.painter().galley(
+            pill_rect.center() - galley.size() / 2.0,
+            galley,
+            palette.on_accent,
+        );
+    }
+    response
+}
+
 /// One clickable row of a list, as wide as the space it is in and as tall
 /// as a control. `add` lays its contents out left to right; labels inside
 /// do not take the click.
@@ -41,7 +90,7 @@ pub(crate) fn list_row(
     add: impl FnOnce(&mut egui::Ui),
 ) -> egui::Response {
     let palette = theme::palette(ui.ctx());
-    let height = theme::metrics(ui.ctx()).control_height;
+    let height = theme::control_height(ui);
     let (rect, response) = ui.allocate_exact_size(
         egui::vec2(ui.available_width(), height),
         egui::Sense::click(),
@@ -238,6 +287,51 @@ mod tests {
         assert!(shapes(&output).iter().any(
             |shape| matches!(shape, egui::Shape::Rect(pill) if pill.fill == fill && pill.rect == rect)
         ));
+    }
+
+    #[test]
+    fn a_badge_button_is_a_control_tall_click_target_with_its_count() {
+        let ctx = egui::Context::default();
+        theme::apply(&ctx, &DisplayPrefs::default());
+        let fill = Palette::dark().mention;
+        let mut rect = egui::Rect::NOTHING;
+        let output = frame(&ctx, Vec::new(), |ui| {
+            rect = badge_button(ui, "Activity", Some(("2", fill))).rect;
+        });
+        assert_eq!(rect.height(), 44.0);
+        let texts = texts(&output);
+        assert!(texts.contains(&"Activity".to_owned()) && texts.contains(&"2".to_owned()));
+        assert!(shapes(&output).iter().any(
+            |shape| matches!(shape, egui::Shape::Rect(pill) if pill.fill == fill && rect.contains_rect(pill.rect))
+        ));
+
+        let mut plain = egui::Rect::NOTHING;
+        let output = frame(&ctx, Vec::new(), |ui| {
+            plain = badge_button(ui, "Activity", None).rect;
+        });
+        assert!(plain.width() < rect.width());
+        assert!(
+            !shapes(&output)
+                .iter()
+                .any(|shape| matches!(shape, egui::Shape::Rect(pill) if pill.fill == fill))
+        );
+
+        let press = |pressed| egui::Event::PointerButton {
+            pos: rect.center(),
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        let mut clicked = false;
+        for events in [
+            vec![egui::Event::PointerMoved(rect.center()), press(true)],
+            vec![press(false)],
+        ] {
+            frame(&ctx, events, |ui| {
+                clicked |= badge_button(ui, "Activity", Some(("2", fill))).clicked();
+            });
+        }
+        assert!(clicked);
     }
 
     #[test]

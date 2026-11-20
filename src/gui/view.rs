@@ -13,47 +13,39 @@ use crate::irc::IrcCommand;
 impl Session {
     /// Connection status for the toolbar: state dot, nick, network, lag and
     /// away message.
-    pub(crate) fn draw_status_summary(&self, ui: &mut egui::Ui, network_label: &str) {
-        if self.is_connected() {
-            if self.away_status.is_some() {
-                ui.label(RichText::new("●").color(Color32::from_rgb(255, 200, 0)));
+    /// The one-line connection summary for the top bar, and whether it
+    /// reports something the user should notice (an unencrypted or
+    /// unverified link).
+    pub(crate) fn status_line(&self, network_label: &str) -> (String, bool) {
+        use crate::irc::client::{AuthenticationStatus, TlsStatus};
+        if !self.is_connected() {
+            let text = if self.is_connecting() {
+                format!("Connecting to {network_label}...")
             } else {
-                ui.label(RichText::new("●").color(Color32::GREEN));
-            }
-            ui.label(&self.my_nick);
-            ui.label("@");
-            ui.label(network_label);
-            self.draw_account_security_status(ui);
-
-            if let Some(lag) = self.lag_ms {
-                let lag_color = if lag < 100 {
-                    Color32::GREEN
-                } else if lag < 300 {
-                    Color32::YELLOW
-                } else {
-                    Color32::from_rgb(255, 100, 100)
-                };
-                ui.label(
-                    RichText::new(format!("({}ms)", lag))
-                        .color(lag_color)
-                        .small(),
-                );
-            }
-
-            if let Some(away_msg) = &self.away_status {
-                ui.separator();
-                ui.label(
-                    RichText::new(format!("Away: {}", away_msg))
-                        .color(Color32::from_rgb(255, 200, 0)),
-                );
-            }
-        } else if self.is_connecting() {
-            ui.label(RichText::new("●").color(Color32::YELLOW));
-            ui.label(format!("Connecting to {network_label}..."));
-        } else {
-            ui.label(RichText::new("●").color(Color32::RED));
-            ui.label("Disconnected");
+                "Disconnected".to_owned()
+            };
+            return (text, false);
         }
+        let (security, warning) = match self.connection_status.tls {
+            TlsStatus::Verified => ("Encrypted", false),
+            TlsStatus::Unverified => ("Encrypted, certificate not checked", true),
+            TlsStatus::Negotiating => ("Securing…", false),
+            TlsStatus::Plaintext => ("Not encrypted", true),
+        };
+        let mut parts = vec![security.to_owned()];
+        parts.push(match &self.connection_status.authentication {
+            AuthenticationStatus::LoggedIn { account } => format!("signed in as {account}"),
+            AuthenticationStatus::Authenticated => "signed in".to_owned(),
+            AuthenticationStatus::Authenticating => "signing in…".to_owned(),
+            _ => "not signed in".to_owned(),
+        });
+        if let Some(lag) = self.lag_ms {
+            parts.push(format!("{lag} ms"));
+        }
+        if let Some(away) = &self.away_status {
+            parts.push(format!("away: {away}"));
+        }
+        (parts.join(" · "), warning)
     }
 
     pub(crate) fn draw_account_security_status(&self, ui: &mut egui::Ui) {
@@ -68,11 +60,12 @@ impl Session {
             _ => "Connected · not authenticated".into(),
         };
         ui.label(RichText::new(auth).small()).on_hover_text(self.connection_status.sasl_mechanism.map_or_else(||"Account status is confirmed by server account events or a correlated self-WHOIS.".into(),|mechanism|format!("SASL used on this connection: {mechanism:?}\nAccount status is confirmed by the server.")));
+        let palette = super::theme::palette(ui.ctx());
         let (tls, color) = match self.connection_status.tls {
-            TlsStatus::Verified => ("TLS verified", Color32::GREEN),
-            TlsStatus::Unverified => ("TLS unverified", Color32::YELLOW),
-            TlsStatus::Negotiating => ("TLS negotiating", Color32::YELLOW),
-            TlsStatus::Plaintext => ("Plaintext", Color32::YELLOW),
+            TlsStatus::Verified => ("TLS verified", palette.online),
+            TlsStatus::Unverified => ("TLS unverified", palette.mention),
+            TlsStatus::Negotiating => ("TLS negotiating", palette.mention),
+            TlsStatus::Plaintext => ("Plaintext", palette.mention),
         };
         let endpoint = self
             .connection_status
