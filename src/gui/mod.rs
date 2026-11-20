@@ -2702,9 +2702,20 @@ impl Session {
         } else {
             &batch.content
         };
+        // Route like a live PRIVMSG: STATUSMSG prefixes are stripped and a DM
+        // addressed to our nick belongs to the sender's query.
+        let routed_target = self.strip_status_prefix(&batch.target).to_string();
+        let is_pm = !self.is_channel_name(&routed_target)
+            && self.identifiers_equal(&routed_target, &self.my_nick);
+        let target = if is_pm {
+            batch.sender.clone()
+        } else {
+            routed_target
+        };
         // Highlight like a live PRIVMSG (#289): without it a nick mention in a
-        // multiline message rendered as a plain row.
-        let is_highlight = !batch.is_notice && self.attention_highlight(&batch.target, content);
+        // multiline message rendered as a plain row. Per-conversation rules are
+        // keyed by the routed conversation, not the raw wire target.
+        let is_highlight = !batch.is_notice && self.attention_highlight(&target, content);
         let fmt = &self.timestamp_format;
         let message = if batch.is_notice {
             ChatMessage::system_fmt(&format!("-{}- {}", batch.sender, content), fmt)
@@ -2726,14 +2737,6 @@ impl Session {
             return;
         }
 
-        let routed_target = self.strip_status_prefix(&batch.target).to_string();
-        let is_pm = !self.is_channel_name(&routed_target)
-            && self.identifiers_equal(&routed_target, &self.my_nick);
-        let target = if is_pm {
-            batch.sender.clone()
-        } else {
-            routed_target
-        };
         if !batch.is_notice {
             let notified_content = truncate_chars(content, 50);
             self.notify_incoming_message(
@@ -14310,6 +14313,42 @@ pub(crate) mod tests {
                 .is_highlight
         );
         assert!(notified(&app).is_empty());
+    }
+
+    #[test]
+    fn multiline_highlight_rules_use_the_routed_conversation() {
+        fn highlighted(app: &Session, conversation: &str, rows_before: usize) -> bool {
+            let rows = &app.conversations[conversation].messages;
+            assert_eq!(rows.len(), rows_before + 1);
+            rows.back().unwrap().is_highlight
+        }
+        let mut app = test_app();
+        app.set_session_nick("me".to_string(), true);
+        app.window_focused = false;
+        app.attention
+            .rule_mut(app.conversation_key("bob"))
+            .highlight_terms = Some(vec!["deploy".into()]);
+        app.attention
+            .rule_mut(app.conversation_key("#room"))
+            .highlight_terms = Some(vec!["deploy".into()]);
+
+        // A DM batch is addressed to our own nick; the rule is keyed by bob.
+        deliver_multiline(&mut app, "p1", "bob!u@h", "me", &["deploy now", "please"]);
+        assert!(highlighted(&app, "bob", 0), "DM rule ignored");
+        // A STATUSMSG batch is addressed to `@#room`.
+        deliver_multiline(&mut app, "p2", "alice!u@h", "@#room", &["deploy now", "x"]);
+        assert!(highlighted(&app, "#room", 0), "STATUSMSG rule ignored");
+
+        // Parity with the single-line path, including an override that
+        // replaces the global highlight words.
+        app.highlight_words = "standup".into();
+        app.highlight_words_lower = vec!["standup".into()];
+        deliver_multiline(&mut app, "p3", "bob!u@h", "me", &["standup soon", "ok"]);
+        assert!(!highlighted(&app, "bob", 1), "global word bypassed rule");
+        app.handle_incoming_message(
+            IrcMessage::parse(":bob!u@h PRIVMSG me :standup soon").unwrap(),
+        );
+        assert!(!highlighted(&app, "bob", 2));
     }
 
     #[test]
