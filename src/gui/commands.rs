@@ -1552,12 +1552,16 @@ impl Session {
             "KNOCK" => {
                 // Request invite to a channel
                 if !args.is_empty() {
-                    let channel = if args.starts_with('#') {
-                        args.to_string()
+                    // The first word is the channel (any prefix the server
+                    // advertises); the rest is the optional knock message.
+                    let (channel_arg, message) = split_word(args);
+                    let channel = self.normalize_channel_name(channel_arg);
+                    let line = if message.is_empty() {
+                        format!("KNOCK {channel}")
                     } else {
-                        format!("#{}", args)
+                        format!("KNOCK {channel} :{message}")
                     };
-                    if self.send_command(IrcCommand::Raw(format!("KNOCK {}", channel))) {
+                    if self.send_command(IrcCommand::Raw(line)) {
                         self.add_message_to_current(ChatMessage::system(&format!(
                             "Knocking on {}",
                             channel
@@ -4648,6 +4652,42 @@ mod tests {
         );
         assert!(feedback.iter().all(|line| !line.contains("Sent")));
         assert!(!app.channel_list_loading);
+    }
+
+    #[test]
+    fn knock_uses_the_servers_channel_prefixes_and_sends_a_trailing_message() {
+        let (mut app, mut rx) = connected_command_app();
+        app.network_support.channel_types = "#&".into();
+
+        app.process_command("/knock &secret");
+        assert_eq!(
+            next_command(&mut rx),
+            IrcCommand::Raw("KNOCK &secret".into())
+        );
+        assert!(
+            app.server_messages
+                .iter()
+                .any(|message| message.content == "Knocking on &secret")
+        );
+
+        // A bare name still gets the default channel prefix.
+        app.process_command("/knock secret");
+        assert_eq!(
+            next_command(&mut rx),
+            IrcCommand::Raw("KNOCK #secret".into())
+        );
+
+        // Any trailing text is the knock message, not part of the channel.
+        app.process_command("/knock #c let me in");
+        assert_eq!(
+            next_command(&mut rx),
+            IrcCommand::Raw("KNOCK #c :let me in".into())
+        );
+        assert!(
+            app.server_messages
+                .iter()
+                .any(|message| message.content == "Knocking on #c")
+        );
     }
 
     #[test]
