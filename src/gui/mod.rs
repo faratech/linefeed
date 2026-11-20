@@ -39,7 +39,10 @@ pub(crate) use app::MAIN_WINDOW_TITLE;
 pub(crate) use conversations::ConversationId;
 use conversations::ConversationStore;
 use formatting::{nick_color, render_segments};
-use helpers::{epoch_time_formatted, format_timestamp, mask_matches, truncate_chars};
+use helpers::{
+    ctcp_action_text, epoch_time_formatted, format_timestamp, mask_matches, parse_ctcp,
+    truncate_chars,
+};
 pub use types::{
     CaseMapping, Channel, ChannelListEntry, ChannelListSort, ChatMessage, KnownUser,
     NetworkSupport, RowHeightEntry, ServerFavorite, Settings, SortDirection, TabCompletion,
@@ -2692,16 +2695,9 @@ impl Session {
         {
             return;
         }
-        let is_action = batch.content.starts_with("\x01ACTION ") && batch.content.ends_with('\x01');
-        let content = if is_action {
-            batch
-                .content
-                .strip_prefix("\x01ACTION ")
-                .and_then(|content| content.strip_suffix('\x01'))
-                .unwrap_or(&batch.content)
-        } else {
-            &batch.content
-        };
+        let action_text = ctcp_action_text(&batch.content);
+        let is_action = action_text.is_some();
+        let content = action_text.unwrap_or(&batch.content);
         // Route like a live PRIVMSG: STATUSMSG prefixes are stripped and a DM
         // addressed to our nick belongs to the sender's query.
         let routed_target = self.strip_status_prefix(&batch.target).to_string();
@@ -4907,7 +4903,7 @@ impl Session {
                     return; // CTCP was handled, don't display as regular message
                 }
 
-                let is_action = content.starts_with("\x01ACTION ") && content.ends_with('\x01');
+                let action_text = ctcp_action_text(content);
 
                 // Check if the message mentions our nick (case-insensitive word boundary check)
                 let highlight_target = if self.identifiers_equal(&routed_target, &self.my_nick) {
@@ -4937,11 +4933,7 @@ impl Session {
                     && msg.get_tag("+evilnet.github.io/chathistory-gap").is_some();
                 let chat_msg = if is_gap_marker {
                     ChatMessage::system_fmt(content, fmt).with_server_time(server_time)
-                } else if is_action {
-                    let action_text = content
-                        .strip_prefix("\x01ACTION ")
-                        .and_then(|s| s.strip_suffix('\x01'))
-                        .unwrap_or(content);
+                } else if let Some(action_text) = action_text {
                     if is_highlight {
                         ChatMessage::action_highlighted_fmt(&sender, action_text, fmt)
                             .with_server_time(server_time)
@@ -5047,14 +5039,8 @@ impl Session {
                     return;
                 }
 
-                // Check for CTCP reply (starts and ends with \x01).
-                // Require >= 2 bytes so the opening and closing \x01 are distinct;
-                // a lone "\x01" would otherwise slice as content[1..0] and panic.
-                if content.len() >= 2 && content.starts_with('\x01') && content.ends_with('\x01') {
-                    let ctcp_content = &content[1..content.len() - 1];
-                    let parts: Vec<&str> = ctcp_content.splitn(2, ' ').collect();
-                    let ctcp_cmd = parts[0];
-                    let ctcp_reply = parts.get(1).copied().unwrap_or("");
+                // Check for a CTCP reply (the closing \x01 is optional).
+                if let Some((ctcp_cmd, ctcp_reply)) = parse_ctcp(content) {
 
                     // Handle CTCP PING reply to show latency
                     if ctcp_cmd.eq_ignore_ascii_case("PING") {
@@ -9157,18 +9143,11 @@ impl Session {
     /// Handle CTCP request and send reply if applicable
     /// Returns true if the message was a CTCP request that was handled
     fn handle_ctcp_request(&mut self, sender: &str, content: &str) -> bool {
-        // CTCP messages start and end with \x01. Require >= 2 bytes so the opening
-        // and closing delimiters are distinct; a lone "\x01" (first byte == last
-        // byte) would otherwise slice as content[1..0] and panic.
-        if content.len() < 2 || !content.starts_with('\x01') || !content.ends_with('\x01') {
+        // The closing \x01 is optional; a lone "\x01" has no command.
+        let Some((ctcp_cmd, ctcp_args)) = parse_ctcp(content) else {
             return false;
-        }
-
-        // Extract CTCP command and args
-        let ctcp_content = &content[1..content.len() - 1];
-        let parts: Vec<&str> = ctcp_content.splitn(2, ' ').collect();
-        let ctcp_cmd = parts[0].to_uppercase();
-        let ctcp_args = parts.get(1).copied().unwrap_or("");
+        };
+        let ctcp_cmd = ctcp_cmd.to_uppercase();
 
         // ACTION is not a request, it's a message type - don't reply
         if ctcp_cmd == "ACTION" {
@@ -14313,6 +14292,60 @@ pub(crate) mod tests {
                 .is_highlight
         );
         assert!(notified(&app).is_empty());
+    }
+
+    #[test]
+    fn unterminated_ctcp_is_recognised_like_the_terminated_form() {
+        let (mut app, mut rx) = test_app_connected();
+        app.set_session_nick("me".to_string(), true);
+        let last = |app: &mut Session, content: &str| {
+            let line = format!(":alice!u@h PRIVMSG #a :{content}");
+            app.handle_incoming_message(IrcMessage::parse(&line).unwrap());
+            app.conversations["#a"].messages.back().cloned()
+        };
+        for (content, text) in [
+            ("\x01ACTION waves", "waves"),
+            ("\x01ACTION waves\x01", "waves"),
+            ("\x01ACTION\x01", ""),
+            ("\x01ACTION", ""),
+        ] {
+            let row = last(&mut app, content).unwrap();
+            assert!(row.is_action, "{content:?}");
+            assert_eq!(row.content, text, "{content:?}");
+        }
+        // Not actions; nothing may panic and no action row appears.
+        for content in ["\x01", "\x01\x01", "\x01ACTIONS waves\x01"] {
+            let row = last(&mut app, content);
+            assert!(row.is_none_or(|row| !row.is_action), "{content:?}");
+        }
+
+        // An unterminated request is answered like a terminated one, to the
+        // sender and not the channel.
+        while rx.try_recv().is_ok() {}
+        app.handle_incoming_message(IrcMessage::parse(":alice!u@h PRIVMSG me :\x01SOURCE").unwrap());
+        let reply = rx.try_recv().expect("unterminated SOURCE answered");
+        assert!(
+            matches!(&reply, IrcCommand::Notice(to, body)
+                if to == "alice" && body.starts_with("\x01SOURCE ") && body.ends_with('\x01')),
+            "{reply:?}"
+        );
+
+        // An unterminated reply is a CTCP reply, not a raw NOTICE.
+        app.handle_incoming_message(
+            IrcMessage::parse(":alice!u@h NOTICE me :\x01VERSION SomeClient 1.0").unwrap(),
+        );
+        assert!(
+            app.server_messages
+                .iter()
+                .chain(app.conversations.values().flat_map(|c| c.messages.iter()))
+                .any(|m| m.content == "[CTCP VERSION reply] alice - SomeClient 1.0"),
+        );
+
+        // draft/multiline batches use the same parser.
+        deliver_multiline(&mut app, "ml", "alice!u@h", "#a", &["\x01ACTION waves", "and smiles"]);
+        let row = app.conversations["#a"].messages.back().unwrap();
+        assert!(row.is_action);
+        assert_eq!(row.content, "waves\nand smiles");
     }
 
     #[test]

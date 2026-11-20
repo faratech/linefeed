@@ -15,6 +15,24 @@ pub fn is_extended_ban(value: &str) -> bool {
         .is_some_and(|colon| colon > 0 && !value[..colon].contains(['!', '@']))
 }
 
+/// Split a CTCP payload into `(command, arguments)`. The closing `\x01` is
+/// optional on the wire (many clients omit it, and a long `/me` loses it to the
+/// line limit), so it is stripped when present. A payload without an opening
+/// `\x01` or without a command (a lone `\x01`, or `\x01\x01`) is not CTCP.
+pub fn parse_ctcp(content: &str) -> Option<(&str, &str)> {
+    let body = content.strip_prefix('\x01')?;
+    let body = body.strip_suffix('\x01').unwrap_or(body);
+    let (command, args) = body.split_once(' ').unwrap_or((body, ""));
+    (!command.is_empty()).then_some((command, args))
+}
+
+/// The text of a CTCP ACTION (`/me`), or `None` for anything else.
+pub fn ctcp_action_text(content: &str) -> Option<&str> {
+    parse_ctcp(content)
+        .filter(|(command, _)| command.eq_ignore_ascii_case("ACTION"))
+        .map(|(_, args)| args)
+}
+
 /// Convert a nick or partial mask into a complete `nick!user@host` ban mask.
 /// A full mask (a '!' followed later by an '@') or an extended ban is returned
 /// unchanged; partial forms like "nick", "nick@host", or "nick!user" are
@@ -299,6 +317,29 @@ pub fn mask_matches(pattern: &str, text: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ctcp_payloads_parse_with_or_without_the_closing_delimiter() {
+        assert_eq!(parse_ctcp("\x01VERSION\x01"), Some(("VERSION", "")));
+        assert_eq!(parse_ctcp("\x01VERSION"), Some(("VERSION", "")));
+        assert_eq!(parse_ctcp("\x01PING 123\x01"), Some(("PING", "123")));
+        assert_eq!(parse_ctcp("\x01PING 123"), Some(("PING", "123")));
+        assert_eq!(parse_ctcp("\x01FOO a b\x01"), Some(("FOO", "a b")));
+        // Not CTCP: no opening delimiter, or no command.
+        assert_eq!(parse_ctcp("hello\x01"), None);
+        assert_eq!(parse_ctcp("\x01"), None);
+        assert_eq!(parse_ctcp("\x01\x01"), None);
+        assert_eq!(parse_ctcp(""), None);
+
+        assert_eq!(ctcp_action_text("\x01ACTION waves\x01"), Some("waves"));
+        assert_eq!(ctcp_action_text("\x01ACTION waves"), Some("waves"));
+        assert_eq!(ctcp_action_text("\x01action waves\x01"), Some("waves"));
+        assert_eq!(ctcp_action_text("\x01ACTION\x01"), Some(""));
+        assert_eq!(ctcp_action_text("\x01ACTION"), Some(""));
+        assert_eq!(ctcp_action_text("\x01ACTIONS waves\x01"), None);
+        assert_eq!(ctcp_action_text("\x01VERSION\x01"), None);
+        assert_eq!(ctcp_action_text("plain"), None);
+    }
 
     #[test]
     fn nick_to_mask_fills_empty_components() {
