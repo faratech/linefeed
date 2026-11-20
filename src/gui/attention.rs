@@ -71,6 +71,17 @@ impl AttentionSettings {
     pub(crate) fn rule(&self, key: &ConversationKey) -> Option<&ConversationRule> {
         self.rules.iter().find(|rule| &rule.conversation == key)
     }
+    /// Carry a conversation's rule to its new name. An existing rule for the
+    /// new name wins. Keys include the logical network, so applying one
+    /// rename to every copy of the settings is safe and idempotent.
+    pub(crate) fn rename_conversation(&mut self, old: &ConversationKey, new: &ConversationKey) {
+        if self.rules.iter().any(|rule| &rule.conversation == new) {
+            return;
+        }
+        if let Some(rule) = self.rules.iter_mut().find(|rule| &rule.conversation == old) {
+            rule.conversation = new.clone();
+        }
+    }
     pub(crate) fn rule_mut(&mut self, key: ConversationKey) -> &mut ConversationRule {
         if let Some(i) = self.rules.iter().position(|rule| rule.conversation == key) {
             return &mut self.rules[i];
@@ -396,6 +407,29 @@ mod tests {
             LayoutFile::default(),
         )
     }
+    #[test]
+    fn renaming_a_conversation_moves_its_rule_but_never_replaces_an_existing_one() {
+        let key = |target: &str| event(target, true, false).reference.conversation;
+        let mut settings = AttentionSettings::default();
+        settings.rule_mut(key("alice")).level = AlertLevel::Muted;
+        settings.rename_conversation(&key("alice"), &key("alice_"));
+        assert!(settings.rule(&key("alice")).is_none());
+        assert_eq!(
+            settings.rule(&key("alice_")).map(|rule| rule.level),
+            Some(AlertLevel::Muted)
+        );
+        // Repeating the same rename is harmless.
+        settings.rename_conversation(&key("alice"), &key("alice_"));
+        assert_eq!(settings.rules.len(), 1);
+        // A rule that already exists for the new name is kept.
+        settings.rule_mut(key("bob")).level = AlertLevel::All;
+        settings.rename_conversation(&key("bob"), &key("alice_"));
+        assert_eq!(
+            settings.rule(&key("alice_")).map(|rule| rule.level),
+            Some(AlertLevel::Muted)
+        );
+    }
+
     #[test]
     fn legacy_notification_defaults_migrate_without_enabling_sound_or_sharing() {
         let settings: Settings = serde_json::from_str("{\"notifications_enabled\":false}").unwrap();

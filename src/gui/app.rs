@@ -1086,20 +1086,14 @@ impl App {
         {
             reply.conversation = new_key.clone();
         }
-        if !self
-            .settings
+        // Every session mirrors the rules (its copy gates All and highlight
+        // alerts and is exported back over the canonical one), so migrate
+        // them all; a rule for another network never matches.
+        self.settings
             .attention
-            .rules
-            .iter()
-            .any(|rule| rule.conversation == new_key)
-            && let Some(rule) = self
-                .settings
-                .attention
-                .rules
-                .iter_mut()
-                .find(|rule| rule.conversation == old_key)
-        {
-            rule.conversation = new_key;
+            .rename_conversation(&old_key, &new_key);
+        for session in &mut self.sessions {
+            session.attention.rename_conversation(&old_key, &new_key);
         }
         let network = Self::network_identity(&self.sessions[index]);
         let old_persist = PersistKey {
@@ -3919,6 +3913,44 @@ mod tests {
                 },
             );
             output.textures_delta.clear();
+        }
+    }
+
+    #[test]
+    fn a_nick_change_moves_the_alert_rule_in_every_copy() {
+        use super::super::attention::AlertLevel;
+        for level in [AlertLevel::Muted, AlertLevel::All] {
+            let (mut app, _rx_a, _rx_b) = two_networks();
+            assert!(app.sessions[0].open_query("alice"));
+            let old_key = app.sessions[0].conversation_key("alice");
+            let new_key = app.sessions[0].conversation_key("alice_");
+            app.sessions[0].attention.rule_mut(old_key.clone()).level = level;
+            app.sessions[0].export_config(&mut app.settings);
+            app.push_config();
+
+            feed(&mut app, 0, ":alice!u@h NICK alice_");
+            app.process_events();
+
+            // The session's own copy drives the All and highlight gates.
+            assert_eq!(
+                app.sessions[0].attention.rule(&new_key).map(|r| r.level),
+                Some(level)
+            );
+            assert!(app.sessions[0].attention.rule(&old_key).is_none());
+            assert_eq!(
+                app.settings.attention.rule(&new_key).map(|r| r.level),
+                Some(level)
+            );
+            // The next export from the session must not undo the move.
+            app.sessions[0].export_config(&mut app.settings);
+            assert_eq!(
+                app.settings.attention.rule(&new_key).map(|r| r.level),
+                Some(level)
+            );
+            assert!(app.settings.attention.rule(&old_key).is_none());
+            // Every session mirrors the rules, so the other copy moves too.
+            assert!(app.sessions[1].attention.rule(&old_key).is_none());
+            assert!(app.sessions[1].attention.rule(&new_key).is_some());
         }
     }
 
