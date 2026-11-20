@@ -426,7 +426,7 @@ impl WindowManager {
         // would scale every window to nothing and become the baseline the
         // real area is later scaled from. Ignore it; the last sane area
         // stays the baseline.
-        if !area.is_finite() || area.width() < MIN_FIT_AREA || area.height() < MIN_FIT_AREA {
+        if !usable_area(area) {
             return;
         }
         let Some(old) = self.area.replace(area) else {
@@ -544,6 +544,13 @@ const CASCADE_STEP: f32 = 26.0;
 /// Smallest chat area per side that floating windows are fitted to: far below
 /// the 640x480 window minimum, above any collapsed or restored-tiny frame.
 const MIN_FIT_AREA: f32 = 64.0;
+
+/// Whether `area` is a real chat area: floating windows are neither fitted nor
+/// drawn (egui would clamp them to it and write the clamped rects back)
+/// while it is degenerate.
+pub(crate) fn usable_area(area: Rect) -> bool {
+    area.is_finite() && area.width() >= MIN_FIT_AREA && area.height() >= MIN_FIT_AREA
+}
 
 /// Grid rects for `n` windows inside `area`: as many columns as the square
 /// root rounds up to, rows filled left to right, the last row's windows

@@ -2497,6 +2497,13 @@ impl App {
     }
 
     fn draw_floating(&mut self, ctx: &egui::Context, area: egui::Rect) {
+        // Drawing constrains each window to the area and writes the clamped
+        // rect back (and saves layout.json), so skip a degenerate frame
+        // (a restored tiny window) rather than collapse the layout. A queued
+        // tile request waits for a real area.
+        if !super::windows::usable_area(area) {
+            return;
+        }
         // Before any tile/cascade, so a placement made for this area is not
         // rescaled again.
         self.windows.fit_to_area(area);
@@ -5841,6 +5848,56 @@ mod tests {
             "{texts:?}"
         );
         assert!(texts.iter().any(|t| t.contains("apt is fine")), "{texts:?}");
+    }
+
+    #[test]
+    fn a_degenerate_viewport_leaves_floating_windows_and_the_saved_layout_alone() {
+        let (mut app, _rx_a, _rx_b) = two_networks();
+        feed(&mut app, 0, ":alice!u@h PRIVMSG #rust :one");
+        feed(&mut app, 1, ":bob!u@h PRIVMSG #debian :two");
+        app.windows.mode = LayoutMode::Floating;
+        app.tile_request = Some(TileRequest::Tile);
+        let ctx = egui::Context::default();
+        for _ in 0..5 {
+            frame(&mut app, &ctx);
+        }
+        let rects = |app: &App| -> Vec<Option<egui::Rect>> {
+            app.windows.windows.iter().map(|w| w.child_rect).collect()
+        };
+        let settled = rects(&app);
+        assert!(
+            settled
+                .iter()
+                .all(|rect| rect.is_some_and(|r| r.height() > 100.0))
+        );
+        app.layout_dirty_since = None;
+        app.windows.dirty = false;
+
+        // A restored minimized-size window: the toolbar and switchbar leave
+        // the chat area no height.
+        for size in [egui::vec2(160.0, 30.0), egui::vec2(1024.0, 60.0)] {
+            for _ in 0..3 {
+                let mut output = ctx.run_ui(
+                    egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)),
+                        ..Default::default()
+                    },
+                    |ui| app.ui(ui),
+                );
+                output.textures_delta.clear();
+            }
+        }
+        assert_eq!(rects(&app), settled);
+        assert!(!app.windows.dirty);
+        assert!(
+            app.layout_dirty_since.is_none(),
+            "layout.json would be saved"
+        );
+
+        // Back to a normal frame: still the same layout.
+        frame(&mut app, &ctx);
+        frame(&mut app, &ctx);
+        assert_eq!(rects(&app), settled);
     }
 
     #[test]

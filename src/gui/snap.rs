@@ -537,6 +537,10 @@ impl App {
     /// window is dragged to the top, the flyout of a maximize button, the
     /// preview of where a window would go, and Snap Assist.
     pub(super) fn draw_snap(&mut self, ctx: &egui::Context, area: Rect) {
+        // Nothing can be snapped into a degenerate area (see `draw_floating`).
+        if !super::windows::usable_area(area) {
+            return;
+        }
         // Snaps are computed in this area. While windows are maximized
         // nothing else keeps their placements in step with it, and a snap
         // made against a stale area would be rescaled on the next floating
