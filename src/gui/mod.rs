@@ -5446,6 +5446,8 @@ impl Session {
                     }
                     if let Some(joined_channel) = self.channel_mut(channel) {
                         joined_channel.joined = true;
+                        // Membership starts over with this join's NAMES.
+                        joined_channel.abandon_user_burst();
                         if pending_key.is_some() {
                             joined_channel.key = pending_key;
                         }

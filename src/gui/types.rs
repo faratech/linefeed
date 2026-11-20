@@ -1057,10 +1057,6 @@ pub struct Channel {
     names_snapshot: Option<Vec<ChannelUser>>,
     /// Canonical nick key -> position in `names_snapshot`.
     names_index: HashMap<String, usize>,
-    /// When the newest 353 of the pending burst arrived; a 353 arriving long
-    /// after it means the previous burst was abandoned and must not be
-    /// appended to.
-    burst_activity: Option<std::time::Instant>,
     mode_parameters: HashMap<char, String>,
     /// `(nick, username, hostname)` of users who recently left, newest last.
     /// A ban set from the user list is `*!user@host`, which only this can
@@ -1095,7 +1091,6 @@ impl Channel {
             user_index: HashMap::new(),
             names_snapshot: None,
             names_index: HashMap::new(),
-            burst_activity: None,
             mode_parameters: HashMap::new(),
             departed: VecDeque::new(),
         }
@@ -1511,27 +1506,24 @@ impl Channel {
     /// Start an authoritative NAMES snapshot. The visible membership is left
     /// untouched until RPL_ENDOFNAMES, avoiding partial-list flicker.
     pub fn begin_user_burst(&mut self) {
-        // A burst that never reached RPL_ENDOFNAMES leaves a partial snapshot
-        // behind. NAMES lines stream back-to-back, so a 353 arriving long
-        // after the last one means the previous burst was abandoned: start
-        // fresh rather than appending to it (which would resurrect ghost
-        // users when the new burst completes).
-        const BURST_GAP: std::time::Duration = std::time::Duration::from_secs(5);
-        let stale = self.burst_activity.is_some_and(|t| t.elapsed() > BURST_GAP);
-        if self.names_snapshot.is_none() || stale {
+        // A burst that never reaches RPL_ENDOFNAMES is dropped by the events
+        // that end it (`abandon_user_burst` on disconnect or reconnect, our
+        // own JOIN, PART or KICK), never by elapsed time: a network stall in
+        // the middle of one reply must not discard the names already
+        // received.
+        if self.names_snapshot.is_none() {
             self.names_snapshot = Some(Vec::new());
             self.names_index.clear();
         }
     }
 
     /// Drop a NAMES burst that will never reach RPL_ENDOFNAMES (its
-    /// connection is gone). Without this the next connection's first 353,
-    /// if it arrives within the burst gap, would be appended to the dead
-    /// burst and its names resurrected as ghost members at 366.
+    /// connection is gone, or we joined or left the channel). Without this
+    /// the next 353 would be appended to the dead burst and its names
+    /// resurrected as ghost members at 366.
     pub fn abandon_user_burst(&mut self) {
         self.names_snapshot = None;
         self.names_index.clear();
-        self.burst_activity = None;
     }
 
     /// Insert a user into the pending NAMES snapshot. Used while streaming a
@@ -1548,14 +1540,12 @@ impl Channel {
             return;
         }
         self.begin_user_burst();
-        self.burst_activity = Some(std::time::Instant::now());
         self.snapshot_add(clean_nick, modes);
     }
 
     /// Atomically replace membership with the authoritative NAMES snapshot,
     /// preserving IRCv3 metadata for users who are still present.
     pub fn finish_user_burst(&mut self) {
-        self.burst_activity = None;
         let Some(mut snapshot) = self.names_snapshot.take() else {
             return;
         };
@@ -1980,6 +1970,46 @@ mod tests {
         // Forgotten when the channel's membership is cleared.
         ch.clear_users();
         assert_eq!(ch.departed_identity("n0"), None);
+    }
+
+    #[test]
+    fn a_stall_inside_one_names_reply_keeps_the_earlier_names() {
+        let mut ch = Channel::new();
+        ch.begin_user_burst();
+        ch.add_user_burst_modes("alice", &[UserMode::Normal]);
+        ch.add_user_burst_modes("bob", &[UserMode::Normal]);
+        // The link stalls; no timer may discard what already arrived.
+        ch.begin_user_burst();
+        ch.add_user_burst_modes("carol", &[UserMode::Normal]);
+        ch.finish_user_burst();
+
+        let mut nicks: Vec<&str> = ch.users.iter().map(|u| u.nick.as_str()).collect();
+        nicks.sort_unstable();
+        assert_eq!(nicks, vec!["alice", "bob", "carol"]);
+    }
+
+    #[test]
+    fn an_abandoned_names_burst_never_leaks_into_the_next_one() {
+        let mut ch = Channel::new();
+        ch.begin_user_burst();
+        ch.add_user_burst_modes("ghost", &[UserMode::Normal]);
+        // The connection ended before RPL_ENDOFNAMES.
+        ch.abandon_user_burst();
+        ch.begin_user_burst();
+        ch.add_user_burst_modes("alice", &[UserMode::Normal]);
+        ch.finish_user_burst();
+        let nicks: Vec<&str> = ch.users.iter().map(|u| u.nick.as_str()).collect();
+        assert_eq!(nicks, vec!["alice"]);
+
+        // Being removed from the channel drops a pending burst as well.
+        ch.begin_user_burst();
+        ch.add_user_burst_modes("late", &[UserMode::Normal]);
+        ch.clear_users();
+        ch.begin_user_burst();
+        ch.add_user_burst_modes("bob", &[UserMode::Normal]);
+        ch.finish_user_burst();
+        let nicks: Vec<&str> = ch.users.iter().map(|u| u.nick.as_str()).collect();
+        assert_eq!(nicks, vec!["bob"]);
     }
 
     #[test]
