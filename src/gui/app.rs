@@ -359,19 +359,9 @@ impl App {
     }
     /// The production constructor: persisted settings and layout.
     pub fn load() -> Self {
-        let (settings, writable) = match Settings::try_load() {
-            Ok(Some(settings)) => (settings, true),
-            Ok(None) => (Settings::default(), true),
-            // Unparsable: `load` backs the file up and starts fresh, as
-            // before, so saving can no longer lose anything.
-            Err(error) if error.kind() == std::io::ErrorKind::InvalidData => {
-                (Settings::load(), true)
-            }
-            Err(error) => {
-                tracing::error!("Settings could not be read, so none will be saved: {error}");
-                (Settings::default(), false)
-            }
-        };
+        // An unreadable file is quarantined to a unique backup (or, when that
+        // fails or the file cannot be read at all, not saved over).
+        let (settings, writable) = Settings::load_checked();
         let needs_ids = settings.server_favorites.iter().any(|f| f.id.is_empty());
         let mut app = Self::with_settings(settings, LayoutFile::load());
         app.workspace = super::workspace::WorkspaceStore::open_default();

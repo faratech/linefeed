@@ -210,58 +210,82 @@ impl Settings {
     }
 
     /// Read the settings file without any fallback: `Ok(None)` when there is
-    /// none yet, `Err` when it exists but cannot be read or parsed. A caller
-    /// that read-modify-writes must stop on `Err`, or it would overwrite the
-    /// real file with defaults.
-    #[cfg_attr(test, allow(dead_code))]
-    pub fn try_load() -> std::io::Result<Option<Self>> {
-        match Self::config_path() {
-            Some(path) => Self::try_load_from(&path),
-            None => Ok(None),
-        }
-    }
-
+    /// none yet, `Err` when it exists but cannot be read or decoded.
     fn try_load_from(path: &std::path::Path) -> std::io::Result<Option<Self>> {
-        let data = match std::fs::read_to_string(path) {
+        let data = match std::fs::read(path) {
             Ok(data) => data,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(error) => return Err(error),
         };
-        serde_json::from_str(&data)
+        // Bytes that are not UTF-8 (e.g. a UTF-16 re-save) are as unusable as
+        // malformed JSON: both are `InvalidData`.
+        serde_json::from_slice(&data)
             .map(Some)
             .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
     }
 
-    pub fn load() -> Self {
-        if let Some(path) = Self::config_path()
-            && path.exists()
-        {
-            match std::fs::read_to_string(&path) {
-                Ok(data) => match serde_json::from_str(&data) {
-                    Ok(settings) => {
-                        tracing::info!("Loaded settings from {:?}", path);
-                        return settings;
+    /// The one place that decides what an unreadable file means. A missing
+    /// file is a fresh start. A file that is not valid UTF-8 or not valid
+    /// settings JSON is moved aside to a unique `.bak` and replaced by
+    /// defaults (`true`: saving can no longer lose anything). Any other read
+    /// failure, or a failed move, yields defaults that must not be saved
+    /// over the file (`false`).
+    pub(crate) fn load_or_quarantine_from(path: &std::path::Path) -> (Self, bool) {
+        match Self::try_load_from(path) {
+            Ok(Some(settings)) => {
+                tracing::info!("Loaded settings from {:?}", path);
+                (settings, true)
+            }
+            Ok(None) => (Self::default(), true),
+            Err(error) if error.kind() == std::io::ErrorKind::InvalidData => {
+                tracing::error!("Failed to parse settings file {:?}: {}", path, error);
+                match Self::quarantine(path) {
+                    Ok(backup) => {
+                        tracing::warn!("Unreadable settings file backed up to {:?}", backup);
+                        (Self::default(), true)
                     }
-                    Err(e) => {
-                        // Preserve the unreadable file instead of leaving it to be
-                        // overwritten: starting with defaults and then saving would
-                        // permanently destroy every server favorite (and stored
-                        // password) after e.g. a torn write.
-                        tracing::error!("Failed to parse settings file {:?}: {}", path, e);
-                        let backup = path.with_extension("json.bak");
-                        match std::fs::rename(&path, &backup) {
-                            Ok(_) => {
-                                tracing::warn!("Unreadable settings file backed up to {:?}", backup)
-                            }
-                            Err(e) => tracing::error!("Failed to back up settings: {}", e),
-                        }
+                    Err(error) => {
+                        tracing::error!(
+                            "Failed to back up settings, so none will be saved: {error}"
+                        );
+                        (Self::default(), false)
                     }
-                },
-                Err(e) => tracing::error!("Failed to read settings file {:?}: {}", path, e),
+                }
+            }
+            Err(error) => {
+                tracing::error!("Failed to read settings file {:?}: {}", path, error);
+                (Self::default(), false)
             }
         }
-        tracing::info!("Using default settings");
-        Self::default()
+    }
+
+    /// Move an unreadable settings file to `settings.json.bak`, or the first
+    /// free `settings.json.bak.N`, so an earlier backup is never overwritten.
+    /// A rename keeps the file's private mode (it holds plaintext passwords).
+    fn quarantine(path: &std::path::Path) -> std::io::Result<PathBuf> {
+        let mut candidate = path.with_extension("json.bak");
+        let mut n = 1u32;
+        while candidate.symlink_metadata().is_ok() {
+            let mut name = path.as_os_str().to_owned();
+            name.push(format!(".bak.{n}"));
+            candidate = PathBuf::from(name);
+            n += 1;
+        }
+        std::fs::rename(path, &candidate)?;
+        Ok(candidate)
+    }
+
+    /// Load the persisted settings. The flag says whether saving over the
+    /// file is safe (see `load_or_quarantine_from`).
+    pub fn load_checked() -> (Self, bool) {
+        match Self::config_path() {
+            Some(path) => Self::load_or_quarantine_from(&path),
+            None => (Self::default(), true),
+        }
+    }
+
+    pub fn load() -> Self {
+        Self::load_checked().0
     }
 
     #[cfg_attr(test, allow(dead_code))]
@@ -2505,6 +2529,81 @@ mod tests {
         std::fs::create_dir_all(&unreadable).unwrap();
         assert!(Settings::try_load_from(&unreadable).is_err());
 
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    fn scratch_dir(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("linefeed-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn undecodable_settings_are_quarantined_not_overwritten() {
+        let dir = scratch_dir("settings-utf16");
+        let path = dir.join("settings.json");
+        // UTF-16LE with a BOM, as Notepad's "Unicode" save or PowerShell 5
+        // `Out-File` writes it.
+        let original: Vec<u8> = vec![0xFF, 0xFE, b'{', 0, b'}', 0];
+        std::fs::write(&path, &original).unwrap();
+
+        let (settings, writable) = Settings::load_or_quarantine_from(&path);
+
+        assert!(writable);
+        assert_eq!(settings.server_host, Settings::default().server_host);
+        assert!(!path.exists(), "the unreadable file is moved aside");
+        assert_eq!(
+            std::fs::read(dir.join("settings.json.bak")).unwrap(),
+            original
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn quarantine_never_clobbers_an_earlier_backup() {
+        let dir = scratch_dir("settings-quarantine");
+        let path = dir.join("settings.json");
+        let corrupt: [&[u8]; 3] = [b"{\"server_host\":", b"\xff\xfe broken", b"{{"];
+        for (n, content) in corrupt.into_iter().enumerate() {
+            std::fs::write(&path, content).unwrap();
+            let (_, writable) = Settings::load_or_quarantine_from(&path);
+            assert!(writable, "attempt {n}");
+            assert!(!path.exists());
+        }
+        let mut backups: Vec<Vec<u8>> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|entry| std::fs::read(entry.unwrap().path()).unwrap())
+            .collect();
+        backups.sort();
+        let mut expected: Vec<Vec<u8>> = corrupt.iter().map(|bytes| bytes.to_vec()).collect();
+        expected.sort();
+        assert_eq!(backups, expected);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn load_or_quarantine_keeps_good_missing_and_unreadable_files() {
+        let dir = scratch_dir("settings-load-kinds");
+        let path = dir.join("settings.json");
+
+        let (settings, writable) = Settings::load_or_quarantine_from(&path);
+        assert!(writable);
+        assert_eq!(settings.server_host, Settings::default().server_host);
+
+        std::fs::write(&path, r#"{"server_host":"irc.example"}"#).unwrap();
+        let (settings, writable) = Settings::load_or_quarantine_from(&path);
+        assert!(writable);
+        assert_eq!(settings.server_host, "irc.example");
+        assert!(path.exists());
+
+        // A read failure that is not corruption (a directory) must not be
+        // written over and is not moved aside.
+        let directory = dir.join("settings-dir");
+        std::fs::create_dir_all(&directory).unwrap();
+        let (_, writable) = Settings::load_or_quarantine_from(&directory);
+        assert!(!writable);
+        assert!(directory.is_dir());
         std::fs::remove_dir_all(dir).unwrap();
     }
 }
