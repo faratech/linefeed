@@ -279,6 +279,22 @@ impl Session {
         }
     }
 
+    /// Current names and keys of the automatic JOINs still held back, so a
+    /// connection lost before the login confirms keeps them as recovery intent.
+    pub(super) fn deferred_automatic_join_targets(&self) -> Vec<(String, Option<String>)> {
+        self.account_history
+            .automatic_joins
+            .iter()
+            .map(|join| {
+                let name = join
+                    .owner
+                    .and_then(|id| self.target_name(id))
+                    .unwrap_or(&join.target);
+                (name.to_owned(), join.key.clone())
+            })
+            .collect()
+    }
+
     /// Accepted explicit membership changes supersede a deferred automatic
     /// request, including raw/tagged JOIN and PART forms.
     pub(super) fn cancel_automatic_join(&mut self, target: &str) {
@@ -1191,5 +1207,81 @@ mod tests {
         ] {
             assert!(line_login_service(line, 0).is_some(), "{line}");
         }
+    }
+
+    fn lose_connection_then_reregister(
+        app: &mut Session,
+        lose: impl FnOnce(&mut Session),
+    ) -> mpsc::UnboundedReceiver<IrcCommand> {
+        lose(app);
+        app.begin_connection_attempt();
+        let (tx, rx) = mpsc::unbounded_channel();
+        app.test_set_connecting(tx, None);
+        feed(app, ":srv 001 me :Welcome");
+        rx
+    }
+
+    fn joins_of(commands: &[IrcCommand]) -> Vec<String> {
+        commands
+            .iter()
+            .filter_map(|command| match command {
+                IrcCommand::Join(target, _, _, _) => Some(target.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn deferred_automatic_joins_survive_a_drop_before_login_confirmation() {
+        for explicit in [false, true] {
+            let (mut app, mut rx) = app("/ns IDENTIFY example-password");
+            feed(&mut app, ":srv 001 me :Welcome");
+            assert!(joins_of(&drain(&mut rx)).is_empty());
+            assert_eq!(app.account_history.automatic_joins.len(), 1);
+            let mut rx2 = lose_connection_then_reregister(&mut app, |app| {
+                if explicit {
+                    app.request_reconnect_after_close("x");
+                    app.test_finish_close();
+                } else {
+                    app.mark_connection_lost();
+                }
+            });
+            app.run_timed_tasks();
+            assert!(joins_of(&drain(&mut rx2)).is_empty());
+            feed(&mut app, ":srv 900 me me!u@h account :Logged in");
+            app.run_timed_tasks();
+            assert_eq!(joins_of(&drain(&mut rx2)), vec!["#room".to_string()]);
+        }
+    }
+
+    #[test]
+    fn deferred_automatic_joins_survive_repeated_drops_and_keep_their_key() {
+        let (mut app, mut rx) = app("/ns IDENTIFY example-password");
+        app.active_session.as_mut().unwrap().auto_join_channels = "#room secret".into();
+        feed(&mut app, ":srv 001 me :Welcome");
+        drain(&mut rx);
+        let mut rx2 = lose_connection_then_reregister(&mut app, Session::mark_connection_lost);
+        let mut rx3 = lose_connection_then_reregister(&mut app, Session::mark_connection_lost);
+        drain(&mut rx2);
+        app.run_timed_tasks();
+        drain(&mut rx3);
+        feed(&mut app, ":srv 900 me me!u@h account :Logged in");
+        app.run_timed_tasks();
+        assert!(drain(&mut rx3).iter().any(|command| matches!(command,
+            IrcCommand::Join(target, key, _, _)
+                if target == "#room" && key.as_deref() == Some("secret"))));
+    }
+
+    #[test]
+    fn explicit_part_cancels_a_deferred_join_across_a_drop() {
+        let (mut app, mut rx) = app("/ns IDENTIFY example-password");
+        feed(&mut app, ":srv 001 me :Welcome");
+        drain(&mut rx);
+        app.process_command("/part #room");
+        let mut rx2 = lose_connection_then_reregister(&mut app, Session::mark_connection_lost);
+        app.run_timed_tasks();
+        feed(&mut app, ":srv 900 me me!u@h account :Logged in");
+        app.run_timed_tasks();
+        assert!(joins_of(&drain(&mut rx2)).is_empty());
     }
 }

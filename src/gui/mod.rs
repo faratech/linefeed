@@ -1840,6 +1840,23 @@ impl Session {
             return;
         }
         let mut rejoins = self.pending_rejoins.take().unwrap_or_default();
+        // Automatic JOINs still deferred behind a services login were never
+        // sent, so no membership intent exists for them yet. They are the
+        // lineage's intent: an exact empty list here would suppress them on
+        // every later reconnect.
+        for (name, key) in self.deferred_automatic_join_targets() {
+            if self.is_parting(&name) {
+                continue;
+            }
+            if let Some(existing) = rejoins
+                .iter_mut()
+                .find(|(target, _)| self.network_support.identifiers_equal(target, &name))
+            {
+                *existing = (name, key);
+            } else {
+                rejoins.push((name, key));
+            }
+        }
         for (name, channel) in &self.conversations {
             if !channel.joined || self.is_parting(name) {
                 continue;
@@ -3328,6 +3345,9 @@ impl Session {
     }
 
     pub fn request_reconnect_after_close(&mut self, reason: &str) {
+        // Capture before the reset below discards still-deferred automatic
+        // JOINs, which are part of the membership to recover.
+        self.capture_rejoin_memberships();
         self.reset_history_authentication();
         self.close_connection(Some(reason.to_string()), true);
     }
