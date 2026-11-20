@@ -7885,7 +7885,13 @@ impl Session {
         wrapper_prefix: &str,
         wrapper_suffix: &str,
     ) -> TextSendOutcome {
-        let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
+        let mut normalized = text.replace("\r\n", "\n").replace('\r', "\n");
+        // As in the composer (#380): blank edge lines are dropped, and blank
+        // interior lines are never sent as empty messages one per line.
+        if normalized.contains('\n') {
+            normalized = message_ui::trim_blank_edges(&normalized);
+        }
+        let multi_line = normalized.contains('\n');
         let sensitive = commands::service_message_contains_credentials(target, &normalized)
             || normalized
                 .split('\n')
@@ -7898,7 +7904,12 @@ impl Session {
             .max(IRC_MAX_LINE_BYTES);
         let line_limit = line_limit.saturating_sub(self.relay_prefix_reserve(line_limit));
         let mut chunks = Vec::new();
+        let mut sent_lines = 0;
         for logical_line in normalized.split('\n') {
+            if multi_line && logical_line.trim().is_empty() {
+                continue;
+            }
+            sent_lines += 1;
             let Some(mut line_chunks) = Self::split_irc_text_payload_with_limit(
                 command,
                 target,
@@ -7926,6 +7937,19 @@ impl Session {
                 .multiline_max_bytes
                 .is_none_or(|max| full_text.len() <= max);
         if !use_multiline {
+            // Unbatched lines go out in one burst; refuse a flooding paste.
+            // One long line still goes out in as many chunks as it needs.
+            // The commands then add "Message not sent", as the composer does.
+            if sent_lines > message_ui::MAX_FALLBACK_LINES {
+                self.add_message_to_current(
+                    ChatMessage::system_fmt(
+                        &message_ui::SendError::TooManyLines.to_string(),
+                        &self.timestamp_format,
+                    )
+                    .without_logging(),
+                );
+                return TextSendOutcome::default();
+            }
             return self.send_text_parts(command, target, chunks, sensitive);
         }
 
@@ -13235,6 +13259,47 @@ pub(crate) mod tests {
         app.test_set_connecting_flag(false);
         app.auto_reconnect = false;
         assert!(!app.awaiting_reconnect(), "setting disabled");
+    }
+
+    fn sent_privmsg_texts(rx: &mut mpsc::UnboundedReceiver<IrcCommand>) -> Vec<String> {
+        let mut texts = Vec::new();
+        while let Ok(command) = rx.try_recv() {
+            let commands = match command {
+                IrcCommand::ClientBatch(commands) => commands,
+                other => vec![other],
+            };
+            texts.extend(commands.into_iter().filter_map(|command| match command {
+                IrcCommand::Privmsg(_, text) => Some(text),
+                _ => None,
+            }));
+        }
+        texts
+    }
+
+    #[test]
+    fn multi_line_msg_skips_blank_lines_and_refuses_a_flooding_paste() {
+        let (mut app, mut rx) = test_app_connected();
+        app.process_command("/msg alice first\n\nsecond\n");
+        assert_eq!(sent_privmsg_texts(&mut rx), ["first", "second"]);
+
+        // Each case uses a target with no open query, so it takes the
+        // command path rather than the composer path (which #380 covers).
+        let paste: Vec<String> = (0..=20).map(|i| format!("line {i}")).collect();
+        app.process_command(&format!("/msg bob {}", paste.join("\n")));
+        assert!(
+            sent_privmsg_texts(&mut rx).is_empty(),
+            "an unbatched paste over the line cap is refused"
+        );
+        assert!(
+            app.server_messages
+                .iter()
+                .any(|message| message.content.contains("Too many lines")),
+            "the refusal explains itself"
+        );
+
+        let few: Vec<String> = (0..20).map(|i| format!("line {i}")).collect();
+        app.process_command(&format!("/msg carol {}", few.join("\n")));
+        assert_eq!(sent_privmsg_texts(&mut rx).len(), 20);
     }
 
     #[test]

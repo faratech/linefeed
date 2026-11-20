@@ -260,8 +260,8 @@ pub(crate) enum SendReceipt {
 }
 /// Without `draft/multiline` every line is its own message, written in one
 /// burst. Larger pastes risk an excess-flood disconnect, so they are refused.
-const MAX_FALLBACK_LINES: usize = 20;
-fn trim_blank_edges(text: &str) -> String {
+pub(super) const MAX_FALLBACK_LINES: usize = 20;
+pub(super) fn trim_blank_edges(text: &str) -> String {
     let lines: Vec<&str> = text.split('\n').collect();
     let start = lines.iter().position(|l| !l.trim().is_empty()).unwrap_or(0);
     let end = lines
