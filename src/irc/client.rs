@@ -3089,6 +3089,8 @@ struct PemBlock {
 fn parse_pem_blocks(text: &str) -> Result<Vec<PemBlock>, String> {
     let mut blocks = Vec::new();
     let mut open: Option<(String, String)> = None;
+    // `trim` leaves a UTF-8 BOM (written by Notepad and similar) in place.
+    let text = text.strip_prefix('\u{feff}').unwrap_or(text);
     for line in text.lines() {
         let line = line.trim();
         if let Some((label, body)) = open.as_mut() {
@@ -6694,6 +6696,25 @@ mod tests {
         )
         .replace('\n', "\r\n");
         let (chain, key) = split_client_identity_pem(combined.as_bytes(), None).unwrap();
+        assert_eq!(chain, TEST_LEAF_CERT.as_bytes());
+        assert_eq!(key, TEST_KEY_PKCS8.as_bytes());
+    }
+
+    #[test]
+    fn combined_pem_with_a_utf8_bom_is_split_in_either_order() {
+        // Windows tools such as Notepad write a BOM before the first line.
+        let cert_first = format!("\u{feff}{TEST_LEAF_CERT}{TEST_KEY_PKCS8}");
+        let key_first = format!("\u{feff}{TEST_KEY_PKCS8}{TEST_LEAF_CERT}");
+        for combined in [&cert_first, &key_first] {
+            let (chain, key) = split_client_identity_pem(combined.as_bytes(), None).unwrap();
+            assert_eq!(chain, TEST_LEAF_CERT.as_bytes());
+            assert_eq!(key, TEST_KEY_PKCS8.as_bytes());
+        }
+        let (chain, key) = split_client_identity_pem(
+            format!("\u{feff}{TEST_LEAF_CERT}").as_bytes(),
+            Some(format!("\u{feff}{TEST_KEY_PKCS8}").as_bytes()),
+        )
+        .unwrap();
         assert_eq!(chain, TEST_LEAF_CERT.as_bytes());
         assert_eq!(key, TEST_KEY_PKCS8.as_bytes());
     }
