@@ -55,6 +55,12 @@ pub(crate) fn write_private_atomic(path: &Path, data: &[u8]) -> io::Result<()> {
     result
 }
 
+/// `bytes` without one leading UTF-8 byte order mark. Windows tools (Notepad,
+/// PowerShell 5 `Out-File -Encoding utf8`) write it, and JSON parsers reject it.
+pub(crate) fn strip_utf8_bom(bytes: &[u8]) -> &[u8] {
+    bytes.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(bytes)
+}
+
 /// Move an unreadable file aside to `<name>.bak`, or the first free
 /// `<name>.bak.N`, so an earlier backup is never overwritten. A rename keeps
 /// the file's private mode (these files can hold plaintext credentials).

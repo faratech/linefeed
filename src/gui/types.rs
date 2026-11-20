@@ -219,7 +219,7 @@ impl Settings {
         };
         // Bytes that are not UTF-8 (e.g. a UTF-16 re-save) are as unusable as
         // malformed JSON: both are `InvalidData`.
-        serde_json::from_slice(&data)
+        serde_json::from_slice(crate::persistence::strip_utf8_bom(&data))
             .map(Some)
             .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
     }
@@ -2643,6 +2643,24 @@ mod tests {
             std::fs::read(dir.join("settings.json.bak")).unwrap(),
             original
         );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_utf8_bom_prefixed_settings_file_loads_and_is_not_quarantined() {
+        let dir = scratch_dir("settings-bom");
+        let path = dir.join("settings.json");
+        // PowerShell 5 `Out-File -Encoding utf8` writes a BOM.
+        let mut bytes = b"\xEF\xBB\xBF".to_vec();
+        bytes.extend_from_slice(br#"{"server_host":"irc.bom.example"}"#);
+        std::fs::write(&path, &bytes).unwrap();
+
+        let (settings, writable) = Settings::load_or_quarantine_from(&path);
+
+        assert!(writable);
+        assert_eq!(settings.server_host, "irc.bom.example");
+        assert_eq!(std::fs::read(&path).unwrap(), bytes, "file left in place");
+        assert!(!dir.join("settings.json.bak").exists());
         std::fs::remove_dir_all(dir).unwrap();
     }
 

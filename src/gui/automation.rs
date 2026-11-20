@@ -632,7 +632,9 @@ impl AutomationUi {
             Ok(bytes)
         });
         match bytes {
-            Ok(bytes) => match serde_json::from_slice::<AutomationConfig>(&bytes) {
+            Ok(bytes) => match serde_json::from_slice::<AutomationConfig>(
+                crate::persistence::strip_utf8_bom(&bytes),
+            ) {
                 Ok(config) => match config.validate() {
                     Ok(()) => {
                         ui.config = Arc::new(config.clone());
@@ -1461,6 +1463,22 @@ mod persistence_tests {
             assert!(AutomationUi::load_from(path.clone()).error.is_none());
             std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
         }
+    }
+
+    #[test]
+    fn a_utf8_bom_prefixed_automation_file_loads() {
+        let path = scratch_automation_path("bom");
+        let mut bytes = b"\xEF\xBB\xBF".to_vec();
+        bytes.extend_from_slice(
+            br#"{"version":1,"aliases":[{"id":"g","name":"greet","steps":["/echo hi"]}],"shortcuts":[]}"#,
+        );
+        std::fs::write(&path, &bytes).unwrap();
+
+        let ui = AutomationUi::load_from(path.clone());
+
+        assert!(ui.error.is_none(), "{:?}", ui.error);
+        assert_eq!(ui.config.aliases[0].name, "greet");
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
 
     #[test]
