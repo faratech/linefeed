@@ -2425,10 +2425,22 @@ impl Session {
     /// closing connection, else the active one. After `/server` the connect
     /// form is restored to the previous saved profile while the connection is
     /// on another network, so the form cannot stand in for it (#367).
+    ///
+    /// `active_session` outlives its connection (after /disconnect or a
+    /// failure it still names the old network), so it is authoritative only
+    /// while the lifecycle really has a connection: an owner, a pending
+    /// connect or retry, or a staged replacement. Otherwise the form is.
     fn live_session_config(&self) -> Option<&SessionConfig> {
-        self.connection
-            .staged_config()
-            .or(self.active_session.as_ref())
+        if let Some(staged) = self.connection.staged_config() {
+            return Some(staged);
+        }
+        let has_connection =
+            self.connection.has_owner() || self.has_pending_connect() || self.awaiting_reconnect();
+        if has_connection {
+            self.active_session.as_ref()
+        } else {
+            None
+        }
     }
 
     /// Whether the connect form still describes the live connection (same
@@ -2459,9 +2471,10 @@ impl Session {
     /// form only while the form still describes that connection.
     fn edit_auto_perform(&mut self, edit: impl Fn(&mut String)) {
         let form_follows = self.form_describes_live_connection();
+        let has_live = self.live_session_config().is_some();
         if let Some(staged) = self.connection.staged_config_mut() {
             edit(&mut staged.auto_perform);
-        } else if let Some(active) = self.active_session.as_mut() {
+        } else if has_live && let Some(active) = self.active_session.as_mut() {
             edit(&mut active.auto_perform);
         }
         if form_follows {
@@ -5422,6 +5435,47 @@ mod tests {
             "/join #b"
         );
         assert_eq!(app.auto_perform, "/ns identify nickserv-pass");
+    }
+
+    #[test]
+    fn perform_while_idle_edits_the_form_not_the_old_connections_config() {
+        let mut app = saved_libera_profile_app();
+        app.form_profile = Some("libera".into());
+        assert!(app.start_session_from_form());
+        app.process_command("/disconnect");
+        assert!(app.is_fully_stopped());
+        // The old config is still remembered, but nothing is connected.
+        assert!(app.active_session.is_some());
+
+        // The user picks another favorite in the form without connecting.
+        app.form_profile = Some("oftc".into());
+        app.server_host = "irc.oftc.net".into();
+        app.auto_perform = "/msg NickServ IDENTIFY oftc-pass".into();
+        let _ = app.events.drain(..);
+
+        app.process_command("/perform /join #b");
+
+        assert_eq!(
+            app.auto_perform,
+            "/msg NickServ IDENTIFY oftc-pass\n/join #b"
+        );
+        assert_eq!(
+            app.active_session.as_ref().unwrap().auto_perform,
+            "/ns identify nickserv-pass",
+            "the old connection's list must not be edited"
+        );
+        let save = app.auto_perform_save();
+        assert_eq!(save.profile.as_deref(), Some("oftc"));
+        assert_eq!(save.list, "/msg NickServ IDENTIFY oftc-pass\n/join #b");
+        assert_eq!(save.endpoint.0, "irc.oftc.net");
+        assert!(!save.live);
+        // Listing shows the form's list.
+        app.process_command("/perform");
+        assert!(
+            perform_lines(&app)
+                .iter()
+                .any(|line| line.contains("1.") && line.contains("redacted"))
+        );
     }
 
     #[test]

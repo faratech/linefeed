@@ -4805,6 +4805,47 @@ mod tests {
     }
 
     #[test]
+    fn perform_while_idle_goes_to_the_favorite_in_the_form_not_the_one_last_connected() {
+        let mut settings = test_settings();
+        for (name, host, list) in [
+            ("A", "irc.a.example", "/msg NickServ IDENTIFY apass"),
+            ("B", "irc.b.example", "/msg NickServ IDENTIFY bpass"),
+        ] {
+            settings.server_favorites.push(ServerFavorite {
+                id: name.to_lowercase(),
+                name: name.into(),
+                host: host.into(),
+                port: "6697".into(),
+                use_tls: true,
+                auto_perform: list.into(),
+                ..ServerFavorite::default()
+            });
+        }
+        let mut app = App::with_settings(settings, LayoutFile::default());
+        app.start(None);
+        let a = app.settings.server_favorites[0].clone();
+        let b = app.settings.server_favorites[1].clone();
+        app.sessions[0].load_favorite(&a);
+        assert!(app.sessions[0].start_session_from_form());
+        app.sessions[0].process_command("/disconnect");
+        app.process_events();
+
+        // Pick B in the form, but do not connect.
+        app.sessions[0].load_favorite(&b);
+        app.sessions[0].process_command("/perform /join #b");
+        app.process_events();
+
+        assert_eq!(
+            app.settings.server_favorites[0].auto_perform,
+            "/msg NickServ IDENTIFY apass"
+        );
+        assert_eq!(
+            app.settings.server_favorites[1].auto_perform,
+            "/msg NickServ IDENTIFY bpass\n/join #b"
+        );
+    }
+
+    #[test]
     fn perform_after_server_switch_never_reaches_the_old_favorite_or_defaults() {
         let mut settings = test_settings();
         settings.server_host = "irc.libera.chat".into();
