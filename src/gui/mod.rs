@@ -6803,9 +6803,13 @@ impl Session {
                     return;
                 }
 
+                // Use the advertised CHANTYPES ('!' and '+' channels exist on
+                // IRCnet); params[0] is our own nick.
                 let channel_idx = params
                     .iter()
-                    .position(|p| p.starts_with('#') || p.starts_with('&'));
+                    .skip(1)
+                    .position(|p| self.network_support.is_channel(p))
+                    .map(|index| index + 1);
 
                 let parsed = channel_idx.and_then(|ci| {
                     if ci + 1 >= params.len() {
@@ -6858,9 +6862,13 @@ impl Session {
                         // Fallback: if we have at least 3 params, assume standard format
                         // [client, channel, count, topic]
                         if params.len() >= 3 {
+                            let user_count = params[2].replace(',', "").parse().unwrap_or(0);
+                            if user_count < self.channel_list_min_users as usize {
+                                return;
+                            }
                             self.channel_list.push(ChannelListEntry::new(
                                 params[1].clone(),
-                                params[2].replace(',', "").parse().unwrap_or(0),
+                                user_count,
                                 params.get(3).cloned().unwrap_or_default(),
                             ));
                             self.channel_list_dirty = true;
@@ -12518,6 +12526,36 @@ pub(crate) mod tests {
         assert!(!app.check_nick_mention("xfoo-bar"));
         assert!(!app.check_nick_mention("node.jss"));
         assert!(!app.check_nick_mention("no highlights here"));
+    }
+
+    #[test]
+    fn rpl_list_min_users_filter_applies_to_every_channel_prefix() {
+        let rows = [
+            ("#small", "1"),
+            ("!ABCDEsafe", "1"),
+            ("+modeless", "2"),
+            ("#big", "50"),
+            ("!ABCDEbig", "50"),
+            ("+bigmodeless", "12"),
+        ];
+        for (min_users, expected) in [
+            (10, vec!["#big", "!ABCDEbig", "+bigmodeless"]),
+            (
+                0,
+                vec!["#small", "!ABCDEsafe", "+modeless", "#big", "!ABCDEbig", "+bigmodeless"],
+            ),
+        ] {
+            let mut app = test_app();
+            app.channel_list_min_users = min_users;
+            for (name, users) in rows {
+                app.handle_numeric(
+                    RPL_LIST,
+                    &["me".into(), name.into(), users.into(), "topic".into()],
+                );
+            }
+            let names: Vec<_> = app.channel_list.iter().map(|e| e.name.as_str()).collect();
+            assert_eq!(names, expected, "min users {min_users}");
+        }
     }
 
     #[test]
