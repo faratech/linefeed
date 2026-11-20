@@ -55,6 +55,27 @@ pub(crate) fn write_private_atomic(path: &Path, data: &[u8]) -> io::Result<()> {
     result
 }
 
+/// Move an unreadable file aside to `<name>.bak`, or the first free
+/// `<name>.bak.N`, so an earlier backup is never overwritten. A rename keeps
+/// the file's private mode (these files can hold plaintext credentials).
+pub(crate) fn quarantine(path: &Path) -> io::Result<PathBuf> {
+    let filename = path.file_name().ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidInput, "missing source filename")
+    })?;
+    let mut name = filename.to_owned();
+    name.push(".bak");
+    let mut candidate = path.with_file_name(&name);
+    let mut n = 1u32;
+    while candidate.symlink_metadata().is_ok() {
+        let mut numbered = filename.to_owned();
+        numbered.push(format!(".bak.{n}"));
+        candidate = path.with_file_name(numbered);
+        n += 1;
+    }
+    fs::rename(path, &candidate)?;
+    Ok(candidate)
+}
+
 /// The caller retains this file for the entire read-modify-write transaction.
 /// The lock file must remain at its stable path, even after its handle closes.
 pub(crate) fn exclusive_lock(path: &Path, wait: Duration) -> io::Result<File> {

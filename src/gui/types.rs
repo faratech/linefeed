@@ -239,7 +239,7 @@ impl Settings {
             Ok(None) => (Self::default(), true),
             Err(error) if error.kind() == std::io::ErrorKind::InvalidData => {
                 tracing::error!("Failed to parse settings file {:?}: {}", path, error);
-                match Self::quarantine(path) {
+                match crate::persistence::quarantine(path) {
                     Ok(backup) => {
                         tracing::warn!("Unreadable settings file backed up to {:?}", backup);
                         (Self::default(), true)
@@ -257,22 +257,6 @@ impl Settings {
                 (Self::default(), false)
             }
         }
-    }
-
-    /// Move an unreadable settings file to `settings.json.bak`, or the first
-    /// free `settings.json.bak.N`, so an earlier backup is never overwritten.
-    /// A rename keeps the file's private mode (it holds plaintext passwords).
-    fn quarantine(path: &std::path::Path) -> std::io::Result<PathBuf> {
-        let mut candidate = path.with_extension("json.bak");
-        let mut n = 1u32;
-        while candidate.symlink_metadata().is_ok() {
-            let mut name = path.as_os_str().to_owned();
-            name.push(format!(".bak.{n}"));
-            candidate = PathBuf::from(name);
-            n += 1;
-        }
-        std::fs::rename(path, &candidate)?;
-        Ok(candidate)
     }
 
     /// Load the persisted settings. The flag says whether saving over the

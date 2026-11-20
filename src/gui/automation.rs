@@ -587,6 +587,10 @@ pub(crate) struct AutomationUi {
     pub editing: AutomationConfig,
     pub path: Option<PathBuf>,
     pub error: Option<String>,
+    /// The file on disk could not be loaded. `editing` holds defaults, so
+    /// committing would destroy the user's file; it is refused until the file
+    /// is explicitly discarded (and kept as a backup).
+    blocked: bool,
     selected: Option<usize>,
     name: String,
     scope: String,
@@ -601,6 +605,7 @@ impl Default for AutomationUi {
             editing: config,
             path: None,
             error: None,
+            blocked: false,
             selected: None,
             name: String::new(),
             scope: String::new(),
@@ -654,10 +659,35 @@ impl AutomationUi {
                 ..AutomationConfig::default()
             };
             ui.config = Arc::new(unavailable);
+            ui.blocked = true;
         }
         ui
     }
+    /// Move the unloadable file aside to a backup so the editor may start
+    /// fresh. Aliases stay unavailable until the next commit.
+    pub(crate) fn discard_unusable_file(&mut self) -> Result<(), String> {
+        if !self.blocked {
+            return Ok(());
+        }
+        if let Some(path) = &self.path {
+            match crate::persistence::quarantine(path) {
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(_) => return Err("Could not back up the unreadable automation file".into()),
+            }
+        }
+        self.blocked = false;
+        self.error = None;
+        Ok(())
+    }
     pub(crate) fn commit(&mut self) -> Result<(), String> {
+        if self.blocked {
+            return Err(
+                "The existing automation file is unreadable or invalid and was not \
+                 overwritten. Fix the file, or discard it (a backup is kept)."
+                    .into(),
+            );
+        }
         self.editing.validate()?;
         if let Some(path) = &self.path {
             let bytes = serde_json::to_vec_pretty(&self.editing)
@@ -865,7 +895,19 @@ impl AutomationUi {
                     self.editing.shortcuts = super::actions::default_bindings();
                     self.capture = None;
                 }
-                if ui.button("Apply and save automation").clicked() {
+                if self.blocked
+                    && ui
+                        .button("Discard unreadable file and start fresh")
+                        .on_hover_text("The file is kept next to it as automation.json.bak")
+                        .clicked()
+                    && let Err(error) = self.discard_unusable_file()
+                {
+                    self.error = Some(error);
+                }
+                if ui
+                    .add_enabled(!self.blocked, egui::Button::new("Apply and save automation"))
+                    .clicked()
+                {
                     match self.commit() {
                         Ok(()) => {
                             applied = true;
@@ -1377,5 +1419,73 @@ mod persistence_tests {
                 .any(|message| message.content.contains("private-argument"))
         );
         std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    fn scratch_automation_path(name: &str) -> PathBuf {
+        let directory = std::env::temp_dir().join(format!(
+            "linefeed-automation-{name}-{}",
+            super::super::new_profile_id()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        directory.join("automation.json")
+    }
+
+    #[test]
+    fn an_invalid_file_is_not_overwritten_until_it_is_explicitly_discarded() {
+        let reserved_alias = br#"{"version":1,"aliases":[{"id":"x","name":"away","steps":["/echo hi"]}],"shortcuts":[]}"#;
+        let cases: [&[u8]; 3] = [
+            b"invalid configuration",
+            reserved_alias,
+            br#"{"version":2,"aliases":[],"shortcuts":[]}"#,
+        ];
+        for (n, original) in cases.into_iter().enumerate() {
+            let path = scratch_automation_path(&format!("blocked{n}"));
+            std::fs::write(&path, original).unwrap();
+            let mut ui = AutomationUi::load_from(path.clone());
+            assert!(ui.error.is_some(), "case {n}");
+
+            assert!(ui.commit().is_err(), "case {n}: commit must be refused");
+            assert_eq!(std::fs::read(&path).unwrap(), original, "case {n}");
+
+            ui.discard_unusable_file().unwrap();
+            assert!(ui.error.is_none());
+            assert_eq!(
+                std::fs::read(path.with_file_name("automation.json.bak")).unwrap(),
+                original,
+                "case {n}: the backup keeps the original bytes"
+            );
+            ui.commit().unwrap();
+            assert!(AutomationUi::load_from(path.clone()).error.is_none());
+            std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+        }
+    }
+
+    #[test]
+    fn a_missing_file_commits_without_a_discard() {
+        let path = scratch_automation_path("missing");
+        let mut ui = AutomationUi::load_from(path.clone());
+        assert!(ui.error.is_none());
+        ui.commit().unwrap();
+        assert!(path.exists());
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn discarding_twice_keeps_every_backup() {
+        let path = scratch_automation_path("twice");
+        for original in [&b"first broken"[..], &b"second broken"[..]] {
+            std::fs::write(&path, original).unwrap();
+            let mut ui = AutomationUi::load_from(path.clone());
+            ui.discard_unusable_file().unwrap();
+        }
+        assert_eq!(
+            std::fs::read(path.with_file_name("automation.json.bak")).unwrap(),
+            b"first broken"
+        );
+        assert_eq!(
+            std::fs::read(path.with_file_name("automation.json.bak.1")).unwrap(),
+            b"second broken"
+        );
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
 }
