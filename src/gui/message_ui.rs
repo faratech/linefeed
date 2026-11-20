@@ -121,6 +121,7 @@ pub(crate) enum SendError {
     InvalidMessage,
     TooLong,
     SensitiveSplit,
+    TooManyLines,
 }
 impl std::fmt::Display for SendError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -134,6 +135,9 @@ impl std::fmt::Display for SendError {
             Self::InvalidMessage => "Message contains invalid IRC characters",
             Self::TooLong => "Message cannot fit the server's limits",
             Self::SensitiveSplit => "Credential commands must fit in one IRC message",
+            Self::TooManyLines => {
+                "Too many lines to send as separate messages on this network; send fewer lines or share a file"
+            }
         })
     }
 }
@@ -141,6 +145,18 @@ impl std::fmt::Display for SendError {
 pub(crate) enum SendReceipt {
     Queued,
     Rejected(SendError),
+}
+/// Without `draft/multiline` every line is its own message, written in one
+/// burst. Larger pastes risk an excess-flood disconnect, so they are refused.
+const MAX_FALLBACK_LINES: usize = 20;
+fn trim_blank_edges(text: &str) -> String {
+    let lines: Vec<&str> = text.split('\n').collect();
+    let start = lines.iter().position(|l| !l.trim().is_empty()).unwrap_or(0);
+    let end = lines
+        .iter()
+        .rposition(|l| !l.trim().is_empty())
+        .map_or(0, |i| i + 1);
+    lines[start..end].join("\n")
 }
 fn tag(value: &str) -> String {
     value
@@ -223,6 +239,9 @@ impl Session {
         if normalized.contains('\0') || normalized.trim().is_empty() {
             return Err(SendError::InvalidMessage);
         }
+        // Leading/trailing blank lines are never content (Shift+Enter, Enter);
+        // interior ones stay, since a multiline batch may carry them.
+        let normalized = trim_blank_edges(&normalized);
         let reply = if let Some(reference) = &request.reply_to {
             if reference.conversation != self.conversation_key(target)
                 || !self.enabled_caps.contains("message-tags")
@@ -270,6 +289,10 @@ impl Session {
             .ok_or(SendError::TooLong)?;
         let mut parts = Vec::new();
         for line in normalized.split('\n') {
+            // An empty fallback line would be an empty PRIVMSG (ERR_NOTEXTTOSEND).
+            if line.trim().is_empty() {
+                continue;
+            }
             if request.kind == ChatKind::Action {
                 for part in split_utf8(line, max.saturating_sub(9))? {
                     parts.push(format!("\x01ACTION {part}\x01"));
@@ -317,6 +340,9 @@ impl Session {
         if wire.is_empty() {
             if sensitive && parts.len() > 1 {
                 return Err(SendError::SensitiveSplit);
+            }
+            if parts.len() > MAX_FALLBACK_LINES {
+                return Err(SendError::TooManyLines);
             }
             wire.extend(parts.into_iter().map(|part| {
                 if reply.is_some() {
@@ -1278,6 +1304,106 @@ mod tests {
                 assert!(relayed_len(&command, &worst) <= 512, "{command}");
             }
         }
+    }
+    fn plain(id: ConversationId, body: &str, kind: ChatKind) -> ChatSendRequest {
+        ChatSendRequest {
+            target: id,
+            body: body.into(),
+            kind,
+            reply_to: None,
+        }
+    }
+    #[test]
+    fn blank_lines_are_not_sent_as_empty_messages_without_multiline() {
+        let (session, _rx, id) = session();
+        for (body, expected) in [
+            ("hello\n", vec!["hello"]),
+            ("\nhello", vec!["hello"]),
+            ("a\n\nb", vec!["a", "b"]),
+            ("  indented\n   \nnext\n", vec!["  indented", "next"]),
+        ] {
+            let plan = session
+                .plan_chat_send(&plain(id, body, ChatKind::Privmsg))
+                .unwrap();
+            assert_eq!(plan.payloads, expected, "{body:?}");
+            assert_eq!(plan.wire.len(), expected.len(), "{body:?}");
+            assert!(plan.wire.iter().all(|c| !c.to_string().ends_with(" :")));
+        }
+        let plan = session
+            .plan_chat_send(&plain(id, "waves\n\n", ChatKind::Action))
+            .unwrap();
+        assert_eq!(plan.payloads, ["\x01ACTION waves\x01"]);
+        assert!(matches!(
+            session.plan_chat_send(&plain(id, "\n\n  \n", ChatKind::Privmsg)),
+            Err(SendError::InvalidMessage)
+        ));
+    }
+    #[test]
+    fn multiline_batch_keeps_interior_blank_lines_but_drops_edge_ones() {
+        let (mut session, _rx, id) = session();
+        session.enabled_caps.insert("draft/multiline".into());
+        let plan = session
+            .plan_chat_send(&plain(id, "\na\n\nb\n\n", ChatKind::Privmsg))
+            .unwrap();
+        assert_eq!(plan.payloads, ["a\n\nb"]);
+        let children: Vec<String> = plan.wire.iter().map(|c| c.to_string()).collect();
+        assert_eq!(children.len(), 5, "{children:?}");
+        assert!(children[1].ends_with("PRIVMSG #room :a"));
+        assert!(children[2].ends_with("PRIVMSG #room :"));
+        assert!(children[3].ends_with("PRIVMSG #room :b"));
+        // A single line plus a trailing newline needs no batch at all.
+        let plan = session
+            .plan_chat_send(&plain(id, "solo\n", ChatKind::Privmsg))
+            .unwrap();
+        assert_eq!(plan.payloads, ["solo"]);
+        assert_eq!(plan.wire.len(), 1);
+    }
+    #[test]
+    fn large_paste_without_multiline_is_rejected_and_keeps_the_draft() {
+        let (mut session, mut rx, id) = session();
+        let few = (0..MAX_FALLBACK_LINES)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(
+            session
+                .plan_chat_send(&plain(id, &few, ChatKind::Privmsg))
+                .unwrap()
+                .wire
+                .len(),
+            MAX_FALLBACK_LINES
+        );
+        let many = (0..=MAX_FALLBACK_LINES)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(matches!(
+            session.plan_chat_send(&plain(id, &many, ChatKind::Privmsg)),
+            Err(SendError::TooManyLines)
+        ));
+        // Blank lines do not count towards the cap.
+        let spaced = many.replace('\n', "\n\n");
+        assert!(matches!(
+            session.plan_chat_send(&plain(id, &spaced, ChatKind::Privmsg)),
+            Err(SendError::TooManyLines)
+        ));
+        session.input_text = many.clone();
+        session.submit_composer();
+        assert_eq!(session.input_text, many);
+        assert!(rx.try_recv().is_err());
+        // Multiline fallback over the server's line cap is bounded as well.
+        session.enabled_caps.insert("draft/multiline".into());
+        session.network_support.multiline_max_lines = Some(5);
+        assert!(matches!(
+            session.plan_chat_send(&plain(id, &many, ChatKind::Privmsg)),
+            Err(SendError::TooManyLines)
+        ));
+        session.network_support.multiline_max_lines = None;
+        assert!(
+            session
+                .plan_chat_send(&plain(id, &many, ChatKind::Privmsg))
+                .is_ok()
+        );
     }
     #[test]
     fn invalid_last_line_never_enters_queue() {
