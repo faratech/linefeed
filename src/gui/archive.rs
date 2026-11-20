@@ -107,6 +107,9 @@ pub(crate) struct SearchQuery {
     pub text: String,
     pub network: Option<LogicalNetworkKey>,
     pub target: Option<String>,
+    /// Other spellings of `target` that also name the conversation (at most
+    /// three), for when the casemapping that stored it is unknown.
+    pub target_also: Vec<String>,
     pub sender: String,
     pub from: Option<i64>,
     pub until: Option<i64>,
@@ -1818,7 +1821,7 @@ fn execute_search(
     if use_fts {
         sql.push_str("JOIN record_search ON record_search.rowid=r.rowid ");
     }
-    sql.push_str("WHERE r.deleted=0 AND (?1='' OR r.network=?1) AND (?2='' OR r.target=?2)
+    sql.push_str("WHERE r.deleted=0 AND (?1='' OR r.network=?1) AND (?2='' OR r.target IN (?2,?11,?12,?13))
        AND (?3='' OR r.sender_fold=?3) AND ((?4 IS NULL AND ?5 IS NULL) OR
        (r.occurred IS NOT NULL AND (?4 IS NULL OR r.occurred>=?4) AND (?5 IS NULL OR r.occurred<?5)) OR (?6 AND r.occurred IS NULL)) ");
     if use_fts {
@@ -1839,6 +1842,15 @@ fn execute_search(
         .as_ref()
         .map(LogicalNetworkKey::storage_key)
         .unwrap_or_default();
+    // Unused slots repeat the primary target, which the IN list already holds.
+    let also = |index: usize| {
+        query
+            .target_also
+            .get(index)
+            .map(String::as_str)
+            .or(query.target.as_deref())
+            .unwrap_or("")
+    };
     let mut rows = stmt
         .query(params![
             network,
@@ -1850,7 +1862,10 @@ fn execute_search(
             needle,
             query.after.map(|(occurred, _)| occurred),
             query.network_pattern.to_lowercase(),
-            query.after.map_or(0, |(_, rowid)| rowid)
+            query.after.map_or(0, |(_, rowid)| rowid),
+            also(0),
+            also(1),
+            also(2)
         ])
         .map_err(|e| e.to_string())?;
     let mut found = Vec::new();

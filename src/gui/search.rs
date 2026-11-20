@@ -235,22 +235,46 @@ impl App {
         self.search.appending = self.search.query.after.is_some();
         // Stored targets are casemapped keys, so the typed filter must be too.
         let mut query = self.search.query.clone();
-        query.target = query
+        query.target_also.clear();
+        let typed = query
             .target
             .as_deref()
             .map(str::trim)
             .filter(|target| !target.is_empty())
-            .map(|target| {
-                let session = query.network.as_ref().and_then(|network| {
-                    self.sessions
-                        .iter()
-                        .find(|session| session.logical_network_key().as_ref() == Some(network))
-                });
-                match session {
-                    Some(session) => session.network_support.canonicalize(target),
-                    None => super::NetworkSupport::default().canonicalize(target),
+            .map(str::to_owned);
+        let session = query.network.as_ref().and_then(|network| {
+            self.sessions
+                .iter()
+                .find(|session| session.logical_network_key().as_ref() == Some(network))
+        });
+        query.target = match (typed, session) {
+            (Some(target), Some(session)) => Some(session.network_support.canonicalize(&target)),
+            (Some(target), None) => {
+                // Without one known network the stored casemapping is unknown:
+                // accept the key every supported mapping would have stored.
+                let mut forms: Vec<String> = Vec::new();
+                for mapping in [
+                    super::types::CaseMapping::Rfc1459,
+                    super::types::CaseMapping::Ascii,
+                    super::types::CaseMapping::StrictRfc1459,
+                    super::types::CaseMapping::Utf8Rfc8265,
+                ] {
+                    let support = super::NetworkSupport {
+                        case_mapping: mapping,
+                        ..Default::default()
+                    };
+                    let form = support.canonicalize(&target);
+                    if !forms.contains(&form) {
+                        forms.push(form);
+                    }
                 }
-            });
+                let mut forms = forms.into_iter();
+                let primary = forms.next();
+                query.target_also = forms.collect();
+                primary
+            }
+            (None, _) => None,
+        };
         self.search.generation = self.archive.client.search(query);
         self.search.pending = true;
         self.search.changed = None;
@@ -989,6 +1013,39 @@ mod tests {
             .map(|message| message.content.as_str())
             .collect();
         assert_eq!(shown, ["kept body"]);
+        drop(app);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn conversation_filter_without_a_network_matches_every_casemapping() {
+        let (mut app, root) = app_with_archive();
+        // The same typed name is stored folded differently by networks that
+        // advertise ascii, rfc1459, strict-rfc1459 or rfc8265 casemapping.
+        for (index, target) in ["#a[b]\\^~", "#a{b}|~~", "#a{b}|^~"]
+            .into_iter()
+            .enumerate()
+        {
+            let mut row = record();
+            row.id = format!("row{index}");
+            row.msgid = Some(format!("m{index}"));
+            row.conversation.target = target.into();
+            app.archive.client.upsert(row);
+        }
+        let mut other = record();
+        other.id = "other".into();
+        other.msgid = Some("other".into());
+        other.conversation.target = "#a[c]".into();
+        app.archive.client.upsert(other);
+        assert!(app.archive.client.flush_barrier(Duration::from_secs(5)));
+        app.search.open = true;
+        app.search.query.network = None;
+        app.search.query.target = Some(" #A[B]\\^~ ".into());
+        app.submit_search();
+        finish_query(&mut app);
+        let mut ids: Vec<_> = app.search.results.iter().map(|r| r.id.as_str()).collect();
+        ids.sort_unstable();
+        assert_eq!(ids, ["row0", "row1", "row2"]);
         drop(app);
         std::fs::remove_dir_all(root).unwrap();
     }
