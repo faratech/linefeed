@@ -1092,7 +1092,45 @@ pub struct Channel {
     departed: VecDeque<(String, String, String)>,
 }
 
+/// One row of a channel's people list.
+pub(crate) enum PeopleRow<'a> {
+    /// The heading of a role with how many people hold it.
+    Group {
+        label: &'static str,
+        count: usize,
+    },
+    Person(&'a ChannelUser),
+}
+
 impl Channel {
+    /// The people list as rows: each role that has someone, highest first,
+    /// headed by its name and count, then its people in the channel's order.
+    pub(crate) fn people_rows(&self) -> Vec<PeopleRow<'_>> {
+        const GROUPS: [(UserMode, &str); 6] = [
+            (UserMode::Owner, "Owners"),
+            (UserMode::Admin, "Admins"),
+            (UserMode::Op, "Operators"),
+            (UserMode::HalfOp, "Half-ops"),
+            (UserMode::Voice, "Voiced"),
+            (UserMode::Normal, "Members"),
+        ];
+        let mut rows = Vec::with_capacity(self.users.len() + GROUPS.len());
+        for (mode, label) in GROUPS {
+            let count = self.users.iter().filter(|user| user.mode == mode).count();
+            if count == 0 {
+                continue;
+            }
+            rows.push(PeopleRow::Group { label, count });
+            rows.extend(
+                self.users
+                    .iter()
+                    .filter(|user| user.mode == mode)
+                    .map(PeopleRow::Person),
+            );
+        }
+        rows
+    }
+
     /// How many of the unread messages mention the user.
     pub(crate) fn unread_mentions(&self) -> usize {
         self.messages
@@ -1955,6 +1993,67 @@ pub struct TabCompletion {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn people(channel: &Channel) -> Vec<String> {
+        channel
+            .people_rows()
+            .into_iter()
+            .map(|row| match row {
+                PeopleRow::Group { label, count } => format!("[{label} {count}]"),
+                PeopleRow::Person(user) => user.nick.clone(),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn people_rows_group_by_role_with_counts_and_skip_empty_groups() {
+        let mut channel = Channel::new();
+        channel.add_user("erin", UserMode::Normal);
+        channel.add_user("carol", UserMode::Voice);
+        channel.add_user("bob", UserMode::Op);
+        channel.add_user("dave", UserMode::Voice);
+        assert_eq!(
+            people(&channel),
+            [
+                "[Operators 1]",
+                "bob",
+                "[Voiced 2]",
+                "carol",
+                "dave",
+                "[Members 1]",
+                "erin"
+            ]
+        );
+        channel.add_user("zed", UserMode::Owner);
+        channel.add_user("amy", UserMode::Admin);
+        channel.add_user("hal", UserMode::HalfOp);
+        assert_eq!(
+            people(&channel)
+                .into_iter()
+                .filter(|row| row.starts_with('['))
+                .collect::<Vec<_>>(),
+            [
+                "[Owners 1]",
+                "[Admins 1]",
+                "[Operators 1]",
+                "[Half-ops 1]",
+                "[Voiced 2]",
+                "[Members 1]"
+            ]
+        );
+        assert!(Channel::new().people_rows().is_empty());
+    }
+
+    #[test]
+    fn people_rows_keep_the_channel_order_inside_a_group() {
+        let mut channel = Channel::new();
+        for nick in ["mallory", "alice", "Bob", "zoe"] {
+            channel.add_user(nick, UserMode::Normal);
+        }
+        let listed: Vec<String> = channel.users.iter().map(|user| user.nick.clone()).collect();
+        let grouped: Vec<String> = people(&channel).into_iter().skip(1).collect();
+        assert_eq!(grouped, listed);
+    }
 
     #[test]
     fn unread_mentions_counts_highlights_among_the_unread_tail_only() {

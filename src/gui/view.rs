@@ -6,7 +6,7 @@
 
 use egui::{Color32, RichText, ScrollArea, TextEdit};
 
-use super::{Session, UserMode, commands};
+use super::{Session, commands};
 use crate::irc::IrcCommand;
 
 /// The people button's label: "1 person", "12 people".
@@ -144,9 +144,9 @@ impl Session {
             egui::Panel::right(("users", salt))
                 .frame(egui::Frame::side_top_panel(ui.style()).fill(palette.panel))
                 .resizable(true)
-                .default_size(140.0)
-                .min_size(80.0)
-                .max_size((ui.available_width() * 0.35).max(80.0))
+                .default_size(208.0)
+                .min_size(140.0)
+                .max_size((ui.available_width() * 0.35).max(140.0))
                 .show(ui, |ui| self.draw_user_list(ui, &channel_name));
         }
         // Messages and the composer sit on the chat ground; the people
@@ -250,58 +250,77 @@ impl Session {
         let mut kick_nick: Option<(String, String)> = None;
 
         if let Some(channel) = self.conversations.get(channel_name) {
-            let away_count = channel.away_count();
-            if away_count > 0 {
-                ui.heading(format!(
-                    "Users ({}, {} away)",
-                    channel.users.len(),
-                    away_count
-                ));
-            } else {
-                ui.heading(format!("Users ({})", channel.users.len()));
-            }
-            ui.separator();
+            let palette = super::theme::palette(ui.ctx());
+            let rows = channel.people_rows();
             let current_selected = self.selected_user.clone();
             let mut new_selected: Option<String> = current_selected.clone();
 
             // Row virtualization: only the visible slice is built each frame,
-            // which matters for channels with thousands of users.
-            let row_height = ui.text_style_height(&egui::TextStyle::Body);
+            // which matters for channels with thousands of users. Headings
+            // are rows of the same height as people, so every row is uniform.
+            let row_height = super::theme::control_height(ui);
             ScrollArea::vertical()
                 .id_salt(("user_list", self.id, self.current_conversation))
-                .show_rows(ui, row_height, channel.users.len(), |ui, row_range| {
-                    for user in &channel.users[row_range] {
+                .auto_shrink([false, false])
+                .show_rows(ui, row_height, rows.len(), |ui, row_range| {
+                    for row in &rows[row_range] {
+                        let user = match row {
+                            super::types::PeopleRow::Group { label, count } => {
+                                let (rect, _) = ui.allocate_exact_size(
+                                    egui::vec2(ui.available_width(), row_height),
+                                    egui::Sense::hover(),
+                                );
+                                let mut heading = ui.new_child(
+                                    egui::UiBuilder::new()
+                                        .max_rect(rect.shrink2(egui::vec2(10.0, 0.0)))
+                                        .layout(egui::Layout::left_to_right(egui::Align::Center)),
+                                );
+                                super::widgets::section_label(
+                                    &mut heading,
+                                    &format!("{label} · {count}"),
+                                );
+                                continue;
+                            }
+                            super::types::PeopleRow::Person(user) => *user,
+                        };
                         let nick = &user.nick;
                         let is_selected = current_selected.as_ref() == Some(nick);
                         let is_away = user.is_away();
-                        let base_color = match user.mode {
-                            UserMode::Owner => Color32::from_rgb(255, 100, 100),
-                            UserMode::Admin => Color32::from_rgb(255, 150, 100),
-                            UserMode::Op => Color32::from_rgb(100, 200, 100),
-                            UserMode::HalfOp => Color32::from_rgb(100, 200, 200),
-                            UserMode::Voice => Color32::from_rgb(200, 200, 100),
-                            UserMode::Normal => Color32::WHITE,
-                        };
-                        let color = if is_away {
-                            Color32::from_rgb(
-                                base_color.r() / 2,
-                                base_color.g() / 2,
-                                base_color.b() / 2,
-                            )
-                        } else {
-                            base_color
-                        };
-                        let state = match (is_away, user.bot) {
-                            (true, true) => " (away, bot)",
-                            (true, false) => " (away)",
-                            (false, true) => " (bot)",
+                        let note = match (is_away, user.bot) {
+                            (true, true) => "away, bot",
+                            (true, false) => "away",
+                            (false, true) => "bot",
                             (false, false) => "",
                         };
-                        let display_text = format!("{}{nick}{state}", user.prefix());
-                        let response = ui.selectable_label(
-                            is_selected,
-                            RichText::new(display_text).color(color),
-                        );
+                        let response = super::widgets::list_row(ui, is_selected, |ui| {
+                            // Away is a ring, present a filled dot: told
+                            // apart by shape, not by colour alone.
+                            let dot = if is_away {
+                                palette.faint
+                            } else {
+                                palette.online
+                            };
+                            super::widgets::dot(ui, dot, !is_away);
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    if !note.is_empty() {
+                                        ui.label(RichText::new(note).small().color(palette.faint));
+                                    }
+                                    ui.with_layout(
+                                        egui::Layout::left_to_right(egui::Align::Center),
+                                        |ui| {
+                                            let color =
+                                                if is_away { palette.faint } else { palette.text };
+                                            super::widgets::truncated(
+                                                ui,
+                                                RichText::new(nick).color(color),
+                                            );
+                                        },
+                                    );
+                                },
+                            );
+                        });
                         if let Some(away_msg) = &user.away {
                             response
                                 .clone()

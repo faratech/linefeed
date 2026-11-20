@@ -7443,6 +7443,8 @@ mod tests {
     struct Painted {
         texts: Vec<(String, egui::Rect, Color32)>,
         fills: Vec<(egui::Rect, Color32)>,
+        /// Centre, fill and outline width of every circle.
+        circles: Vec<(egui::Pos2, Color32, f32)>,
     }
 
     impl Painted {
@@ -7497,6 +7499,10 @@ mod tests {
                     ));
                 }
                 egui::Shape::Rect(rect) => out.fills.push((rect.rect, rect.fill)),
+                egui::Shape::Circle(circle) => {
+                    out.circles
+                        .push((circle.center, circle.fill, circle.stroke.width));
+                }
                 egui::Shape::Vec(shapes) => shapes.iter().for_each(|s| collect(s, out)),
                 _ => {}
             }
@@ -7516,6 +7522,7 @@ mod tests {
         let mut painted = Painted {
             texts: Vec::new(),
             fills: Vec::new(),
+            circles: Vec::new(),
         };
         for clipped in &output.shapes {
             collect(&clipped.shape, &mut painted);
@@ -8308,6 +8315,136 @@ mod tests {
             "nick above text: {nick:?} {text:?}"
         );
         assert!((nick.left() - text.left()).abs() < 2.0);
+    }
+
+    #[test]
+    fn the_people_list_is_grouped_by_role_with_counts() {
+        let (mut app, _rx_a, _rx_b) = two_networks();
+        feed(
+            &mut app,
+            0,
+            ":srv 353 me = #rust :@bob +carol +dave erin me",
+        );
+        feed(&mut app, 0, ":srv 366 me #rust :End of /NAMES list.");
+        let rust = target_key(&app, app.sessions[0].id, "#rust");
+        app.user_activate(rust);
+        let ctx = egui::Context::default();
+        let painted = settled(&mut app, &ctx, 1360.0);
+        let listed: Vec<(f32, &str)> = {
+            let mut rows: Vec<(f32, &str)> = painted
+                .texts
+                .iter()
+                .filter(|(_, rect, _)| rect.left() > 1100.0 && rect.top() > 60.0)
+                .map(|(text, rect, _)| (rect.top(), text.as_str()))
+                .collect();
+            rows.sort_by(|a, b| a.0.total_cmp(&b.0));
+            rows
+        };
+        let texts: Vec<&str> = listed.iter().map(|(_, text)| *text).collect();
+        assert_eq!(
+            texts,
+            [
+                "OPERATORS · 1",
+                "bob",
+                "VOICED · 2",
+                "carol",
+                "dave",
+                "MEMBERS · 2",
+                "erin",
+                "me"
+            ]
+        );
+        assert!(
+            !painted
+                .strings()
+                .iter()
+                .any(|text| text.starts_with("Users ("))
+        );
+    }
+
+    #[test]
+    fn a_channel_with_5000_users_draws_only_the_visible_people() {
+        let (mut app, _rx_a, _rx_b) = two_networks();
+        for chunk in (0..5000).collect::<Vec<u32>>().chunks(40) {
+            let names: Vec<String> = chunk.iter().map(|n| format!("u{n:04}")).collect();
+            feed(
+                &mut app,
+                0,
+                &format!(":srv 353 me = #rust :{}", names.join(" ")),
+            );
+        }
+        feed(&mut app, 0, ":srv 366 me #rust :End of /NAMES list.");
+        let rust = target_key(&app, app.sessions[0].id, "#rust");
+        app.user_activate(rust);
+        let ctx = egui::Context::default();
+        let painted = settled(&mut app, &ctx, 1360.0);
+        let drawn = painted
+            .texts
+            .iter()
+            .filter(|(text, rect, _)| {
+                text.starts_with('u') && text.len() == 5 && rect.left() > 1100.0
+            })
+            .count();
+        assert!(drawn > 5 && drawn < 80, "{drawn} people rows drawn");
+        assert!(painted.has("5000 people"), "{:?}", &painted.strings()[..12]);
+    }
+
+    #[test]
+    fn away_people_are_marked_by_shape_and_note() {
+        let (mut app, _rust) = rust_with_topic("Rust talk");
+        app.sessions[0]
+            .conversations
+            .get_mut("#rust")
+            .unwrap()
+            .set_user_away("bob", Some("gone fishing".into()));
+        let ctx = egui::Context::default();
+        let painted = settled(&mut app, &ctx, 1360.0);
+        let palette = super::super::theme::palette(&ctx);
+        let row = |nick: &str| {
+            painted
+                .texts
+                .iter()
+                .find(|(text, rect, _)| text == nick && rect.left() > 1100.0)
+                .unwrap_or_else(|| panic!("{nick} in the people list"))
+                .clone()
+        };
+        let dot_beside = |rect: egui::Rect| {
+            painted
+                .circles
+                .iter()
+                .find(|(center, _, _)| {
+                    (center.y - rect.center().y).abs() < 6.0
+                        && center.x < rect.left()
+                        && center.x > 1100.0
+                })
+                .copied()
+                .expect("a status dot beside the nick")
+        };
+        let (_, bob, bob_color) = row("bob");
+        let (_, fill, outline) = dot_beside(bob);
+        assert_eq!(
+            (fill, outline),
+            (Color32::TRANSPARENT, 2.0),
+            "away is a ring"
+        );
+        assert_eq!(bob_color, palette.faint);
+        let note = painted
+            .texts
+            .iter()
+            .find(|(text, rect, _)| {
+                text == "away" && (rect.center().y - bob.center().y).abs() < 6.0
+            })
+            .expect("an away note on bob's row");
+        assert!(note.1.left() > bob.right());
+
+        let (_, me, me_color) = row("me");
+        let (_, fill, outline) = dot_beside(me);
+        assert_eq!(
+            (fill, outline),
+            (palette.online, 0.0),
+            "present is a filled dot"
+        );
+        assert_eq!(me_color, palette.text);
     }
 
     /// The colour of the topmost opaque fill painted behind `rect`.
