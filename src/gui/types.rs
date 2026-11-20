@@ -1016,6 +1016,9 @@ impl ChannelUser {
     }
 }
 
+/// How many departed users' identities a channel remembers.
+const MAX_DEPARTED_IDENTITIES: usize = 64;
+
 /// An IRC channel with users and messages
 #[derive(Debug, Clone)]
 pub struct Channel {
@@ -1059,6 +1062,10 @@ pub struct Channel {
     /// appended to.
     burst_activity: Option<std::time::Instant>,
     mode_parameters: HashMap<char, String>,
+    /// `(nick, username, hostname)` of users who recently left, newest last.
+    /// A ban set from the user list is `*!user@host`, which only this can
+    /// connect back to the nick once the user is gone (#369).
+    departed: VecDeque<(String, String, String)>,
 }
 
 impl Channel {
@@ -1090,6 +1097,7 @@ impl Channel {
             names_index: HashMap::new(),
             burst_activity: None,
             mode_parameters: HashMap::new(),
+            departed: VecDeque::new(),
         }
     }
 
@@ -1696,12 +1704,35 @@ impl Channel {
 
     pub fn remove_user(&mut self, nick: &str) {
         if let Some(pos) = self.user_position(nick) {
-            self.remove_user_at(pos);
+            let user = self.remove_user_at(pos);
+            if let (Some(username), Some(hostname)) = (user.username, user.hostname) {
+                self.remember_departed(user.nick, username, hostname);
+            }
         }
         self.snapshot_remove(nick);
     }
 
+    fn remember_departed(&mut self, nick: String, username: String, hostname: String) {
+        let mapping = self.case_mapping;
+        self.departed
+            .retain(|(known, _, _)| !mapping.eq(known, &nick));
+        self.departed.push_back((nick, username, hostname));
+        while self.departed.len() > MAX_DEPARTED_IDENTITIES {
+            self.departed.pop_front();
+        }
+    }
+
+    /// The `(username, hostname)` a user who has since left had, if known.
+    pub fn departed_identity(&self, nick: &str) -> Option<(&str, &str)> {
+        self.departed
+            .iter()
+            .rev()
+            .find(|(known, _, _)| self.case_mapping.eq(known, nick))
+            .map(|(_, username, hostname)| (username.as_str(), hostname.as_str()))
+    }
+
     pub fn clear_users(&mut self) {
+        self.departed.clear();
         self.users.clear();
         self.user_index.clear();
         self.names_snapshot = None;
@@ -1908,6 +1939,47 @@ mod tests {
         assert_eq!(full.timestamp.len(), "[00-00 00:00]".len());
 
         ChatMessage::configure_default_timestamp_format("short");
+    }
+
+    #[test]
+    fn departed_identities_are_remembered_case_insensitively_and_bounded() {
+        let mut ch = Channel::new();
+        let identify = |ch: &mut Channel, nick: &str, host: &str| {
+            ch.add_user(nick, UserMode::Normal);
+            ch.apply_user_identity(&KnownUser {
+                nick: nick.into(),
+                username: Some("~u".into()),
+                hostname: Some(host.into()),
+                ..KnownUser::default()
+            });
+        };
+        identify(&mut ch, "Alice", "a.example");
+        // A user whose identity was never learned leaves no record.
+        ch.add_user("mystery", UserMode::Normal);
+        ch.remove_user("alice");
+        ch.remove_user("mystery");
+        assert_eq!(ch.departed_identity("ALICE"), Some(("~u", "a.example")));
+        assert_eq!(ch.departed_identity("mystery"), None);
+
+        // Leaving again refreshes the record rather than duplicating it.
+        identify(&mut ch, "alice", "b.example");
+        ch.remove_user("alice");
+        assert_eq!(ch.departed_identity("alice"), Some(("~u", "b.example")));
+        assert_eq!(ch.departed.len(), 1);
+
+        // Only the newest MAX_DEPARTED_IDENTITIES are kept.
+        for i in 0..MAX_DEPARTED_IDENTITIES {
+            let nick = format!("n{i}");
+            identify(&mut ch, &nick, "h.example");
+            ch.remove_user(&nick);
+        }
+        assert_eq!(ch.departed.len(), MAX_DEPARTED_IDENTITIES);
+        assert_eq!(ch.departed_identity("alice"), None, "oldest was evicted");
+        assert!(ch.departed_identity("n0").is_some());
+
+        // Forgotten when the channel's membership is cleared.
+        ch.clear_users();
+        assert_eq!(ch.departed_identity("n0"), None);
     }
 
     #[test]

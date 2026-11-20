@@ -2313,16 +2313,25 @@ impl Session {
         if let Some(channel) = channel {
             let nick_key = self.network_support.canonicalize(value);
             let built_key = self.network_support.canonicalize(&built);
-            let identity =
-                channel
-                    .get_user(value)
-                    .and_then(|user| match (&user.username, &user.hostname) {
-                        (Some(username), Some(hostname)) => Some(
-                            self.network_support
-                                .canonicalize(&format!("{}!{username}@{hostname}", user.nick)),
-                        ),
-                        _ => None,
-                    });
+            // The user's identity: from the user list, or, once they have
+            // left, the one remembered when they did (#369).
+            let identity = match channel.get_user(value) {
+                Some(user) => match (&user.username, &user.hostname) {
+                    (Some(username), Some(hostname)) => {
+                        Some(format!("{}!{username}@{hostname}", user.nick))
+                    }
+                    _ => None,
+                },
+                None => channel
+                    .departed_identity(value)
+                    .map(|(username, hostname)| format!("{value}!{username}@{hostname}")),
+            }
+            .map(|identity| self.network_support.canonicalize(&identity));
+            // What /ban builds for them: *!user@host.
+            let identity_ban = identity.as_deref().and_then(|identity| {
+                let (_, user_host) = identity.split_once('!')?;
+                Some(self.network_support.canonicalize(&format!("*!{user_host}")))
+            });
             let mut exact: Vec<String> = Vec::new();
             let mut covering: Vec<&str> = Vec::new();
             for ban in &channel.bans {
@@ -2333,6 +2342,7 @@ impl Session {
                     .split_once('!')
                     .is_some_and(|(nick, _)| nick == nick_key)
                     || mask == built_key
+                    || identity_ban.as_deref() == Some(mask.as_str())
                     || identity.as_deref() == Some(mask.as_str())
                 {
                     exact.push(ban.mask.clone());
@@ -3668,6 +3678,66 @@ mod tests {
         expect_mode(&mut rx, "-b", "*!*@other.test");
         app.process_command("/unban bob@host");
         expect_mode(&mut rx, "-b", "bob!*@host");
+    }
+
+    #[test]
+    fn unban_nick_finds_the_host_ban_after_the_user_left() {
+        // /kickban sets *!~alice@host.example from the user list; the KICK
+        // then removes alice, so only the remembered identity can connect
+        // /unban alice to that ban (#369).
+        let (mut app, mut rx) = ban_command_app();
+        app.process_command("/kickban alice");
+        expect_mode(&mut rx, "+b", "*!~alice@host.example");
+        assert!(matches!(rx.try_recv(), Ok(IrcCommand::Kick(..))));
+        let channel = app.conversations.get_mut("#chan").unwrap();
+        channel.apply_mode_list_change('+', 'b', "*!~alice@host.example", "me");
+        channel.apply_mode_list_change('+', 'b', "*!~other@elsewhere.test", "op");
+        channel.remove_user("alice");
+        assert!(channel.get_user("alice").is_none());
+
+        app.process_command("/unban ALICE");
+        expect_mode(&mut rx, "-b", "*!~alice@host.example");
+        assert!(rx.try_recv().is_err());
+        assert!(!last_note(&app).contains("No matching ban"));
+    }
+
+    #[test]
+    fn unban_nick_prefers_the_identity_of_a_rejoined_user() {
+        let (mut app, mut rx) = ban_command_app();
+        {
+            let channel = app.conversations.get_mut("#chan").unwrap();
+            channel.apply_mode_list_change('+', 'b', "*!~alice@host.example", "op");
+            channel.apply_mode_list_change('+', 'b', "*!~alice@new.example", "op");
+            channel.remove_user("alice");
+        }
+        // alice comes back from a new host before /unban.
+        app.conversations
+            .get_mut("#chan")
+            .unwrap()
+            .add_user("alice", crate::gui::types::UserMode::Normal);
+        app.update_user_identity(
+            "alice",
+            Some(Some("~alice".into())),
+            Some(Some("new.example".into())),
+            None,
+            None,
+            None,
+            None,
+            Some(true),
+        );
+        app.process_command("/unban alice");
+        expect_mode(&mut rx, "-b", "*!~alice@new.example");
+    }
+
+    #[test]
+    fn unban_of_a_departed_nick_without_a_matching_ban_falls_back_to_the_nick_mask() {
+        let (mut app, mut rx) = ban_command_app();
+        app.conversations
+            .get_mut("#chan")
+            .unwrap()
+            .remove_user("alice");
+        app.process_command("/unban alice");
+        expect_mode(&mut rx, "-b", "alice!*@*");
     }
 
     fn set_bans(app: &mut Session, masks: &[&str]) {
