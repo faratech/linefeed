@@ -184,6 +184,15 @@ enum Task {
     Flush(mpsc::SyncSender<bool>),
 }
 
+#[cfg(test)]
+pub(crate) struct TestSink(mpsc::Receiver<Task>);
+#[cfg(test)]
+impl TestSink {
+    pub(crate) fn queued(&self) -> usize {
+        self.0.try_iter().count()
+    }
+}
+
 #[derive(Clone, Default)]
 pub(crate) struct ArchiveClient {
     tx: Option<mpsc::SyncSender<Task>>,
@@ -313,6 +322,18 @@ impl ArchiveClient {
             );
         }
     }
+    /// A client whose queue holds `capacity` tasks and nothing consumes them;
+    /// beyond that every submit fails like a full archive queue.
+    #[cfg(test)]
+    pub(crate) fn test_sink(capacity: usize) -> (Self, TestSink) {
+        let (tx, rx) = mpsc::sync_channel(capacity);
+        let client = Self {
+            tx: Some(tx),
+            available: Arc::new(AtomicBool::new(true)),
+            ..Default::default()
+        };
+        (client, TestSink(rx))
+    }
     pub(crate) fn reaction(
         &self,
         conversation: ConversationKey,
@@ -320,14 +341,14 @@ impl ArchiveClient {
         actor: String,
         emoji: String,
         present: bool,
-    ) {
+    ) -> bool {
         self.submit(Task::Event(JournalEvent::Reaction {
             conversation,
             msgid,
             actor,
             emoji,
             present,
-        }));
+        }))
     }
     pub(crate) fn search(&self, query: SearchQuery) -> u64 {
         let generation = self.generation.fetch_add(1, Ordering::SeqCst) + 1;

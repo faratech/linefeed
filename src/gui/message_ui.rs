@@ -4,7 +4,7 @@ use super::identity::{MessageRef, ScrollAnchor};
 use super::{ChatMessage, Session, SessionEvent};
 use crate::irc::{IrcCommand, IrcMessage};
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -85,30 +85,105 @@ struct OutgoingTyping {
 type PendingReactions = HashMap<(String, String), Vec<(String, String, bool)>>;
 /// How many recent reaction states are remembered to avoid re-journaling.
 const REACTION_JOURNAL_CACHE: usize = 1024;
+/// Per (conversation, actor) journaling budget: a burst, refilled per minute.
+const REACTION_ACTOR_BURST: f64 = 30.0;
+const REACTION_ACTOR_PER_MINUTE: f64 = 30.0;
+/// Whole-session ceiling, so many nicks cannot multiply the per-actor budget.
+const REACTION_SESSION_BURST: f64 = 600.0;
+const REACTION_SESSION_PER_MINUTE: f64 = 600.0;
+/// Remembered per-actor budgets; refilled buckets are forgotten first.
+const REACTION_BUDGETS: usize = 1024;
 type ReactionKey = (super::identity::ConversationKey, String, String, String);
-/// Bounded memory of the last journaled `present` value per
-/// (conversation, msgid, canonical actor, emoji), so repeated or replayed
-/// reactions cannot grow the permanent archive journal. Oldest entries are
-/// forgotten first; forgetting only costs one redundant journal line.
+type ActorKey = (super::identity::ConversationKey, String);
+struct Bucket {
+    tokens: f64,
+    last: Instant,
+}
+impl Bucket {
+    fn new(burst: f64, now: Instant) -> Self {
+        Self {
+            tokens: burst,
+            last: now,
+        }
+    }
+    fn refill(&mut self, burst: f64, per_minute: f64, now: Instant) {
+        let elapsed = now.saturating_duration_since(self.last).as_secs_f64();
+        self.tokens = (self.tokens + elapsed * per_minute / 60.0).min(burst);
+        self.last = now;
+    }
+}
+/// What may reach the permanent archive journal from incoming reactions.
+/// A bounded LRU remembers the last journaled `present` value per
+/// (conversation, msgid, canonical actor, emoji), so repeats and replays are
+/// not journaled again; token buckets per (conversation, actor) and per
+/// session bound everything else, including reactions to unknown messages
+/// and endless distinct emoji. Over-budget reactions still update the live
+/// UI. Forgetting an entry only costs one redundant journal line.
 #[derive(Default)]
 struct ReactionJournal {
-    state: HashMap<ReactionKey, bool>,
-    order: VecDeque<ReactionKey>,
+    state: HashMap<ReactionKey, (bool, u64)>,
+    tick: u64,
+    actors: HashMap<ActorKey, Bucket>,
+    session: Option<Bucket>,
 }
 impl ReactionJournal {
-    /// True when `present` differs from what was last journaled for `key`.
-    fn record(&mut self, key: ReactionKey, present: bool) -> bool {
-        if let Some(last) = self.state.get_mut(&key) {
-            return std::mem::replace(last, present) != present;
+    /// True when `present` is what was last journaled for `key`.
+    fn is_current(&mut self, key: &ReactionKey, present: bool) -> bool {
+        self.tick += 1;
+        let tick = self.tick;
+        self.state.get_mut(key).is_some_and(|(last, used)| {
+            *used = tick;
+            *last == present
+        })
+    }
+    /// Spends one journal write from the actor's and the session's budget.
+    fn admit(&mut self, conversation: &ActorKey, now: Instant) -> bool {
+        let session = self
+            .session
+            .get_or_insert_with(|| Bucket::new(REACTION_SESSION_BURST, now));
+        session.refill(REACTION_SESSION_BURST, REACTION_SESSION_PER_MINUTE, now);
+        if !self.actors.contains_key(conversation) && self.actors.len() >= REACTION_BUDGETS {
+            self.actors.retain(|_, bucket| {
+                bucket.refill(REACTION_ACTOR_BURST, REACTION_ACTOR_PER_MINUTE, now);
+                bucket.tokens < REACTION_ACTOR_BURST
+            });
+            if self.actors.len() >= REACTION_BUDGETS
+                && let Some(oldest) = self
+                    .actors
+                    .iter()
+                    .min_by_key(|(_, bucket)| bucket.last)
+                    .map(|(key, _)| key.clone())
+            {
+                self.actors.remove(&oldest);
+            }
         }
-        if self.order.len() >= REACTION_JOURNAL_CACHE
-            && let Some(oldest) = self.order.pop_front()
+        let bucket = self
+            .actors
+            .entry(conversation.clone())
+            .or_insert_with(|| Bucket::new(REACTION_ACTOR_BURST, now));
+        bucket.refill(REACTION_ACTOR_BURST, REACTION_ACTOR_PER_MINUTE, now);
+        if bucket.tokens < 1.0 || session.tokens < 1.0 {
+            return false;
+        }
+        bucket.tokens -= 1.0;
+        session.tokens -= 1.0;
+        true
+    }
+    /// Remembers a state the archive actually accepted, evicting the least
+    /// recently used key when full.
+    fn record(&mut self, key: ReactionKey, present: bool) {
+        self.tick += 1;
+        if !self.state.contains_key(&key)
+            && self.state.len() >= REACTION_JOURNAL_CACHE
+            && let Some(oldest) = self
+                .state
+                .iter()
+                .min_by_key(|(_, (_, used))| *used)
+                .map(|(key, _)| key.clone())
         {
             self.state.remove(&oldest);
         }
-        self.order.push_back(key.clone());
-        self.state.insert(key, present);
-        true
+        self.state.insert(key, (present, self.tick));
     }
     #[cfg(test)]
     fn len(&self) -> usize {
@@ -116,7 +191,7 @@ impl ReactionJournal {
     }
     #[cfg(test)]
     fn get(&self, key: &ReactionKey) -> Option<bool> {
-        self.state.get(key).copied()
+        self.state.get(key).map(|(present, _)| *present)
     }
 }
 #[derive(Default)]
@@ -842,8 +917,12 @@ impl Session {
                 actor_key.clone(),
                 emoji.to_string(),
             );
-            if self.message_ui.reaction_journal.record(key, present) {
-                archive.reaction(conversation, id.into(), actor_key, emoji.into(), present);
+            let journal = &mut self.message_ui.reaction_journal;
+            if !journal.is_current(&key, present)
+                && journal.admit(&(conversation.clone(), actor_key.clone()), Instant::now())
+                && archive.reaction(conversation, id.into(), actor_key, emoji.into(), present)
+            {
+                journal.record(key, present);
             }
         }
     }
@@ -1555,41 +1634,133 @@ mod tests {
                 .is_empty()
         );
     }
+    fn logging_session(
+        capacity: usize,
+    ) -> (Session, crate::gui::archive::TestSink, ConversationId) {
+        let (mut sess, _, id) = session();
+        let (client, sink) = crate::gui::archive::ArchiveClient::test_sink(capacity);
+        sess.logging_enabled = true;
+        sess.archive_client = Some(client);
+        (sess, sink, id)
+    }
     #[test]
     fn repeated_reactions_are_journaled_once_per_state_change() {
-        let (mut sess, _, _) = session();
-        sess.logging_enabled = true;
-        sess.archive_client = Some(crate::gui::archive::ArchiveClient::default());
+        let (mut sess, sink, _) = logging_session(4096);
         // Unknown message ids are journaled too (late upserts), but only once.
         for _ in 0..50 {
             sess.apply_reaction("#room", "unknown", "Mal", "x", true);
             sess.apply_reaction("#room", "unknown", "mal", "x", true);
         }
+        assert_eq!(sink.queued(), 1);
         assert_eq!(sess.message_ui.reaction_journal.len(), 1);
-        let key = (
-            sess.conversation_key("#room"),
-            "unknown".to_string(),
-            sess.network_support.canonicalize("mal"),
-            "x".to_string(),
-        );
-        assert_eq!(sess.message_ui.reaction_journal.get(&key), Some(true));
-        assert!(!sess.message_ui.reaction_journal.record(key.clone(), true));
         // A real state change is journaled again, then deduplicated.
-        assert!(sess.message_ui.reaction_journal.record(key.clone(), false));
-        assert!(!sess.message_ui.reaction_journal.record(key.clone(), false));
-        assert!(sess.message_ui.reaction_journal.record(key, true));
-        // The cache is bounded: flooding distinct reactions cannot grow it.
-        for i in 0..(REACTION_JOURNAL_CACHE * 2) {
-            sess.apply_reaction("#room", "unknown", "mal", &format!("e{i}"), true);
-        }
-        assert_eq!(
-            sess.message_ui.reaction_journal.len(),
-            REACTION_JOURNAL_CACHE
-        );
+        sess.apply_reaction("#room", "unknown", "mal", "x", false);
+        sess.apply_reaction("#room", "unknown", "mal", "x", false);
+        sess.apply_reaction("#room", "unknown", "mal", "x", true);
+        assert_eq!(sink.queued(), 2);
         // Without a logging archive nothing is tracked.
         let (mut quiet, _, _) = session();
         quiet.apply_reaction("#room", "unknown", "mal", "x", true);
         assert_eq!(quiet.message_ui.reaction_journal.len(), 0);
+    }
+    #[test]
+    fn one_actor_cannot_journal_more_than_its_budget() {
+        let (mut sess, sink, id) = logging_session(4096);
+        // Distinct emoji and distinct unknown msgids are all new keys.
+        for i in 0..200 {
+            sess.apply_reaction("#room", "unknown", "mal", &format!("e{i}"), true);
+            sess.apply_reaction("#room", &format!("m{i}"), "MAL", "x", true);
+        }
+        let journaled = sink.queued();
+        assert!(
+            (30..=31).contains(&journaled),
+            "only the burst is journaled: {journaled}"
+        );
+        // The live view is unaffected by the budget.
+        sess.add_message_to_channel(
+            "#room",
+            ChatMessage::new_fmt("bob", "parent", "short").with_irc_metadata(
+                None,
+                Some("live".into()),
+                None,
+            ),
+        );
+        sink.queued(); // the parent message's own journal record
+        sess.apply_reaction("#room", "live", "mal", "🎉", true);
+        assert_eq!(sink.queued(), 0);
+        let message = sess
+            .conversation_channel(id)
+            .unwrap()
+            .messages
+            .back()
+            .unwrap();
+        assert_eq!(message.reactions[0].actors, ["mal"]);
+        // Another actor has its own budget; the budget refills with time.
+        sess.apply_reaction("#room", "unknown", "eve", "x", true);
+        assert_eq!(sink.queued(), 1);
+        let actor = (sess.conversation_key("#room"), "mal".to_string());
+        let journal = &mut sess.message_ui.reaction_journal;
+        assert!(!journal.admit(&actor, Instant::now()));
+        assert!(journal.admit(&actor, Instant::now() + Duration::from_secs(120)));
+    }
+    #[test]
+    fn many_actors_cannot_multiply_the_session_budget_or_budget_memory() {
+        let (mut sess, sink, _) = logging_session(8192);
+        for i in 0..2000 {
+            sess.apply_reaction("#room", "unknown", &format!("nick{i}"), "x", true);
+        }
+        let journaled = sink.queued();
+        assert!(journaled <= 601, "{journaled}");
+        assert!(sess.message_ui.reaction_journal.actors.len() <= REACTION_BUDGETS);
+    }
+    #[test]
+    fn a_dropped_submit_is_not_remembered_as_journaled() {
+        let (mut sess, sink, _) = logging_session(1);
+        sess.apply_reaction("#room", "unknown", "mal", "a", true);
+        // The queue (capacity 1) is now full: this reaction is dropped.
+        sess.apply_reaction("#room", "unknown", "mal", "b", true);
+        assert_eq!(sess.message_ui.reaction_journal.len(), 1);
+        assert_eq!(sink.queued(), 1);
+        // Once there is room, replaying the dropped reaction is journaled.
+        sess.apply_reaction("#room", "unknown", "mal", "b", true);
+        assert_eq!(sess.message_ui.reaction_journal.len(), 2);
+        assert_eq!(sink.queued(), 1);
+        // A client with no queue at all caches nothing.
+        sess.archive_client = Some(crate::gui::archive::ArchiveClient::default());
+        sess.apply_reaction("#room", "unknown", "mal", "c", true);
+        assert_eq!(sess.message_ui.reaction_journal.len(), 2);
+    }
+    #[test]
+    fn reaction_cache_evicts_the_least_recently_used_key() {
+        let mut journal = ReactionJournal::default();
+        let network = {
+            let (sess, _, _) = session();
+            sess.conversation_key("#room")
+        };
+        let key = |i: usize| {
+            (
+                network.clone(),
+                "m".to_string(),
+                "a".to_string(),
+                i.to_string(),
+            )
+        };
+        for i in 0..REACTION_JOURNAL_CACHE {
+            journal.record(key(i), true);
+        }
+        // Using key 0 keeps it; the next insert evicts key 1 instead.
+        assert!(journal.is_current(&key(0), true));
+        journal.record(key(REACTION_JOURNAL_CACHE), true);
+        assert_eq!(journal.len(), REACTION_JOURNAL_CACHE);
+        assert_eq!(journal.get(&key(0)), Some(true));
+        assert_eq!(journal.get(&key(1)), None);
+        // Cycling through more keys than fit does not evict a hot key.
+        for i in 0..REACTION_JOURNAL_CACHE * 2 {
+            assert!(journal.is_current(&key(0), true));
+            journal.record(key(10_000 + i), true);
+        }
+        assert_eq!(journal.get(&key(0)), Some(true));
+        assert_eq!(journal.len(), REACTION_JOURNAL_CACHE);
     }
     #[test]
     fn early_reactions_attach_when_parent_arrives() {
