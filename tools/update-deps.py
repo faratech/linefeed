@@ -467,6 +467,37 @@ def update_cargo_toml(
         print(f"\nUpdated Cargo.toml with {len(updates)} changes")
 
 
+def _lock_package_spec(crate_name: str, manifest_text: str, lock_text: str) -> str:
+    """The `cargo update -p` spec for this project's direct dependency on a crate.
+
+    A bare name is ambiguous to Cargo when Cargo.lock holds more than one
+    version of the crate (e.g. a direct getrandom 0.4 next to a transitive
+    0.3). Cargo.lock then lists the root package's dependency as
+    "name version", which selects the locked version to update.
+    """
+    match = re.search(
+        r'^\[package\][^\[]*?^name\s*=\s*"([^"]+)"', manifest_text, re.MULTILINE
+    )
+    root_name = match.group(1) if match else None
+    for block in re.split(r"^\[\[package\]\]\s*$", lock_text, flags=re.MULTILINE):
+        name = re.search(r'^name = "([^"]+)"', block, re.MULTILINE)
+        if not name:
+            continue
+        if root_name is not None:
+            if name.group(1) != root_name:
+                continue
+        elif re.search(r"^source = ", block, re.MULTILINE):
+            continue
+        deps = re.search(r"^dependencies = \[(.*?)^\]", block, re.MULTILINE | re.DOTALL)
+        if not deps:
+            continue
+        for entry in re.findall(r'"([^"]+)"', deps.group(1)):
+            parts = entry.split()
+            if len(parts) >= 2 and parts[0] == crate_name:
+                return f"{crate_name}@{parts[1]}"
+    return crate_name
+
+
 def update_manifest_and_lock(
     updates: dict[str, str],
     pin: bool = False,
@@ -475,6 +506,12 @@ def update_manifest_and_lock(
     """Update Cargo.toml and Cargo.lock as one rollback-safe operation."""
     original_toml = CARGO_TOML.read_bytes()
     original_lock = CARGO_LOCK.read_bytes() if CARGO_LOCK.exists() else None
+    manifest_text = original_toml.decode("utf-8", errors="replace")
+    lock_text = (original_lock or b"").decode("utf-8", errors="replace")
+    specs = {
+        crate_name: _lock_package_spec(crate_name, manifest_text, lock_text)
+        for crate_name in updates
+    }
 
     try:
         update_cargo_toml(updates, targets=targets)
@@ -482,7 +519,7 @@ def update_manifest_and_lock(
             # --precise applies to a single -p package, so update per crate.
             for crate_name, new_version in updates.items():
                 result = run_cmd(
-                    ["cargo", "update", "-p", crate_name, "--precise", new_version]
+                    ["cargo", "update", "-p", specs[crate_name], "--precise", new_version]
                 )
                 if result.returncode != 0:
                     detail = (result.stdout or "") + (result.stderr or "")
@@ -490,7 +527,7 @@ def update_manifest_and_lock(
         elif updates:
             cmd = ["cargo", "update"]
             for crate_name in updates:
-                cmd += ["-p", crate_name]
+                cmd += ["-p", specs[crate_name]]
             result = run_cmd(cmd)
             if result.returncode != 0:
                 detail = (result.stdout or "") + (result.stderr or "")

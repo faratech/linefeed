@@ -220,6 +220,57 @@ class DependencyUpdaterTests(unittest.TestCase):
             self.assertEqual(run.call_args_list[-1].args[0][1:3], ["metadata", "--locked"])
 
 
+    def test_crates_locked_at_two_versions_are_updated_by_versioned_spec(self):
+        updater = load_module("linefeed_update_deps_ambiguous", ROOT / "tools" / "update-deps.py")
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            manifest = root / "Cargo.toml"
+            lock = root / "Cargo.lock"
+            manifest.write_text(
+                '[package]\nname = "linefeed"\nversion = "0.1.0"\n\n'
+                '[dependencies]\ngetrandom = "0.4.3"\nserde = "1.0.1"\n'
+            )
+            lock.write_text(
+                "version = 4\n\n"
+                '[[package]]\nname = "getrandom"\nversion = "0.3.4"\n'
+                'source = "registry+https://github.com/rust-lang/crates.io-index"\n\n'
+                '[[package]]\nname = "getrandom"\nversion = "0.4.3"\n'
+                'source = "registry+https://github.com/rust-lang/crates.io-index"\n\n'
+                '[[package]]\nname = "linefeed"\nversion = "0.1.0"\n'
+                'dependencies = [\n "getrandom 0.4.3",\n "serde",\n]\n\n'
+                '[[package]]\nname = "serde"\nversion = "1.0.1"\n'
+                'source = "registry+https://github.com/rust-lang/crates.io-index"\n'
+                'dependencies = [\n "getrandom 0.3.4",\n]\n'
+            )
+            updater.CARGO_TOML = manifest
+            updater.CARGO_LOCK = lock
+
+            ok = subprocess.CompletedProcess([], 0, stdout="ok", stderr="")
+            for pin in (True, False):
+                with mock.patch.object(updater, "run_cmd", return_value=ok) as run:
+                    self.assertTrue(
+                        updater.update_manifest_and_lock(
+                            {"getrandom": "0.4.5", "serde": "1.0.2"}, pin=pin
+                        )
+                    )
+                update_args = [
+                    call.args[0] for call in run.call_args_list if call.args[0][1] == "update"
+                ]
+                if pin:
+                    self.assertEqual(
+                        update_args,
+                        [
+                            ["cargo", "update", "-p", "getrandom@0.4.3", "--precise", "0.4.5"],
+                            ["cargo", "update", "-p", "serde", "--precise", "1.0.2"],
+                        ],
+                    )
+                else:
+                    self.assertEqual(
+                        update_args,
+                        [["cargo", "update", "-p", "getrandom@0.4.3", "-p", "serde"]],
+                    )
+
+
 class DependencyVersionAndParsingTests(unittest.TestCase):
     def setUp(self):
         self.updater = load_module(
