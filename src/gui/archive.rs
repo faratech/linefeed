@@ -990,8 +990,8 @@ fn copy_rest_of_line(reader: &mut impl BufRead, out: &mut dyn Write) -> std::io:
 
 /// Copy one journal to `out`, replacing each targeted Upsert (single-line or
 /// reassembled from checked chunk frames) with the same record carrying no
-/// body. Every other byte, including lines this build cannot parse, is copied
-/// unchanged. Returns whether anything was replaced; with `stop_at_first` it
+/// body. Every other byte is copied unchanged, including lines this build
+/// cannot parse, unless such a line mentions a target (it is dropped). Returns whether anything was replaced; with `stop_at_first` it
 /// returns as soon as the first replacement is found, without finishing `out`.
 fn rewrite_journal(
     path: &Path,
@@ -1154,7 +1154,19 @@ fn rewrite_journal(
             }
             Err(_) => {
                 flush_run(&mut run, out)?;
-                out.write_all(&bytes).map_err(io)?;
+                if needles.found_in(&bytes) {
+                    // A torn or unreadable line is never replayed, but it may
+                    // still hold a redacted body: drop it rather than keep it.
+                    tracing::warn!(
+                        "Dropping an unreadable history journal line that mentions a redacted message"
+                    );
+                    changed = true;
+                    if stop_at_first {
+                        return Ok(true);
+                    }
+                } else {
+                    out.write_all(&bytes).map_err(io)?;
+                }
             }
         }
     }
@@ -3081,6 +3093,45 @@ mod tests {
         assert_eq!(hex_digest(&digest), line_digest(&after));
         assert!(!contains(&after, "hunter2-odd-marker"));
         assert_eq!(lines(&after).len(), 501);
+    }
+
+    #[test]
+    fn unreadable_lines_mentioning_a_redacted_message_are_dropped_and_others_kept() {
+        let root = Scratch::new();
+        let path = root.0.join("torn.jsonl");
+        let secret = record("#a", "hunter2-torn-marker", "one");
+        let other = record("#a", "other body", "two");
+        write_journal(&path, &[upsert(&other), upsert(&secret)]);
+        let mut bytes = fs::read(&path).unwrap();
+        // A torn copy of the secret's line (valid prefix, no end) and an
+        // unreadable line that mentions nothing targeted.
+        let secret_line = lines(&bytes).remove(1);
+        bytes.extend_from_slice(&secret_line[..secret_line.len() - 20]);
+        bytes.extend_from_slice(b"\n");
+        bytes.extend_from_slice(b"garbage unrelated line\n");
+        fs::write(&path, &bytes).unwrap();
+        let before = lines(&bytes);
+
+        let mut targets = ScrubTargets::default();
+        targets.ids.insert(secret.id.clone());
+        targets
+            .msgids
+            .insert("one".into(), vec![secret.conversation.clone()]);
+        let digest = scrub_journal_file(&path, &targets).unwrap().unwrap();
+        let after_bytes = fs::read(&path).unwrap();
+        assert_eq!(hex_digest(&digest), line_digest(&after_bytes));
+        assert!(!contains(&after_bytes, "hunter2-torn-marker"));
+        let after = lines(&after_bytes);
+        // other, bodyless secret, unrelated garbage; the torn copy is gone.
+        assert_eq!(after.len(), 3);
+        assert_eq!(after[0], before[0]);
+        assert_eq!(after[2], before[3]);
+
+        // A journal whose only mention is such a line is rewritten too.
+        let torn_only = root.0.join("torn-only.jsonl");
+        fs::write(&torn_only, &secret_line[..secret_line.len() - 20]).unwrap();
+        assert!(scrub_journal_file(&torn_only, &targets).unwrap().is_some());
+        assert!(fs::read(&torn_only).unwrap().is_empty());
     }
 
     #[test]
