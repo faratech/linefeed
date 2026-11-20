@@ -554,8 +554,9 @@ impl App {
         self.settings.automatic_updates
     }
 
-    pub fn font_size(&self) -> f32 {
-        self.settings.font_size
+    /// Put the saved display choices (theme, spacing, fonts) into effect.
+    pub fn apply_display(&self, ctx: &egui::Context) {
+        super::theme::apply(ctx, &self.settings.display());
     }
 
     /// Network and application background work both need a visible-window

@@ -499,7 +499,11 @@ impl Session {
         true
     }
 
-    fn settings_tab_display(&mut self, ui: &mut egui::Ui, font_size: &mut f32) {
+    fn settings_tab_display(
+        &mut self,
+        ui: &mut egui::Ui,
+        display: &mut super::theme::DisplayPrefs,
+    ) {
         ui.heading("Timestamps");
         ui.add_space(4.0);
 
@@ -550,13 +554,13 @@ impl Session {
             ui.label("Size:");
             let changed = ui
                 .add(
-                    egui::DragValue::new(font_size)
+                    egui::DragValue::new(&mut display.font_size)
                         .speed(0.5)
                         .range(10.0..=24.0),
                 )
                 .changed();
             if changed {
-                super::apply_font_size(ui.ctx(), *font_size);
+                super::theme::apply(ui.ctx(), display);
             }
             ui.label("px");
         });
@@ -1574,7 +1578,11 @@ impl App {
                                         favorites_ui,
                                     )
                                 }
-                                1 => session.settings_tab_display(ui, &mut settings.font_size),
+                                1 => {
+                                    let mut display = settings.display();
+                                    session.settings_tab_display(ui, &mut display);
+                                    settings.set_display(display);
+                                }
                                 2 => session.settings_tab_behavior(
                                     ui,
                                     &mut settings.notifications_enabled,

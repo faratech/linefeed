@@ -130,6 +130,11 @@ pub struct Settings {
     pub timestamp_format: String, // "short" = HH:MM, "long" = HH:MM:SS, "full" = MM-DD HH:MM
     pub hide_join_part: bool,
     pub font_size: f32,
+    pub(crate) theme: super::theme::ThemeChoice,
+    pub(crate) density: super::theme::Density,
+    pub(crate) message_font: super::theme::MessageFont,
+    /// Give each nickname its own colour in message rows.
+    pub color_nicks: bool,
     pub max_scrollback: usize,
     // Privacy
     pub ctcp_replies_enabled: bool,
@@ -186,7 +191,11 @@ impl Default for Settings {
             // Display
             timestamp_format: "short".to_string(),
             hide_join_part: false,
-            font_size: 14.0,
+            font_size: super::theme::DEFAULT_FONT_SIZE,
+            theme: Default::default(),
+            density: Default::default(),
+            message_font: Default::default(),
+            color_nicks: true,
             max_scrollback: 1000,
             // Privacy
             ctcp_replies_enabled: true,
@@ -205,6 +214,25 @@ impl Default for Settings {
 }
 
 impl Settings {
+    /// The display choices, as the theme applies them.
+    pub(crate) fn display(&self) -> super::theme::DisplayPrefs {
+        super::theme::DisplayPrefs {
+            theme: self.theme,
+            density: self.density,
+            message_font: self.message_font,
+            font_size: self.font_size,
+            color_nicks: self.color_nicks,
+        }
+    }
+
+    pub(crate) fn set_display(&mut self, display: super::theme::DisplayPrefs) {
+        self.theme = display.theme;
+        self.density = display.density;
+        self.message_font = display.message_font;
+        self.font_size = display.font_size;
+        self.color_nicks = display.color_nicks;
+    }
+
     fn config_path() -> Option<PathBuf> {
         dirs::config_dir().map(|p| p.join("linefeed").join("settings.json"))
     }
@@ -1917,6 +1945,45 @@ pub struct TabCompletion {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn settings_saved_by_0_1_9_load_with_the_new_display_defaults() {
+        use crate::gui::theme::{Density, MessageFont, ThemeChoice};
+        let s: Settings =
+            serde_json::from_str(r#"{"font_size":14.0,"timestamp_format":"full"}"#).unwrap();
+        assert_eq!(
+            (s.theme, s.density, s.message_font, s.color_nicks),
+            (
+                ThemeChoice::Dark,
+                Density::Comfortable,
+                MessageFont::Proportional,
+                true
+            )
+        );
+        assert_eq!(s.font_size, 14.0);
+        assert_eq!(Settings::default().font_size, 15.0);
+        let display = Settings::default().display();
+        assert_eq!(display.font_size, 15.0);
+        assert!(display.color_nicks);
+    }
+
+    #[test]
+    fn display_choices_round_trip_through_settings_json() {
+        use crate::gui::theme::{Density, MessageFont, ThemeChoice};
+        let s = Settings {
+            theme: ThemeChoice::System,
+            density: Density::Compact,
+            message_font: MessageFont::Monospace,
+            color_nicks: false,
+            ..Settings::default()
+        };
+        let json = serde_json::to_string(&s).unwrap();
+        assert!(json.contains(r#""theme":"system""#), "{json}");
+        assert!(json.contains(r#""density":"compact""#), "{json}");
+        assert!(json.contains(r#""message_font":"monospace""#), "{json}");
+        let back: Settings = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.display(), s.display());
+    }
 
     #[test]
     fn default_system_timestamp_uses_configured_format() {

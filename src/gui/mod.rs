@@ -18,6 +18,7 @@ mod logging;
 mod message_ui;
 mod search;
 mod snap;
+pub(crate) mod theme;
 mod types;
 mod uploads;
 mod view;
@@ -514,27 +515,6 @@ const COMMAND_COMPLETIONS: &[&str] = &[
     "/whois",
     "/whowas",
 ];
-
-fn style_with_font_size(mut style: egui::Style, font_size: f32) -> egui::Style {
-    let font_size = font_size.clamp(10.0, 24.0);
-    for (text_style, size) in [
-        (egui::TextStyle::Small, font_size * 0.85),
-        (egui::TextStyle::Body, font_size),
-        (egui::TextStyle::Button, font_size),
-        (egui::TextStyle::Monospace, font_size),
-        (egui::TextStyle::Heading, font_size * 1.35),
-    ] {
-        if let Some(font_id) = style.text_styles.get_mut(&text_style) {
-            font_id.size = size;
-        }
-    }
-    style
-}
-
-pub(crate) fn apply_font_size(ctx: &egui::Context, font_size: f32) {
-    let style = style_with_font_size((*ctx.global_style()).clone(), font_size);
-    ctx.set_global_style(style);
-}
 
 pub struct Session {
     pub(crate) upload_settings: uploads::UploadSettings,
@@ -9474,15 +9454,6 @@ pub(crate) mod tests {
             );
         });
         assert!(!logs.contains("swordfish"), "{logs}");
-    }
-
-    #[test]
-    fn configured_font_size_updates_body_and_monospace_styles() {
-        let style = style_with_font_size(egui::Style::default(), 20.0);
-        assert_eq!(style.text_styles[&egui::TextStyle::Body].size, 20.0);
-        assert_eq!(style.text_styles[&egui::TextStyle::Monospace].size, 20.0);
-        assert_eq!(style.text_styles[&egui::TextStyle::Small].size, 17.0);
-        assert_eq!(style.text_styles[&egui::TextStyle::Heading].size, 27.0);
     }
 
     #[test]

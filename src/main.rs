@@ -392,10 +392,7 @@ fn main() -> eframe::Result<()> {
             let automatic_updates = app.automatic_updates();
             app.updater
                 .start(paths, cc.egui_ctx.clone(), automatic_updates);
-            let mut style = (*cc.egui_ctx.global_style()).clone();
-            style.spacing.item_spacing = egui::vec2(8.0, 4.0);
-            cc.egui_ctx.set_global_style(style);
-            gui::apply_font_size(&cc.egui_ctx, app.font_size());
+            app.apply_display(&cc.egui_ctx);
 
             Ok(Box::new(LinefeedApp {
                 app,
