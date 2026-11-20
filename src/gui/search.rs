@@ -191,7 +191,25 @@ impl App {
             return;
         }
         self.search.appending = self.search.query.after.is_some();
-        self.search.generation = self.archive.client.search(self.search.query.clone());
+        // Stored targets are casemapped keys, so the typed filter must be too.
+        let mut query = self.search.query.clone();
+        query.target = query
+            .target
+            .as_deref()
+            .map(str::trim)
+            .filter(|target| !target.is_empty())
+            .map(|target| {
+                let session = query.network.as_ref().and_then(|network| {
+                    self.sessions
+                        .iter()
+                        .find(|session| session.logical_network_key().as_ref() == Some(network))
+                });
+                match session {
+                    Some(session) => session.network_support.canonicalize(target),
+                    None => super::NetworkSupport::default().canonicalize(target),
+                }
+            });
+        self.search.generation = self.archive.client.search(query);
         self.search.pending = true;
         self.search.changed = None;
     }
@@ -808,6 +826,32 @@ mod tests {
         ids.sort();
         ids.dedup();
         assert_eq!(ids.len(), 100);
+        drop(app);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn typed_conversation_filter_is_trimmed_and_casemapped_like_the_stored_key() {
+        let (mut app, root) = app_with_archive();
+        let row = record();
+        app.archive.client.upsert(row.clone());
+        assert!(app.archive.client.flush_barrier(Duration::from_secs(5)));
+        app.search.open = true;
+        for typed in ["#TEST", " #test ", "#Test"] {
+            app.search.query.target = Some(typed.into());
+            app.submit_search();
+            finish_query(&mut app);
+            assert_eq!(app.search.results.len(), 1, "{typed:?} found nothing");
+        }
+        app.search.query.target = Some("#other".into());
+        app.submit_search();
+        finish_query(&mut app);
+        assert!(app.search.results.is_empty());
+        // A blank box means no conversation filter, not a literal blank target.
+        app.search.query.target = Some("   ".into());
+        app.submit_search();
+        finish_query(&mut app);
+        assert_eq!(app.search.results.len(), 1);
         drop(app);
         std::fs::remove_dir_all(root).unwrap();
     }
