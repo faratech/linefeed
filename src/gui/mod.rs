@@ -4077,10 +4077,15 @@ pub(crate) fn new_profile_id() -> String {
 }
 
 fn rand_suffix() -> u32 {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    (SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
+    suffix_from(std::time::SystemTime::now())
+}
+
+/// Four-digit nickname suffix from a clock reading. A clock set before 1970
+/// (a dead RTC battery) reads as the epoch instead of aborting startup.
+fn suffix_from(time: std::time::SystemTime) -> u32 {
+    (time
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
         .as_millis()
         % 10000) as u32
 }
@@ -11866,6 +11871,15 @@ pub(crate) mod tests {
             Ok(IrcCommand::Notice(target, reply))
                 if target == "peer" && reply.contains("SOURCE")
         ));
+    }
+
+    #[test]
+    fn default_nickname_suffix_survives_a_pre_1970_clock() {
+        use std::time::{Duration, UNIX_EPOCH};
+        assert_eq!(suffix_from(UNIX_EPOCH + Duration::from_millis(12345)), 2345);
+        assert_eq!(suffix_from(UNIX_EPOCH - Duration::from_secs(1)), 0);
+        assert_eq!(suffix_from(UNIX_EPOCH - Duration::from_secs(1_000_000_000)), 0);
+        assert!(rand_suffix() < 10000);
     }
 
     #[test]
