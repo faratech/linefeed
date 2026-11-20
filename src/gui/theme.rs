@@ -258,6 +258,9 @@ pub(crate) fn apply(ctx: &egui::Context, prefs: &DisplayPrefs) {
     visuals.faint_bg_color = palette.raise;
     visuals.code_bg_color = palette.raise;
     visuals.hyperlink_color = palette.accent;
+    // Hints and other weak text: egui's default is the text colour at half
+    // strength, which does not read on the light theme.
+    visuals.weak_text_color = Some(palette.faint);
     visuals.window_stroke = egui::Stroke::new(1.0, palette.line);
     visuals.selection.bg_fill = palette.active_row();
     visuals.selection.stroke = egui::Stroke::new(1.0, palette.text);

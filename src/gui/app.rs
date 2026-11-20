@@ -2487,19 +2487,30 @@ impl App {
             );
         }
         title.append("  ▾", 0.0, format(font, palette.muted));
-        ui.menu_button(title, |ui| {
-            ui.set_min_width(240.0);
-            let mut picked = false;
-            egui::ScrollArea::vertical()
-                .max_height(420.0)
-                .show(ui, |ui| picked = self.draw_conversation_rows(ui));
-            ui.separator();
-            self.connection_menu(ui);
-            if picked {
-                ui.close();
-            }
-        })
-        .response
+        // The menu closes only when something is picked or on a click
+        // outside it, so the join field can be opened and typed into.
+        let (response, menu) = egui::containers::menu::MenuButton::new(title)
+            .config(
+                egui::containers::menu::MenuConfig::new()
+                    .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside),
+            )
+            .ui(ui, |ui| {
+                ui.set_min_width(240.0);
+                let mut picked = false;
+                egui::ScrollArea::vertical()
+                    .max_height(420.0)
+                    .show(ui, |ui| picked = self.draw_conversation_rows(ui));
+                ui.separator();
+                self.connection_menu(ui);
+                if picked {
+                    ui.close();
+                }
+            });
+        if menu.is_none() {
+            // A join field left open goes away with the menu.
+            self.join_row = None;
+        }
+        response
     }
 
     /// One quiet line saying how the active connection stands; an
@@ -2725,6 +2736,10 @@ impl App {
                 });
             }
             if !network.connected {
+                // No field waits for a reconnect.
+                if self.join_row == Some(network.conn) {
+                    self.join_row = None;
+                }
                 continue;
             }
             if self.join_row == Some(network.conn) {
@@ -8707,6 +8722,131 @@ mod tests {
             (text.center().y - field.center().y).abs() < 2.0,
             "{text:?} in {field:?}"
         );
+    }
+
+    #[test]
+    fn a_long_conversation_name_is_cut_in_the_header() {
+        for width in [1360.0, 900.0, 640.0] {
+            let (mut app, _rx_a, _rx_b) = two_networks();
+            let long = format!("#{}", "w".repeat(60));
+            feed(&mut app, 0, &format!(":me!u@h JOIN {long}"));
+            feed(&mut app, 0, &format!(":srv 332 me {long} :A topic"));
+            app.sync_windows();
+            let key = target_key(&app, app.sessions[0].id, &long);
+            app.user_activate(key);
+            let ctx = egui::Context::default();
+            let painted = settled(&mut app, &ctx, width);
+            let (_, people, _) = painted.containing(" people");
+            let name = painted
+                .texts
+                .iter()
+                .find(|(text, rect, _)| {
+                    text.starts_with("#www") && (rect.center().y - people.center().y).abs() < 10.0
+                })
+                .unwrap_or_else(|| panic!("{width}: the header names the channel"))
+                .1;
+            assert!(
+                name.right() <= people.left(),
+                "{width}: the name stops before the buttons: {name:?} vs {people:?}"
+            );
+        }
+    }
+
+    fn enter() -> egui::Event {
+        egui::Event::Key {
+            key: egui::Key::Enter,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        }
+    }
+
+    #[test]
+    fn joining_from_the_narrow_switcher_sends_a_join() {
+        let (mut app, mut rx_a, _rx_b) = two_networks();
+        let rust = target_key(&app, app.sessions[0].id, "#rust");
+        app.user_activate(rust);
+        let ctx = egui::Context::default();
+        let painted = settled(&mut app, &ctx, 640.0);
+        drain(&mut rx_a);
+        let label = app.network_label(&app.sessions[0]);
+        let (_, switcher, _) = painted.containing(&format!("#rust on {label}"));
+        let painted = click(&mut app, &ctx, 640.0, switcher.center());
+        let (join, _) = painted.text("Join a channel");
+        let painted = click(&mut app, &ctx, 640.0, join.center());
+        assert!(
+            painted.has("#channel"),
+            "the join field opens inside the menu: {:?}",
+            painted.strings()
+        );
+        paint(&mut app, &ctx, 640.0, vec![egui::Event::Text("new".into())]);
+        paint(&mut app, &ctx, 640.0, vec![enter()]);
+        let sent = drain(&mut rx_a);
+        assert!(sent.iter().any(|line| line == "JOIN #new"), "{sent:?}");
+    }
+
+    #[test]
+    fn a_join_field_does_not_outlive_its_menu_or_its_connection() {
+        let (mut app, _rx_a, _rx_b) = two_networks();
+        let ctx = egui::Context::default();
+        // Narrow: open the join field in the switcher menu, then click away.
+        let painted = settled(&mut app, &ctx, 640.0);
+        let label = app.network_label(&app.sessions[app.active_index()]);
+        let (_, switcher, _) = painted.containing(&format!(" on {label}"));
+        let painted = click(&mut app, &ctx, 640.0, switcher.center());
+        let (join, _) = painted.text("Join a channel");
+        click(&mut app, &ctx, 640.0, join.center());
+        assert!(app.join_row.is_some());
+        click(&mut app, &ctx, 640.0, egui::pos2(500.0, 600.0));
+        settled(&mut app, &ctx, 640.0);
+        assert_eq!(
+            app.join_row, None,
+            "closing the menu puts the join row away"
+        );
+
+        // Wide: a field open for a network that then disconnects.
+        let painted = settled(&mut app, &ctx, 1360.0);
+        let (join, _) = painted.text("Join a channel");
+        click(&mut app, &ctx, 1360.0, join.center());
+        let conn = app.join_row.expect("the join field is open");
+        let index = app.session_index(conn).unwrap();
+        app.sessions[index].test_set_disconnected();
+        settled(&mut app, &ctx, 1360.0);
+        assert_eq!(app.join_row, None, "no field waits for a reconnect");
+    }
+
+    #[test]
+    fn placeholder_text_reads_on_its_field_in_both_themes() {
+        use super::super::theme::{self, DisplayPrefs, ThemeChoice};
+        for choice in [ThemeChoice::Dark, ThemeChoice::Light] {
+            let (mut app, _rust) = rust_with_topic("Rust talk");
+            let ctx = egui::Context::default();
+            theme::apply(
+                &ctx,
+                &DisplayPrefs {
+                    theme: choice,
+                    ..DisplayPrefs::default()
+                },
+            );
+            let painted = settled(&mut app, &ctx, 1360.0);
+            let palette = theme::palette(&ctx);
+            for (hint, ground) in [
+                ("Search history (Ctrl+F)", palette.bg),
+                ("Message #rust", palette.panel),
+            ] {
+                let (_, color) = painted.text(hint);
+                assert_eq!(
+                    color.a(),
+                    255,
+                    "{choice:?}: {hint} is drawn in a solid colour"
+                );
+                assert!(
+                    theme::contrast(color, ground) >= 4.5,
+                    "{choice:?}: {hint} {color:?} on {ground:?}"
+                );
+            }
+        }
     }
 
     /// The colour of the topmost opaque fill painted behind `rect`.

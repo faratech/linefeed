@@ -769,6 +769,25 @@ pub(crate) fn with_mentions(
     out
 }
 
+/// The text colour and background a segment is drawn with. A colour chosen
+/// for someone else's ground must still read on what it lands on here: our
+/// row ground, the segment's own background, or after reverse video the
+/// colour that became the background.
+fn segment_colors(span: &RenderSegment, style: &SegmentStyle) -> (Color32, Option<Color32>) {
+    let mut color = span.fg_color.unwrap_or(style.color);
+    let mut background = span.bg_color;
+    if span.reverse {
+        let foreground = color;
+        color = background.unwrap_or(style.ground);
+        background = Some(foreground);
+    }
+    let lands_on = background.unwrap_or(style.ground);
+    if span.fg_color.is_some() || background.is_some() {
+        color = super::theme::readable_on(color, lands_on, 3.0);
+    }
+    (color, background)
+}
+
 /// Render pre-parsed segments (see `layout_irc_text`) as one wrapping run,
 /// after an optional `prefix` such as an action's "* nick".
 pub(crate) fn render_segments(
@@ -783,21 +802,7 @@ pub(crate) fn render_segments(
             ui.label(prefix);
         }
         for span in segments {
-            let mut color = match span.fg_color {
-                // A colour chosen for someone else's background must still
-                // read on ours.
-                Some(color) if span.bg_color.is_none() && !span.reverse => {
-                    super::theme::readable_on(color, style.ground, 3.0)
-                }
-                Some(color) => color,
-                None => style.color,
-            };
-            let mut bg_color = span.bg_color;
-            if span.reverse {
-                let old_color = color;
-                color = bg_color.unwrap_or(style.ground);
-                bg_color = Some(old_color);
-            }
+            let (color, bg_color) = segment_colors(span, style);
 
             if span.is_url {
                 let url = link_target(&span.text);
@@ -837,6 +842,56 @@ pub(crate) fn render_segments(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn style_on(ground: Color32, text: Color32) -> SegmentStyle {
+        SegmentStyle {
+            color: text,
+            ground,
+            link: text,
+            bold: None,
+        }
+    }
+
+    #[test]
+    fn reversed_and_backgrounded_text_reads_on_the_background_it_gets() {
+        use crate::gui::theme::{Palette, contrast};
+        for palette in [Palette::dark(), Palette::light()] {
+            let style = style_on(palette.bg, palette.text);
+            for wire in [
+                "\x16\x0308reversed yellow",
+                "\x16\x0300reversed white",
+                "\x16reversed plain",
+                "\x0300,08white on yellow",
+                "\x0308,00yellow on white",
+                "\x0301,01black on black",
+            ] {
+                for segment in layout_irc_text(wire) {
+                    let (text, background) = segment_colors(&segment, &style);
+                    let ground = background.unwrap_or(style.ground);
+                    assert!(
+                        contrast(text, ground) >= 3.0,
+                        "{wire:?} on {:?}: {text:?} on {ground:?}",
+                        palette.bg
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn plain_and_readable_coloured_text_keeps_its_colour() {
+        use crate::gui::theme::Palette;
+        let palette = Palette::dark();
+        let style = style_on(palette.bg, palette.text);
+        let plain = &layout_irc_text("plain")[0];
+        assert_eq!(segment_colors(plain, &style), (palette.text, None));
+        let yellow = &layout_irc_text("\x0308yellow")[0];
+        assert_eq!(
+            segment_colors(yellow, &style),
+            (yellow.fg_color.unwrap(), None),
+            "yellow already reads on the dark ground"
+        );
+    }
 
     #[test]
     fn mentions_are_split_out_at_nick_boundaries_only() {

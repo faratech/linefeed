@@ -222,7 +222,10 @@ impl Session {
                 }
                 ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
                     let heading = egui::TextStyle::Heading.resolve(ui.style()).size;
-                    let response = ui.label(
+                    // A long name is cut rather than run over the buttons;
+                    // the topic gets whatever width is left.
+                    let response = super::widgets::truncated(
+                        ui,
                         super::widgets::strong(&name)
                             .size(heading)
                             .color(palette.text),
