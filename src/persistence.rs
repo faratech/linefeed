@@ -160,7 +160,19 @@ mod tests {
             let done = done.clone();
             std::thread::spawn(move || {
                 while !done.load(Ordering::Acquire) {
-                    let data = fs::read(&path).unwrap();
+                    let data = match fs::read(&path) {
+                        Ok(data) => data,
+                        // Windows briefly denies opening a file while a rename
+                        // replaces it; that is not a partial payload.
+                        Err(error)
+                            if cfg!(windows)
+                                && error.kind() == std::io::ErrorKind::PermissionDenied =>
+                        {
+                            std::thread::yield_now();
+                            continue;
+                        }
+                        Err(error) => panic!("read during replacement: {error}"),
+                    };
                     assert!(
                         payloads.contains(&data),
                         "a partial/mixed payload was published"

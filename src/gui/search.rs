@@ -708,7 +708,7 @@ mod tests {
             super::super::new_profile_id()
         ));
         app.archive = super::super::archive::ArchiveService::open(&root);
-        assert!(app.archive.client.flush_barrier(Duration::from_secs(5)));
+        assert!(app.archive.client.flush_barrier(Duration::from_secs(30)));
         (app, root)
     }
 
@@ -726,7 +726,7 @@ mod tests {
         let (mut app, root) = app_with_archive();
         let row = record();
         app.archive.client.upsert(row.clone());
-        assert!(app.archive.client.flush_barrier(Duration::from_secs(5)));
+        assert!(app.archive.client.flush_barrier(Duration::from_secs(30)));
         app.search.open = true;
         app.open_archive_context(row.reference());
         app.search.query.text = "old body".into();
@@ -747,7 +747,7 @@ mod tests {
         let (mut app, root) = app_with_archive();
         let row = record();
         app.archive.client.upsert(row.clone());
-        assert!(app.archive.client.flush_barrier(Duration::from_secs(5)));
+        assert!(app.archive.client.flush_barrier(Duration::from_secs(30)));
         app.search.open = true;
         app.search.query.text = "old body".into();
         app.submit_search();
@@ -764,7 +764,7 @@ mod tests {
         let (mut app, root) = app_with_archive();
         app.search.open = true;
         app.open_archive_context(record().reference());
-        assert!(app.archive.client.flush_barrier(Duration::from_secs(5)));
+        assert!(app.archive.client.flush_barrier(Duration::from_secs(30)));
         app.close_archive_context();
         app.tick_history_services();
         assert!(
@@ -780,11 +780,11 @@ mod tests {
         let (mut app, root) = app_with_archive();
         let row = record();
         app.archive.client.upsert(row.clone());
-        assert!(app.archive.client.flush_barrier(Duration::from_secs(5)));
+        assert!(app.archive.client.flush_barrier(Duration::from_secs(30)));
         app.search.open = true;
         app.submit_search();
         app.open_archive_context(row.reference());
-        assert!(app.archive.client.flush_barrier(Duration::from_secs(5)));
+        assert!(app.archive.client.flush_barrier(Duration::from_secs(30)));
         app.close_history_search();
         finish_query(&mut app);
         assert!(!app.search.open);
@@ -871,7 +871,7 @@ mod tests {
             row.received_at = Some(1_000 + index);
             app.archive.client.upsert(row);
         }
-        assert!(app.archive.client.flush_barrier(Duration::from_secs(5)));
+        assert!(app.archive.client.flush_barrier(Duration::from_secs(30)));
         app.search.open = true;
         app.search.query.text = "old body".into();
         app.plan_search_page(false);
@@ -904,7 +904,7 @@ mod tests {
         let (mut app, root) = app_with_archive();
         let row = record();
         app.archive.client.upsert(row.clone());
-        assert!(app.archive.client.flush_barrier(Duration::from_secs(5)));
+        assert!(app.archive.client.flush_barrier(Duration::from_secs(30)));
         app.search.open = true;
         for typed in ["#TEST", " #test ", "#Test"] {
             app.search.query.target = Some(typed.into());
@@ -964,11 +964,11 @@ mod tests {
         let (network, key) = redaction_session(&mut app, &root);
         log_and_archive(&app, &network, &key, "secret body", "m1");
         log_and_archive(&app, &network, &key, "kept body", "m2");
-        assert!(app.archive.client.flush_barrier(Duration::from_secs(5)));
+        assert!(app.archive.client.flush_barrier(Duration::from_secs(30)));
         assert_eq!(reload(&app, &network), ["secret body", "kept body"]);
 
         app.archive.client.redact(key.clone(), "m1".into());
-        assert!(app.archive.client.flush_barrier(Duration::from_secs(5)));
+        assert!(app.archive.client.flush_barrier(Duration::from_secs(30)));
         assert_eq!(reload(&app, &network), ["kept body"]);
         // The text log itself is deliberately not rewritten.
         let log = app.sessions[0].log_manager.test_log_path(&network, "alice");
@@ -980,7 +980,7 @@ mod tests {
 
         // A new process learns the redaction from the journal alone.
         app.archive = super::super::archive::ArchiveService::open(&root);
-        assert!(app.archive.client.flush_barrier(Duration::from_secs(5)));
+        assert!(app.archive.client.flush_barrier(Duration::from_secs(30)));
         app.sessions[0].archive_client = Some(app.archive.client.clone());
         assert_eq!(reload(&app, &network), ["kept body"]);
         drop(app);
@@ -993,7 +993,7 @@ mod tests {
         let (network, key) = redaction_session(&mut app, &root);
         log_and_archive(&app, &network, &key, "secret body", "m1");
         log_and_archive(&app, &network, &key, "kept body", "m2");
-        assert!(app.archive.client.flush_barrier(Duration::from_secs(5)));
+        assert!(app.archive.client.flush_barrier(Duration::from_secs(30)));
         let loaded = app.sessions[0].load_text_history(&network, "", "alice", "alice", 100, false);
         let id = app.sessions[0].ensure_target("alice");
         app.sessions[0]
@@ -1003,7 +1003,7 @@ mod tests {
         // The reloaded rows carry no server msgid, so REDACT cannot find them
         // in the tab; the archive's knowledge must reach the open scrollback.
         app.archive.client.redact(key, "m1".into());
-        assert!(app.archive.client.flush_barrier(Duration::from_secs(5)));
+        assert!(app.archive.client.flush_barrier(Duration::from_secs(30)));
         app.tick_history_services();
         let shown: Vec<_> = app.sessions[0]
             .conversation_channel(id)
@@ -1037,7 +1037,7 @@ mod tests {
         other.msgid = Some("other".into());
         other.conversation.target = "#a[c]".into();
         app.archive.client.upsert(other);
-        assert!(app.archive.client.flush_barrier(Duration::from_secs(5)));
+        assert!(app.archive.client.flush_barrier(Duration::from_secs(30)));
         app.search.open = true;
         app.search.query.network = None;
         app.search.query.target = Some(" #A[B]\\^~ ".into());

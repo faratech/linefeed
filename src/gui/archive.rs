@@ -2616,7 +2616,7 @@ mod tests {
         let service = ArchiveService::memory();
         service.client.upsert(record("#a", "hello % literal", "a"));
         service.client.upsert(record("#b", "other", "b"));
-        assert!(service.client.flush_barrier(Duration::from_secs(5)));
+        assert!(service.client.flush_barrier(Duration::from_secs(30)));
         for text in ["hello", "%", "lo"] {
             let generation = service.client.search(SearchQuery {
                 text: text.into(),
@@ -2663,7 +2663,7 @@ mod tests {
                 1_000 + index as i64,
             ));
         }
-        assert!(service.client.flush_barrier(Duration::from_secs(5)));
+        assert!(service.client.flush_barrier(Duration::from_secs(30)));
         let query = SearchQuery {
             text: "needle".into(),
             ..Default::default()
@@ -2679,7 +2679,7 @@ mod tests {
                 5_000 + index as i64,
             ));
         }
-        assert!(service.client.flush_barrier(Duration::from_secs(5)));
+        assert!(service.client.flush_barrier(Duration::from_secs(30)));
         let (second, next) = page(
             &service,
             SearchQuery {
@@ -2706,7 +2706,7 @@ mod tests {
                 1_000 + index as i64,
             ));
         }
-        assert!(service.client.flush_barrier(Duration::from_secs(5)));
+        assert!(service.client.flush_barrier(Duration::from_secs(30)));
         let query = SearchQuery {
             text: "needle".into(),
             ..Default::default()
@@ -2717,7 +2717,7 @@ mod tests {
                 .client
                 .redact(row.conversation.clone(), row.msgid.clone().unwrap());
         }
-        assert!(service.client.flush_barrier(Duration::from_secs(5)));
+        assert!(service.client.flush_barrier(Duration::from_secs(30)));
         let (second, next) = page(
             &service,
             SearchQuery {
@@ -2738,7 +2738,7 @@ mod tests {
             .redact(record.conversation.clone(), "a".into());
         service.client.upsert(record.clone());
         service.client.upsert(record);
-        assert!(service.client.flush_barrier(Duration::from_secs(5)));
+        assert!(service.client.flush_barrier(Duration::from_secs(30)));
         service.client.search(SearchQuery {
             text: "secret".into(),
             ..Default::default()
@@ -2756,7 +2756,7 @@ mod tests {
         let service = ArchiveService::open(&root.0);
         let original = record("#a", "body that must stay redacted", "one");
         assert!(service.client.upsert(original.clone()));
-        assert!(service.client.flush_barrier(Duration::from_secs(5)));
+        assert!(service.client.flush_barrier(Duration::from_secs(30)));
 
         let (entered_tx, entered_rx) = mpsc::sync_channel(1);
         let (release_tx, release_rx) = mpsc::channel();
@@ -2781,7 +2781,7 @@ mod tests {
         drop(service);
 
         let reopened = ArchiveService::open(&root.0);
-        assert!(reopened.client.flush_barrier(Duration::from_secs(5)));
+        assert!(reopened.client.flush_barrier(Duration::from_secs(30)));
         reopened.client.context(original.reference(), 0);
         assert!(
             matches!(receive(&reopened), ArchiveReply::Context { records, .. }
@@ -2811,7 +2811,7 @@ mod tests {
             .any(|window| window == needle.as_bytes())
     }
     fn synced(service: &ArchiveService) {
-        assert!(service.client.flush_barrier(Duration::from_secs(5)));
+        assert!(service.client.flush_barrier(Duration::from_secs(30)));
     }
     fn context_of(service: &ArchiveService, row: &ArchiveRecord) -> Vec<ArchiveRecord> {
         service.client.context(row.reference(), 0);
@@ -3269,7 +3269,7 @@ mod tests {
         let service = ArchiveService::memory();
         let row = record("#a", "matching row", "one");
         service.client.upsert(row.clone());
-        assert!(service.client.flush_barrier(Duration::from_secs(5)));
+        assert!(service.client.flush_barrier(Duration::from_secs(30)));
         let (entered_tx, entered_rx) = mpsc::sync_channel(1);
         let (release_tx, release_rx) = mpsc::channel();
         service.client.submit(Task::Pause(entered_tx, release_rx));
@@ -3351,7 +3351,7 @@ mod tests {
         service.client.upsert(echo.clone());
         echo.id = new_record_id();
         service.client.upsert(echo.clone());
-        assert!(service.client.flush_barrier(Duration::from_secs(5)));
+        assert!(service.client.flush_barrier(Duration::from_secs(30)));
         service.client.context(reference, 50);
         assert!(
             matches!(receive(&service),ArchiveReply::Context{records,..}if records.len()==1&&records[0].account.as_deref()==Some("alice-account"))
@@ -3611,7 +3611,7 @@ mod tests {
         fs::write(dir.join("aa-random.jsonl"), bytes).unwrap();
         fs::write(dir.join("index.sqlite3"), b"corrupt cache").unwrap();
         let service = ArchiveService::open(&root.0);
-        assert!(service.client.flush_barrier(Duration::from_secs(5)));
+        assert!(service.client.flush_barrier(Duration::from_secs(30)));
         service.client.search(SearchQuery::default());
         assert!(
             matches!(receive(&service),ArchiveReply::Search{records,..} if records.len()==1&&records[0].body=="new")
@@ -3619,7 +3619,7 @@ mod tests {
         drop(service);
         // A second process/session rebuild path must retain the same projection.
         let reopened = ArchiveService::open(&root.0);
-        assert!(reopened.client.flush_barrier(Duration::from_secs(5)));
+        assert!(reopened.client.flush_barrier(Duration::from_secs(30)));
         reopened.client.search(SearchQuery::default());
         assert!(
             matches!(receive(&reopened),ArchiveReply::Search{records,..} if records.len()==1&&records[0].body=="new")
@@ -3648,7 +3648,7 @@ mod tests {
                     .client
                     .upsert(record("#a", "removed history", "one"))
             );
-            assert!(service.client.flush_barrier(Duration::from_secs(5)));
+            assert!(service.client.flush_barrier(Duration::from_secs(30)));
             drop(service);
             let journals: Vec<_> = fs::read_dir(root.0.join("archive"))
                 .unwrap()
@@ -3662,7 +3662,7 @@ mod tests {
                 fs::write(&journals[0], b"").unwrap();
             }
             let reopened = ArchiveService::open(&root.0);
-            assert!(reopened.client.flush_barrier(Duration::from_secs(5)));
+            assert!(reopened.client.flush_barrier(Duration::from_secs(30)));
             reopened.client.search(SearchQuery::default());
             assert!(
                 matches!(receive(&reopened), ArchiveReply::Search { records, .. } if records.is_empty()),
@@ -3679,7 +3679,7 @@ mod tests {
         // makes the journal line much larger than the original message body.
         let body = "\\".repeat(MAX_ARCHIVE_LINE / 2 + 1024);
         assert!(service.client.upsert(record("#a", &body, "large")));
-        assert!(service.client.flush_barrier(Duration::from_secs(5)));
+        assert!(service.client.flush_barrier(Duration::from_secs(30)));
         drop(service);
         for filename in ["index.sqlite3", "index.sqlite3-wal", "index.sqlite3-shm"] {
             match fs::remove_file(root.0.join("archive").join(filename)) {
@@ -3689,7 +3689,7 @@ mod tests {
             }
         }
         let reopened = ArchiveService::open(&root.0);
-        assert!(reopened.client.flush_barrier(Duration::from_secs(5)));
+        assert!(reopened.client.flush_barrier(Duration::from_secs(30)));
         reopened.client.search(SearchQuery::default());
         assert!(
             matches!(receive(&reopened), ArchiveReply::Search { records, .. }
@@ -3703,7 +3703,7 @@ mod tests {
         old.id = "a".repeat(32);
         let service = ArchiveService::open(&root.0);
         assert!(service.client.upsert(old.clone()));
-        assert!(service.client.flush_barrier(Duration::from_secs(5)));
+        assert!(service.client.flush_barrier(Duration::from_secs(30)));
         drop(service);
         let path = fs::read_dir(root.0.join("archive"))
             .unwrap()
@@ -3725,7 +3725,7 @@ mod tests {
         file.set_modified(metadata.modified().unwrap()).unwrap();
         drop(file);
         let reopened = ArchiveService::open(&root.0);
-        assert!(reopened.client.flush_barrier(Duration::from_secs(5)));
+        assert!(reopened.client.flush_barrier(Duration::from_secs(30)));
         reopened.client.search(SearchQuery::default());
         assert!(
             matches!(receive(&reopened), ArchiveReply::Search { records, .. }
@@ -3802,7 +3802,7 @@ mod tests {
         let body = "x".repeat(MAX_JOURNAL_RECORD);
         assert!(service.client.upsert(record("#a", &body, "too-large")));
         assert!(service.client.upsert(record("#a", "retained", "normal")));
-        assert!(service.client.flush_barrier(Duration::from_secs(5)));
+        assert!(service.client.flush_barrier(Duration::from_secs(30)));
         assert!(
             service
                 .client

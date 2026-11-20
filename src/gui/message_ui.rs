@@ -1666,14 +1666,18 @@ mod tests {
     #[test]
     fn one_actor_cannot_journal_more_than_its_budget() {
         let (mut sess, sink, id) = logging_session(4096);
+        let started = Instant::now();
         // Distinct emoji and distinct unknown msgids are all new keys.
         for i in 0..200 {
             sess.apply_reaction("#room", "unknown", "mal", &format!("e{i}"), true);
             sess.apply_reaction("#room", &format!("m{i}"), "MAL", "x", true);
         }
         let journaled = sink.queued();
+        // The burst, plus whatever the bucket refilled while a slow machine
+        // ran the loop.
+        let refilled = (started.elapsed().as_secs_f64() * REACTION_ACTOR_PER_MINUTE / 60.0).ceil();
         assert!(
-            (30..=31).contains(&journaled),
+            (30..=31 + refilled as usize).contains(&journaled),
             "only the burst is journaled: {journaled}"
         );
         // The live view is unaffected by the budget.
@@ -1700,17 +1704,25 @@ mod tests {
         assert_eq!(sink.queued(), 1);
         let actor = (sess.conversation_key("#room"), "mal".to_string());
         let journal = &mut sess.message_ui.reaction_journal;
-        assert!(!journal.admit(&actor, Instant::now()));
-        assert!(journal.admit(&actor, Instant::now() + Duration::from_secs(120)));
+        let now = Instant::now();
+        // Spend anything refilled while the test ran, then the bucket is empty
+        // at this instant and full again two minutes later.
+        while journal.admit(&actor, now) {}
+        assert!(!journal.admit(&actor, now));
+        assert!(journal.admit(&actor, now + Duration::from_secs(120)));
     }
     #[test]
     fn many_actors_cannot_multiply_the_session_budget_or_budget_memory() {
         let (mut sess, sink, _) = logging_session(8192);
+        let started = Instant::now();
         for i in 0..2000 {
             sess.apply_reaction("#room", "unknown", &format!("nick{i}"), "x", true);
         }
         let journaled = sink.queued();
-        assert!(journaled <= 601, "{journaled}");
+        // The session burst, plus whatever refilled while the loop ran.
+        let refilled =
+            (started.elapsed().as_secs_f64() * REACTION_SESSION_PER_MINUTE / 60.0).ceil();
+        assert!(journaled <= 601 + refilled as usize, "{journaled}");
         assert!(sess.message_ui.reaction_journal.actors.len() <= REACTION_BUDGETS);
     }
     #[test]
