@@ -40,8 +40,8 @@ pub(crate) use conversations::ConversationId;
 use conversations::ConversationStore;
 use formatting::{nick_color, render_segments};
 use helpers::{
-    ctcp_action_text, epoch_time_formatted, format_timestamp, mask_matches, parse_ctcp,
-    truncate_chars,
+    ctcp_action_text, epoch_time_formatted, format_ctcp_time, format_timestamp,
+    local_utc_offset_secs, mask_matches, parse_ctcp, truncate_chars,
 };
 pub use types::{
     CaseMapping, Channel, ChannelListEntry, ChannelListSort, ChatMessage, KnownUser,
@@ -9203,30 +9203,7 @@ impl Session {
                     .unwrap_or_default()
                     .as_secs();
 
-                #[cfg(unix)]
-                let time_str = {
-                    let t = secs as libc::time_t;
-                    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
-                    unsafe { libc::localtime_r(&t, &mut tm) };
-                    format!(
-                        "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
-                        tm.tm_year + 1900,
-                        tm.tm_mon + 1,
-                        tm.tm_mday,
-                        tm.tm_hour,
-                        tm.tm_min,
-                        tm.tm_sec
-                    )
-                };
-
-                #[cfg(not(unix))]
-                let time_str = {
-                    let days = secs / 86400;
-                    let hours = (secs % 86400) / 3600;
-                    let mins = (secs % 3600) / 60;
-                    let s = secs % 60;
-                    format!("Day {} {:02}:{:02}:{:02} UTC", days, hours, mins, s)
-                };
+                let time_str = format_ctcp_time(secs, local_utc_offset_secs(secs));
 
                 Some(format!("\x01TIME {}\x01", time_str))
             }
@@ -11889,6 +11866,30 @@ pub(crate) mod tests {
             Ok(IrcCommand::Notice(target, reply))
                 if target == "peer" && reply.contains("SOURCE")
         ));
+    }
+
+    #[test]
+    fn ctcp_time_reply_is_a_calendar_date() {
+        let (mut app, mut rx) = test_app_connected();
+        assert!(app.handle_ctcp_request("peer", "\x01TIME\x01"));
+        let Ok(IrcCommand::Notice(target, reply)) = rx.try_recv() else {
+            panic!("TIME must be answered with a NOTICE");
+        };
+        assert_eq!(target, "peer");
+        let body = reply
+            .strip_prefix("\x01TIME ")
+            .and_then(|body| body.strip_suffix('\x01'))
+            .expect("framed reply");
+        let bytes = body.as_bytes();
+        assert_eq!(bytes.len(), 19, "{body}");
+        for (i, byte) in bytes.iter().enumerate() {
+            match i {
+                4 | 7 => assert_eq!(*byte, b'-', "{body}"),
+                10 => assert_eq!(*byte, b' ', "{body}"),
+                13 | 16 => assert_eq!(*byte, b':', "{body}"),
+                _ => assert!(byte.is_ascii_digit(), "{body}"),
+            }
+        }
     }
 
     #[test]

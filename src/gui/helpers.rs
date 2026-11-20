@@ -268,6 +268,21 @@ pub fn days_to_ymd(days: u64) -> (u32, u32, u32) {
     (y as u32, m, d)
 }
 
+/// The body of a CTCP TIME reply: `YYYY-MM-DD HH:MM:SS` at `secs` since the
+/// epoch shifted by `utc_offset` seconds (the local zone's offset). Pure so the
+/// calendar formatting is testable on every platform.
+pub fn format_ctcp_time(secs: u64, utc_offset: i64) -> String {
+    let local = secs.saturating_add_signed(utc_offset);
+    let (year, month, day) = days_to_ymd(local / 86400);
+    let rem = local % 86400;
+    format!(
+        "{year:04}-{month:02}-{day:02} {:02}:{:02}:{:02}",
+        rem / 3600,
+        (rem % 3600) / 60,
+        rem % 60
+    )
+}
+
 /// Truncate a string to N characters efficiently, adding "..." if truncated
 /// Uses char_indices to avoid collecting into a Vec
 pub fn truncate_chars(s: &str, max_chars: usize) -> String {
@@ -317,6 +332,24 @@ pub fn mask_matches(pattern: &str, text: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ctcp_time_is_a_calendar_date_not_a_day_count() {
+        assert_eq!(format_ctcp_time(0, 0), "1970-01-01 00:00:00");
+        assert_eq!(format_ctcp_time(1_700_000_000, 0), "2023-11-14 22:13:20");
+        // 2000-02-29 00:00:00 UTC, with zone offsets crossing midnight.
+        let leap_day = 951_782_400;
+        assert_eq!(format_ctcp_time(leap_day + 3661, 0), "2000-02-29 01:01:01");
+        assert_eq!(
+            format_ctcp_time(leap_day + 3661, -7200),
+            "2000-02-28 23:01:01"
+        );
+        assert_eq!(
+            format_ctcp_time(leap_day + 82_800, 7200),
+            "2000-03-01 01:00:00"
+        );
+        assert!(!format_ctcp_time(1_700_000_000, 0).contains("Day"));
+    }
 
     #[test]
     fn ctcp_payloads_parse_with_or_without_the_closing_delimiter() {
