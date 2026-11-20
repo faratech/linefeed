@@ -59,6 +59,25 @@ fn parse_attributes(input: &str) -> BTreeMap<String, Option<String>> {
         .collect()
 }
 
+/// Configuration for another upstream reached through the same bouncer account.
+/// It keeps only what identifies the bouncer account and endpoint; per-network
+/// automation (auto-perform, possibly a services password for a different
+/// network), auto-join, invisibility, upload credentials and the profile
+/// binding belong to the session they were written for.
+fn config_for_discovered_network(
+    active: &super::SessionConfig,
+    network_id: &str,
+) -> Option<super::SessionConfig> {
+    let mut config = active.clone();
+    config.server.bouncer.as_mut()?.network = network_id.to_owned();
+    config.auto_perform.clear();
+    config.auto_join_channels.clear();
+    config.set_invisible = false;
+    config.upload_settings = Default::default();
+    config.profile_id = None;
+    Some(config)
+}
+
 impl Session {
     pub(super) fn load_connection_form(&mut self, config: &super::SessionConfig) {
         let server = &config.server;
@@ -217,11 +236,11 @@ impl Session {
             ui.horizontal(|ui| {
                 ui.label(format!("{name} — {state}"));
                 if ui.button("Open network").clicked()
-                    && let Some(mut config) = self.active_session.clone()
-                    && let Some(binding) = &mut config.server.bouncer
+                    && let Some(config) = self
+                        .active_session
+                        .as_ref()
+                        .and_then(|active| config_for_discovered_network(active, &id))
                 {
-                    binding.network = id.clone();
-                    config.profile_id = None;
                     self.events
                         .push(SessionEvent::NewBouncerNetwork(Box::new(config)));
                 }
@@ -298,6 +317,38 @@ mod tests {
         });
         assert!(session.start_session_from_form());
         session
+    }
+
+    #[test]
+    fn opening_a_discovered_network_does_not_inherit_per_network_automation() {
+        let source = session(BouncerProvider::Soju, "1");
+        let mut active = source.active_session.clone().unwrap();
+        active.auto_perform = "/ns identify secret-for-network-one".into();
+        active.auto_join_channels = "#one".into();
+        active.set_invisible = true;
+        active.upload_settings.use_custom = true;
+        active.upload_settings.secret = "upload-secret".into();
+        active.profile_id = Some("profile-one".into());
+
+        let opened = config_for_discovered_network(&active, "2").unwrap();
+        let binding = opened.server.bouncer.as_ref().unwrap();
+        assert_eq!(binding.network, "2");
+        assert_eq!(binding.account, "alice");
+        assert!(opened.auto_perform.is_empty());
+        assert!(opened.auto_join_channels.is_empty());
+        assert!(!opened.set_invisible);
+        assert!(!opened.upload_settings.use_custom);
+        assert!(opened.upload_settings.secret.is_empty());
+        assert!(opened.profile_id.is_none());
+        // The bouncer account itself is shared by every upstream.
+        assert_eq!(opened.server.sasl_username.as_deref(), Some("alice"));
+        assert_eq!(
+            opened.server.sasl_password.as_deref(),
+            Some("example-password")
+        );
+        assert_ne!(opened.logical_network_key(), active.logical_network_key());
+        // The source session keeps its own settings.
+        assert_eq!(active.auto_perform, "/ns identify secret-for-network-one");
     }
 
     #[test]
