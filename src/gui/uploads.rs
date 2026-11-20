@@ -98,6 +98,9 @@ pub(crate) struct UploadDiscovery {
 #[derive(Clone)]
 enum UploadAuth {
     None,
+    /// Account credentials exist but the file host is not part of the IRC
+    /// network, so none are sent (behaves as `None`; only the error differs).
+    Withheld,
     Basic(String, String),
     Bearer(String),
     ServiceBearer(String),
@@ -242,8 +245,49 @@ fn service_token_current(token: &str) -> bool {
         .and_then(serde_json::Value::as_i64)
         .is_none_or(|expiry| expiry > super::archive::epoch_now())
 }
-fn io_http_error(error: ureq::Error) -> String {
+/// Whether a network-advertised FILEHOST may receive the IRC account's
+/// credentials: the IRC server's own host, a subdomain of it, or a subdomain
+/// of its parent domain (irc.example.org -> files.example.org). A public
+/// suffix is never a shared parent, and IP endpoints only match themselves.
+fn filehost_host_trusted(url: &url::Url, server_host: &str) -> bool {
+    use url::Host;
+    let server_host = server_host.trim();
+    let server_host = if server_host.contains(':') && !server_host.starts_with('[') {
+        format!("[{server_host}]")
+    } else {
+        server_host.to_string()
+    };
+    let (Some(host), Ok(server)) = (url.host(), Host::parse(&server_host)) else {
+        return false;
+    };
+    let (Host::Domain(host), Host::Domain(server)) = (&host, &server) else {
+        return match (host, server) {
+            (Host::Ipv4(a), Host::Ipv4(b)) => a == b,
+            (Host::Ipv6(a), Host::Ipv6(b)) => a == b,
+            _ => false,
+        };
+    };
+    let host = host.trim_end_matches('.');
+    let server = server.trim_end_matches('.');
+    if host == server || host.ends_with(&format!(".{server}")) {
+        return true;
+    }
+    let Some((_, parent)) = server.split_once('.') else {
+        return false;
+    };
+    let labels: Vec<_> = parent.split('.').collect();
+    // Two labels like "co.uk" are a public suffix, not an organisation.
+    let public_suffix = labels.len() == 2
+        && labels[1].len() == 2
+        && matches!(
+            labels[0],
+            "co" | "com" | "org" | "net" | "gov" | "edu" | "ac" | "or" | "ne" | "go" | "mil"
+        );
+    labels.len() >= 2 && !public_suffix && host.ends_with(&format!(".{parent}"))
+}
+fn io_http_error(error: ureq::Error, withheld: bool) -> String {
     match error {
+        ureq::Error::StatusCode(401 | 403) if withheld => "File host rejected the upload; your IRC credentials were withheld because the upload host is not part of the IRC network. Use a generated upload token or configure a custom file host.".into(),
         ureq::Error::StatusCode(401 | 403) => {
             "File host rejected authentication; check upload credentials".into()
         }
@@ -329,8 +373,17 @@ impl Session {
             }
             _ => UploadAuth::None,
         };
+        // The URL is server-supplied 005 data: only hosts of the IRC network
+        // itself may receive the account's password or client certificate.
+        let parsed = https_url(url)?;
+        let auth = if matches!(auth, UploadAuth::None) || filehost_host_trusted(&parsed, &server.host)
+        {
+            auth
+        } else {
+            UploadAuth::Withheld
+        };
         Ok(Provider {
-            url: https_url(url)?.to_string(),
+            url: parsed.to_string(),
             auth,
             max_bytes: config.max_bytes.clamp(1, 1024 * 1024 * 1024),
         })
@@ -1314,6 +1367,7 @@ fn perform_filehost_request(
     bytes: Arc<AtomicU64>,
 ) -> Result<String, String> {
     let UploadBody { reader, size, mime } = payload;
+    let withheld = matches!(provider.auth, UploadAuth::Withheld);
     let mut options = agent.options(&provider.url);
     if let Some(tls) = &client_tls {
         options = options.config().tls_config(tls.clone()).build();
@@ -1329,7 +1383,9 @@ fn perform_filehost_request(
         UploadAuth::Bearer(token) => options.header("Authorization", format!("Bearer {token}")),
         _ => options,
     };
-    let options = options.call().map_err(io_http_error)?;
+    let options = options
+        .call()
+        .map_err(|error| io_http_error(error, withheld))?;
     if let Some(accepted) = options
         .headers()
         .get("accept-post")
@@ -1382,7 +1438,7 @@ fn perform_filehost_request(
     };
     let response = request
         .send(ureq::SendBody::from_reader(&mut reader))
-        .map_err(io_http_error)?;
+        .map_err(|error| io_http_error(error, withheld))?;
     if cancelled.load(Ordering::SeqCst) {
         return Err("Cancelled".into());
     }
@@ -1698,7 +1754,7 @@ mod tests {
         assert!(session.start_session_from_form());
         session.network_support.isupport.insert(
             "SOJU.IM/FILEHOST".into(),
-            Some("https://files.example/upload".into()),
+            Some("https://files.irc.example/upload".into()),
         );
         session.connection_status.sasl_mechanism = Some(SaslMechanism::Plain);
         session.connection_status.authentication = AuthenticationStatus::LoggedIn {
@@ -1719,6 +1775,114 @@ mod tests {
             session.upload_provider().unwrap().auth,
             UploadAuth::Certificate(_, _)
         ));
+    }
+
+    #[test]
+    fn filehost_credentials_only_go_to_the_networks_own_hosts() {
+        let trusted = |url: &str, server: &str| {
+            let url = https_url(url).unwrap();
+            filehost_host_trusted(&url, server)
+        };
+        // The server itself, its subdomains, and siblings under its domain.
+        assert!(trusted("https://irc.example.org/up", "irc.example.org"));
+        assert!(trusted("https://IRC.Example.ORG./up", "irc.example.org"));
+        assert!(trusted("https://files.irc.example.org/up", "irc.example.org"));
+        assert!(trusted("https://files.example.org/up", "irc.example.org"));
+        assert!(trusted("https://upload.example.org/up", "IRC.example.org"));
+        // Lookalikes and unrelated hosts never are.
+        assert!(!trusted("https://example.org.attacker.net/up", "irc.example.org"));
+        assert!(!trusted("https://attackerexample.org/up", "irc.example.org"));
+        assert!(!trusted("https://files.attacker.net/up", "irc.example.org"));
+        assert!(!trusted("https://example.org/up", "irc.example.org"));
+        // A bare two-label server has no parent domain to share.
+        assert!(trusted("https://files.irc.example/up", "irc.example"));
+        assert!(!trusted("https://files.example/up", "irc.example"));
+        // A public suffix is not a shared domain.
+        assert!(!trusted("https://files.other.co.uk/up", "irc.co.uk"));
+        assert!(trusted("https://files.example.co.uk/up", "irc.example.co.uk"));
+        // IP endpoints only match themselves.
+        assert!(trusted("https://192.0.2.1/up", "192.0.2.1"));
+        assert!(!trusted("https://192.0.2.2/up", "192.0.2.1"));
+        assert!(trusted("https://[2001:db8::1]/up", "2001:db8::1"));
+    }
+
+    #[test]
+    fn network_filehost_off_the_network_gets_no_credentials() {
+        use crate::irc::client::{AuthenticationStatus, SaslMechanism};
+        for key in ["SOJU.IM/FILEHOST", "DRAFT/FILEHOST", "FILEHOST"] {
+            for mechanism in [
+                SaslMechanism::Plain,
+                SaslMechanism::ScramSha256,
+                SaslMechanism::External,
+            ] {
+                let mut session = Session::with_settings(super::super::Settings {
+                    server_host: "irc.example.org".into(),
+                    nickname: "me".into(),
+                    logging_enabled: false,
+                    sasl_username: "alice".into(),
+                    sasl_password: "dummy-password".into(),
+                    tls_client_cert_path: "test-cert.pem".into(),
+                    ..Default::default()
+                });
+                assert!(session.start_session_from_form());
+                session.connection_status.sasl_mechanism = Some(mechanism);
+                session.connection_status.authentication = AuthenticationStatus::LoggedIn {
+                    account: "alice".into(),
+                };
+                session
+                    .network_support
+                    .isupport
+                    .insert(key.into(), Some("https://attacker.example/up".into()));
+                let off = session.upload_provider().unwrap();
+                assert!(
+                    matches!(off.auth, UploadAuth::Withheld),
+                    "{key} {mechanism:?}"
+                );
+                session
+                    .network_support
+                    .isupport
+                    .insert(key.into(), Some("https://files.example.org/up".into()));
+                let on = session.upload_provider().unwrap();
+                assert!(
+                    matches!(on.auth, UploadAuth::Basic(..) | UploadAuth::Certificate(..)),
+                    "{key} {mechanism:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn withheld_credentials_send_no_authorization_and_explain_a_rejection() {
+        let (url, requests) = filehost_fixture(vec![
+            "HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".into(),
+        ]);
+        let agent = ureq::Agent::config_builder()
+            .proxy(None)
+            .timeout_global(Some(Duration::from_secs(5)))
+            .build()
+            .new_agent();
+        let error = perform_filehost_request(
+            agent,
+            Provider {
+                url,
+                auth: UploadAuth::Withheld,
+                max_bytes: 100,
+            },
+            "a.txt",
+            UploadBody {
+                reader: Box::new(Cursor::new(b"hello")),
+                size: 5,
+                mime: "text/plain".into(),
+            },
+            None,
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicU64::new(0)),
+        )
+        .unwrap_err();
+        assert!(error.contains("credentials were withheld"), "{error}");
+        assert!(error.contains("not part of the IRC network"), "{error}");
+        let (options, _) = requests.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(!options.to_lowercase().contains("authorization:"));
     }
 
     fn upload_app() -> (
