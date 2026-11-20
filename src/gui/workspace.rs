@@ -149,6 +149,9 @@ impl WorkspaceStore {
         let errors = store.errors.clone();
         std::thread::spawn(move || {
             let mut previous: Option<Vec<u8>> = None;
+            // A failure is retried at every checkpoint but reported once; a
+            // success re-arms the report.
+            let mut reported: Option<String> = None;
             while let Ok(WriteRequest::Save(snapshot, acknowledge)) = receiver.recv() {
                 let result = snapshot
                     .bytes()
@@ -164,8 +167,14 @@ impl WorkspaceStore {
                         Ok(())
                     })
                     .map_err(|error| error.to_string());
-                if let Err(error) = &result {
-                    *errors.lock().unwrap() = Some(format!("Workspace was not saved: {error}"));
+                match &result {
+                    Ok(()) => reported = None,
+                    Err(error) if reported.as_ref() != Some(error) => {
+                        *errors.lock().unwrap() =
+                            Some(format!("Workspace was not saved: {error}"));
+                        reported = Some(error.clone());
+                    }
+                    Err(_) => {}
                 }
                 if let Some(acknowledge) = acknowledge {
                     let _ = acknowledge.send(result);
@@ -268,6 +277,39 @@ mod tests {
         assert!(readonly.finish(WorkspaceSnapshot::new(Vec::new(), 0)));
         assert_eq!(std::fs::read(&path).unwrap(), future);
         std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn a_persistent_save_failure_is_reported_once_and_rearmed_by_a_success() {
+        let directory = path().with_extension("d");
+        let location = directory.join("workspace.json");
+        let mut store = WorkspaceStore::open(location.clone());
+        // A regular file where the directory should be fails every save.
+        let break_location = || std::fs::write(&directory, b"in the way").unwrap();
+        break_location();
+
+        assert!(!store.finish(WorkspaceSnapshot::new(Vec::new(), 0)));
+        let first = store.take_error().expect("the first failure is reported");
+        assert!(first.starts_with("Workspace was not saved"));
+        for active in 0..3 {
+            assert!(!store.finish(WorkspaceSnapshot::new(Vec::new(), active)));
+            assert!(
+                store.take_error().is_none(),
+                "an identical failure is not reported again"
+            );
+        }
+
+        std::fs::remove_file(&directory).unwrap();
+        std::fs::create_dir_all(&directory).unwrap();
+        assert!(store.finish(WorkspaceSnapshot::new(Vec::new(), 4)));
+        assert!(store.take_error().is_none());
+
+        // After a success the next failure is news again.
+        std::fs::remove_dir_all(&directory).unwrap();
+        break_location();
+        assert!(!store.finish(WorkspaceSnapshot::new(Vec::new(), 5)));
+        assert!(store.take_error().is_some());
+        std::fs::remove_file(&directory).unwrap();
     }
 
     #[test]
