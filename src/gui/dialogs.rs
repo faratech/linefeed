@@ -402,7 +402,7 @@ impl Session {
             ui.add(
                 TextEdit::singleline(&mut self.tls_client_cert_path)
                     .desired_width(260.0)
-                    .hint_text("combined PEM or certificate PEM"),
+                    .hint_text("PEM: certificate(s), or combined with a PKCS#8 key"),
             );
         });
         ui.horizontal_wrapped(|ui| {
@@ -410,7 +410,7 @@ impl Session {
             ui.add(
                 TextEdit::singleline(&mut self.tls_client_key_path)
                     .desired_width(260.0)
-                    .hint_text("optional; defaults to cert PEM"),
+                    .hint_text("optional PKCS#8 PEM; defaults to cert file"),
             );
         });
 

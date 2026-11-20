@@ -1653,14 +1653,23 @@ impl IrcClient {
         if let Some(cert_path) = self.config.tls_client_cert_path.as_deref() {
             let cert = std::fs::read(cert_path)
                 .map_err(|e| format!("Failed to read TLS client certificate {cert_path:?}: {e}"))?;
-            let key_path = self
+            // An unset key path, or one naming the certificate file, means the
+            // key is in the same (combined) PEM.
+            let key = match self
                 .config
                 .tls_client_key_path
                 .as_deref()
-                .unwrap_or(cert_path);
-            let key = std::fs::read(key_path)
-                .map_err(|e| format!("Failed to read TLS client key {key_path:?}: {e}"))?;
-            let identity = native_tls::Identity::from_pkcs8(&cert, &key)
+                .filter(|key_path| *key_path != cert_path)
+            {
+                Some(key_path) => Some(
+                    std::fs::read(key_path)
+                        .map_err(|e| format!("Failed to read TLS client key {key_path:?}: {e}"))?,
+                ),
+                None => None,
+            };
+            let (chain, key) = split_client_identity_pem(&cert, key.as_deref())
+                .map_err(|e| format!("Invalid TLS client certificate/key: {e}"))?;
+            let identity = native_tls::Identity::from_pkcs8(&chain, &key)
                 .map_err(|e| format!("Invalid TLS client certificate/key: {e}"))?;
             tls_builder.identity(identity);
         }
@@ -3066,6 +3075,123 @@ impl IrcClient {
 #[cfg(test)]
 #[path = "client_identity_tests.rs"]
 mod identity_tests;
+
+/// One `-----BEGIN label-----` ... `-----END label-----` block of a PEM file,
+/// re-emitted with LF line endings and without anything between the blocks.
+struct PemBlock {
+    label: String,
+    text: String,
+}
+
+/// Split PEM text into its blocks. Text outside blocks (such as the
+/// `Bag Attributes` that openssl prints) is ignored. Errors never include
+/// file contents, which may be private key material.
+fn parse_pem_blocks(text: &str) -> Result<Vec<PemBlock>, String> {
+    let mut blocks = Vec::new();
+    let mut open: Option<(String, String)> = None;
+    for line in text.lines() {
+        let line = line.trim();
+        if let Some((label, body)) = open.as_mut() {
+            if let Some(end) = line
+                .strip_prefix("-----END ")
+                .and_then(|rest| rest.strip_suffix("-----"))
+            {
+                if end != label {
+                    return Err(format!("mismatched PEM block (BEGIN {label}, END {end})"));
+                }
+                body.push_str(line);
+                body.push('\n');
+                let (label, text) = open.take().expect("block is open");
+                blocks.push(PemBlock { label, text });
+            } else if !line.is_empty() {
+                body.push_str(line);
+                body.push('\n');
+            }
+        } else if let Some(label) = line
+            .strip_prefix("-----BEGIN ")
+            .and_then(|rest| rest.strip_suffix("-----"))
+        {
+            open = Some((label.to_owned(), format!("{line}\n")));
+        }
+    }
+    if let Some((label, _)) = open {
+        return Err(format!("unterminated PEM block (BEGIN {label})"));
+    }
+    Ok(blocks)
+}
+
+fn pem_text<'a>(bytes: &'a [u8], what: &str) -> Result<&'a str, String> {
+    std::str::from_utf8(bytes).map_err(|_| {
+        format!(
+            "the {what} file is not PEM text (DER is not supported; convert it with \
+             `openssl x509 -inform der` or `openssl pkcs8 -topk8 -nocrypt -inform der`)"
+        )
+    })
+}
+
+/// Turn the client certificate file, and the key file when one is configured
+/// separately, into what `native_tls::Identity::from_pkcs8` accepts on every
+/// backend: only CERTIFICATE blocks (the chain, in file order, leaf first) and
+/// a lone PKCS#8 `PRIVATE KEY` block. A combined PEM may list its blocks in
+/// either order, and the key is taken from the certificate file when no
+/// separate key file is given.
+fn split_client_identity_pem(
+    cert_file: &[u8],
+    key_file: Option<&[u8]>,
+) -> Result<(Vec<u8>, Vec<u8>), String> {
+    let cert_blocks = parse_pem_blocks(pem_text(cert_file, "client certificate")?)?;
+    if cert_blocks.is_empty() {
+        return Err("the client certificate file contains no PEM blocks".into());
+    }
+    let key_blocks = match key_file {
+        Some(bytes) => {
+            let blocks = parse_pem_blocks(pem_text(bytes, "client key")?)?;
+            if blocks.is_empty() {
+                return Err("the client key file contains no PEM blocks".into());
+            }
+            blocks
+        }
+        None => Vec::new(),
+    };
+    let chain: String = cert_blocks
+        .iter()
+        .filter(|block| block.label == "CERTIFICATE")
+        .map(|block| block.text.as_str())
+        .collect();
+    if chain.is_empty() {
+        return Err("the client certificate file has no CERTIFICATE block".into());
+    }
+    let key_source = if key_file.is_some() {
+        &key_blocks
+    } else {
+        &cert_blocks
+    };
+    let mut keys = key_source
+        .iter()
+        .filter(|block| block.label == "PRIVATE KEY");
+    let Some(key) = keys.next() else {
+        let has = |wanted: &str| key_source.iter().any(|block| block.label == wanted);
+        return Err(if has("ENCRYPTED PRIVATE KEY") {
+            "the private key is encrypted; decrypt it to PKCS#8 with \
+             `openssl pkcs8 -topk8 -nocrypt`"
+                .into()
+        } else if has("RSA PRIVATE KEY") || has("EC PRIVATE KEY") || has("DSA PRIVATE KEY") {
+            "the private key is not PKCS#8 (BEGIN PRIVATE KEY); convert it with \
+             `openssl pkcs8 -topk8 -nocrypt`"
+                .into()
+        } else if key_file.is_some() {
+            "the client key file has no PKCS#8 PRIVATE KEY block".into()
+        } else {
+            "no PKCS#8 PRIVATE KEY block in the client certificate file; add one, \
+             or set the client key file"
+                .into()
+        });
+    };
+    if keys.next().is_some() {
+        return Err("more than one PRIVATE KEY block; keep only the matching key".into());
+    }
+    Ok((chain.into_bytes(), key.text.clone().into_bytes()))
+}
 
 #[cfg(test)]
 mod tests {
@@ -6522,6 +6648,183 @@ mod tests {
                 .expect("IPv6 connect timed out")
                 .unwrap();
             server.await.unwrap();
+        });
+    }
+
+    // Throwaway self-signed EC P-256 identities generated for these tests only.
+    const TEST_LEAF_CERT: &str = "-----BEGIN CERTIFICATE-----\nMIIBcDCCARagAwIBAgIUYOzMdFE58lSIsnbJP3LTI+Au5fIwCgYIKoZIzj0EAwIw\nHTEbMBkGA1UEAwwSbGluZWZlZWQtdGVzdC1sZWFmMCAXDTI2MTEyMDEyMzgxOVoY\nDzIxMjYxMDI3MTIzODE5WjAdMRswGQYDVQQDDBJsaW5lZmVlZC10ZXN0LWxlYWYw\nWTATBgcqhkjOPQIBBggqhkjOPQMBBwNCAAQUq6YYwaG2bJDa5m3Hu6KIOMr2Wlmf\n+IFEpZniPeQj2XSSlYHMxEADniGaI6CXb5P23TrcxXh3w/niY63cZ02KozIwMDAd\nBgNVHQ4EFgQU4c1B9Qo85yfB5JeWN8guos7QmpgwDwYDVR0TAQH/BAUwAwEB/zAK\nBggqhkjOPQQDAgNIADBFAiEA7hBhM9bWXq76G/soNmfQ/Eg9wvDATTrZ07vv3XEB\n7dcCIBaGTv7gkfixW9a01gODaSYE4FUz7KO2y79EevkZ4QvQ\n-----END CERTIFICATE-----\n";
+    const TEST_INTERMEDIATE_CERT: &str = "-----BEGIN CERTIFICATE-----\nMIIBcTCCARigAwIBAgIUG54N7tRlJilJitJOy0P+cXTQyB0wCgYIKoZIzj0EAwIw\nHjEcMBoGA1UEAwwTbGluZWZlZWQtdGVzdC1pbnRlcjAgFw0yNjExMjAxMjM4MTla\nGA8yMTI2MTAyNzEyMzgxOVowHjEcMBoGA1UEAwwTbGluZWZlZWQtdGVzdC1pbnRl\ncjBZMBMGByqGSM49AgEGCCqGSM49AwEHA0IABJRDDJIP5cDzggVP4HwablSlcr4N\nduJ8n7fIySMGEp9tM0pSjfUaNUr4siUYBpw5TeITmv1PfiAuPGmM1DeWDIWjMjAw\nMB0GA1UdDgQWBBQ8YCwSCyAloqJksTUFXx3OuIAVdjAPBgNVHRMBAf8EBTADAQH/\nMAoGCCqGSM49BAMCA0cAMEQCIC6DH/le2v6kpU7i9hgvhKxywEyNdpL+zeBczaJj\n1m2/AiAsS7ArAlk2DJHbhnPaqSBaQV++NBGeYyPGLmdsdS2j2w==\n-----END CERTIFICATE-----\n";
+    const TEST_KEY_PKCS8: &str = "-----BEGIN PRIVATE KEY-----\nMIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgg5I5HKnKmGdrVLOw\n2AQ3P9jLnk3tgT0/1Axg/sh39gmhRANCAAQUq6YYwaG2bJDa5m3Hu6KIOMr2Wlmf\n+IFEpZniPeQj2XSSlYHMxEADniGaI6CXb5P23TrcxXh3w/niY63cZ02K\n-----END PRIVATE KEY-----\n";
+
+    fn blocks_of(pem: &[u8]) -> Vec<String> {
+        parse_pem_blocks(std::str::from_utf8(pem).unwrap())
+            .unwrap()
+            .into_iter()
+            .map(|block| block.label)
+            .collect()
+    }
+
+    fn assert_usable_identity(chain: &[u8], key: &[u8]) {
+        assert_eq!(blocks_of(chain), vec!["CERTIFICATE"; blocks_of(chain).len()]);
+        assert!(chain.starts_with(b"-----BEGIN CERTIFICATE-----"));
+        assert!(key.starts_with(b"-----BEGIN PRIVATE KEY-----"));
+        assert_eq!(blocks_of(key), vec!["PRIVATE KEY"]);
+    }
+
+    #[test]
+    fn combined_pem_works_with_the_certificate_or_the_key_first() {
+        let cert_first = format!("{TEST_LEAF_CERT}{TEST_KEY_PKCS8}");
+        let key_first = format!("{TEST_KEY_PKCS8}{TEST_LEAF_CERT}");
+        for combined in [&cert_first, &key_first] {
+            let (chain, key) = split_client_identity_pem(combined.as_bytes(), None).unwrap();
+            assert_usable_identity(&chain, &key);
+            assert_eq!(chain, TEST_LEAF_CERT.as_bytes());
+            assert_eq!(key, TEST_KEY_PKCS8.as_bytes());
+            native_tls::Identity::from_pkcs8(&chain, &key).unwrap();
+        }
+    }
+
+    #[test]
+    fn combined_pem_tolerates_crlf_comments_and_surrounding_text() {
+        let combined = format!(
+            "Bag Attributes\n    friendlyName: x\n{TEST_KEY_PKCS8}\n# note\n{TEST_LEAF_CERT}"
+        )
+        .replace('\n', "\r\n");
+        let (chain, key) = split_client_identity_pem(combined.as_bytes(), None).unwrap();
+        assert_eq!(chain, TEST_LEAF_CERT.as_bytes());
+        assert_eq!(key, TEST_KEY_PKCS8.as_bytes());
+    }
+
+    #[test]
+    fn certificate_chain_keeps_file_order_and_drops_the_key() {
+        let combined = format!("{TEST_LEAF_CERT}{TEST_KEY_PKCS8}{TEST_INTERMEDIATE_CERT}");
+        let (chain, key) = split_client_identity_pem(combined.as_bytes(), None).unwrap();
+        assert_eq!(
+            chain,
+            format!("{TEST_LEAF_CERT}{TEST_INTERMEDIATE_CERT}").as_bytes()
+        );
+        assert_eq!(key, TEST_KEY_PKCS8.as_bytes());
+    }
+
+    #[test]
+    fn separate_key_file_may_hold_extra_blocks_and_overrides_the_cert_file() {
+        let cert_file = format!("{TEST_LEAF_CERT}{TEST_INTERMEDIATE_CERT}");
+        let key_file = format!("{TEST_LEAF_CERT}{TEST_KEY_PKCS8}");
+        let (chain, key) =
+            split_client_identity_pem(cert_file.as_bytes(), Some(key_file.as_bytes())).unwrap();
+        assert_eq!(chain, cert_file.as_bytes());
+        assert_eq!(key, TEST_KEY_PKCS8.as_bytes());
+        // A certificate file that also carries a key does not leak it into the
+        // chain when a separate key file is configured.
+        let cert_with_key = format!("{TEST_KEY_PKCS8}{TEST_LEAF_CERT}");
+        let (chain, _) = split_client_identity_pem(
+            cert_with_key.as_bytes(),
+            Some(TEST_KEY_PKCS8.as_bytes()),
+        )
+        .unwrap();
+        assert_eq!(chain, TEST_LEAF_CERT.as_bytes());
+    }
+
+    #[test]
+    fn unsupported_or_missing_identity_material_gets_a_clear_error() {
+        let fake = |label: &str| {
+            format!("-----BEGIN {label}-----\nc2VjcmV0LWtleS1ib2R5\n-----END {label}-----\n")
+        };
+        for (label, expect) in [
+            ("RSA PRIVATE KEY", "PKCS#8"),
+            ("EC PRIVATE KEY", "PKCS#8"),
+            ("ENCRYPTED PRIVATE KEY", "encrypted"),
+        ] {
+            let combined = format!("{TEST_LEAF_CERT}{}", fake(label));
+            let error = split_client_identity_pem(combined.as_bytes(), None).unwrap_err();
+            assert!(error.contains(expect), "{label}: {error}");
+            assert!(!error.contains("c2VjcmV0"), "{error}");
+            let error =
+                split_client_identity_pem(TEST_LEAF_CERT.as_bytes(), Some(fake(label).as_bytes()))
+                    .unwrap_err();
+            assert!(error.contains(expect), "{label}: {error}");
+        }
+        let error = split_client_identity_pem(TEST_LEAF_CERT.as_bytes(), None).unwrap_err();
+        assert!(error.contains("no PKCS#8 PRIVATE KEY"), "{error}");
+        let error = split_client_identity_pem(TEST_KEY_PKCS8.as_bytes(), None).unwrap_err();
+        assert!(error.contains("no CERTIFICATE"), "{error}");
+        let error = split_client_identity_pem(b"just text", None).unwrap_err();
+        assert!(error.contains("no PEM blocks"), "{error}");
+        let truncated = TEST_LEAF_CERT.replace("-----END CERTIFICATE-----", "");
+        let error = split_client_identity_pem(truncated.as_bytes(), None).unwrap_err();
+        assert!(error.contains("unterminated"), "{error}");
+        let two_keys = format!("{TEST_LEAF_CERT}{TEST_KEY_PKCS8}{TEST_KEY_PKCS8}");
+        let error = split_client_identity_pem(two_keys.as_bytes(), None).unwrap_err();
+        assert!(error.contains("more than one"), "{error}");
+        let error = split_client_identity_pem(TEST_LEAF_CERT.as_bytes(), Some(b"")).unwrap_err();
+        assert!(error.contains("no PEM blocks"), "{error}");
+    }
+
+    #[test]
+    fn der_files_are_rejected_without_reaching_the_tls_backend() {
+        // DER starts 0x30 0x82; the Windows PEM parser unwraps UTF-8 and would
+        // panic the connection thread on bytes like these.
+        let der = [0x30u8, 0x82, 0xff, 0x01];
+        let error = split_client_identity_pem(&der, None).unwrap_err();
+        assert!(error.contains("not PEM text"), "{error}");
+        let error =
+            split_client_identity_pem(TEST_LEAF_CERT.as_bytes(), Some(&der)).unwrap_err();
+        assert!(error.contains("not PEM text"), "{error}");
+    }
+
+    #[test]
+    fn combined_pem_client_identity_completes_a_tls_handshake() {
+        // End to end through handle_tls_connection: the path the connection
+        // dialog advertises ("combined PEM", key path left empty).
+        test_runtime().block_on(async {
+            let directory = std::env::temp_dir().join(format!(
+                "linefeed-pem-{}-{:x}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            std::fs::create_dir(&directory).unwrap();
+            let combined = directory.join("combined.pem");
+            std::fs::write(&combined, format!("{TEST_LEAF_CERT}{TEST_KEY_PKCS8}")).unwrap();
+
+            let server_identity = native_tls::Identity::from_pkcs8(
+                TEST_LEAF_CERT.as_bytes(),
+                TEST_KEY_PKCS8.as_bytes(),
+            )
+            .unwrap();
+            let acceptor = tokio_native_tls::TlsAcceptor::from(
+                native_tls::TlsAcceptor::new(server_identity).unwrap(),
+            );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                let tls = acceptor.accept(stream).await.unwrap();
+                let mut reader = tokio::io::BufReader::new(tls);
+                read_wire_line(&mut reader).await
+            });
+
+            let config = ServerConfig {
+                host: "127.0.0.1".to_string(),
+                port: addr.port(),
+                use_tls: true,
+                accept_invalid_certs: true,
+                tls_client_cert_path: Some(combined.to_string_lossy().into_owned()),
+                nick: "tester".to_string(),
+                ..Default::default()
+            };
+            let (msg_tx, _msg_rx) = mpsc::channel(100);
+            let (_cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+            let mut client = IrcClient::new(config);
+            let connect = tokio::spawn(async move { client.connect(msg_tx, cmd_rx).await });
+            let first_line = tokio::select! {
+                line = server => line.unwrap(),
+                result = connect => panic!("client gave up before the handshake: {:?}", result.unwrap().err()),
+            };
+            assert!(!first_line.is_empty());
+            let _ = std::fs::remove_dir_all(&directory);
         });
     }
 }
