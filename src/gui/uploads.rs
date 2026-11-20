@@ -1162,7 +1162,7 @@ impl App {
                     "Adds a link to your draft. You send it when ready.",
                 ).small());
                 if let Some(notice) = &self.uploads.notice {
-                    ui.colored_label(egui::Color32::YELLOW, notice);
+                    ui.colored_label(super::theme::palette(ui.ctx()).mention, notice);
                 }
                 ui.separator();
                 if self.uploads.jobs.is_empty() {
@@ -1187,7 +1187,7 @@ impl App {
                                             ctx.copy_text(url.clone());
                                         }
                                     }
-                                    State::Failed(error) => { ui.colored_label(egui::Color32::RED, error); }
+                                    State::Failed(error) => { ui.colored_label(super::theme::palette(ui.ctx()).danger, error); }
                                     State::Cancelled => { ui.label("Cancelled"); }
                                 }
                                 if matches!(job.state, State::Queued | State::Token | State::Uploading)

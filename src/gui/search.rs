@@ -468,10 +468,10 @@ impl App {
                         ctx.request_repaint_after(Duration::from_millis(100));
                     }
                     if let Some(error) = &status.error {
-                        ui.colored_label(egui::Color32::YELLOW, error);
+                        ui.colored_label(super::theme::palette(ui.ctx()).mention, error);
                     }
                     if let Some(error) = &self.search.error {
-                        ui.colored_label(egui::Color32::RED, error);
+                        ui.colored_label(super::theme::palette(ui.ctx()).danger, error);
                     }
                     if self.search.pending {
                         ui.spinner();
@@ -565,7 +565,7 @@ impl App {
                         reference.conversation.target
                     ));
                     if let Some(error) = &self.search.context_error {
-                        ui.colored_label(egui::Color32::RED, error);
+                        ui.colored_label(super::theme::palette(ui.ctx()).danger, error);
                     }
                     if self.search.context_pending {
                         ui.spinner();
@@ -624,7 +624,7 @@ impl App {
                                     egui::Label::new(if selected {
                                         egui::RichText::new(text)
                                             .strong()
-                                            .color(egui::Color32::LIGHT_BLUE)
+                                            .color(super::theme::palette(ui.ctx()).accent)
                                     } else {
                                         egui::RichText::new(text)
                                     })

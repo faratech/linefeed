@@ -49,7 +49,16 @@ fn settings_help(ui: &mut egui::Ui, text: &str) -> egui::Response {
     ui.allocate_ui_with_layout(
         Vec2::new(ui.available_width().min(visible_width), 0.0),
         egui::Layout::top_down(egui::Align::Min),
-        |ui| ui.add(egui::Label::new(RichText::new(text).small().color(Color32::GRAY)).wrap()),
+        |ui| {
+            ui.add(
+                egui::Label::new(
+                    RichText::new(text)
+                        .small()
+                        .color(super::theme::palette(ui.ctx()).muted),
+                )
+                .wrap(),
+            )
+        },
     )
     .inner
 }
@@ -313,7 +322,7 @@ impl Session {
             self.note_unprofiled_endpoint_edit();
         }
         if let Some(error) = self.connection_error() {
-            ui.label(RichText::new(error).color(Color32::RED));
+            ui.label(RichText::new(error).color(super::theme::palette(ui.ctx()).danger));
         }
 
         if self.use_tls {
@@ -418,7 +427,7 @@ impl Session {
             ui.label(
                 RichText::new("Auto prefers SCRAM-SHA-256 when advertised, then PLAIN.")
                     .small()
-                    .color(Color32::GRAY),
+                    .color(super::theme::palette(ui.ctx()).muted),
             );
         }
 
@@ -792,7 +801,7 @@ impl Session {
         ui.label(
             RichText::new("Logs: ~/.config/linefeed/logs/")
                 .small()
-                .color(Color32::GRAY),
+                .color(super::theme::palette(ui.ctx()).muted),
         );
 
         ui.add_space(8.0);
@@ -844,14 +853,16 @@ impl Session {
             ui.label(
                 RichText::new("No users ignored")
                     .italics()
-                    .color(Color32::GRAY),
+                    .color(super::theme::palette(ui.ctx()).muted),
             );
             ui.label("Use /ignore <nick|mask> to add.");
         } else {
             let ignore_display = self.ignore_list.join(", ");
             ui.horizontal_wrapped(|ui| {
                 ui.label("Ignored:");
-                ui.label(RichText::new(&ignore_display).color(Color32::GRAY));
+                ui.label(
+                    RichText::new(&ignore_display).color(super::theme::palette(ui.ctx()).muted),
+                );
             });
             ui.label("Use /unignore <nick> to remove.");
         }
@@ -938,7 +949,7 @@ impl Session {
                     if self.channel_list.is_empty() && !self.channel_list_loading {
                         ui.label(
                             RichText::new("(No channels found - server may be restricting /list)")
-                                .color(Color32::GOLD)
+                                .color(super::theme::palette(ui.ctx()).mention)
                                 .small(),
                         );
                     }
@@ -976,7 +987,9 @@ impl Session {
                         .add_sized(
                             [channel_width, 16.0],
                             egui::Button::new(
-                                RichText::new(chan_text).strong().color(Color32::WHITE),
+                                RichText::new(chan_text)
+                                    .strong()
+                                    .color(super::theme::palette(ui.ctx()).text),
                             ),
                         )
                         .clicked()
@@ -998,7 +1011,9 @@ impl Session {
                         .add_sized(
                             [users_width, 16.0],
                             egui::Button::new(
-                                RichText::new(users_text).strong().color(Color32::WHITE),
+                                RichText::new(users_text)
+                                    .strong()
+                                    .color(super::theme::palette(ui.ctx()).text),
                             ),
                         )
                         .clicked()
@@ -1020,7 +1035,9 @@ impl Session {
                         .add_sized(
                             [topic_width, 16.0],
                             egui::Button::new(
-                                RichText::new(topic_text).strong().color(Color32::WHITE),
+                                RichText::new(topic_text)
+                                    .strong()
+                                    .color(super::theme::palette(ui.ctx()).text),
                             ),
                         )
                         .clicked()
@@ -1060,16 +1077,16 @@ impl Session {
 
                             // Alternate row background
                             let bg_color = if is_selected {
-                                Color32::from_rgb(60, 80, 120)
+                                super::theme::palette(ui.ctx()).active_row()
                             } else if row_idx % 2 == 0 {
                                 Color32::TRANSPARENT
                             } else {
-                                Color32::from_rgba_unmultiplied(255, 255, 255, 8)
+                                super::theme::palette(ui.ctx()).raise.gamma_multiply(0.5)
                             };
                             let text_color = if is_selected {
-                                Color32::WHITE
+                                super::theme::palette(ui.ctx()).text
                             } else {
-                                Color32::from_rgb(180, 210, 255)
+                                super::theme::palette(ui.ctx()).accent
                             };
 
                             ui.horizontal(|ui| {
@@ -1108,7 +1125,7 @@ impl Session {
                                             egui::Label::new(
                                                 RichText::new(&channel_topic)
                                                     .small()
-                                                    .color(Color32::GRAY),
+                                                    .color(super::theme::palette(ui.ctx()).muted),
                                             )
                                             .wrap_mode(egui::TextWrapMode::Wrap),
                                         );
@@ -1129,7 +1146,7 @@ impl Session {
                                     [users_width, row_height],
                                     egui::Label::new(
                                         RichText::new(format!("{}", entry.user_count))
-                                            .color(Color32::LIGHT_GREEN),
+                                            .color(super::theme::palette(ui.ctx()).online),
                                     ),
                                 );
 
@@ -1137,7 +1154,8 @@ impl Session {
                                 ui.add_sized(
                                     [topic_width, row_height],
                                     egui::Label::new(
-                                        RichText::new(&entry.topic_clean).color(Color32::GRAY),
+                                        RichText::new(&entry.topic_clean)
+                                            .color(super::theme::palette(ui.ctx()).muted),
                                     )
                                     .truncate(),
                                 );
@@ -1212,7 +1230,10 @@ impl Session {
                     ui.horizontal(|ui| {
                         ui.label(RichText::new(&channel_name).strong().size(16.0));
                         if !ch.modes.is_empty() {
-                            ui.label(RichText::new(format!("({})", ch.modes)).color(Color32::GRAY));
+                            ui.label(
+                                RichText::new(format!("({})", ch.modes))
+                                    .color(super::theme::palette(ui.ctx()).muted),
+                            );
                         }
                     });
                     ui.separator();
@@ -1262,11 +1283,15 @@ impl Session {
                             ui.label(
                                 RichText::new(format!("Set by {} on {}", setter, time_str))
                                     .small()
-                                    .color(Color32::GRAY),
+                                    .color(super::theme::palette(ui.ctx()).muted),
                             );
                         }
                     } else {
-                        ui.label(RichText::new("No topic set").italics().color(Color32::GRAY));
+                        ui.label(
+                            RichText::new("No topic set")
+                                .italics()
+                                .color(super::theme::palette(ui.ctx()).muted),
+                        );
                     }
 
                     ui.separator();
@@ -1280,7 +1305,9 @@ impl Session {
                             if ch.bans.is_empty() {
                                 if ch.ban_list_complete {
                                     ui.label(
-                                        RichText::new("No bans").italics().color(Color32::GRAY),
+                                        RichText::new("No bans")
+                                            .italics()
+                                            .color(super::theme::palette(ui.ctx()).muted),
                                     );
                                 } else {
                                     if ui.button("Load Ban List").clicked() {
@@ -1301,7 +1328,7 @@ impl Session {
                                                         format_timestamp(ban.set_time)
                                                     ))
                                                     .small()
-                                                    .color(Color32::GRAY),
+                                                    .color(super::theme::palette(ui.ctx()).muted),
                                                 );
                                             }
                                         });
@@ -1329,7 +1356,7 @@ impl Session {
                                         ui.label(
                                             RichText::new("No entries")
                                                 .italics()
-                                                .color(Color32::GRAY),
+                                                .color(super::theme::palette(ui.ctx()).muted),
                                         );
                                     } else if ui.button(format!("Load +{mode} List")).clicked() {
                                         load_mode_lists.push(mode);
@@ -1349,11 +1376,9 @@ impl Session {
                                                             format_timestamp(entry.set_time)
                                                         )
                                                     };
-                                                    ui.label(
-                                                        RichText::new(detail)
-                                                            .small()
-                                                            .color(Color32::GRAY),
-                                                    );
+                                                    ui.label(RichText::new(detail).small().color(
+                                                        super::theme::palette(ui.ctx()).muted,
+                                                    ));
                                                 }
                                             });
                                         }
@@ -1503,7 +1528,7 @@ impl Session {
                         for (idx, (code, name, color)) in colors.iter().enumerate() {
                             // Use contrasting border for visibility
                             let border = if *code == 0 || *code == 15 {
-                                Color32::DARK_GRAY
+                                super::theme::palette(ui.ctx()).line
                             } else {
                                 Color32::TRANSPARENT
                             };
@@ -1552,7 +1577,7 @@ impl Session {
                 ui.label(
                     RichText::new("Shortcuts: Ctrl+B Bold, Ctrl+U Underline, Ctrl+I Italic")
                         .small()
-                        .color(Color32::GRAY),
+                        .color(super::theme::palette(ui.ctx()).muted),
                 );
             });
 
@@ -1611,7 +1636,7 @@ impl App {
                 });
                 ui.separator();
                 if let Some(error) = self.sessions[active].connection_error() {
-                    ui.colored_label(Color32::RED, error);
+                    ui.colored_label(super::theme::palette(ui.ctx()).danger, error);
                 }
                 let roomy = ctx.content_rect().height() > 450.0;
                 let footer_height = if roomy {
@@ -1670,12 +1695,12 @@ impl App {
                             "Save stores connection defaults without reconnecting. Favorites have their own save buttons.",
                         )
                         .small()
-                        .color(Color32::GRAY),
+                        .color(super::theme::palette(ui.ctx()).muted),
                     );
                 }
                 if roomy {
                     ui.label(RichText::new("Global preferences apply immediately. Cancel discards connection edits.")
-                        .small().color(Color32::GRAY));
+                        .small().color(super::theme::palette(ui.ctx()).muted));
                 }
                 ui.horizontal_wrapped(|ui| {
                     if self.settings_tab == 0 {
@@ -1798,7 +1823,7 @@ impl App {
             ui.label(
                 RichText::new("Built with Rust + egui")
                     .small()
-                    .color(Color32::GRAY),
+                    .color(super::theme::palette(ui.ctx()).muted),
             );
             ui.add_space(20.0);
             ui.label(
@@ -1871,7 +1896,7 @@ impl App {
                     ui.label("Preparing to restart…");
                 }
                 Status::Error(message) => {
-                    ui.colored_label(Color32::LIGHT_RED, message);
+                    ui.colored_label(super::theme::palette(ui.ctx()).danger, message);
                 }
             }
             if let Some(offer) = &self.updater.offer {

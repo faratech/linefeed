@@ -923,7 +923,7 @@ impl AutomationUi {
                 }
             });
             if let Some(error) = &self.error {
-                ui.colored_label(egui::Color32::RED, error);
+                ui.colored_label(super::theme::palette(ui.ctx()).danger, error);
             }
         });
         applied

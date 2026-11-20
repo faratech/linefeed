@@ -8611,6 +8611,71 @@ mod tests {
         assert!(theme::palette(&ctx).dark);
     }
 
+    /// On-screen texts whose colour reads on none of the palette's grounds.
+    /// Text on an accent fill, and the half-transparent hint and disabled
+    /// texts, are not judged.
+    fn unreadable_texts(app: &mut App, ctx: &egui::Context) -> Vec<(String, Color32)> {
+        use super::super::theme;
+        let painted = settled(app, ctx, 1360.0);
+        let palette = theme::palette(ctx);
+        let grounds = [
+            palette.bg,
+            palette.panel,
+            palette.raise,
+            palette.mention_row,
+            palette.active_row(),
+        ];
+        painted
+            .texts
+            .iter()
+            .filter(|(text, rect, color)| {
+                // A status dot is a mark, not text to read.
+                !text.trim().is_empty()
+                    && !text.starts_with('●')
+                    && rect.bottom() <= 768.0
+                    && color.a() == 255
+                    && *color != palette.on_accent
+                    && !grounds
+                        .iter()
+                        .any(|ground| theme::contrast(*color, *ground) >= 4.5)
+            })
+            .map(|(text, _, color)| (text.clone(), *color))
+            .collect()
+    }
+
+    #[test]
+    fn every_text_reads_on_its_ground_in_both_themes() {
+        use super::super::theme::{self, DisplayPrefs, ThemeChoice};
+        for choice in [ThemeChoice::Dark, ThemeChoice::Light] {
+            let (mut app, ctx) = display_settings();
+            app.settings.theme = choice;
+            theme::apply(
+                &ctx,
+                &DisplayPrefs {
+                    theme: choice,
+                    ..DisplayPrefs::default()
+                },
+            );
+            feed(&mut app, 0, ":bob!u@h PRIVMSG #rust :me: a mention");
+            feed(&mut app, 0, ":carol!u@h JOIN #rust");
+            for tab in 0..4 {
+                app.settings_tab = tab;
+                let unreadable = unreadable_texts(&mut app, &ctx);
+                assert!(
+                    unreadable.is_empty(),
+                    "{choice:?}, Settings tab {tab}: {unreadable:?}"
+                );
+            }
+            // The main window on its own.
+            app.cancel_settings_window();
+            let unreadable = unreadable_texts(&mut app, &ctx);
+            assert!(
+                unreadable.is_empty(),
+                "{choice:?}, main window: {unreadable:?}"
+            );
+        }
+    }
+
     /// The colour of the topmost opaque fill painted behind `rect`.
     fn ground_behind(painted: &Painted, rect: egui::Rect) -> Color32 {
         painted
