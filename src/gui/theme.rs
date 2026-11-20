@@ -153,7 +153,6 @@ impl Palette {
     }
 
     /// A stable colour for a nickname.
-    #[cfg_attr(not(test), allow(dead_code))] // until message rows use it
     pub(crate) fn nick(&self, nick: &str) -> Color32 {
         let hash: u32 = nick
             .bytes()
@@ -221,7 +220,6 @@ pub(crate) fn control_height(ui: &egui::Ui) -> f32 {
 }
 
 /// The sizes in force; comfortable until [`apply`] has run.
-#[cfg_attr(not(test), allow(dead_code))] // until message rows read it
 pub(crate) fn metrics(ctx: &egui::Context) -> Metrics {
     applied(ctx).metrics
 }
@@ -328,7 +326,6 @@ pub(crate) fn contrast(a: Color32, b: Color32) -> f32 {
 
 /// `color` unless it is too close to `ground` to read: then the nearest
 /// step towards black or white that reaches `min` contrast.
-#[cfg_attr(not(test), allow(dead_code))] // until the drawing code reads it
 pub(crate) fn readable_on(color: Color32, ground: Color32, min: f32) -> Color32 {
     if contrast(color, ground) >= min {
         return color;

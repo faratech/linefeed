@@ -7488,9 +7488,11 @@ mod tests {
                         .map(|section| section.format.color)
                         .filter(|color| *color != Color32::PLACEHOLDER)
                         .unwrap_or(text.fallback_color);
+                    // A right-aligned galley extends to the left of its
+                    // position.
                     out.texts.push((
                         text.galley.text().to_string(),
-                        egui::Rect::from_min_size(text.pos, text.galley.size()),
+                        text.galley.rect.translate(text.pos.to_vec2()),
                         color,
                     ));
                 }
@@ -8089,6 +8091,277 @@ mod tests {
         );
     }
 
+    /// #rust as the active, already drawn window, then these messages.
+    fn rust_with_messages(lines: &[(&str, &str)]) -> (App, egui::Context) {
+        let (mut app, _rx_a, _rx_b) = two_networks();
+        let rust = target_key(&app, app.sessions[0].id, "#rust");
+        app.user_activate(rust);
+        let ctx = egui::Context::default();
+        settled(&mut app, &ctx, 1360.0);
+        for (nick, text) in lines {
+            feed(&mut app, 0, &format!(":{nick}!u@h PRIVMSG #rust :{text}"));
+        }
+        (app, ctx)
+    }
+
+    fn is_time(text: &str) -> bool {
+        let bytes = text.as_bytes();
+        bytes.len() == 5
+            && bytes[2] == b':'
+            && [0, 1, 3, 4].iter().all(|i| bytes[*i].is_ascii_digit())
+    }
+
+    /// What was painted in the message area: right of the sidebar, left of
+    /// the people list, below the header.
+    fn chat_texts(painted: &Painted) -> Vec<(String, egui::Rect, Color32)> {
+        painted
+            .texts
+            .iter()
+            // On screen: rows being measured are laid out far below it.
+            .filter(|(_, rect, _)| {
+                rect.left() > 248.0
+                    && rect.right() < 1100.0
+                    && rect.top() > 60.0
+                    && rect.bottom() <= 768.0
+            })
+            .cloned()
+            .collect()
+    }
+
+    fn chat_text(painted: &Painted, text: &str) -> (egui::Rect, Color32) {
+        chat_texts(painted)
+            .into_iter()
+            .find(|(painted, _, _)| painted == text)
+            .map(|(_, rect, color)| (rect, color))
+            .unwrap_or_else(|| panic!("{text:?} is not in the chat: {:?}", painted.strings()))
+    }
+
+    #[test]
+    fn a_run_of_messages_from_one_person_shows_the_nick_once() {
+        let (mut app, ctx) =
+            rust_with_messages(&[("bob", "one"), ("bob", "two"), ("carol", "three")]);
+        let painted = settled(&mut app, &ctx, 1360.0);
+        let count = |nick: &str| {
+            chat_texts(&painted)
+                .iter()
+                .filter(|(text, _, _)| text == nick)
+                .count()
+        };
+        assert_eq!(count("bob"), 1, "{:?}", painted.strings());
+        assert_eq!(count("carol"), 1);
+        assert_eq!(
+            chat_text(&painted, "one").0.left(),
+            chat_text(&painted, "two").0.left()
+        );
+    }
+
+    #[test]
+    fn a_system_row_breaks_a_run() {
+        let (mut app, ctx) = rust_with_messages(&[("bob", "one")]);
+        feed(&mut app, 0, ":dave!u@h JOIN #rust");
+        feed(&mut app, 0, ":bob!u@h PRIVMSG #rust :two");
+        let painted = settled(&mut app, &ctx, 1360.0);
+        let bobs = chat_texts(&painted)
+            .iter()
+            .filter(|(text, _, _)| text == "bob")
+            .count();
+        assert_eq!(bobs, 2, "{:?}", painted.strings());
+    }
+
+    #[test]
+    fn time_nick_and_text_sit_in_their_columns() {
+        let (mut app, ctx) = rust_with_messages(&[("bob", "one"), ("carol", "three")]);
+        let painted = settled(&mut app, &ctx, 1360.0);
+        let (bob, _) = chat_text(&painted, "bob");
+        let (carol, _) = chat_text(&painted, "carol");
+        assert!(
+            (bob.right() - carol.right()).abs() < 1.0,
+            "nicks end together: {bob:?} {carol:?}"
+        );
+        let (one, _) = chat_text(&painted, "one");
+        let (three, _) = chat_text(&painted, "three");
+        assert_eq!(one.left(), three.left());
+        assert!(
+            (one.left() - bob.right() - 12.0).abs() < 1.5,
+            "{one:?} after {bob:?}"
+        );
+        assert!(
+            (one.center().y - bob.center().y).abs() < 4.0,
+            "nick and text share a line"
+        );
+        let times: Vec<egui::Rect> = chat_texts(&painted)
+            .into_iter()
+            .filter(|(text, _, _)| is_time(text))
+            .map(|(_, rect, _)| rect)
+            .collect();
+        assert!(times.len() >= 2, "{:?}", painted.strings());
+        assert!(times.iter().all(|time| time.left() == times[0].left()));
+        assert!(
+            times
+                .iter()
+                .all(|time| time.right() < carol.left().min(bob.left()))
+        );
+        let palette = super::super::theme::palette(&ctx);
+        assert_eq!(chat_text(&painted, "one").1, palette.text);
+        let time_color = chat_texts(&painted)
+            .into_iter()
+            .find(|(text, _, _)| is_time(text))
+            .unwrap()
+            .2;
+        assert_eq!(time_color, palette.faint);
+    }
+
+    #[test]
+    fn hiding_timestamps_removes_the_time_column() {
+        let (mut app, ctx) = rust_with_messages(&[("bob", "one")]);
+        let with_time = chat_text(&settled(&mut app, &ctx, 1360.0), "one").0;
+        app.sessions[0].timestamp_format = "off".into();
+        let painted = settled(&mut app, &ctx, 1360.0);
+        assert!(
+            !chat_texts(&painted)
+                .iter()
+                .any(|(text, _, _)| is_time(text))
+        );
+        let without = chat_text(&painted, "one").0;
+        assert!(
+            without.left() < with_time.left() - 40.0,
+            "{without:?} vs {with_time:?}"
+        );
+    }
+
+    #[test]
+    fn a_highlighted_row_is_filled_and_only_the_nick_is_coloured() {
+        let (mut app, ctx) = rust_with_messages(&[("bob", "me: hello there")]);
+        let painted = settled(&mut app, &ctx, 1360.0);
+        let palette = super::super::theme::palette(&ctx);
+        let (mention, color) = chat_text(&painted, "me");
+        assert_eq!(color, palette.mention);
+        let (rest, color) = chat_text(&painted, ": hello there");
+        assert_eq!(color, palette.text);
+        assert!(
+            painted
+                .fills
+                .iter()
+                .any(|(rect, fill)| *fill == palette.mention_row
+                    && rect.contains_rect(mention)
+                    && rect.contains_rect(rest)
+                    && rect.width() > 600.0),
+            "the row is not filled across the chat"
+        );
+    }
+
+    #[test]
+    fn irc_coloured_text_is_kept_readable_on_the_light_theme() {
+        use super::super::theme::{self, DisplayPrefs, ThemeChoice};
+        let (mut app, ctx) = rust_with_messages(&[]);
+        theme::apply(
+            &ctx,
+            &DisplayPrefs {
+                theme: ThemeChoice::Light,
+                ..DisplayPrefs::default()
+            },
+        );
+        feed(&mut app, 0, ":bob!u@h PRIVMSG #rust :\x0300white words");
+        let painted = settled(&mut app, &ctx, 1360.0);
+        let (_, color) = chat_text(&painted, "white words");
+        let bg = theme::palette(&ctx).bg;
+        assert!(theme::contrast(color, bg) >= 3.0, "{color:?} on {bg:?}");
+    }
+
+    #[test]
+    fn a_long_nick_is_cut_inside_its_column() {
+        let long = "n".repeat(60);
+        let (mut app, ctx) = rust_with_messages(&[("bob", "short"), (long.as_str(), "long")]);
+        let painted = settled(&mut app, &ctx, 1360.0);
+        let (bob, _) = chat_text(&painted, "bob");
+        let nick = chat_texts(&painted)
+            .into_iter()
+            .find(|(text, _, _)| text.starts_with("nnnn"))
+            .expect("the long nick")
+            .1;
+        assert!(
+            nick.width() <= 108.0 && (nick.right() - bob.right()).abs() < 1.0,
+            "{nick:?}"
+        );
+        assert_eq!(
+            chat_text(&painted, "long").0.left(),
+            chat_text(&painted, "short").0.left()
+        );
+    }
+
+    #[test]
+    fn rows_stack_when_the_chat_area_is_narrow() {
+        let (mut app, _rust) = rust_with_topic("Rust talk");
+        let ctx = egui::Context::default();
+        let painted = settled(&mut app, &ctx, 640.0);
+        let (people, _) = painted.text("2 people");
+        let painted = click(&mut app, &ctx, 640.0, people.center());
+        let nick = painted
+            .texts
+            .iter()
+            .find(|(text, rect, _)| text == "bob" && rect.left() < 300.0 && rect.top() > 60.0)
+            .expect("bob's message row")
+            .1;
+        let (text, _) = painted.text("hello marker");
+        assert!(
+            nick.bottom() <= text.top() + 2.0,
+            "nick above text: {nick:?} {text:?}"
+        );
+        assert!((nick.left() - text.left()).abs() < 2.0);
+    }
+
+    /// The colour of the topmost opaque fill painted behind `rect`.
+    fn ground_behind(painted: &Painted, rect: egui::Rect) -> Color32 {
+        painted
+            .fills
+            .iter()
+            .rev()
+            .find(|(fill_rect, fill)| fill.a() == 255 && fill_rect.contains_rect(rect))
+            .map(|(_, fill)| *fill)
+            .expect("something is painted behind the text")
+    }
+
+    #[test]
+    fn messages_and_the_composer_sit_on_the_chat_ground_and_people_on_the_panel() {
+        let (mut app, _rust) = rust_with_topic("Rust talk");
+        let ctx = egui::Context::default();
+        let painted = settled(&mut app, &ctx, 1360.0);
+        let palette = super::super::theme::palette(&ctx);
+        let (message, _) = painted.text("hello marker");
+        assert_eq!(ground_behind(&painted, message), palette.bg);
+        let person = painted
+            .texts
+            .iter()
+            .find(|(text, rect, _)| text == "bob" && rect.left() > 700.0)
+            .expect("bob in the people list")
+            .1;
+        assert_eq!(ground_behind(&painted, person), palette.panel);
+    }
+
+    #[test]
+    fn the_unread_marker_has_room_of_its_own() {
+        let (mut app, _rx_a, _rx_b) = two_networks();
+        let rust = target_key(&app, app.sessions[0].id, "#rust");
+        let status = WindowKey::new(app.sessions[0].id, None);
+        app.user_activate(rust);
+        let ctx = egui::Context::default();
+        feed(&mut app, 0, ":bob!u@h PRIVMSG #rust :one");
+        settled(&mut app, &ctx, 1360.0);
+        app.user_activate(status);
+        settled(&mut app, &ctx, 1360.0);
+        feed(&mut app, 0, ":bob!u@h PRIVMSG #rust :two");
+        app.user_activate(rust);
+        let painted = paint(&mut app, &ctx, 1360.0, Vec::new());
+        let (marker, color) = chat_text(&painted, "New messages");
+        assert_eq!(color, super::super::theme::palette(&ctx).accent);
+        let (one, _) = chat_text(&painted, "one");
+        let (two, _) = chat_text(&painted, "two");
+        assert!(
+            one.bottom() <= marker.top() && marker.bottom() <= two.top(),
+            "{one:?} {marker:?} {two:?}"
+        );
+    }
+
     fn focus_frame(app: &mut App, ctx: &egui::Context, focused: bool) -> egui::FullOutput {
         let mut output = ctx.run_ui(
             egui::RawInput {
@@ -8112,7 +8385,7 @@ mod tests {
         for _ in 0..3 {
             output = focus_frame(app, ctx, focused);
         }
-        texts(&output).iter().any(|text| text == "Unread messages")
+        texts(&output).iter().any(|text| text == "New messages")
     }
 
     #[test]

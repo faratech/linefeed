@@ -9,6 +9,15 @@ use egui::{Color32, RichText, ScrollArea, TextEdit};
 use super::{Session, UserMode, commands};
 use crate::irc::IrcCommand;
 
+/// The people button's label: "1 person", "12 people".
+fn people_label(count: usize) -> String {
+    if count == 1 {
+        "1 person".to_owned()
+    } else {
+        format!("{count} people")
+    }
+}
+
 impl Session {
     /// Connection status for the toolbar: state dot, nick, network, lag and
     /// away message.
@@ -112,6 +121,7 @@ impl Session {
         controls: &mut dyn FnMut(&mut egui::Ui),
     ) {
         let salt = (self.id, self.current_conversation);
+        let palette = super::theme::palette(ui.ctx());
         self.capture_upload_drop(ui);
         self.draw_target_header(ui, network_label, narrow, controls);
         if self.timeline.borrow().restore_pending {
@@ -132,19 +142,26 @@ impl Session {
             && self.people_visible(narrow)
         {
             egui::Panel::right(("users", salt))
+                .frame(egui::Frame::side_top_panel(ui.style()).fill(palette.panel))
                 .resizable(true)
                 .default_size(140.0)
                 .min_size(80.0)
                 .max_size((ui.available_width() * 0.35).max(80.0))
                 .show(ui, |ui| self.draw_user_list(ui, &channel_name));
         }
+        // Messages and the composer sit on the chat ground; the people
+        // list is a panel beside them.
         egui::Panel::bottom(("input", salt))
+            .frame(egui::Frame::side_top_panel(ui.style()).fill(palette.bg))
             .show_separator_line(true)
             .show(ui, |ui| self.draw_input_row(ui));
-        egui::CentralPanel::default().show(ui, |ui| {
-            let available_height = ui.available_height();
-            self.draw_scrollback(ui, available_height);
-        });
+        let chat_ground = egui::Frame::central_panel(ui.style()).fill(palette.bg);
+        egui::CentralPanel::default()
+            .frame(chat_ground)
+            .show(ui, |ui| {
+                let available_height = ui.available_height();
+                self.draw_scrollback(ui, available_height);
+            });
     }
 
     /// Whether this window shows its people list: the user's own choice,
@@ -192,7 +209,7 @@ impl Session {
             } else {
                 "Show or hide the people list".to_owned()
             };
-            (format!("{} people", channel.users.len()), hover)
+            (people_label(channel.users.len()), hover)
         });
         let mut toggle_people = false;
         ui.horizontal(|ui| {
@@ -561,6 +578,13 @@ impl Session {
 #[cfg(test)]
 mod composer_tests {
     use super::*;
+
+    #[test]
+    fn the_people_button_counts_one_person_and_several_people() {
+        assert_eq!(people_label(1), "1 person");
+        assert_eq!(people_label(0), "0 people");
+        assert_eq!(people_label(12), "12 people");
+    }
     use crate::gui::{Channel, Settings};
     use tokio::sync::mpsc;
     fn frame(
