@@ -3,15 +3,24 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::{Duration, Instant};
 
-use super::{ConversationId, HistoryPlacement, Session};
+use super::{ChatMessage, ConversationId, HistoryPlacement, Session};
 use crate::irc::numerics::*;
 use crate::irc::{IrcCommand, IrcMessage};
+
+const LOGIN_JOIN_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Default)]
 pub(super) struct AccountHistory {
     required: bool,
     awaiting: bool,
     attempt_started: Option<Instant>,
+    /// When the latest login attempt stops holding automatic JOINs. Unlike
+    /// `attempt_started` it survives an inconclusive verification probe, so a
+    /// network that never emits any account signal cannot hold joins forever.
+    login_deadline: Option<Instant>,
+    /// Set once a login definitively failed or timed out. Releases only the
+    /// deferred JOINs; history keeps waiting for a confirmed login.
+    joins_released: bool,
     queued_logins: usize,
     services: HashSet<String>,
     deferred: HashMap<ConversationId, HistoryPlacement>,
@@ -147,6 +156,8 @@ impl Session {
         self.account_history.required = true;
         self.account_history.awaiting = true;
         self.account_history.attempt_started = Some(Instant::now());
+        self.account_history.login_deadline = Some(Instant::now() + LOGIN_JOIN_TIMEOUT);
+        self.account_history.joins_released = false;
         // Replies to an earlier login's WHOIS remain in the FIFO, but can no
         // longer confirm a later login or consume its verification exchange.
         self.account_history.probe = None;
@@ -233,6 +244,7 @@ impl Session {
         self.account_history.required = false;
         self.account_history.awaiting = false;
         self.account_history.attempt_started = None;
+        self.account_history.login_deadline = None;
         self.account_history.probe = None;
     }
 
@@ -265,10 +277,30 @@ impl Session {
             .retain(|join| join.owner != Some(id));
     }
 
+    /// Whether automatic JOINs must still wait: for a login that is pending
+    /// (and neither definitively failed nor timed out) or still queued.
+    fn automatic_joins_blocked(&self) -> bool {
+        (self.account_history.required && !self.account_history.joins_released)
+            || self.account_history.queued_logins > 0
+    }
+
+    /// A login that can no longer succeed (or whose outcome never arrived)
+    /// must not strand the automatic JOINs. History is deliberately left
+    /// waiting for a positive confirmation.
+    fn release_automatic_joins(&mut self, reason: &str) {
+        if !self.account_history.required || self.account_history.joins_released {
+            return;
+        }
+        self.account_history.joins_released = true;
+        self.add_server_message(ChatMessage::system(&format!(
+            "Services login could not be confirmed ({reason}); joining channels anyway"
+        )));
+    }
+
     /// Configured and recovery JOINs must not race an asynchronous services
     /// login. Manual JOINs still use the regular transport path immediately.
     pub(super) fn send_automatic_join(&mut self, target: String, key: Option<String>) {
-        if self.account_history.required || self.account_history.queued_logins > 0 {
+        if self.automatic_joins_blocked() {
             let owner = self.id_for_target(&target);
             self.cancel_automatic_join(&target);
             self.account_history
@@ -358,8 +390,22 @@ impl Session {
     pub(super) fn flush_authenticated_history(&mut self) {
         if self
             .account_history
+            .login_deadline
+            .is_some_and(|deadline| Instant::now() >= deadline)
+            || self
+                .account_history
+                .attempt_started
+                .is_some_and(|started| started.elapsed() >= LOGIN_JOIN_TIMEOUT)
+        {
+            self.account_history.login_deadline = None;
+            if self.account_history.queued_logins == 0 {
+                self.release_automatic_joins("timed out");
+            }
+        }
+        if self
+            .account_history
             .attempt_started
-            .is_some_and(|started| started.elapsed() >= Duration::from_secs(30))
+            .is_some_and(|started| started.elapsed() >= LOGIN_JOIN_TIMEOUT)
             || self
                 .account_history
                 .probe
@@ -382,10 +428,7 @@ impl Session {
             self.account_history.probe = None;
             self.request_account_verification();
         }
-        if !self.account_history.required
-            && self.account_history.queued_logins == 0
-            && self.is_connected()
-        {
+        if !self.automatic_joins_blocked() && self.is_connected() {
             self.flush_authenticated_joins();
         }
         if self.account_history.required
@@ -479,6 +522,7 @@ impl Session {
                 }
                 if matches!(*number, ERR_SASLFAIL | ERR_SASLTOOLONG | ERR_SASLABORTED) {
                     self.account_history.awaiting = false;
+                    self.release_automatic_joins("SASL failed");
                 }
             }
             if recipient_is_self
@@ -492,6 +536,9 @@ impl Session {
                 self.account_history.awaiting = false;
                 self.account_history.attempt_started = None;
                 self.account_history.probe = None;
+                if self.account_history.queued_logins == 0 {
+                    self.release_automatic_joins("services are unavailable");
+                }
             }
             if recipient_is_self && *number == ERR_NOSUCHSERVER {
                 // A remote WHOIS routing failure ends the entire command,
@@ -1283,5 +1330,114 @@ mod tests {
         feed(&mut app, ":srv 900 me me!u@h account :Logged in");
         app.run_timed_tasks();
         assert!(joins_of(&drain(&mut rx2)).is_empty());
+    }
+
+    fn unconfirmed_login_notice(app: &Session) -> usize {
+        app.server_messages
+            .iter()
+            .filter(|message| message.content.contains("could not be confirmed"))
+            .count()
+    }
+
+    fn sent_login_awaiting_join() -> (Session, mpsc::UnboundedReceiver<IrcCommand>) {
+        let (mut app, mut rx) = app("/msg NickServ IDENTIFY wrongpw");
+        feed(&mut app, ":srv 001 me :Welcome");
+        app.run_timed_tasks();
+        let commands = drain(&mut rx);
+        assert!(joins_of(&commands).is_empty());
+        assert!(commands.iter().any(
+            |command| matches!(command, IrcCommand::Privmsg(target, _) if target == "NickServ")
+        ));
+        (app, rx)
+    }
+
+    #[test]
+    fn unconfirmed_login_releases_joins_after_timeout_but_not_history() {
+        let (mut app, mut rx) = sent_login_awaiting_join();
+        app.run_timed_tasks();
+        assert!(joins_of(&drain(&mut rx)).is_empty());
+        app.account_history.attempt_started = Some(Instant::now() - Duration::from_secs(31));
+        app.run_timed_tasks();
+        app.run_timed_tasks();
+        let commands = drain(&mut rx);
+        assert_eq!(joins_of(&commands), vec!["#room".to_string()]);
+        assert_eq!(history(&commands), 0);
+        assert!(app.account_history.required);
+        assert_eq!(unconfirmed_login_notice(&app), 1);
+        // The login can still be confirmed later, which then releases history.
+        feed(&mut app, ":me!u@h JOIN #room");
+        drain(&mut rx);
+        feed(&mut app, ":srv 900 me me!u@h account :Logged in");
+        app.run_timed_tasks();
+        assert_eq!(history(&drain(&mut rx)), 1);
+    }
+
+    #[test]
+    fn wrong_password_without_account_numerics_releases_joins_at_the_deadline() {
+        let (mut app, mut rx) = sent_login_awaiting_join();
+        feed(&mut app, ":NickServ!s@services NOTICE me :Invalid password");
+        assert!(drain(&mut rx).iter().any(|c| matches!(c, IrcCommand::Whois(_))));
+        feed(&mut app, ":srv 318 me me :End of WHOIS");
+        app.run_timed_tasks();
+        // The probe ended without a confirmation, which clears the attempt
+        // timer, but the join deadline still holds.
+        assert!(joins_of(&drain(&mut rx)).is_empty());
+        app.account_history.login_deadline = Some(Instant::now() - Duration::from_secs(1));
+        app.run_timed_tasks();
+        assert_eq!(joins_of(&drain(&mut rx)), vec!["#room".to_string()]);
+        assert_eq!(unconfirmed_login_notice(&app), 1);
+    }
+
+    #[test]
+    fn missing_services_release_joins_immediately_but_not_history() {
+        let (mut app, mut rx) = sent_login_awaiting_join();
+        feed(&mut app, ":srv 401 me NickServ :No such nick");
+        app.run_timed_tasks();
+        let commands = drain(&mut rx);
+        assert_eq!(joins_of(&commands), vec!["#room".to_string()]);
+        assert_eq!(history(&commands), 0);
+        assert!(app.account_history.required);
+        assert_eq!(unconfirmed_login_notice(&app), 1);
+    }
+
+    #[test]
+    fn failed_login_keeps_the_recovery_key_and_does_not_release_early() {
+        let (mut app, mut rx) = app("/ns IDENTIFY example-password");
+        app.ensure_target("#recover");
+        app.pending_rejoins = super::super::connection::RecoveryPolicy::ExactMemberships(vec![(
+            "#recover".into(),
+            Some("saved-key".into()),
+        )]);
+        feed(&mut app, ":srv 001 me :Welcome");
+        app.run_timed_tasks();
+        drain(&mut rx);
+        app.run_timed_tasks();
+        assert!(joins_of(&drain(&mut rx)).is_empty());
+        feed(&mut app, ":srv 401 me NickServ :No such nick");
+        app.run_timed_tasks();
+        assert!(drain(&mut rx).iter().any(|command| matches!(command,
+            IrcCommand::Join(target, key, _, _)
+                if target == "#recover" && key.as_deref() == Some("saved-key"))));
+    }
+
+    #[test]
+    fn a_failed_login_does_not_release_joins_before_the_next_queued_login() {
+        let (mut app, mut rx) = app(
+            "/msg AuthServ AUTH first example-password\n/msg NickServ IDENTIFY example-password",
+        );
+        feed(&mut app, ":srv 001 me :Welcome");
+        app.run_timed_tasks();
+        drain(&mut rx);
+        feed(&mut app, ":srv 401 me AuthServ :No such nick");
+        app.run_timed_tasks();
+        let commands = drain(&mut rx);
+        assert!(commands.iter().any(
+            |command| matches!(command, IrcCommand::Privmsg(target, _) if target == "NickServ")
+        ));
+        assert!(joins_of(&commands).is_empty());
+        assert_eq!(unconfirmed_login_notice(&app), 0);
+        feed(&mut app, ":srv 401 me NickServ :No such nick");
+        app.run_timed_tasks();
+        assert_eq!(joins_of(&drain(&mut rx)), vec!["#room".to_string()]);
     }
 }
