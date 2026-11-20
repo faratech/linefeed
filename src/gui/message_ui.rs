@@ -61,7 +61,12 @@ impl Default for ComposerState {
 pub(crate) struct TimelineView {
     pub anchor: Option<ScrollAnchor>,
     pub last_read: Option<MessageRef>,
+    /// The last message read before the unread ones the "Unread messages"
+    /// marker introduces. The marker is drawn under this row.
     pub entry_read_boundary: Option<MessageRef>,
+    /// Key of the newest message at the time everything under the marker
+    /// had been read. A newer message after that retires the marker.
+    pub caught_up_tail: Option<String>,
     pub restore_pending: bool,
     pub hydrating: bool,
     pub restored_hold: bool,

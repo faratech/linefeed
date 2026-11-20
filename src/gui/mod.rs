@@ -4175,6 +4175,15 @@ fn row_height(
     h
 }
 
+/// Whether a saved message reference names this scrollback row.
+fn message_ref_names(reference: &identity::MessageRef, message: &ChatMessage) -> bool {
+    reference.archive_id.as_deref() == Some(message.message_key.as_str())
+        || reference
+            .server_msgid
+            .as_ref()
+            .is_some_and(|id| message.msgid.as_ref() == Some(id))
+}
+
 /// Draw one scrollback row: timestamp, optional indicator, nick, body.
 fn draw_chat_row(
     ui: &mut egui::Ui,
@@ -8694,6 +8703,53 @@ impl Session {
         self.tab_completion = None;
     }
 
+    /// Keep the "Unread messages" marker above messages that were unread
+    /// when this window came to show them, and retire it afterwards. It marks
+    /// the first unread message when there is no marker yet, and it goes once
+    /// everything under it was read and the conversation has moved on (a
+    /// newer message arrived while the newest ones are on screen). Messages
+    /// read as they arrive therefore never get one, and a new absence marks
+    /// its own messages rather than keeping the old position.
+    fn settle_read_boundary(&self, msgs: &VecDeque<ChatMessage>, unread: usize) {
+        let Some(newest) = msgs.back() else {
+            return;
+        };
+        {
+            let mut timeline = self.timeline.borrow_mut();
+            let at_bottom = timeline
+                .anchor
+                .as_ref()
+                .is_none_or(|anchor| anchor.at_bottom);
+            if timeline.entry_read_boundary.is_some() {
+                let caught_up = timeline
+                    .last_read
+                    .as_ref()
+                    .is_some_and(|read| message_ref_names(read, newest));
+                if caught_up {
+                    if timeline.caught_up_tail.as_deref() != Some(newest.message_key.as_str()) {
+                        timeline.caught_up_tail = Some(newest.message_key.clone());
+                    }
+                } else if at_bottom
+                    && timeline
+                        .caught_up_tail
+                        .as_ref()
+                        .is_some_and(|seen| *seen != newest.message_key)
+                {
+                    timeline.entry_read_boundary = None;
+                    timeline.caught_up_tail = None;
+                }
+            }
+        }
+        if self.timeline.borrow().entry_read_boundary.is_none()
+            && unread > 0
+            && unread < msgs.len()
+            && let Some(target) = self.current_target_name()
+        {
+            self.timeline.borrow_mut().entry_read_boundary =
+                Some(self.live_message_reference(target, &msgs[msgs.len() - unread - 1]));
+        }
+    }
+
     /// Draw the active view's message scrollback, virtualized: only the rows
     /// intersecting the viewport (plus one straddler below) are laid out
     /// visibly each frame. Row heights are cached per message and invalidated
@@ -8721,15 +8777,7 @@ impl Session {
             .current_target_name()
             .and_then(|target| self.conversations.get(target))
             .map_or(0, |channel| channel.unread);
-        if self.timeline.borrow().entry_read_boundary.is_none()
-            && self.timeline.borrow().last_read.is_none()
-            && unread > 0
-            && unread < msgs.len()
-            && let Some(target) = self.current_target_name()
-        {
-            self.timeline.borrow_mut().entry_read_boundary =
-                Some(self.live_message_reference(target, &msgs[msgs.len() - unread - 1]));
-        }
+        self.settle_read_boundary(msgs, unread);
         let unread_from_start = unread > 0
             && unread >= msgs.len()
             && self.timeline.borrow().entry_read_boundary.is_none();
@@ -8902,18 +8950,14 @@ impl Session {
                                 .sense(egui::Sense::click()),
                             |ui| draw_chat_row(ui, msg, &my_nick),
                         );
-                        let divider = self
-                            .timeline
-                            .borrow()
-                            .entry_read_boundary
-                            .as_ref()
-                            .is_some_and(|reference| {
-                                reference.archive_id.as_deref() == Some(msg.message_key.as_str())
-                                    || reference
-                                        .server_msgid
-                                        .as_ref()
-                                        .is_some_and(|id| msg.msgid.as_ref() == Some(id))
-                            });
+                        // Under the newest row the marker would introduce nothing.
+                        let divider = !msgs.back().is_some_and(|newest| std::ptr::eq(newest, msg))
+                            && self
+                                .timeline
+                                .borrow()
+                                .entry_read_boundary
+                                .as_ref()
+                                .is_some_and(|reference| message_ref_names(reference, msg));
                         if divider || (unread_from_start && msg.message_key == msgs[0].message_key)
                         {
                             let y = if divider {
@@ -8999,9 +9043,6 @@ impl Session {
         {
             let mut timeline = self.timeline.borrow_mut();
             if let Some(target) = target {
-                if timeline.entry_read_boundary.is_none() {
-                    timeline.entry_read_boundary = timeline.last_read.clone();
-                }
                 if !restore || !timeline.restore_pending || scroll_interaction {
                     timeline.anchor = Some(identity::ScrollAnchor {
                         message: first_visible

@@ -1623,6 +1623,7 @@ impl App {
         {
             let timeline = window.view.timeline.get_mut();
             timeline.entry_read_boundary = timeline.last_read.clone();
+            timeline.caught_up_tail = None;
         }
         let Some(index) = self.session_index(key.conn) else {
             return;
@@ -7030,6 +7031,142 @@ mod tests {
         app.sessions[0].add_server_message(ChatMessage::system("later"));
         app.user_activate(status);
         assert_eq!(app.sessions[0].server_unread, 1);
+    }
+
+    fn focus_frame(app: &mut App, ctx: &egui::Context, focused: bool) -> egui::FullOutput {
+        let mut output = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1024.0, 768.0),
+                )),
+                focused,
+                ..Default::default()
+            },
+            |ui| app.ui(ui),
+        );
+        output.textures_delta.clear();
+        output
+    }
+
+    /// Draw until a viewport report has been taken as read, and say whether
+    /// the last frame painted the unread marker.
+    fn unread_marker_after_frames(app: &mut App, ctx: &egui::Context, focused: bool) -> bool {
+        let mut output = focus_frame(app, ctx, focused);
+        for _ in 0..3 {
+            output = focus_frame(app, ctx, focused);
+        }
+        texts(&output).iter().any(|text| text == "Unread messages")
+    }
+
+    #[test]
+    fn messages_read_as_they_arrive_get_no_unread_marker() {
+        let (mut app, _rx_a, _rx_b) = two_networks();
+        let rust = target_key(&app, app.sessions[0].id, "#rust");
+        app.user_activate(rust);
+        let ctx = egui::Context::default();
+        assert!(!unread_marker_after_frames(&mut app, &ctx, true));
+
+        for text in ["one", "two"] {
+            feed(&mut app, 0, &format!(":bob!u@h PRIVMSG #rust :{text}"));
+            assert!(
+                !unread_marker_after_frames(&mut app, &ctx, true),
+                "{text} was read as it arrived"
+            );
+        }
+        assert_eq!(app.sessions[0].conversations["#rust"].unread, 0);
+    }
+
+    #[test]
+    fn returning_to_a_read_window_shows_no_unread_marker() {
+        let (mut app, _rx_a, _rx_b) = two_networks();
+        let rust = target_key(&app, app.sessions[0].id, "#rust");
+        let status = WindowKey::new(app.sessions[0].id, None);
+        app.user_activate(rust);
+        let ctx = egui::Context::default();
+        feed(&mut app, 0, ":bob!u@h PRIVMSG #rust :one");
+        unread_marker_after_frames(&mut app, &ctx, true);
+
+        app.user_activate(status);
+        unread_marker_after_frames(&mut app, &ctx, true);
+        app.user_activate(rust);
+        assert!(
+            !unread_marker_after_frames(&mut app, &ctx, true),
+            "nothing arrived while the window was in the background"
+        );
+
+        // What arrives now is read on arrival; the old position is no marker.
+        feed(&mut app, 0, ":bob!u@h PRIVMSG #rust :two");
+        assert!(!unread_marker_after_frames(&mut app, &ctx, true));
+    }
+
+    #[test]
+    fn the_unread_marker_shows_above_unread_messages_until_the_conversation_moves_on() {
+        let (mut app, _rx_a, _rx_b) = two_networks();
+        let rust = target_key(&app, app.sessions[0].id, "#rust");
+        let status = WindowKey::new(app.sessions[0].id, None);
+        app.user_activate(rust);
+        let ctx = egui::Context::default();
+        feed(&mut app, 0, ":bob!u@h PRIVMSG #rust :one");
+        unread_marker_after_frames(&mut app, &ctx, true);
+
+        app.user_activate(status);
+        unread_marker_after_frames(&mut app, &ctx, true);
+        feed(&mut app, 0, ":bob!u@h PRIVMSG #rust :two");
+        feed(&mut app, 0, ":bob!u@h PRIVMSG #rust :three");
+        assert_eq!(app.sessions[0].conversations["#rust"].unread, 2);
+
+        app.user_activate(rust);
+        assert!(
+            unread_marker_after_frames(&mut app, &ctx, true),
+            "the marker stays above what was unread on entry, even once read"
+        );
+        assert_eq!(app.sessions[0].conversations["#rust"].unread, 0);
+
+        feed(&mut app, 0, ":bob!u@h PRIVMSG #rust :four");
+        assert!(
+            !unread_marker_after_frames(&mut app, &ctx, true),
+            "a message read on arrival retires the marker above older ones"
+        );
+    }
+
+    #[test]
+    fn messages_arriving_while_the_app_is_unfocused_get_the_unread_marker() {
+        let (mut app, _rx_a, _rx_b) = two_networks();
+        let rust = target_key(&app, app.sessions[0].id, "#rust");
+        app.user_activate(rust);
+        let ctx = egui::Context::default();
+        unread_marker_after_frames(&mut app, &ctx, true);
+        feed(&mut app, 0, ":bob!u@h PRIVMSG #rust :one");
+        assert!(!unread_marker_after_frames(&mut app, &ctx, true));
+
+        unread_marker_after_frames(&mut app, &ctx, false);
+        feed(&mut app, 0, ":bob!u@h PRIVMSG #rust :two");
+        assert!(unread_marker_after_frames(&mut app, &ctx, false));
+        assert_eq!(app.sessions[0].conversations["#rust"].unread, 1);
+
+        // Focus returns: the message is read and stays marked as the new one.
+        assert!(unread_marker_after_frames(&mut app, &ctx, true));
+        assert_eq!(app.sessions[0].conversations["#rust"].unread, 0);
+
+        // A second absence marks its own messages, not the earlier ones.
+        unread_marker_after_frames(&mut app, &ctx, false);
+        feed(&mut app, 0, ":bob!u@h PRIVMSG #rust :three");
+        unread_marker_after_frames(&mut app, &ctx, false);
+        let boundary = app
+            .windows
+            .get(&rust)
+            .and_then(|window| window.view.timeline.borrow().entry_read_boundary.clone())
+            .expect("the new unread message is marked");
+        let two = app.sessions[0].conversations["#rust"]
+            .messages
+            .iter()
+            .find(|message| message.content == "two")
+            .map(|message| message.message_key.clone());
+        assert_eq!(
+            boundary.archive_id, two,
+            "the marker sits under the last read message"
+        );
     }
 
     #[test]
