@@ -376,12 +376,12 @@ impl Session {
         // The URL is server-supplied 005 data: only hosts of the IRC network
         // itself may receive the account's password or client certificate.
         let parsed = https_url(url)?;
-        let auth = if matches!(auth, UploadAuth::None) || filehost_host_trusted(&parsed, &server.host)
-        {
-            auth
-        } else {
-            UploadAuth::Withheld
-        };
+        let auth =
+            if matches!(auth, UploadAuth::None) || filehost_host_trusted(&parsed, &server.host) {
+                auth
+            } else {
+                UploadAuth::Withheld
+            };
         Ok(Provider {
             url: parsed.to_string(),
             auth,
@@ -527,9 +527,7 @@ impl Session {
             return;
         };
         if !ui.max_rect().contains(pos)
-            || ctx
-                .layer_id_at(pos)
-                .is_some_and(|top| top != ui.layer_id())
+            || ctx.layer_id_at(pos).is_some_and(|top| top != ui.layer_id())
         {
             return;
         }
@@ -1786,12 +1784,21 @@ mod tests {
         // The server itself, its subdomains, and siblings under its domain.
         assert!(trusted("https://irc.example.org/up", "irc.example.org"));
         assert!(trusted("https://IRC.Example.ORG./up", "irc.example.org"));
-        assert!(trusted("https://files.irc.example.org/up", "irc.example.org"));
+        assert!(trusted(
+            "https://files.irc.example.org/up",
+            "irc.example.org"
+        ));
         assert!(trusted("https://files.example.org/up", "irc.example.org"));
         assert!(trusted("https://upload.example.org/up", "IRC.example.org"));
         // Lookalikes and unrelated hosts never are.
-        assert!(!trusted("https://example.org.attacker.net/up", "irc.example.org"));
-        assert!(!trusted("https://attackerexample.org/up", "irc.example.org"));
+        assert!(!trusted(
+            "https://example.org.attacker.net/up",
+            "irc.example.org"
+        ));
+        assert!(!trusted(
+            "https://attackerexample.org/up",
+            "irc.example.org"
+        ));
         assert!(!trusted("https://files.attacker.net/up", "irc.example.org"));
         assert!(!trusted("https://example.org/up", "irc.example.org"));
         // A bare two-label server has no parent domain to share.
@@ -1799,7 +1806,10 @@ mod tests {
         assert!(!trusted("https://files.example/up", "irc.example"));
         // A public suffix is not a shared domain.
         assert!(!trusted("https://files.other.co.uk/up", "irc.co.uk"));
-        assert!(trusted("https://files.example.co.uk/up", "irc.example.co.uk"));
+        assert!(trusted(
+            "https://files.example.co.uk/up",
+            "irc.example.co.uk"
+        ));
         // IP endpoints only match themselves.
         assert!(trusted("https://192.0.2.1/up", "192.0.2.1"));
         assert!(!trusted("https://192.0.2.2/up", "192.0.2.1"));

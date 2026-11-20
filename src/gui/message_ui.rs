@@ -1342,7 +1342,11 @@ mod tests {
     fn legacy_text_send_leaves_room_for_the_relayed_prefix() {
         let (mut session, mut rx, _) = session();
         let worst = "me!abcdefghij@".to_string() + &"h".repeat(63);
-        assert!(session.send_privmsg_text("#room", &"z".repeat(1200)).complete);
+        assert!(
+            session
+                .send_privmsg_text("#room", &"z".repeat(1200))
+                .complete
+        );
         let mut seen = 0;
         while let Ok(sent) = rx.try_recv() {
             for command in crate::gui::flatten_test_commands(sent) {
@@ -1352,7 +1356,11 @@ mod tests {
         }
         assert!(seen >= 3);
         session.enabled_caps.insert("draft/multiline".into());
-        assert!(session.send_privmsg_text("#room", &"z".repeat(1200)).complete);
+        assert!(
+            session
+                .send_privmsg_text("#room", &"z".repeat(1200))
+                .complete
+        );
         while let Ok(sent) = rx.try_recv() {
             for command in crate::gui::flatten_test_commands(sent) {
                 assert!(relayed_len(&command, &worst) <= 512, "{command}");
