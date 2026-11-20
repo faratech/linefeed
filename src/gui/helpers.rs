@@ -81,6 +81,17 @@ fn epoch_to_utc_parts(secs: u64) -> (u64, u64, u64, u64, u64) {
     )
 }
 
+/// Decompose `secs` shifted by the local offset `offset_at` reports for that
+/// instant. The offset function is a parameter so the per-instant behaviour is
+/// testable without a time-zone database.
+#[cfg(any(windows, test))]
+fn epoch_to_parts_with_offset(
+    secs: u64,
+    offset_at: impl Fn(u64) -> i64,
+) -> (u64, u64, u64, u64, u64) {
+    epoch_to_utc_parts(secs.saturating_add_signed(offset_at(secs)))
+}
+
 /// Decompose an epoch timestamp in LOCAL time into (month, day, hours, minutes, seconds).
 fn epoch_to_local_parts(secs: u64) -> (u64, u64, u64, u64, u64) {
     #[cfg(unix)]
@@ -105,12 +116,10 @@ fn epoch_to_local_parts(secs: u64) -> (u64, u64, u64, u64, u64) {
 
     #[cfg(windows)]
     {
-        // Windows has no localtime_r equivalent that is trivially callable here,
-        // so derive the current UTC offset (local now - UTC now) and apply it.
-        // DST transitions between `secs` and now are approximated; acceptable
-        // for message timestamps.
-        let offset = windows_local_offset_secs();
-        epoch_to_utc_parts(secs.saturating_add_signed(offset))
+        // Windows has no localtime_r, so ask the time-zone rules for the offset
+        // in force at this very instant (not today's), which keeps timestamps
+        // from the other side of a DST change correct.
+        epoch_to_parts_with_offset(secs, windows_local_offset_secs_at)
     }
 
     #[cfg(not(any(unix, windows)))]
@@ -135,8 +144,7 @@ pub fn local_utc_offset_secs(secs: u64) -> i64 {
 
     #[cfg(windows)]
     {
-        let _ = secs;
-        windows_local_offset_secs()
+        windows_local_offset_secs_at(secs)
     }
 
     #[cfg(not(any(unix, windows)))]
@@ -146,41 +154,96 @@ pub fn local_utc_offset_secs(secs: u64) -> i64 {
     }
 }
 
-/// Current UTC offset in seconds on Windows (local now minus UTC now).
+/// Mirrors the Win32 struct name.
+#[cfg(windows)]
+#[allow(clippy::upper_case_acronyms)]
+#[repr(C)]
+struct SYSTEMTIME {
+    year: u16,
+    month: u16,
+    day_of_week: u16,
+    day: u16,
+    hour: u16,
+    minute: u16,
+    second: u16,
+    milliseconds: u16,
+}
+
+#[cfg(windows)]
+impl SYSTEMTIME {
+    fn as_epoch_secs(&self) -> i64 {
+        ymd_to_days(self.year as i64, self.month as u32, self.day as u32) * 86400
+            + self.hour as i64 * 3600
+            + self.minute as i64 * 60
+            + self.second as i64
+    }
+}
+
+/// Current UTC offset in seconds on Windows (local now minus UTC now). Only a
+/// fallback for instants the per-instant conversion cannot handle.
 #[cfg(windows)]
 fn windows_local_offset_secs() -> i64 {
     use std::mem::MaybeUninit;
     use std::time::{SystemTime, UNIX_EPOCH};
-    // Mirrors the Win32 struct name.
-    #[allow(clippy::upper_case_acronyms)]
-    #[repr(C)]
-    struct SYSTEMTIME {
-        year: u16,
-        month: u16,
-        day_of_week: u16,
-        day: u16,
-        hour: u16,
-        minute: u16,
-        second: u16,
-        milliseconds: u16,
-    }
     unsafe extern "system" {
         fn GetLocalTime(lpSystemTime: *mut SYSTEMTIME);
     }
     let mut st = MaybeUninit::<SYSTEMTIME>::uninit();
     let local_epoch = unsafe {
         GetLocalTime(st.as_mut_ptr());
-        let st = st.assume_init();
-        ymd_to_days(st.year as i64, st.month as u32, st.day as u32) * 86400
-            + st.hour as i64 * 3600
-            + st.minute as i64 * 60
-            + st.second as i64
+        st.assume_init().as_epoch_secs()
     };
     let utc_epoch = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs() as i64;
     local_epoch - utc_epoch
+}
+
+/// UTC offset in seconds that the local time zone had at epoch time `secs`,
+/// using the zone's DST rules for that date (`SystemTimeToTzSpecificLocalTime`)
+/// rather than today's offset. Falls back to the current offset for instants
+/// outside the SYSTEMTIME range or if the conversion fails.
+#[cfg(windows)]
+fn windows_local_offset_secs_at(secs: u64) -> i64 {
+    unsafe extern "system" {
+        fn SystemTimeToTzSpecificLocalTime(
+            lpTimeZoneInformation: *const core::ffi::c_void,
+            lpUniversalTime: *const SYSTEMTIME,
+            lpLocalTime: *mut SYSTEMTIME,
+        ) -> i32;
+    }
+    let (year, month, day) = days_to_ymd(secs / 86400);
+    if !(1601..=30827).contains(&year) {
+        return windows_local_offset_secs();
+    }
+    let rem = secs % 86400;
+    let utc = SYSTEMTIME {
+        year: year as u16,
+        month: month as u16,
+        day_of_week: 0,
+        day: day as u16,
+        hour: (rem / 3600) as u16,
+        minute: ((rem % 3600) / 60) as u16,
+        second: (rem % 60) as u16,
+        milliseconds: 0,
+    };
+    let mut local = SYSTEMTIME {
+        year: 0,
+        month: 0,
+        day_of_week: 0,
+        day: 0,
+        hour: 0,
+        minute: 0,
+        second: 0,
+        milliseconds: 0,
+    };
+    // A null time zone means the current one, with the rules for `utc`'s year.
+    let converted = unsafe { SystemTimeToTzSpecificLocalTime(std::ptr::null(), &utc, &mut local) };
+    if converted == 0 {
+        return windows_local_offset_secs();
+    }
+    local.as_epoch_secs() - secs as i64
 }
 
 /// Get current local time formatted according to preference
@@ -332,6 +395,36 @@ pub fn mask_matches(pattern: &str, text: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn local_time_uses_the_offset_in_force_at_the_instant() {
+        // A zone that observes DST: UTC-4 until 2026-11-01T06:00:00Z, then UTC-5.
+        let dst_end = 1_793_512_800;
+        let offset_at = |secs: u64| if secs < dst_end { -4 * 3600 } else { -5 * 3600 };
+        // 2026-10-20T18:30:00Z was 14:30 local; 2026-11-10T18:30:00Z is 13:30.
+        let before = epoch_to_parts_with_offset(1_792_521_000, offset_at);
+        assert_eq!(before, (10, 20, 14, 30, 0));
+        let after = epoch_to_parts_with_offset(1_794_335_400, offset_at);
+        assert_eq!(after, (11, 10, 13, 30, 0));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_offset_is_resolved_per_instant() {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        // The present instant agrees with the current-offset computation.
+        assert_eq!(windows_local_offset_secs_at(now), windows_local_offset_secs());
+        // Half a year apart the offsets differ by at most the DST shift (zero
+        // in a zone without DST), and the epoch itself is convertible.
+        let (winter, summer) = (1_768_478_400, 1_784_116_800);
+        let shift = windows_local_offset_secs_at(winter) - windows_local_offset_secs_at(summer);
+        assert!(shift.abs() <= 3600, "{shift}");
+        assert_eq!(local_utc_offset_secs(winter), windows_local_offset_secs_at(winter));
+        let _ = windows_local_offset_secs_at(0);
+    }
 
     #[test]
     fn ctcp_time_is_a_calendar_date_not_a_day_count() {
