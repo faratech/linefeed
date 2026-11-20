@@ -226,6 +226,15 @@ impl ConnectionLifecycle {
             _ => None,
         }
     }
+    pub(super) fn staged_config_mut(&mut self) -> Option<&mut SessionConfig> {
+        match &mut self.phase {
+            ConnectionPhase::Closing(a) => match &mut a.next {
+                AfterClose::Connect(plan) => Some(&mut plan.config),
+                AfterClose::Stop | AfterClose::Retry { .. } => None,
+            },
+            _ => None,
+        }
+    }
     pub(super) fn has_pending_connect(&self) -> bool {
         self.is_connecting() || self.staged_config().is_some()
     }

@@ -1195,30 +1195,35 @@ impl App {
 
     /// Persist `/perform` edits where they belong. Auto-perform is part of a
     /// server profile (it typically identifies to that network's services):
-    /// it goes to the favorite the form was loaded from, or to the Quick
-    /// Connect defaults only when those are for this same server. Never to
-    /// another network's profile or defaults.
+    /// it goes to the favorite of the live connection, if that favorite is
+    /// still for the live endpoint, or to the Quick Connect defaults only
+    /// when those are for this same server. Never to another network's
+    /// profile or defaults, whatever the connect form currently shows (#367).
     fn save_auto_perform_from(&mut self, index: usize) {
-        let session = &self.sessions[index];
-        let list = session.auto_perform.clone();
-        if let Some(id) = session.form_profile.clone()
-            && let Some(favorite) = self
-                .settings
-                .server_favorites
-                .iter_mut()
-                .find(|favorite| favorite.id == id)
-        {
-            favorite.auto_perform = list;
+        let save = self.sessions[index].auto_perform_save();
+        let endpoint = (&save.endpoint.0, &save.endpoint.1, save.endpoint.2);
+        let favorite = save.profile.as_ref().and_then(|id| {
+            self.settings.server_favorites.iter_mut().find(|favorite| {
+                favorite.id == *id
+                    && (!save.live
+                        || same_endpoint(
+                            (&favorite.host, &favorite.port, favorite.use_tls),
+                            (endpoint.0, endpoint.1, endpoint.2),
+                        ))
+            })
+        });
+        if let Some(favorite) = favorite {
+            favorite.auto_perform = save.list;
             self.save_settings();
         } else if same_endpoint(
-            (&session.server_host, &session.server_port, session.use_tls),
+            (endpoint.0, endpoint.1, endpoint.2),
             (
                 &self.settings.server_host,
                 &self.settings.server_port,
                 self.settings.use_tls,
             ),
         ) {
-            self.settings.auto_perform = list;
+            self.settings.auto_perform = save.list;
             self.save_settings();
         } else {
             self.sessions[index].add_server_message(ChatMessage::system(
@@ -4797,6 +4802,78 @@ mod tests {
                 .iter()
                 .any(|m| m.content.contains("this connection only"))
         );
+    }
+
+    #[test]
+    fn perform_after_server_switch_never_reaches_the_old_favorite_or_defaults() {
+        let mut settings = test_settings();
+        settings.server_host = "irc.libera.chat".into();
+        settings.server_port = "6697".into();
+        settings.use_tls = true;
+        settings.auto_perform = "/msg NickServ IDENTIFY liberapass".into();
+        settings.server_favorites.push(ServerFavorite {
+            name: "OFTC".into(),
+            host: "irc.oftc.net".into(),
+            port: "6697".into(),
+            use_tls: true,
+            auto_perform: "/msg NickServ IDENTIFY oftcpass".into(),
+            ..ServerFavorite::default()
+        });
+        let mut app = App::with_settings(settings, LayoutFile::default());
+        app.start(None);
+        let favorite = app.settings.server_favorites[0].clone();
+        app.sessions[0].load_favorite(&favorite);
+        assert!(app.sessions[0].start_session_from_form());
+
+        // Switch to another network, then identify there.
+        app.sessions[0].process_command("/server irc.other.example 6697");
+        app.sessions[0].process_command("/perform /msg NickServ IDENTIFY otherpass");
+        app.process_events();
+
+        let saved = app.settings_file.clone();
+        let favorite_list = |app: &App| app.settings.server_favorites[0].auto_perform.clone();
+        assert_eq!(favorite_list(&app), "/msg NickServ IDENTIFY oftcpass");
+        assert_eq!(
+            app.settings.auto_perform,
+            "/msg NickServ IDENTIFY liberapass"
+        );
+        if let Some(saved) = saved {
+            assert!(!saved.auto_perform.contains("otherpass"));
+            assert!(
+                saved
+                    .server_favorites
+                    .iter()
+                    .all(|favorite| !favorite.auto_perform.contains("otherpass"))
+            );
+        }
+        // The line is session-only, and says so.
+        assert!(
+            app.sessions[0]
+                .server_messages
+                .iter()
+                .any(|m| m.content.contains("this connection only"))
+        );
+        assert_eq!(
+            app.sessions[0]
+                .active_session
+                .as_ref()
+                .unwrap()
+                .auto_perform,
+            "/msg NickServ IDENTIFY otherpass"
+        );
+        // The form still describes the saved profile.
+        assert_eq!(
+            app.sessions[0].auto_perform,
+            "/msg NickServ IDENTIFY oftcpass"
+        );
+
+        // Switching to the Quick Connect defaults' own endpoint persists
+        // there (and only there).
+        app.sessions[0].process_command("/server irc.libera.chat 6697");
+        app.sessions[0].process_command("/perform /join #libera");
+        app.process_events();
+        assert_eq!(app.settings.auto_perform, "/join #libera");
+        assert_eq!(favorite_list(&app), "/msg NickServ IDENTIFY oftcpass");
     }
 
     #[test]

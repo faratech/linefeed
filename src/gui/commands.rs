@@ -1,8 +1,17 @@
 //! IRC command processing and help system
 
 use super::helpers::{is_extended_ban, mask_matches, nick_to_mask};
-use super::{ChatMessage, Session, SessionEvent, WindowCommand};
+use super::{ChatMessage, Session, SessionConfig, SessionEvent, WindowCommand};
 use crate::irc::IrcCommand;
+
+/// Where a `/perform` edit may be persisted; see `Session::auto_perform_save`.
+pub(super) struct AutoPerformSave {
+    pub(super) list: String,
+    pub(super) profile: Option<String>,
+    pub(super) endpoint: (String, String, bool),
+    /// A connection exists, so `profile` and `endpoint` are its own.
+    pub(super) live: bool,
+}
 
 impl Session {
     pub(super) fn process_builtin_command(&mut self, input: &str) {
@@ -1989,14 +1998,14 @@ impl Session {
 
             "PERFORM" => {
                 if args.is_empty() {
-                    // Show current auto-perform
-                    if self.auto_perform.is_empty() {
+                    // Show the list the live connection will run
+                    let current = self.effective_auto_perform();
+                    if current.is_empty() {
                         self.add_message_to_current(ChatMessage::system(
                             "No auto-perform commands set. Use /perform <command> to add.",
                         ));
                     } else {
-                        let lines: Vec<String> = self
-                            .auto_perform
+                        let lines: Vec<String> = current
                             .lines()
                             .filter(|line| !line.trim().is_empty())
                             .enumerate()
@@ -2019,17 +2028,19 @@ impl Session {
                         }
                     }
                 } else if args.eq_ignore_ascii_case("clear") {
-                    self.auto_perform.clear();
+                    self.edit_auto_perform(String::clear);
                     self.save_auto_perform();
                     self.add_message_to_current(ChatMessage::system(
                         "Auto-perform commands cleared.",
                     ));
                 } else {
                     // Add to auto-perform
-                    if !self.auto_perform.is_empty() {
-                        self.auto_perform.push('\n');
-                    }
-                    self.auto_perform.push_str(args);
+                    self.edit_auto_perform(|list| {
+                        if !list.is_empty() {
+                            list.push('\n');
+                        }
+                        list.push_str(args);
+                    });
                     self.save_auto_perform();
                     self.add_message_to_current(
                         ChatMessage::system("Added command to auto-perform.").without_logging(),
@@ -2390,6 +2401,86 @@ impl Session {
         self.accept_invalid_certs = false;
         // Without its credentials the form no longer describes the profile.
         self.form_profile = None;
+    }
+
+    /// The connection `/perform` acts on: the replacement staged behind a
+    /// closing connection, else the active one. After `/server` the connect
+    /// form is restored to the previous saved profile while the connection is
+    /// on another network, so the form cannot stand in for it (#367).
+    fn live_session_config(&self) -> Option<&SessionConfig> {
+        self.connection
+            .staged_config()
+            .or(self.active_session.as_ref())
+    }
+
+    /// Whether the connect form still describes the live connection (same
+    /// saved profile and endpoint). With no connection yet it is the only
+    /// authority.
+    fn form_describes_live_connection(&self) -> bool {
+        self.live_session_config().is_none_or(|live| {
+            self.form_profile == live.profile_id
+                && live
+                    .server
+                    .host
+                    .trim()
+                    .eq_ignore_ascii_case(self.server_host.trim())
+                && self.server_port.trim().parse::<u16>() == Ok(live.server.port)
+                && live.server.use_tls == self.use_tls
+        })
+    }
+
+    /// The auto-perform list `/perform` shows: what the live connection runs.
+    fn effective_auto_perform(&self) -> String {
+        self.live_session_config().map_or_else(
+            || self.auto_perform.clone(),
+            |live| live.auto_perform.clone(),
+        )
+    }
+
+    /// Apply a `/perform` edit to the live connection, and to the connect
+    /// form only while the form still describes that connection.
+    fn edit_auto_perform(&mut self, edit: impl Fn(&mut String)) {
+        let form_follows = self.form_describes_live_connection();
+        if let Some(staged) = self.connection.staged_config_mut() {
+            edit(&mut staged.auto_perform);
+        } else if let Some(active) = self.active_session.as_mut() {
+            edit(&mut active.auto_perform);
+        }
+        if form_follows {
+            edit(&mut self.auto_perform);
+        }
+    }
+
+    /// What `App::save_auto_perform_from` may persist, and where it may go.
+    /// With a live connection the profile and endpoint are the connection's,
+    /// never the (possibly restored) form's.
+    pub(super) fn auto_perform_save(&self) -> AutoPerformSave {
+        match self.live_session_config() {
+            Some(live) => AutoPerformSave {
+                list: if self.form_describes_live_connection() {
+                    self.auto_perform.clone()
+                } else {
+                    live.auto_perform.clone()
+                },
+                profile: live.profile_id.clone(),
+                endpoint: (
+                    live.server.host.clone(),
+                    live.server.port.to_string(),
+                    live.server.use_tls,
+                ),
+                live: true,
+            },
+            None => AutoPerformSave {
+                list: self.auto_perform.clone(),
+                profile: self.form_profile.clone(),
+                endpoint: (
+                    self.server_host.clone(),
+                    self.server_port.clone(),
+                    self.use_tls,
+                ),
+                live: false,
+            },
+        }
     }
 
     /// Snapshot the connection-form fields that make up the saved network
@@ -5108,6 +5199,82 @@ mod tests {
         assert_eq!(saved.auto_join_channels, "#private key");
         assert_eq!(saved.auto_perform, "/ns identify nickserv-pass");
         assert!(saved.accept_invalid_certs);
+    }
+
+    fn perform_lines(app: &Session) -> Vec<String> {
+        app.server_messages
+            .iter()
+            .map(|message| message.content.clone())
+            .collect()
+    }
+
+    #[test]
+    fn perform_after_server_switch_edits_the_live_connection_not_the_old_profile() {
+        let mut app = saved_libera_profile_app();
+        app.form_profile = Some("libera".into());
+        app.process_command("/server irc.oftc.net 6667");
+        assert_eq!(app.active_server_config().unwrap().host, "irc.oftc.net");
+        let _ = app.events.drain(..);
+
+        app.process_command("/perform /msg NickServ IDENTIFY b-pass");
+
+        // The line belongs to the live (oftc) connection...
+        assert_eq!(
+            app.active_session.as_ref().unwrap().auto_perform,
+            "/msg NickServ IDENTIFY b-pass"
+        );
+        // ...and the form, which still describes the saved Libera profile, is
+        // untouched, so nothing can be persisted under that favorite.
+        assert_eq!(app.auto_perform, "/ns identify nickserv-pass");
+        assert_eq!(app.form_profile.as_deref(), Some("libera"));
+        // Listing shows the live connection's list, not the old profile's.
+        app.process_command("/perform");
+        let shown = perform_lines(&app).join("\n");
+        assert!(!shown.contains("nickserv-pass"), "{shown}");
+        assert!(shown.contains("<credential command redacted>"), "{shown}");
+        // /perform clear clears the live list only.
+        app.process_command("/perform clear");
+        assert!(app.active_session.as_ref().unwrap().auto_perform.is_empty());
+        assert_eq!(app.auto_perform, "/ns identify nickserv-pass");
+    }
+
+    #[test]
+    fn perform_while_a_server_switch_is_staged_edits_the_replacement() {
+        let (mut app, _rx) = connected_command_app();
+        app.server_host = "irc.libera.chat".into();
+        app.form_profile = Some("libera".into());
+        app.auto_perform = "/ns identify nickserv-pass".into();
+        app.process_command("/server irc.oftc.net 6667");
+        assert!(app.connection.staged_config().is_some());
+
+        app.process_command("/perform /join #b");
+
+        assert_eq!(
+            app.connection.staged_config().unwrap().auto_perform,
+            "/join #b"
+        );
+        assert_eq!(app.auto_perform, "/ns identify nickserv-pass");
+    }
+
+    #[test]
+    fn perform_on_the_connection_the_form_describes_still_edits_the_form() {
+        let mut app = saved_libera_profile_app();
+        app.form_profile = Some("libera".into());
+        assert!(app.start_session_from_form());
+        let _ = app.events.drain(..);
+
+        app.process_command("/perform /join #a");
+
+        assert_eq!(app.auto_perform, "/ns identify nickserv-pass\n/join #a");
+        assert_eq!(
+            app.active_session.as_ref().unwrap().auto_perform,
+            "/ns identify nickserv-pass\n/join #a"
+        );
+        assert!(
+            app.events
+                .iter()
+                .any(|event| matches!(event, SessionEvent::SaveAutoPerform))
+        );
     }
 
     #[test]
