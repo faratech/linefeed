@@ -422,6 +422,13 @@ impl WindowManager {
     /// rect proportionally, so a tiled layout stays tiled and nothing is
     /// left off screen or overlapping after the area moves or resizes.
     pub(crate) fn fit_to_area(&mut self, area: Rect) {
+        // A transient degenerate area (a restored minimized or tiny window)
+        // would scale every window to nothing and become the baseline the
+        // real area is later scaled from. Ignore it; the last sane area
+        // stays the baseline.
+        if !area.is_finite() || area.width() < MIN_FIT_AREA || area.height() < MIN_FIT_AREA {
+            return;
+        }
         let Some(old) = self.area.replace(area) else {
             return;
         };
@@ -534,6 +541,9 @@ const LAYOUT_VERSION: u32 = 1;
 pub(crate) const TILE_GAP: f32 = 4.0;
 /// Diagonal step between cascaded windows, in points.
 const CASCADE_STEP: f32 = 26.0;
+/// Smallest chat area per side that floating windows are fitted to: far below
+/// the 640x480 window minimum, above any collapsed or restored-tiny frame.
+const MIN_FIT_AREA: f32 = 64.0;
 
 /// Grid rects for `n` windows inside `area`: as many columns as the square
 /// root rounds up to, rows filled left to right, the last row's windows
@@ -931,6 +941,55 @@ mod tests {
         }
         manager.fit_to_area(smaller);
         assert!(manager.windows.iter().all(|w| w.pending_place.is_none()));
+    }
+
+    #[test]
+    fn a_degenerate_area_neither_collapses_the_layout_nor_replaces_the_remembered_area() {
+        let mut manager = WindowManager::default();
+        manager.sync(&[
+            present(1, "net", None),
+            present(1, "net", Some("#a")),
+            present(1, "net", Some("#b")),
+            present(1, "net", Some("#c")),
+        ]);
+        manager.fit_to_area(area());
+        manager.tile(area());
+        let tiled: Vec<Option<Rect>> = manager.windows.iter().map(|w| w.child_rect).collect();
+        for window in &mut manager.windows {
+            window.pending_place = None;
+        }
+        manager.dirty = false;
+
+        let nan = Rect::from_min_size(area().min, Vec2::new(f32::NAN, 300.0));
+        for degenerate in [
+            Rect::from_min_size(area().min, Vec2::new(144.0, 0.0)),
+            Rect::from_min_size(area().min, Vec2::new(144.0, -10.0)),
+            Rect::from_min_size(area().min, Vec2::new(1.0, 1.0)),
+            Rect::from_min_size(area().min, Vec2::new(30.0, 600.0)),
+            nan,
+        ] {
+            manager.fit_to_area(degenerate);
+            assert_eq!(manager.area, Some(area()), "{degenerate:?}");
+            assert!(!manager.dirty, "{degenerate:?}");
+            assert!(manager.windows.iter().all(|w| w.pending_place.is_none()));
+            let now: Vec<Option<Rect>> = manager.windows.iter().map(|w| w.child_rect).collect();
+            assert_eq!(now, tiled, "{degenerate:?}");
+        }
+
+        // Back to the normal area: still nothing to rescale.
+        manager.fit_to_area(area());
+        assert!(manager.windows.iter().all(|w| w.pending_place.is_none()));
+        let now: Vec<Option<Rect>> = manager.windows.iter().map(|w| w.child_rect).collect();
+        assert_eq!(now, tiled);
+    }
+
+    #[test]
+    fn a_degenerate_first_area_is_not_remembered() {
+        let mut manager = WindowManager::default();
+        manager.fit_to_area(Rect::from_min_size(Pos2::ZERO, Vec2::new(10.0, 0.0)));
+        assert_eq!(manager.area, None);
+        manager.fit_to_area(area());
+        assert_eq!(manager.area, Some(area()));
     }
 
     #[test]
