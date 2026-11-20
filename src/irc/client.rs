@@ -6665,7 +6665,10 @@ mod tests {
     }
 
     fn assert_usable_identity(chain: &[u8], key: &[u8]) {
-        assert_eq!(blocks_of(chain), vec!["CERTIFICATE"; blocks_of(chain).len()]);
+        assert_eq!(
+            blocks_of(chain),
+            vec!["CERTIFICATE"; blocks_of(chain).len()]
+        );
         assert!(chain.starts_with(b"-----BEGIN CERTIFICATE-----"));
         assert!(key.starts_with(b"-----BEGIN PRIVATE KEY-----"));
         assert_eq!(blocks_of(key), vec!["PRIVATE KEY"]);
@@ -6717,11 +6720,9 @@ mod tests {
         // A certificate file that also carries a key does not leak it into the
         // chain when a separate key file is configured.
         let cert_with_key = format!("{TEST_KEY_PKCS8}{TEST_LEAF_CERT}");
-        let (chain, _) = split_client_identity_pem(
-            cert_with_key.as_bytes(),
-            Some(TEST_KEY_PKCS8.as_bytes()),
-        )
-        .unwrap();
+        let (chain, _) =
+            split_client_identity_pem(cert_with_key.as_bytes(), Some(TEST_KEY_PKCS8.as_bytes()))
+                .unwrap();
         assert_eq!(chain, TEST_LEAF_CERT.as_bytes());
     }
 
@@ -6767,8 +6768,7 @@ mod tests {
         let der = [0x30u8, 0x82, 0xff, 0x01];
         let error = split_client_identity_pem(&der, None).unwrap_err();
         assert!(error.contains("not PEM text"), "{error}");
-        let error =
-            split_client_identity_pem(TEST_LEAF_CERT.as_bytes(), Some(&der)).unwrap_err();
+        let error = split_client_identity_pem(TEST_LEAF_CERT.as_bytes(), Some(&der)).unwrap_err();
         assert!(error.contains("not PEM text"), "{error}");
     }
 

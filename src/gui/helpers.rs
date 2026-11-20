@@ -416,13 +416,19 @@ mod tests {
             .unwrap()
             .as_secs();
         // The present instant agrees with the current-offset computation.
-        assert_eq!(windows_local_offset_secs_at(now), windows_local_offset_secs());
+        assert_eq!(
+            windows_local_offset_secs_at(now),
+            windows_local_offset_secs()
+        );
         // Half a year apart the offsets differ by at most the DST shift (zero
         // in a zone without DST), and the epoch itself is convertible.
         let (winter, summer) = (1_768_478_400, 1_784_116_800);
         let shift = windows_local_offset_secs_at(winter) - windows_local_offset_secs_at(summer);
         assert!(shift.abs() <= 3600, "{shift}");
-        assert_eq!(local_utc_offset_secs(winter), windows_local_offset_secs_at(winter));
+        assert_eq!(
+            local_utc_offset_secs(winter),
+            windows_local_offset_secs_at(winter)
+        );
         let _ = windows_local_offset_secs_at(0);
     }
 

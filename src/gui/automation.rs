@@ -905,7 +905,10 @@ impl AutomationUi {
                     self.error = Some(error);
                 }
                 if ui
-                    .add_enabled(!self.blocked, egui::Button::new("Apply and save automation"))
+                    .add_enabled(
+                        !self.blocked,
+                        egui::Button::new("Apply and save automation"),
+                    )
                     .clicked()
                 {
                     match self.commit() {

@@ -170,8 +170,7 @@ impl WorkspaceStore {
                 match &result {
                     Ok(()) => reported = None,
                     Err(error) if reported.as_ref() != Some(error) => {
-                        *errors.lock().unwrap() =
-                            Some(format!("Workspace was not saved: {error}"));
+                        *errors.lock().unwrap() = Some(format!("Workspace was not saved: {error}"));
                         reported = Some(error.clone());
                     }
                     Err(_) => {}

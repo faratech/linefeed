@@ -1376,7 +1376,11 @@ mod tests {
     fn wrong_password_without_account_numerics_releases_joins_at_the_deadline() {
         let (mut app, mut rx) = sent_login_awaiting_join();
         feed(&mut app, ":NickServ!s@services NOTICE me :Invalid password");
-        assert!(drain(&mut rx).iter().any(|c| matches!(c, IrcCommand::Whois(_))));
+        assert!(
+            drain(&mut rx)
+                .iter()
+                .any(|c| matches!(c, IrcCommand::Whois(_)))
+        );
         feed(&mut app, ":srv 318 me me :End of WHOIS");
         app.run_timed_tasks();
         // The probe ended without a confirmation, which clears the attempt
@@ -1441,7 +1445,8 @@ mod tests {
         assert_eq!(joins_of(&drain(&mut rx)), vec!["#room".to_string()]);
     }
 
-    const TWO_LOGINS: &str = "/ns IDENTIFY first-password\n/msg AuthServ AUTH acct second-password\n/oper u p";
+    const TWO_LOGINS: &str =
+        "/ns IDENTIFY first-password\n/msg AuthServ AUTH acct second-password\n/oper u p";
 
     fn start_with_held_second_login() -> (Session, mpsc::UnboundedReceiver<IrcCommand>) {
         let (mut app, mut rx) = app(TWO_LOGINS);
@@ -1487,8 +1492,10 @@ mod tests {
                     IrcCommand::ClientChat { commands, .. } => commands.clone(),
                     other => vec![other.clone()],
                 })
-                .filter(|command| matches!(command,
-                    IrcCommand::Privmsg(target, _) if target == service))
+                .filter(|command| {
+                    matches!(command,
+                    IrcCommand::Privmsg(target, _) if target == service)
+                })
                 .count()
         };
         assert_eq!(count("NickServ"), 1);

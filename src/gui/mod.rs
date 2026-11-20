@@ -5046,7 +5046,6 @@ impl Session {
 
                 // Check for a CTCP reply (the closing \x01 is optional).
                 if let Some((ctcp_cmd, ctcp_reply)) = parse_ctcp(content) {
-
                     // Handle CTCP PING reply to show latency
                     if ctcp_cmd.eq_ignore_ascii_case("PING") {
                         if let Ok(sent_time) = ctcp_reply.parse::<u128>() {
@@ -10033,7 +10032,9 @@ pub(crate) mod tests {
             assert!(app.pending_channel_keys.is_empty(), "{refusal}: key kept");
             assert!(app.join_focus_requests.is_empty(), "{refusal}: focus kept");
             assert!(
-                app.pending_rejoins.as_ref().is_none_or(|rows| rows.is_empty()),
+                app.pending_rejoins
+                    .as_ref()
+                    .is_none_or(|rows| rows.is_empty()),
                 "{refusal}: rejoin membership kept"
             );
             assert!(app.update_session().tabs.is_empty(), "{refusal}: snapshot");
@@ -10051,7 +10052,11 @@ pub(crate) mod tests {
 
         app.handle_numeric(
             ERR_UNAVAILRESOURCE,
-            &["*".into(), "me".into(), "Nick/channel is temporarily unavailable".into()],
+            &[
+                "*".into(),
+                "me".into(),
+                "Nick/channel is temporarily unavailable".into(),
+            ],
         );
 
         assert!(!app.pending_channel_keys.is_empty());
@@ -10072,7 +10077,12 @@ pub(crate) mod tests {
 
         app.handle_numeric(
             ERR_LINKCHANNEL,
-            &["me".into(), "#old".into(), "#new".into(), "Forwarding".into()],
+            &[
+                "me".into(),
+                "#old".into(),
+                "#new".into(),
+                "Forwarding".into(),
+            ],
         );
 
         assert!(app.pending_channel_keys.is_empty(), "#old key kept");
@@ -11880,7 +11890,10 @@ pub(crate) mod tests {
         use std::time::{Duration, UNIX_EPOCH};
         assert_eq!(suffix_from(UNIX_EPOCH + Duration::from_millis(12345)), 2345);
         assert_eq!(suffix_from(UNIX_EPOCH - Duration::from_secs(1)), 0);
-        assert_eq!(suffix_from(UNIX_EPOCH - Duration::from_secs(1_000_000_000)), 0);
+        assert_eq!(
+            suffix_from(UNIX_EPOCH - Duration::from_secs(1_000_000_000)),
+            0
+        );
         assert!(rand_suffix() < 10000);
     }
 
@@ -12278,10 +12291,18 @@ pub(crate) mod tests {
     fn ban_list_entries_without_setter_or_time_are_kept() {
         let mut app = test_app();
         app.conversations.insert("#room".into(), Channel::new());
-        app.handle_numeric(RPL_BANLIST, &["me".into(), "#room".into(), "*!*@bad.host".into()]);
         app.handle_numeric(
             RPL_BANLIST,
-            &["me".into(), "#room".into(), "*!*@worse.host".into(), "op".into()],
+            &["me".into(), "#room".into(), "*!*@bad.host".into()],
+        );
+        app.handle_numeric(
+            RPL_BANLIST,
+            &[
+                "me".into(),
+                "#room".into(),
+                "*!*@worse.host".into(),
+                "op".into(),
+            ],
         );
         app.handle_numeric(RPL_ENDOFBANLIST, &["me".into(), "#room".into()]);
 
@@ -12559,7 +12580,14 @@ pub(crate) mod tests {
             (10, vec!["#big", "!ABCDEbig", "+bigmodeless"]),
             (
                 0,
-                vec!["#small", "!ABCDEsafe", "+modeless", "#big", "!ABCDEbig", "+bigmodeless"],
+                vec![
+                    "#small",
+                    "!ABCDEsafe",
+                    "+modeless",
+                    "#big",
+                    "!ABCDEbig",
+                    "+bigmodeless",
+                ],
             ),
         ] {
             let mut app = test_app();
@@ -14112,7 +14140,10 @@ pub(crate) mod tests {
             assert_eq!(row.sender, "mallory");
         }
         let srv = find("#room", "x2");
-        assert!(!srv.is_system, "gap markers only count inside a history batch");
+        assert!(
+            !srv.is_system,
+            "gap markers only count inside a history batch"
+        );
         let pm = find("mallory", "x4");
         assert!(!pm.is_system);
         assert_eq!(pm.sender, "mallory");
@@ -14489,7 +14520,9 @@ pub(crate) mod tests {
         // An unterminated request is answered like a terminated one, to the
         // sender and not the channel.
         while rx.try_recv().is_ok() {}
-        app.handle_incoming_message(IrcMessage::parse(":alice!u@h PRIVMSG me :\x01SOURCE").unwrap());
+        app.handle_incoming_message(
+            IrcMessage::parse(":alice!u@h PRIVMSG me :\x01SOURCE").unwrap(),
+        );
         let reply = rx.try_recv().expect("unterminated SOURCE answered");
         assert!(
             matches!(&reply, IrcCommand::Notice(to, body)
@@ -14509,7 +14542,13 @@ pub(crate) mod tests {
         );
 
         // draft/multiline batches use the same parser.
-        deliver_multiline(&mut app, "ml", "alice!u@h", "#a", &["\x01ACTION waves", "and smiles"]);
+        deliver_multiline(
+            &mut app,
+            "ml",
+            "alice!u@h",
+            "#a",
+            &["\x01ACTION waves", "and smiles"],
+        );
         let row = app.conversations["#a"].messages.back().unwrap();
         assert!(row.is_action);
         assert_eq!(row.content, "waves\nand smiles");
