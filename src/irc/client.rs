@@ -1669,6 +1669,19 @@ impl IrcClient {
             };
             let (chain, key) = split_client_identity_pem(&cert, key.as_deref())
                 .map_err(|e| format!("Invalid TLS client certificate/key: {e}"))?;
+            // SChannel's from_pkcs8 imports into an RSA container only and
+            // otherwise fails with an opaque "ASN1 bad tag value met".
+            if cfg!(windows)
+                && let Some(algorithm) =
+                    pkcs8_key_algorithm(&key).filter(|algorithm| *algorithm != KeyAlgorithm::Rsa)
+            {
+                return Err(format!(
+                    "Invalid TLS client certificate/key: on Windows only RSA client keys are \
+                     supported; this key is {}",
+                    algorithm.name()
+                )
+                .into());
+            }
             let identity = native_tls::Identity::from_pkcs8(&chain, &key)
                 .map_err(|e| format!("Invalid TLS client certificate/key: {e}"))?;
             tls_builder.identity(identity);
@@ -3128,6 +3141,69 @@ fn pem_text<'a>(bytes: &'a [u8], what: &str) -> Result<&'a str, String> {
             "the {what} file is not PEM text (DER is not supported; convert it with \
              `openssl x509 -inform der` or `openssl pkcs8 -topk8 -nocrypt -inform der`)"
         )
+    })
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum KeyAlgorithm {
+    Rsa,
+    Ec,
+    Ed25519,
+    Other,
+}
+
+impl KeyAlgorithm {
+    fn name(&self) -> &'static str {
+        match self {
+            Self::Rsa => "RSA",
+            Self::Ec => "EC",
+            Self::Ed25519 => "Ed25519",
+            Self::Other => "not RSA",
+        }
+    }
+}
+
+/// One DER element: its tag, content and what follows it.
+fn der_element(bytes: &[u8]) -> Option<(u8, &[u8], &[u8])> {
+    let (&tag, rest) = bytes.split_first()?;
+    let (&first, rest) = rest.split_first()?;
+    let (length, rest) = if first < 0x80 {
+        (usize::from(first), rest)
+    } else {
+        let count = usize::from(first & 0x7f);
+        if count == 0 || count > 4 || rest.len() < count {
+            return None;
+        }
+        let length = rest[..count]
+            .iter()
+            .fold(0usize, |acc, byte| (acc << 8) | usize::from(*byte));
+        (length, &rest[count..])
+    };
+    (rest.len() >= length).then(|| (tag, &rest[..length], &rest[length..]))
+}
+
+/// The algorithm of a PKCS#8 `PRIVATE KEY` PEM block, from the OID in its
+/// AlgorithmIdentifier. `None` when the block is not well-formed PKCS#8.
+fn pkcs8_key_algorithm(key_pem: &[u8]) -> Option<KeyAlgorithm> {
+    const RSA_ENCRYPTION: &[u8] = &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x01];
+    const EC_PUBLIC_KEY: &[u8] = &[0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01];
+    const ED25519: &[u8] = &[0x2b, 0x65, 0x70];
+    let body: String = std::str::from_utf8(key_pem)
+        .ok()?
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with("-----"))
+        .collect();
+    let der = BASE64_STANDARD.decode(body).ok()?;
+    let (_, private_key_info, _) = der_element(&der).filter(|(tag, ..)| *tag == 0x30)?;
+    let (_, _version, rest) = der_element(private_key_info).filter(|(tag, ..)| *tag == 0x02)?;
+    let (_, algorithm, _) = der_element(rest).filter(|(tag, ..)| *tag == 0x30)?;
+    let (_, oid, _) = der_element(algorithm).filter(|(tag, ..)| *tag == 0x06)?;
+    Some(match oid {
+        RSA_ENCRYPTION => KeyAlgorithm::Rsa,
+        EC_PUBLIC_KEY => KeyAlgorithm::Ec,
+        ED25519 => KeyAlgorithm::Ed25519,
+        _ => KeyAlgorithm::Other,
     })
 }
 
@@ -6658,6 +6734,12 @@ mod tests {
     const TEST_INTERMEDIATE_CERT: &str = "-----BEGIN CERTIFICATE-----\nMIIBcTCCARigAwIBAgIUG54N7tRlJilJitJOy0P+cXTQyB0wCgYIKoZIzj0EAwIw\nHjEcMBoGA1UEAwwTbGluZWZlZWQtdGVzdC1pbnRlcjAgFw0yNjExMjAxMjM4MTla\nGA8yMTI2MTAyNzEyMzgxOVowHjEcMBoGA1UEAwwTbGluZWZlZWQtdGVzdC1pbnRl\ncjBZMBMGByqGSM49AgEGCCqGSM49AwEHA0IABJRDDJIP5cDzggVP4HwablSlcr4N\nduJ8n7fIySMGEp9tM0pSjfUaNUr4siUYBpw5TeITmv1PfiAuPGmM1DeWDIWjMjAw\nMB0GA1UdDgQWBBQ8YCwSCyAloqJksTUFXx3OuIAVdjAPBgNVHRMBAf8EBTADAQH/\nMAoGCCqGSM49BAMCA0cAMEQCIC6DH/le2v6kpU7i9hgvhKxywEyNdpL+zeBczaJj\n1m2/AiAsS7ArAlk2DJHbhnPaqSBaQV++NBGeYyPGLmdsdS2j2w==\n-----END CERTIFICATE-----\n";
     const TEST_KEY_PKCS8: &str = "-----BEGIN PRIVATE KEY-----\nMIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgg5I5HKnKmGdrVLOw\n2AQ3P9jLnk3tgT0/1Axg/sh39gmhRANCAAQUq6YYwaG2bJDa5m3Hu6KIOMr2Wlmf\n+IFEpZniPeQj2XSSlYHMxEADniGaI6CXb5P23TrcxXh3w/niY63cZ02K\n-----END PRIVATE KEY-----\n";
 
+    // Throwaway RSA-2048 identity: the only type SChannel's from_pkcs8 imports,
+    // so tests that load an identity into native-tls use it.
+    const TEST_RSA_CERT: &str = "-----BEGIN CERTIFICATE-----\nMIIC8jCCAdqgAwIBAgIUbPBonHA40vJdEVxrzmcX2y44mCUwDQYJKoZIhvcNAQEL\nBQAwGDEWMBQGA1UEAwwNbGluZWZlZWQtdGVzdDAgFw0yNjExMjAxMzEwMTNaGA8y\nMTI2MTAyNzEzMTAxM1owGDEWMBQGA1UEAwwNbGluZWZlZWQtdGVzdDCCASIwDQYJ\nKoZIhvcNAQEBBQADggEPADCCAQoCggEBAOBJxFmROjUxRxfgDJmVgtjUbbT429pE\nfOBDR+BReOBrNZ/sraZnYB2MuZqqCsRC8hQ9H3pPF8hiYt524ELRkphS2Nv/C3gH\n3tJoOF7Jj57PtvZNpI8rAlbqRDUBBwl/XhZkCpX8fCyTCA4Efxy4w2awj6kljhCE\nuOR92K+qBBYVh8KmEM2VjRKXk75fry6hHfsBNTits5uPg1BhYArVb8aKCsdKgbvF\nH+JQpxixs+deSoe3PsG4o2zuSVpFfbZ8bjOuB1zGAr5RYN7fEUp7ECHY0D17DL/o\nsaEcbXwSMMtUmiG4lNbIKQl9Q5fZOfAaIaLbyWydmWQcYiFi5Y5bqOUCAwEAAaMy\nMDAwHQYDVR0OBBYEFIy0eoRKp/VJ4KzQG7wLFa2yvErRMA8GA1UdEwEB/wQFMAMB\nAf8wDQYJKoZIhvcNAQELBQADggEBABX7ICM2/EHe4cjaLKlO/MRSSQkt3EOJ8Qxq\ndQBmzJfSGXJssyJVIhY43qHb0dkfhkeRQlyFcjUYSH/lLzABWxr61qf+uZXR8EZI\nuRec4kQxk7BeKfZ86030S9g0r/YQkYlhM7itIhCu2wFrRG9vjPBjDcik6JawnVYh\nokMAfOnucl2kLeKsUFHDKpNwAzoUbaIXArJ33iazS2aRZcE0qNRScplmVeE/tSDB\nxRHfUH3EieXNgtgLnVUfRqOrUVPRMO20PP3PIQTsbnvpN4B3l3QVGjuXkBL2gOcU\nPUtwAlHyfd62ZjmNI05kVglwmh8IYtnnGw+CCdvQHU+kwtu65X8=\n-----END CERTIFICATE-----\n";
+    const TEST_RSA_KEY: &str = "-----BEGIN PRIVATE KEY-----\nMIIEvgIBADANBgkqhkiG9w0BAQEFAASCBKgwggSkAgEAAoIBAQDgScRZkTo1MUcX\n4AyZlYLY1G20+NvaRHzgQ0fgUXjgazWf7K2mZ2AdjLmaqgrEQvIUPR96TxfIYmLe\nduBC0ZKYUtjb/wt4B97SaDheyY+ez7b2TaSPKwJW6kQ1AQcJf14WZAqV/HwskwgO\nBH8cuMNmsI+pJY4QhLjkfdivqgQWFYfCphDNlY0Sl5O+X68uoR37ATU4rbObj4NQ\nYWAK1W/GigrHSoG7xR/iUKcYsbPnXkqHtz7BuKNs7klaRX22fG4zrgdcxgK+UWDe\n3xFKexAh2NA9ewy/6LGhHG18EjDLVJohuJTWyCkJfUOX2TnwGiGi28lsnZlkHGIh\nYuWOW6jlAgMBAAECggEAHlv91v3geijEbcfnDLb/Mih2/SMeZ0oT+StCRGvix8Xb\nSV15F+gwS2+sA/J2aKCDMhgf9adVGcuvhFtk+cZyaGn2brj0LXgrQiHXV4VDCoUl\nR+u0laiFtYwaVW5hLHjwHGnIQQsfJ81zLqqPJi0gTfsiRwwNUdEVUeBy/zwtN2vL\nprDhj1S9a8Epx6bEHx0WYmksinmg32can2MLmKPMniiELmLm5IZsgZIVDRWIODBk\npqVlFX0kFNy5COcQJSC1ejVjL/6kl6SXt9MrVRuE/p2kdCmRiT1DxubIMfftXvNX\nmdMZYTwk4lD7laAooYJahidn6RntDf+cwvYxbARZNQKBgQD/e/WCVdutToZgn/iV\neMOnzyOzMiJC1/x69GxbMX/arenXFpzD5g9x9G5ehz6Dd8ja9SntnhXbEEyKvpTc\n0evu9WNAtpWfo5HP2U8n25DbVA2lGnj3+extN+mnPffs7alFJU9tAgpSIM+rlEPk\nC43RXnndJS7FHR9P/daLZKKnZwKBgQDgva9duGNsJWrgCq1KMgkNQgMcg1J28E4X\nCKdGmMRynK0tofzN+6YfvuLQVzKRNH5antC8ubhhgvYDW+HFvTTMJwlQfkEbnWIr\n3LPOh5BePXwfzRjUe65+hrud2TYTEgauRJ9Q+RZuK25A0PHgP3r4CIhq84wWOF37\nsxbyS/R50wKBgQCO05/W82TSKFobXpM8DL1k7PpKTba1o8W0fzysZqnRePSHmE6f\nfdgYnsus8PLT0H1rWy/LdVtGkoAX+J+EK584gdqw7OIM0wbLKfOEls0OsJjIOlpy\nVzgDfwSSyKP3wo2k6EzU5hUbANjYVRT3QjZQW/7I0Oaqr7M3pvLwDpyX9QKBgQDa\nfU7aTILMBuyKd5bVRSOrsfuYYstvOlyQ5CbL6YVC77MlZBCEqRxuTIPxjHRq2p/k\ntfW1JNFua4WE6nTqavHDcEgL61Kc6Dsi7WQZa44dMKVVvW1gVgXkmFQaN6vsil/Y\nWHqSnDcEUFDVzsz3+H8yWAlYAQK2L4KfSxMJ6HH7ZQKBgBd//X42hFLcjISJ9r1x\nX4NNmVQGHYUDNVNAim1tXM17etgIb4vim1aQQixcV224rJR5sAiMOgUPg9pjd2tB\nCWZoFgNb1fz+cDnzvfBZEaYMODZLXEjhJaoOnkPevY0Kzc6Ec8bEJi/Fop30sYe4\nnF58Payb/SncdjtG0VPtFKaG\n-----END PRIVATE KEY-----\n";
+    const TEST_ED25519_KEY: &str = "-----BEGIN PRIVATE KEY-----\nMC4CAQAwBQYDK2VwBCIEIAuJcOOP6xuGspgw2jDbZF0BzQvWODYARyoaK4688XS7\n-----END PRIVATE KEY-----\n";
+
     fn blocks_of(pem: &[u8]) -> Vec<String> {
         parse_pem_blocks(std::str::from_utf8(pem).unwrap())
             .unwrap()
@@ -6678,15 +6760,47 @@ mod tests {
 
     #[test]
     fn combined_pem_works_with_the_certificate_or_the_key_first() {
-        let cert_first = format!("{TEST_LEAF_CERT}{TEST_KEY_PKCS8}");
-        let key_first = format!("{TEST_KEY_PKCS8}{TEST_LEAF_CERT}");
+        let cert_first = format!("{TEST_RSA_CERT}{TEST_RSA_KEY}");
+        let key_first = format!("{TEST_RSA_KEY}{TEST_RSA_CERT}");
         for combined in [&cert_first, &key_first] {
             let (chain, key) = split_client_identity_pem(combined.as_bytes(), None).unwrap();
             assert_usable_identity(&chain, &key);
-            assert_eq!(chain, TEST_LEAF_CERT.as_bytes());
-            assert_eq!(key, TEST_KEY_PKCS8.as_bytes());
+            assert_eq!(chain, TEST_RSA_CERT.as_bytes());
+            assert_eq!(key, TEST_RSA_KEY.as_bytes());
             native_tls::Identity::from_pkcs8(&chain, &key).unwrap();
         }
+    }
+
+    #[test]
+    fn pkcs8_key_algorithm_is_read_from_the_algorithm_identifier() {
+        assert_eq!(
+            pkcs8_key_algorithm(TEST_RSA_KEY.as_bytes()),
+            Some(KeyAlgorithm::Rsa)
+        );
+        assert_eq!(
+            pkcs8_key_algorithm(TEST_KEY_PKCS8.as_bytes()),
+            Some(KeyAlgorithm::Ec)
+        );
+        assert_eq!(
+            pkcs8_key_algorithm(TEST_ED25519_KEY.as_bytes()),
+            Some(KeyAlgorithm::Ed25519)
+        );
+        // Not PKCS#8, not base64, a certificate, and truncated input.
+        assert_eq!(pkcs8_key_algorithm(b"not a key"), None);
+        assert_eq!(
+            pkcs8_key_algorithm(b"-----BEGIN PRIVATE KEY-----\n!!!\n"),
+            None
+        );
+        assert_eq!(pkcs8_key_algorithm(TEST_RSA_CERT.as_bytes()), None);
+        let truncated = &TEST_RSA_KEY[..TEST_RSA_KEY.len() / 8];
+        assert_eq!(pkcs8_key_algorithm(truncated.as_bytes()), None);
+        // The algorithm is identified from the split output as well.
+        let (_, key) = split_client_identity_pem(
+            format!("{TEST_RSA_CERT}{TEST_ED25519_KEY}").as_bytes(),
+            None,
+        )
+        .unwrap();
+        assert_eq!(pkcs8_key_algorithm(&key), Some(KeyAlgorithm::Ed25519));
     }
 
     #[test]
@@ -6808,11 +6922,11 @@ mod tests {
             ));
             std::fs::create_dir(&directory).unwrap();
             let combined = directory.join("combined.pem");
-            std::fs::write(&combined, format!("{TEST_LEAF_CERT}{TEST_KEY_PKCS8}")).unwrap();
+            std::fs::write(&combined, format!("{TEST_RSA_CERT}{TEST_RSA_KEY}")).unwrap();
 
             let server_identity = native_tls::Identity::from_pkcs8(
-                TEST_LEAF_CERT.as_bytes(),
-                TEST_KEY_PKCS8.as_bytes(),
+                TEST_RSA_CERT.as_bytes(),
+                TEST_RSA_KEY.as_bytes(),
             )
             .unwrap();
             let acceptor = tokio_native_tls::TlsAcceptor::from(
