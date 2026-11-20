@@ -81,6 +81,9 @@ pub(crate) struct TargetView {
     pub history_temp: String,
     pub tab_completion: Option<TabCompletion>,
     pub selected_user: Option<String>,
+    /// The people list shown or hidden by hand; `None` follows the window
+    /// width (hidden in a narrow window).
+    pub people_hidden: Option<bool>,
     /// Focus this window's input line on its next draw.
     pub input_focus_request: bool,
     /// Whether this window's input line had focus when last drawn.

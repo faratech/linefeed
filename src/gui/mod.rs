@@ -632,6 +632,8 @@ pub struct Session {
 
     // User list selection
     pub selected_user: Option<String>,
+    /// The drawn window's people-list choice (see `TargetView`).
+    pub(crate) people_hidden: Option<bool>,
 
     // Connection options
     pub auto_join_channels: String,
@@ -870,6 +872,7 @@ impl Session {
             tab_completion: None,
 
             selected_user: None,
+            people_hidden: None,
 
             auto_join_channels: settings.auto_join_channels,
             set_invisible: settings.set_invisible,

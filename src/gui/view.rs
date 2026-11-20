@@ -6,7 +6,6 @@
 
 use egui::{Color32, RichText, ScrollArea, TextEdit};
 
-use super::formatting::render_irc_text;
 use super::{Session, UserMode, commands};
 use crate::irc::IrcCommand;
 
@@ -105,10 +104,16 @@ impl Session {
     /// to the space the window gives it and nothing has a minimum width
     /// beyond it, so a floating window keeps the size it was tiled to or
     /// dragged to instead of growing to fit its content.
-    pub(crate) fn draw_target(&mut self, ui: &mut egui::Ui) {
+    pub(crate) fn draw_target(
+        &mut self,
+        ui: &mut egui::Ui,
+        network_label: &str,
+        narrow: bool,
+        controls: &mut dyn FnMut(&mut egui::Ui),
+    ) {
         let salt = (self.id, self.current_conversation);
         self.capture_upload_drop(ui);
-        self.draw_target_header(ui);
+        self.draw_target_header(ui, network_label, narrow, controls);
         if self.timeline.borrow().restore_pending {
             ui.horizontal_wrapped(|ui| {
                 ui.label(egui::RichText::new("Restoring saved reading position…").small());
@@ -124,6 +129,7 @@ impl Session {
         }
         if let Some(channel_name) = self.current_target_name().map(str::to_string)
             && self.is_channel_name(&channel_name)
+            && self.people_visible(narrow)
         {
             egui::Panel::right(("users", salt))
                 .resizable(true)
@@ -141,36 +147,82 @@ impl Session {
         });
     }
 
-    fn draw_target_header(&self, ui: &mut egui::Ui) {
-        let Some(channel_name) = self.current_target_name() else {
-            return;
+    /// Whether this window shows its people list: the user's own choice,
+    /// or by default everywhere but in a narrow window.
+    pub(crate) fn people_visible(&self, narrow: bool) -> bool {
+        !self.people_hidden.unwrap_or(narrow)
+    }
+
+    /// One row heading the window: its name, the topic on a single line, a
+    /// button that shows or hides the people list, and the window's own
+    /// controls at the right.
+    fn draw_target_header(
+        &mut self,
+        ui: &mut egui::Ui,
+        network_label: &str,
+        narrow: bool,
+        controls: &mut dyn FnMut(&mut egui::Ui),
+    ) {
+        let palette = super::theme::palette(ui.ctx());
+        let target = self.current_target_name().map(str::to_owned);
+        let channel = target
+            .as_deref()
+            .and_then(|name| self.conversations.get(name));
+        let is_channel = target
+            .as_deref()
+            .is_some_and(|name| self.is_channel_name(name));
+        let name = target.as_deref().unwrap_or("Status").to_owned();
+        // What follows the name: the topic, or the network for the status
+        // window.
+        let detail = match (&target, channel) {
+            (None, _) => Some(network_label.to_owned()),
+            (Some(_), Some(channel)) => channel
+                .topic
+                .as_deref()
+                .map(super::formatting::strip_irc_formatting),
+            _ => None,
         };
-        let Some(channel) = self.conversations.get(channel_name) else {
-            return;
-        };
-        if self.is_channel_name(channel_name) && !channel.modes.is_empty() {
-            ui.horizontal_wrapped(|ui| {
-                ui.label(RichText::new(channel_name).strong());
-                ui.label(
-                    RichText::new(format!("[{}]", channel.modes))
-                        .color(Color32::from_rgb(150, 150, 150)),
-                );
-                ui.label(
-                    RichText::new(format!("({} users)", channel.users.len()))
-                        .small()
-                        .color(Color32::GRAY),
-                );
+        let modes = channel
+            .filter(|channel| is_channel && !channel.modes.is_empty())
+            .map(|channel| format!("Modes: {}", channel.modes));
+        let people = channel.filter(|_| is_channel).map(|channel| {
+            let away = channel.away_count();
+            let hover = if away > 0 {
+                format!("{away} away. Show or hide the people list")
+            } else {
+                "Show or hide the people list".to_owned()
+            };
+            (format!("{} people", channel.users.len()), hover)
+        });
+        let mut toggle_people = false;
+        ui.horizontal(|ui| {
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                controls(ui);
+                if let Some((label, hover)) = &people
+                    && ui.small_button(label).on_hover_text(hover).clicked()
+                {
+                    toggle_people = true;
+                }
+                ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                    let heading = egui::TextStyle::Heading.resolve(ui.style()).size;
+                    let response = ui.label(
+                        super::widgets::strong(&name)
+                            .size(heading)
+                            .color(palette.text),
+                    );
+                    if let Some(modes) = &modes {
+                        response.on_hover_text(modes);
+                    }
+                    if let Some(detail) = detail {
+                        super::widgets::truncated(ui, RichText::new(detail).color(palette.muted));
+                    }
+                });
             });
+        });
+        if toggle_people {
+            self.people_hidden = Some(self.people_visible(narrow));
         }
-        if let Some(topic) = &channel.topic {
-            ui.horizontal_wrapped(|ui| {
-                ui.label(RichText::new("Topic:").strong());
-                render_irc_text(ui, topic, Color32::WHITE);
-            });
-        }
-        if self.is_channel_name(channel_name) || channel.topic.is_some() {
-            ui.separator();
-        }
+        ui.separator();
     }
 
     fn draw_user_list(&mut self, ui: &mut egui::Ui, channel_name: &str) {

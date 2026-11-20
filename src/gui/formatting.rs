@@ -780,13 +780,6 @@ pub fn render_segments(ui: &mut egui::Ui, segments: &[RenderSegment], default_co
     });
 }
 
-/// Render IRC formatted text with colors, bold, underline, italic, and clickable URLs.
-/// Parses on every call: use only for rarely-rendered or frequently-changing text
-/// (message scrollback goes through the per-message cache instead).
-pub fn render_irc_text(ui: &mut egui::Ui, text: &str, default_color: Color32) {
-    render_segments(ui, &layout_irc_text(text), default_color);
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

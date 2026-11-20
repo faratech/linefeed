@@ -709,12 +709,16 @@ impl App {
                 .max_size(360.0)
                 .show(root_ui, |ui| self.draw_sidebar(ui));
         }
-        let central = egui::CentralPanel::default().show(root_ui, |ui| {
-            if self.windows.mode == LayoutMode::Maximized {
-                self.draw_maximized(ui);
-            }
-            ui.max_rect()
-        });
+        let chat_ground =
+            egui::Frame::central_panel(&ctx.global_style()).fill(super::theme::palette(&ctx).bg);
+        let central = egui::CentralPanel::default()
+            .frame(chat_ground)
+            .show(root_ui, |ui| {
+                if self.windows.mode == LayoutMode::Maximized {
+                    self.draw_maximized(ui);
+                }
+                ui.max_rect()
+            });
         if self.windows.mode == LayoutMode::Floating {
             self.draw_floating(&ctx, central.inner);
         }
@@ -2837,40 +2841,35 @@ impl App {
             });
             return;
         };
-        let title = self.window_title(&key);
         let mut action = None;
         let mut restore = None;
-        ui.horizontal(|ui| {
-            ui.label(RichText::new(&title).strong());
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui
-                    .small_button("✕")
-                    .on_hover_text("Close (Ctrl+W)")
-                    .clicked()
-                {
-                    action = Some(WindowAction::Close);
-                }
-                if ui
-                    .small_button("Detach")
-                    .on_hover_text("Open in its own window")
-                    .clicked()
-                {
-                    action = Some(WindowAction::Detach);
-                }
-                // Resting on it opens the snap layouts, as on a floating
-                // window's maximize button.
-                let response = ui.small_button("Restore");
-                if response.clicked() {
-                    action = Some(WindowAction::Restore);
-                }
-                restore = Some(response);
-            });
+        // The window's controls close the header row the window draws.
+        self.draw_window_contents(ui, &key, &mut |ui| {
+            if ui
+                .small_button("✕")
+                .on_hover_text("Close (Ctrl+W)")
+                .clicked()
+            {
+                action = Some(WindowAction::Close);
+            }
+            if ui
+                .small_button("Detach")
+                .on_hover_text("Open in its own window")
+                .clicked()
+            {
+                action = Some(WindowAction::Detach);
+            }
+            // Resting on it opens the snap layouts, as on a floating
+            // window's maximize button.
+            let response = ui.small_button("Restore");
+            if response.clicked() {
+                action = Some(WindowAction::Restore);
+            }
+            restore = Some(response);
         });
         if let Some(restore) = restore {
             self.track_maximize_hover(ui.ctx(), &key, &restore);
         }
-        ui.separator();
-        self.draw_window_contents(ui, &key);
         match action {
             Some(WindowAction::Close) => self.request_close(key),
             Some(WindowAction::Detach) => self.toggle_detached(&key),
@@ -2954,7 +2953,7 @@ impl App {
             };
             let shown = window.show(ctx, |ui| {
                 let action = self.draw_caption(ui, key, active);
-                self.draw_window_contents(ui, key);
+                self.draw_window_contents(ui, key, &mut |_| {});
                 action
             });
             if let Some(shown) = shown {
@@ -3104,7 +3103,7 @@ impl App {
                     });
                 }
                 egui::CentralPanel::default().show(ui, |ui| {
-                    self.draw_window_contents(ui, &key);
+                    self.draw_window_contents(ui, &key, &mut |_| {});
                 });
                 self.draw_activity(ui.ctx(), Some(key));
                 self.show_detached_window_dialogs(ui.ctx(), &key);
@@ -3203,7 +3202,14 @@ impl App {
 
     /// Draw one window's contents (topic, user list, scrollback, input) for
     /// its session, with the window's input line swapped in.
-    pub(crate) fn draw_window_contents(&mut self, ui: &mut egui::Ui, key: &WindowKey) {
+    /// Draw one window's header, people list, scrollback and input line.
+    /// `controls` adds the window's own buttons at the right of its header.
+    pub(crate) fn draw_window_contents(
+        &mut self,
+        ui: &mut egui::Ui,
+        key: &WindowKey,
+        controls: &mut dyn FnMut(&mut egui::Ui),
+    ) {
         let Some(index) = self.session_index(key.conn) else {
             return;
         };
@@ -3214,6 +3220,8 @@ impl App {
             return;
         }
         let view_is_active = self.windows.active == Some(*key);
+        let network = self.network_label(&self.sessions[index]);
+        let narrow = narrow(ui.ctx());
         let App {
             sessions, windows, ..
         } = self;
@@ -3230,7 +3238,7 @@ impl App {
                     s.show_channel_info,
                 );
                 s.view_is_active = view_is_active;
-                s.draw_target(ui);
+                s.draw_target(ui, &network, narrow, controls);
                 s.handle_message_actions();
                 (
                     !before.0 && s.show_color_picker,
@@ -4008,6 +4016,7 @@ fn swap_view(session: &mut Session, view: &mut TargetView) {
     std::mem::swap(&mut session.history_temp, &mut view.history_temp);
     std::mem::swap(&mut session.tab_completion, &mut view.tab_completion);
     std::mem::swap(&mut session.selected_user, &mut view.selected_user);
+    std::mem::swap(&mut session.people_hidden, &mut view.people_hidden);
     std::mem::swap(
         &mut session.input_focus_request,
         &mut view.input_focus_request,
@@ -7840,21 +7849,33 @@ mod tests {
             assert!(app.sessions[0].open_query(&format!("q{n:02}")));
         }
         app.sync_windows();
+        let in_sidebar = |painted: &Painted| {
+            painted
+                .texts
+                .iter()
+                .find(|(text, rect, _)| text == "q79" && rect.right() <= 248.0)
+                .map(|(_, rect, _)| *rect)
+        };
         let ctx = egui::Context::default();
-        let painted = settled(&mut app, &ctx, 1360.0);
-        assert!(!painted.has("q79"), "the last row starts below the window");
+        // The list scrolls over a few frames.
+        let after_scrolling = |app: &mut App| {
+            for _ in 0..60 {
+                paint(app, &ctx, 1360.0, Vec::new());
+            }
+            settled(app, &ctx, 1360.0)
+        };
+        let status = WindowKey::new(app.sessions[0].id, None);
+        app.user_activate(status);
+        let painted = after_scrolling(&mut app);
+        assert!(
+            in_sidebar(&painted).is_none(),
+            "the last row starts below the window"
+        );
         let last = target_key(&app, app.sessions[0].id, "q79");
         app.user_activate(last);
-        // The list scrolls there over a few frames.
-        for _ in 0..60 {
-            paint(&mut app, &ctx, 1360.0, Vec::new());
-        }
-        let painted = settled(&mut app, &ctx, 1360.0);
-        let (row, _) = painted.text("q79");
-        assert!(
-            row.top() > 30.0 && row.bottom() <= 768.0 && row.right() <= 248.0,
-            "{row:?}"
-        );
+        let painted = after_scrolling(&mut app);
+        let row = in_sidebar(&painted).expect("the active row is in view");
+        assert!(row.top() > 30.0 && row.bottom() <= 768.0, "{row:?}");
     }
 
     #[test]
@@ -7913,6 +7934,159 @@ mod tests {
         assert!(sent.iter().any(|line| line == "JOIN #new"), "{sent:?}");
         let painted = settled(&mut app, &ctx, 1360.0);
         assert!(painted.has("Join a channel"), "the row is back to a button");
+    }
+
+    /// `two_networks()` with a topic and a second member in #rust, which is
+    /// the active window.
+    fn rust_with_topic(topic: &str) -> (App, WindowKey) {
+        let (mut app, _rx_a, _rx_b) = two_networks();
+        feed(&mut app, 0, &format!(":srv 332 me #rust :{topic}"));
+        feed(&mut app, 0, ":srv 353 me = #rust :me bob");
+        feed(&mut app, 0, ":srv 366 me #rust :End of /NAMES list.");
+        feed(&mut app, 0, ":bob!u@h PRIVMSG #rust :hello marker");
+        let rust = target_key(&app, app.sessions[0].id, "#rust");
+        app.user_activate(rust);
+        (app, rust)
+    }
+
+    #[test]
+    fn the_header_shows_name_topic_and_people_count_on_one_row() {
+        let (mut app, _rust) = rust_with_topic("Rust talk");
+        let ctx = egui::Context::default();
+        let painted = settled(&mut app, &ctx, 1360.0);
+        let name = painted
+            .texts
+            .iter()
+            .find(|(text, rect, _)| text == "#rust" && rect.left() > 248.0)
+            .expect("the header names the conversation")
+            .1;
+        let (topic, _) = painted.text("Rust talk");
+        let (people, _) = painted.text("2 people");
+        for (what, rect) in [("topic", topic), ("people", people)] {
+            assert!(
+                (rect.center().y - name.center().y).abs() < 8.0,
+                "{what} shares the name's row: {rect:?} vs {name:?}"
+            );
+        }
+        assert!(name.right() <= topic.left() && topic.right() <= people.left());
+        let (close, _) = painted.text("✕");
+        assert!((close.center().y - name.center().y).abs() < 8.0);
+        assert!(close.right() > 1360.0 - 32.0);
+        let strings = painted.strings();
+        assert!(
+            !strings.iter().any(|text| text.starts_with("#rust @ ")),
+            "{strings:?}"
+        );
+        assert!(!strings.contains(&"Topic:"), "{strings:?}");
+    }
+
+    #[test]
+    fn a_long_topic_is_cut_to_one_line() {
+        // The first scrollback row sits right under the header.
+        let ctx = egui::Context::default();
+        let (mut app, _rust) = rust_with_topic("Rust talk");
+        let short = settled(&mut app, &ctx, 1360.0).containing("Now talking").1;
+        let ctx = egui::Context::default();
+        let (mut app, _rust) = rust_with_topic(&"long topic ".repeat(60));
+        let painted = settled(&mut app, &ctx, 1360.0);
+        let long = painted.containing("Now talking").1;
+        assert_eq!(long.top(), short.top(), "the header kept its height");
+        let (people, _) = painted.text("2 people");
+        let header_topic = painted
+            .texts
+            .iter()
+            .find(|(text, rect, _)| {
+                text.contains("long topic long topic")
+                    && (rect.center().y - people.center().y).abs() < 8.0
+            })
+            .expect("the topic is on the header row")
+            .1;
+        assert!(
+            header_topic.right() <= people.left(),
+            "{header_topic:?} vs {people:?}"
+        );
+    }
+
+    fn people_list_shown(painted: &Painted) -> bool {
+        painted
+            .texts
+            .iter()
+            .any(|(text, rect, _)| text == "bob" && rect.left() > 700.0)
+    }
+
+    #[test]
+    fn the_people_button_hides_and_shows_the_list() {
+        let (mut app, _rust) = rust_with_topic("Rust talk");
+        let ctx = egui::Context::default();
+        let painted = settled(&mut app, &ctx, 1360.0);
+        assert!(people_list_shown(&painted), "{:?}", painted.strings());
+        let (people, _) = painted.text("2 people");
+        let painted = click(&mut app, &ctx, 1360.0, people.center());
+        assert!(!people_list_shown(&painted));
+        let (people, _) = painted.text("2 people");
+        let painted = click(&mut app, &ctx, 1360.0, people.center());
+        assert!(people_list_shown(&painted));
+    }
+
+    #[test]
+    fn the_people_list_starts_hidden_in_a_narrow_window() {
+        let (mut app, _rust) = rust_with_topic("Rust talk");
+        let ctx = egui::Context::default();
+        let painted = settled(&mut app, &ctx, 640.0);
+        assert!(
+            !painted
+                .texts
+                .iter()
+                .any(|(text, rect, _)| text == "bob" && rect.left() > 400.0),
+            "{:?}",
+            painted.strings()
+        );
+        let (people, _) = painted.text("2 people");
+        let painted = click(&mut app, &ctx, 640.0, people.center());
+        assert!(
+            painted
+                .texts
+                .iter()
+                .any(|(text, rect, _)| text == "bob" && rect.left() > 400.0)
+        );
+    }
+
+    #[test]
+    fn the_status_window_is_headed_by_status_and_its_network() {
+        let (mut app, _rx_a, _rx_b) = two_networks();
+        let status = WindowKey::new(app.sessions[0].id, None);
+        app.user_activate(status);
+        let ctx = egui::Context::default();
+        let painted = settled(&mut app, &ctx, 1360.0);
+        let label = app.network_label(&app.sessions[0]);
+        let name = painted
+            .texts
+            .iter()
+            .find(|(text, rect, _)| text == "Status" && rect.left() > 248.0)
+            .expect("the header names the status window")
+            .1;
+        let network = painted
+            .texts
+            .iter()
+            .find(|(text, rect, _)| *text == label && rect.left() > name.right())
+            .expect("and its network")
+            .1;
+        assert!((network.center().y - name.center().y).abs() < 8.0);
+    }
+
+    #[test]
+    fn the_chat_area_has_its_own_ground() {
+        let (mut app, _rust) = rust_with_topic("Rust talk");
+        let ctx = egui::Context::default();
+        let painted = settled(&mut app, &ctx, 1360.0);
+        let bg = super::super::theme::palette(&ctx).bg;
+        assert!(
+            painted
+                .fills
+                .iter()
+                .any(|(rect, fill)| *fill == bg && rect.width() > 500.0 && rect.height() > 400.0),
+            "the chat area is not filled with the bg colour"
+        );
     }
 
     fn focus_frame(app: &mut App, ctx: &egui::Context, focused: bool) -> egui::FullOutput {
