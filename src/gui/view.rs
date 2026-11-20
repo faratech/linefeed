@@ -4,7 +4,7 @@
 //! `current_conversation` pointed at the window's target and the window's input
 //! state swapped in (see `app::with_window_view`).
 
-use egui::{Color32, RichText, ScrollArea, TextEdit};
+use egui::{RichText, ScrollArea, TextEdit};
 
 use super::{Session, commands};
 use crate::irc::IrcCommand;
@@ -428,10 +428,22 @@ impl Session {
                 }
             });
         }
+        let palette = super::theme::palette(ui.ctx());
+        let metrics = super::theme::metrics(ui.ctx());
         if self.attention.show_typing {
+            // The line keeps its height when nobody types, so the composer
+            // does not jump as people start and stop.
+            let (line, _) = ui
+                .allocate_exact_size(egui::vec2(ui.available_width(), 20.0), egui::Sense::hover());
             let label = self.typing_label();
             if !label.is_empty() {
-                ui.label(RichText::new(label).small().color(Color32::GRAY));
+                ui.painter().text(
+                    line.left_center() + egui::vec2(4.0, 0.0),
+                    egui::Align2::LEFT_CENTER,
+                    label,
+                    egui::TextStyle::Small.resolve(ui.style()),
+                    palette.muted,
+                );
                 ui.ctx()
                     .request_repaint_after(std::time::Duration::from_secs(1));
             }
@@ -463,24 +475,39 @@ impl Session {
                 history_down = Self::consume_plain_composer_key(ui, egui::Key::ArrowDown);
             }
         }
-        let input_font = egui::TextStyle::Monospace.resolve(ui.style());
+        let input_font = match metrics.message_font {
+            super::theme::MessageFont::Proportional => egui::TextStyle::Body,
+            super::theme::MessageFont::Monospace => egui::TextStyle::Monospace,
+        }
+        .resolve(ui.style());
         let line_height = ui.fonts_mut(|fonts| fonts.row_height(&input_font))
             + ui.spacing().extra_text_line_spacing;
-        let max_height = line_height * 4.0 + 8.0;
+        let control_height = super::theme::control_height(ui);
+        let max_height = (line_height * 4.0 + 8.0).max(control_height);
+        let hint = self.current_target_name().map_or_else(
+            || "Type a message…".to_owned(),
+            |target| format!("Message {target}"),
+        );
+        let narrow = super::app::narrow(ui.ctx());
         let output = ui
             .scope_builder(
                 egui::UiBuilder::new().scope_id(input_id.with("row")),
                 |ui| {
                     ui.horizontal_top(|ui| {
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
+                            let send_button = egui::Button::new(
+                                super::widgets::strong("Send").color(palette.on_accent),
+                            )
+                            .fill(palette.accent);
                             if ui
-                                .button("Send")
+                                .add(send_button)
                                 .on_hover_text("Enter sends; Shift+Enter adds a line")
                                 .clicked()
                             {
                                 send = true;
                             }
-                            ui.menu_button("Format", |ui| {
+                            let format_label = if narrow { "Aa" } else { "Format" };
+                            let format = ui.menu_button(format_label, |ui| {
                                 for (label, code) in [
                                     ("Bold", '\x02'),
                                     ("Underline", '\x1f'),
@@ -498,6 +525,9 @@ impl Session {
                                     ui.close();
                                 }
                             });
+                            if narrow {
+                                format.response.on_hover_text("Text formatting");
+                            }
                             // The panel starts at its previous height. Allow the
                             // draft to grow, then shrink the viewport to its text.
                             ui.set_max_height(max_height);
@@ -510,8 +540,10 @@ impl Session {
                                     TextEdit::multiline(&mut self.input_text)
                                         .id(input_id)
                                         .font(input_font.clone())
-                                        .hint_text("Type a message…")
-                                        .align(egui::Align2::LEFT_TOP)
+                                        .hint_text(hint.as_str())
+                                        .background_color(palette.panel)
+                                        .min_size(egui::vec2(0.0, control_height))
+                                        .align(egui::Align2::LEFT_CENTER)
                                         .desired_rows(1)
                                         .desired_width(ui.available_width())
                                         .show(ui)
@@ -524,6 +556,13 @@ impl Session {
                 },
             )
             .inner;
+        if metrics.density == super::theme::Density::Comfortable {
+            ui.label(
+                RichText::new("Enter sends. Shift+Enter starts a new line.")
+                    .small()
+                    .color(palette.faint),
+            );
+        }
         if std::mem::take(&mut self.input_focus_request) {
             output.response.request_focus();
             if let Some(cursor) = self.composer.cursor {
@@ -597,6 +636,7 @@ impl Session {
 #[cfg(test)]
 mod composer_tests {
     use super::*;
+    use egui::Color32;
 
     #[test]
     fn the_people_button_counts_one_person_and_several_people() {
@@ -701,6 +741,184 @@ mod composer_tests {
         }
     }
 
+    /// One frame of the composer at this size: its height, the texts it
+    /// painted with their colours, and its filled rectangles.
+    #[allow(clippy::type_complexity)]
+    fn painted(
+        session: &mut Session,
+        ctx: &egui::Context,
+        size: egui::Vec2,
+    ) -> (
+        f32,
+        Vec<(String, egui::Rect, Color32)>,
+        Vec<(egui::Rect, Color32)>,
+    ) {
+        fn collect(
+            shape: &egui::Shape,
+            texts: &mut Vec<(String, egui::Rect, Color32)>,
+            fills: &mut Vec<(egui::Rect, Color32)>,
+        ) {
+            match shape {
+                egui::Shape::Text(text) => {
+                    let color = text
+                        .galley
+                        .job
+                        .sections
+                        .first()
+                        .map(|section| section.format.color)
+                        .filter(|color| *color != Color32::PLACEHOLDER)
+                        .unwrap_or(text.fallback_color);
+                    texts.push((
+                        text.galley.text().to_string(),
+                        text.galley.rect.translate(text.pos.to_vec2()),
+                        color,
+                    ));
+                }
+                egui::Shape::Rect(rect) => fills.push((rect.rect, rect.fill)),
+                egui::Shape::Vec(shapes) => shapes.iter().for_each(|s| collect(s, texts, fills)),
+                _ => {}
+            }
+        }
+        let mut height = 0.0;
+        let mut output = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)),
+                ..Default::default()
+            },
+            |ui| {
+                egui::Panel::bottom("test_composer").show(ui, |ui| {
+                    height = ui
+                        .scope(|ui| session.draw_input_row(ui))
+                        .response
+                        .rect
+                        .height();
+                });
+            },
+        );
+        output.textures_delta.clear();
+        let (mut texts, mut fills) = (Vec::new(), Vec::new());
+        for clipped in &output.shapes {
+            collect(&clipped.shape, &mut texts, &mut fills);
+        }
+        (height, texts, fills)
+    }
+
+    fn room_session() -> Session {
+        let mut session = Session::with_settings(Settings {
+            nickname: "me".into(),
+            logging_enabled: false,
+            logging_load_history: false,
+            ..Settings::default()
+        });
+        let mut channel = Channel::new();
+        channel.joined = true;
+        session.conversations.insert("#room".into(), channel);
+        session.current_conversation = session.id_for_target("#room");
+        session
+    }
+
+    #[test]
+    fn the_composer_names_its_target_in_the_hint() {
+        let ctx = egui::Context::default();
+        let size = egui::vec2(640.0, 240.0);
+        let mut session = room_session();
+        let (_, texts, _) = painted(&mut session, &ctx, size);
+        assert!(
+            texts.iter().any(|(text, _, _)| text == "Message #room"),
+            "{texts:?}"
+        );
+        session.current_conversation = None;
+        let (_, texts, _) = painted(&mut session, &ctx, size);
+        assert!(texts.iter().any(|(text, _, _)| text == "Type a message…"));
+    }
+
+    #[test]
+    fn send_is_the_accent_button_as_tall_as_a_control() {
+        use crate::gui::theme::{self, DisplayPrefs};
+        let ctx = egui::Context::default();
+        theme::apply(&ctx, &DisplayPrefs::default());
+        let palette = theme::palette(&ctx);
+        let mut session = room_session();
+        let size = egui::vec2(640.0, 240.0);
+        painted(&mut session, &ctx, size);
+        let (_, texts, fills) = painted(&mut session, &ctx, size);
+        let (_, send, color) = texts
+            .iter()
+            .find(|(text, _, _)| text == "Send")
+            .expect("a Send button")
+            .clone();
+        assert_eq!(color, palette.on_accent);
+        let button = fills
+            .iter()
+            .find(|(rect, fill)| *fill == palette.accent && rect.contains_rect(send))
+            .expect("Send is filled with the accent")
+            .0;
+        assert_eq!(button.height(), 44.0);
+        // The last one painted: the panel behind the composer has the same
+        // colour in this test.
+        let field = fills
+            .iter()
+            .rev()
+            .find(|(rect, fill)| *fill == palette.panel && rect.width() > 300.0)
+            .expect("the message field is filled with the panel colour")
+            .0;
+        assert!(field.height() >= 44.0, "{field:?}");
+        assert!(
+            (field.center().y - button.center().y).abs() < 2.0,
+            "field and Send line up: {field:?} vs {button:?}"
+        );
+        assert!(texts.iter().any(|(text, _, color)| text
+            == "Enter sends. Shift+Enter starts a new line."
+            && *color == palette.faint));
+    }
+
+    #[test]
+    fn the_hint_line_is_left_out_of_the_compact_spacing() {
+        use crate::gui::theme::{self, Density, DisplayPrefs};
+        let ctx = egui::Context::default();
+        theme::apply(
+            &ctx,
+            &DisplayPrefs {
+                density: Density::Compact,
+                ..DisplayPrefs::default()
+            },
+        );
+        let mut session = room_session();
+        let (_, texts, _) = painted(&mut session, &ctx, egui::vec2(640.0, 240.0));
+        assert!(
+            !texts
+                .iter()
+                .any(|(text, _, _)| text.starts_with("Enter sends."))
+        );
+    }
+
+    #[test]
+    fn the_typing_line_reserves_its_height_when_nobody_types() {
+        let ctx = egui::Context::default();
+        let size = egui::vec2(640.0, 240.0);
+        let mut session = room_session();
+        painted(&mut session, &ctx, size);
+        let (quiet, texts, _) = painted(&mut session, &ctx, size);
+        assert!(!texts.iter().any(|(text, _, _)| text.contains("typing")));
+        let typing =
+            crate::irc::IrcMessage::parse("@+typing=active :alice!u@h TAGMSG #room").unwrap();
+        session.observe_tagmsg(&typing, "#room", false);
+        let (typed, texts, _) = painted(&mut session, &ctx, size);
+        assert!(
+            texts.iter().any(|(text, _, _)| text == "alice is typing…"),
+            "{texts:?}"
+        );
+        assert_eq!(
+            typed, quiet,
+            "the composer does not jump when someone types"
+        );
+
+        // With typing indicators off there is no line to reserve.
+        session.attention.show_typing = false;
+        let (off, _, _) = painted(&mut session, &ctx, size);
+        assert!(off < quiet - 15.0, "{off} vs {quiet}");
+    }
+
     #[test]
     fn composer_starts_on_one_row_and_bounds_long_drafts() {
         for width in [320.0, 640.0] {
@@ -710,7 +928,17 @@ mod composer_tests {
                     session.conversations.insert(target.into(), Channel::new());
                     session.current_conversation = session.id_for_target(target);
                 }
+                // The compact composer on its own: no typing line, no hint.
+                session.attention.show_typing = false;
                 let ctx = egui::Context::default();
+                crate::gui::theme::apply(
+                    &ctx,
+                    &crate::gui::theme::DisplayPrefs {
+                        density: crate::gui::theme::Density::Compact,
+                        font_size: 14.0,
+                        ..Default::default()
+                    },
+                );
                 let size = egui::vec2(width, 240.0);
                 let mut measure = |text: &str| {
                     session.input_text = text.into();

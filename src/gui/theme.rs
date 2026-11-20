@@ -170,6 +170,7 @@ impl Palette {
 /// Sizes and row options that follow the display preferences.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct Metrics {
+    pub density: Density,
     /// Vertical gap between message rows.
     pub row_gap: f32,
     pub message_font: MessageFont,
@@ -183,6 +184,7 @@ impl Metrics {
             Density::Compact => 0.0,
         };
         Self {
+            density: prefs.density,
             row_gap,
             message_font: prefs.message_font,
             color_nicks: prefs.color_nicks,
