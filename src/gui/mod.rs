@@ -9,6 +9,7 @@ mod commands;
 mod connection;
 mod conversations;
 mod dialogs;
+pub(crate) mod fonts;
 mod formatting;
 mod helpers;
 #[cfg(test)]

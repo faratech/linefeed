@@ -31,94 +31,6 @@ pub(crate) fn load_icon() -> egui::IconData {
     }
 }
 
-/// Load system fonts including Unicode block/box drawing and emoji support
-fn setup_fonts(ctx: &egui::Context) {
-    let mut fonts = egui::FontDefinitions::default();
-
-    // Fonts with good Unicode coverage (block elements, box drawing, symbols)
-    // These contain characters like ▄ █ ▓ ▒ ░ ─ │ etc.
-    let symbol_font_paths: &[&str] = if cfg!(windows) {
-        &[
-            "C:\\Windows\\Fonts\\seguisym.ttf", // Segoe UI Symbol (best coverage)
-            "C:\\Windows\\Fonts\\consola.ttf",  // Consolas (good monospace coverage)
-            "C:\\Windows\\Fonts\\segoeui.ttf",  // Segoe UI
-        ]
-    } else if cfg!(target_os = "macos") {
-        &[
-            "/System/Library/Fonts/Menlo.ttc",
-            "/System/Library/Fonts/Monaco.ttf",
-        ]
-    } else {
-        // Linux
-        &[
-            "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
-            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-            "/usr/share/fonts/truetype/unifont/unifont.ttf",
-            "/usr/share/fonts/truetype/noto/NotoSansMono-Regular.ttf",
-        ]
-    };
-
-    // Load symbol font for block/box drawing characters
-    for path in symbol_font_paths {
-        if let Ok(font_data) = std::fs::read(path) {
-            fonts.font_data.insert(
-                "symbols".to_owned(),
-                Arc::new(egui::FontData::from_owned(font_data)),
-            );
-
-            // Add as fallback for all font families
-            for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
-                if let Some(fonts_for_family) = fonts.families.get_mut(&family) {
-                    fonts_for_family.push("symbols".to_owned());
-                }
-            }
-
-            tracing::info!("Loaded symbol font from {}", path);
-            break;
-        }
-    }
-
-    // Emoji fonts (separate from symbol fonts)
-    let emoji_font_paths: &[&str] = if cfg!(windows) {
-        &[
-            "C:\\Windows\\Fonts\\seguiemj.ttf", // Segoe UI Emoji
-        ]
-    } else if cfg!(target_os = "macos") {
-        &[
-            "/System/Library/Fonts/Apple Color Emoji.ttc",
-            "/Library/Fonts/Apple Color Emoji.ttc",
-        ]
-    } else {
-        // Linux
-        &[
-            "/usr/share/fonts/truetype/noto/NotoColorEmoji.ttf",
-            "/usr/share/fonts/noto-emoji/NotoColorEmoji.ttf",
-            "/usr/share/fonts/google-noto-emoji/NotoColorEmoji.ttf",
-        ]
-    };
-
-    for path in emoji_font_paths {
-        if let Ok(font_data) = std::fs::read(path) {
-            fonts.font_data.insert(
-                "emoji".to_owned(),
-                Arc::new(egui::FontData::from_owned(font_data)),
-            );
-
-            // Add emoji font as fallback for all font families
-            for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
-                if let Some(fonts_for_family) = fonts.families.get_mut(&family) {
-                    fonts_for_family.push("emoji".to_owned());
-                }
-            }
-
-            tracing::info!("Loaded emoji font from {}", path);
-            break;
-        }
-    }
-
-    ctx.set_fonts(fonts);
-}
-
 /// Enable Windows Efficiency Mode (EcoQoS) for the current process
 /// This reduces CPU/battery usage by lowering priority and enabling power throttling
 #[cfg(windows)]
@@ -378,8 +290,7 @@ fn main() -> eframe::Result<()> {
         "Linefeed",
         options,
         Box::new(move |cc| {
-            // Load emoji fonts for comprehensive Unicode support
-            setup_fonts(&cc.egui_ctx);
+            gui::fonts::install(&cc.egui_ctx);
 
             // Reduce texture memory by discarding image data after GPU upload
             cc.egui_ctx.options_mut(|opts| {
