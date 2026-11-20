@@ -2240,82 +2240,145 @@ impl App {
 
     // ----- toolbar and switchbar ------------------------------------------
 
+    /// Name and connection status at the left, the controls at the right.
+    /// What does not fit beside them moves down: first the status line, and
+    /// in a window too narrow for the controls beside the name, everything
+    /// wraps.
     fn draw_toolbar(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal_wrapped(|ui| {
-            ui.heading("Linefeed");
-            if ui
-                .small_button("Search")
-                .on_hover_text("Search saved history (Ctrl+F)")
-                .clicked()
-            {
-                self.open_search(self.active_index(), String::new(), false);
-            }
-            ui.separator();
-            let active = self.active_index();
-            let label = self.network_label(&self.sessions[active]);
-            self.sessions[active].draw_status_summary(ui, &label);
-        });
-        ui.horizontal_wrapped(|ui| {
-            let count = self.activity.items.iter().filter(|item| !item.read).count();
-            let activity_label = if count == 0 {
-                "Activity".into()
-            } else {
-                format!("Activity ({count})")
-            };
-            if ui.button(activity_label).clicked() {
-                self.toggle_activity(None);
-            }
-            if ui.button("Settings").clicked() {
-                let conn = self.sessions[self.active_index()].id;
-                self.open_settings(conn);
-            }
-            ui.menu_button("Window", |ui| {
-                if ui.button("Tile").clicked() {
-                    self.tile_request = Some(TileRequest::Tile);
-                    self.windows.mode = LayoutMode::Floating;
-                    ui.close();
-                }
-                if ui.button("Cascade").clicked() {
-                    self.tile_request = Some(TileRequest::Cascade);
-                    self.windows.mode = LayoutMode::Floating;
-                    ui.close();
-                }
-                let label = match self.windows.mode {
-                    LayoutMode::Maximized => "Restore windows (Ctrl+M)",
-                    LayoutMode::Floating => "Maximize (Ctrl+M)",
-                };
-                if ui.button(label).clicked() {
-                    self.toggle_maximized();
-                    ui.close();
-                }
+        let fit_id = ui.scope_id().with("fit");
+        let previous: Option<ToolbarFit> = ui.ctx().data(|data| data.get_temp(fit_id));
+        let spacing = ui.spacing().item_spacing.x;
+        let available = ui.available_width();
+        let rows = toolbar_rows(previous, available, spacing);
+        let mut fit = previous.unwrap_or_default();
+        fit.rows = rows;
+        let active = self.active_index();
+        let label = self.network_label(&self.sessions[active]);
+        if rows == ToolbarRows::Wrapped {
+            ui.horizontal_wrapped(|ui| {
+                ui.heading("Linefeed");
                 ui.separator();
-                if ui.button("New connection...").clicked() {
-                    self.new_connection();
-                    ui.close();
-                }
-                ui.separator();
-                if ui.button("File sharing…").clicked() {
-                    self.claim_global_dialogs(None);
-                    self.uploads.open = true;
-                    ui.close();
-                }
+                self.sessions[active].draw_status_summary(ui, &label);
             });
-            ui.separator();
-            let active = self.active_index();
-            if !self.sessions[active].is_connected() && !self.sessions[active].is_connecting() {
-                if ui.button("Connect").clicked() {
-                    self.sessions[active].show_connect_dialog = true;
-                    self.open_connection_settings(self.sessions[active].id);
-                }
-            } else if self.sessions[active].is_connected() && ui.button("Disconnect").clicked() {
-                let quit = self.quit_reason();
-                self.sessions[active].request_manual_disconnect(Some(quit));
+            let row = ui.spacing().interact_size.y;
+            let controls = ui
+                .allocate_ui_with_layout(
+                    egui::vec2(available, row),
+                    egui::Layout::right_to_left(egui::Align::Center).with_main_wrap(true),
+                    |ui| {
+                        self.draw_toolbar_controls(ui);
+                        ui.min_rect()
+                    },
+                )
+                .inner;
+            // Wrapped controls say nothing about the width they need.
+            if controls.height() < row * 1.5 {
+                fit.controls = controls.width();
             }
-            let session = &mut self.sessions[active];
-            if session.is_connected() {
-                session.draw_join_box(ui);
+        } else {
+            ui.horizontal(|ui| {
+                fit.heading = ui.heading("Linefeed").rect.width();
+                if rows == ToolbarRows::One {
+                    ui.separator();
+                    fit.status = ui
+                        .scope(|ui| self.sessions[active].draw_status_summary(ui, &label))
+                        .response
+                        .rect
+                        .width();
+                }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    self.draw_toolbar_controls(ui);
+                    fit.controls = ui.min_rect().width();
+                });
+            });
+            if rows == ToolbarRows::Two {
+                fit.status = ui
+                    .horizontal_wrapped(|ui| {
+                        self.sessions[active].draw_status_summary(ui, &label);
+                        ui.min_rect().width()
+                    })
+                    .inner;
+            }
+        }
+        ui.ctx().data_mut(|data| data.insert_temp(fit_id, fit));
+        if toolbar_rows(Some(fit), available, spacing) < rows {
+            // What was just measured does not fit this arrangement: redraw
+            // now. A roomier one waits for the next frame, so two
+            // arrangements that disagree can never keep the app repainting.
+            ui.ctx().request_discard("toolbar arrangement");
+            ui.ctx().request_repaint();
+        }
+    }
+
+    /// The toolbar's controls, in a right-to-left layout: the first one
+    /// drawn sits at the right edge.
+    fn draw_toolbar_controls(&mut self, ui: &mut egui::Ui) {
+        if ui.button("Settings").clicked() {
+            let conn = self.sessions[self.active_index()].id;
+            self.open_settings(conn);
+        }
+        ui.menu_button("Window", |ui| {
+            if ui.button("Tile").clicked() {
+                self.tile_request = Some(TileRequest::Tile);
+                self.windows.mode = LayoutMode::Floating;
+                ui.close();
+            }
+            if ui.button("Cascade").clicked() {
+                self.tile_request = Some(TileRequest::Cascade);
+                self.windows.mode = LayoutMode::Floating;
+                ui.close();
+            }
+            let label = match self.windows.mode {
+                LayoutMode::Maximized => "Restore windows (Ctrl+M)",
+                LayoutMode::Floating => "Maximize (Ctrl+M)",
+            };
+            if ui.button(label).clicked() {
+                self.toggle_maximized();
+                ui.close();
+            }
+            ui.separator();
+            if ui.button("New connection...").clicked() {
+                self.new_connection();
+                ui.close();
+            }
+            ui.separator();
+            if ui.button("File sharing…").clicked() {
+                self.claim_global_dialogs(None);
+                self.uploads.open = true;
+                ui.close();
             }
         });
+        let count = self.activity.items.iter().filter(|item| !item.read).count();
+        let activity_label = if count == 0 {
+            "Activity".into()
+        } else {
+            format!("Activity ({count})")
+        };
+        if ui.button(activity_label).clicked() {
+            self.toggle_activity(None);
+        }
+        if ui
+            .button("Search")
+            .on_hover_text("Search saved history (Ctrl+F)")
+            .clicked()
+        {
+            self.open_search(self.active_index(), String::new(), false);
+        }
+        ui.separator();
+        let active = self.active_index();
+        if !self.sessions[active].is_connected() && !self.sessions[active].is_connecting() {
+            if ui.button("Connect").clicked() {
+                self.sessions[active].show_connect_dialog = true;
+                self.open_connection_settings(self.sessions[active].id);
+            }
+        } else if self.sessions[active].is_connected() && ui.button("Disconnect").clicked() {
+            let quit = self.quit_reason();
+            self.sessions[active].request_manual_disconnect(Some(quit));
+        }
+        let session = &mut self.sessions[active];
+        if session.is_connected() {
+            session.draw_join_box(ui);
+        }
     }
 
     fn draw_switchbar(&mut self, ui: &mut egui::Ui) {
@@ -3502,6 +3565,53 @@ fn child_window_id(key: &WindowKey) -> egui::Id {
 
 pub(crate) fn detached_viewport_id(key: &WindowKey) -> egui::ViewportId {
     egui::ViewportId::from_hash_of(("linefeed_detached", key.conn, key.conversation))
+}
+
+/// How the toolbar is arranged in the width at hand.
+#[derive(Clone, Copy, Debug, Default, PartialEq, PartialOrd)]
+enum ToolbarRows {
+    /// Too narrow for the controls beside the name: everything wraps.
+    Wrapped,
+    /// The controls share the name's row; the status line goes below.
+    Two,
+    /// Name and status at the left, controls at the right.
+    #[default]
+    One,
+}
+
+/// The toolbar's arrangement and the widths its parts were last drawn at.
+#[derive(Clone, Copy, Debug, Default)]
+struct ToolbarFit {
+    rows: ToolbarRows,
+    heading: f32,
+    status: f32,
+    controls: f32,
+}
+
+/// The roomiest arrangement the measured parts fit in. Nothing is measured
+/// before the first frame, which therefore tries the single row. Moving to
+/// a roomier arrangement needs some slack, so that a status line whose
+/// width keeps changing (the lag figure) cannot flip the layout back and
+/// forth.
+fn toolbar_rows(fit: Option<ToolbarFit>, available: f32, spacing: f32) -> ToolbarRows {
+    const SLACK: f32 = 24.0;
+    let Some(fit) = fit else {
+        return ToolbarRows::One;
+    };
+    let fits = |rows: ToolbarRows, width: f32| {
+        let slack = if rows > fit.rows { SLACK } else { 0.0 };
+        width + slack <= available
+    };
+    // Name, separator, status and controls, with a gap between each.
+    let one_row = fit.heading + fit.status + fit.controls + 4.0 * spacing;
+    let two_rows = fit.heading + fit.controls + spacing;
+    if fits(ToolbarRows::One, one_row) {
+        ToolbarRows::One
+    } else if fits(ToolbarRows::Two, two_rows) {
+        ToolbarRows::Two
+    } else {
+        ToolbarRows::Wrapped
+    }
 }
 
 /// Switchbar button text, coloured like the old sidebar: unread channels
@@ -7031,6 +7141,177 @@ mod tests {
         app.sessions[0].add_server_message(ChatMessage::system("later"));
         app.user_activate(status);
         assert_eq!(app.sessions[0].server_unread, 1);
+    }
+
+    /// Where each painted text landed after a few frames at this width.
+    fn text_rects_at_width(app: &mut App, width: f32) -> Vec<(String, egui::Rect)> {
+        fn collect(shape: &egui::Shape, out: &mut Vec<(String, egui::Rect)>) {
+            match shape {
+                egui::Shape::Text(text) => out.push((
+                    text.galley.text().to_string(),
+                    egui::Rect::from_min_size(text.pos, text.galley.size()),
+                )),
+                egui::Shape::Vec(shapes) => shapes.iter().for_each(|s| collect(s, out)),
+                _ => {}
+            }
+        }
+        let ctx = egui::Context::default();
+        let mut out = Vec::new();
+        for _ in 0..3 {
+            let mut output = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(width, 768.0),
+                    )),
+                    ..Default::default()
+                },
+                |ui| app.ui(ui),
+            );
+            output.textures_delta.clear();
+            out.clear();
+            for clipped in &output.shapes {
+                collect(&clipped.shape, &mut out);
+            }
+        }
+        out
+    }
+
+    fn rect_of(rects: &[(String, egui::Rect)], text: &str) -> egui::Rect {
+        rects
+            .iter()
+            .find(|(painted, _)| painted == text)
+            .unwrap_or_else(|| panic!("{text:?} was not painted"))
+            .1
+    }
+
+    const TOOLBAR_CONTROLS: [&str; 6] = [
+        "Join",
+        "Disconnect",
+        "Search",
+        "Activity",
+        "Window",
+        "Settings",
+    ];
+
+    #[test]
+    fn the_toolbar_arrangement_needs_slack_to_grow_but_none_to_shrink() {
+        let fit = |rows| {
+            Some(ToolbarFit {
+                rows,
+                heading: 100.0,
+                status: 400.0,
+                controls: 600.0,
+            })
+        };
+        // One row needs 100 + 400 + 600 + 4 gaps of 8 = 1132.
+        assert_eq!(toolbar_rows(None, 300.0, 8.0), ToolbarRows::One);
+        assert_eq!(
+            toolbar_rows(fit(ToolbarRows::One), 1132.0, 8.0),
+            ToolbarRows::One
+        );
+        assert_eq!(
+            toolbar_rows(fit(ToolbarRows::One), 1131.0, 8.0),
+            ToolbarRows::Two
+        );
+        assert_eq!(
+            toolbar_rows(fit(ToolbarRows::Two), 1140.0, 8.0),
+            ToolbarRows::Two
+        );
+        assert_eq!(
+            toolbar_rows(fit(ToolbarRows::Two), 1156.0, 8.0),
+            ToolbarRows::One
+        );
+        // Name and controls need 100 + 600 + 8 = 708.
+        assert_eq!(
+            toolbar_rows(fit(ToolbarRows::Two), 708.0, 8.0),
+            ToolbarRows::Two
+        );
+        assert_eq!(
+            toolbar_rows(fit(ToolbarRows::One), 707.0, 8.0),
+            ToolbarRows::Wrapped
+        );
+        assert_eq!(
+            toolbar_rows(fit(ToolbarRows::Wrapped), 720.0, 8.0),
+            ToolbarRows::Wrapped
+        );
+        assert_eq!(
+            toolbar_rows(fit(ToolbarRows::Wrapped), 732.0, 8.0),
+            ToolbarRows::Two
+        );
+    }
+
+    #[test]
+    fn a_wide_toolbar_is_one_row_with_the_controls_at_the_right() {
+        let (mut app, _rx_a, _rx_b) = two_networks();
+        let rects = text_rects_at_width(&mut app, 1600.0);
+        let name = rect_of(&rects, "Linefeed");
+        let status = rect_of(&rects, "Connected · not authenticated");
+        assert!(name.left() < 20.0, "{name:?}");
+        let mut left = status.right();
+        for control in TOOLBAR_CONTROLS {
+            let rect = rect_of(&rects, control);
+            assert!(
+                (rect.center().y - status.center().y).abs() < 6.0,
+                "{control} shares the status row: {rect:?} vs {status:?}"
+            );
+            assert!(rect.left() > left, "{control} follows in order: {rect:?}");
+            left = rect.right();
+        }
+        assert!(
+            left > 1600.0 - 24.0,
+            "Settings ends at the right edge: {left}"
+        );
+        assert!(
+            rect_of(&rects, "Join").left() > 800.0,
+            "the controls sit in the right half, not beside the name"
+        );
+    }
+
+    #[test]
+    fn a_default_width_toolbar_keeps_the_controls_right_and_moves_status_below() {
+        let (mut app, _rx_a, _rx_b) = two_networks();
+        let rects = text_rects_at_width(&mut app, 1024.0);
+        let name = rect_of(&rects, "Linefeed");
+        let settings = rect_of(&rects, "Settings");
+        let status = rect_of(&rects, "Connected · not authenticated");
+        assert!(settings.right() > 1024.0 - 24.0, "{settings:?}");
+        assert!(
+            (settings.center().y - name.center().y).abs() < 8.0,
+            "the controls share the name's row: {settings:?} vs {name:?}"
+        );
+        assert!(
+            status.top() > settings.bottom() - 2.0,
+            "the status line is the second row: {status:?} vs {settings:?}"
+        );
+        for control in TOOLBAR_CONTROLS {
+            let rect = rect_of(&rects, control);
+            assert!(
+                rect.left() > name.right() && rect.right() <= 1024.0,
+                "{control}: {rect:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_narrow_toolbar_wraps_inside_the_window() {
+        let (mut app, _rx_a, _rx_b) = two_networks();
+        let rects = text_rects_at_width(&mut app, 640.0);
+        for text in TOOLBAR_CONTROLS
+            .into_iter()
+            .chain(["Linefeed", "Connected · not authenticated"])
+        {
+            let rect = rect_of(&rects, text);
+            assert!(
+                rect.left() >= 0.0 && rect.right() <= 640.0,
+                "{text} stays inside a 640 px window: {rect:?}"
+            );
+        }
+        // Widening again restores the single row.
+        let rects = text_rects_at_width(&mut app, 1600.0);
+        let status = rect_of(&rects, "Connected · not authenticated");
+        let settings = rect_of(&rects, "Settings");
+        assert!((settings.center().y - status.center().y).abs() < 6.0);
     }
 
     fn focus_frame(app: &mut App, ctx: &egui::Context, focused: bool) -> egui::FullOutput {
