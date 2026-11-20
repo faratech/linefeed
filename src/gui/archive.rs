@@ -824,6 +824,99 @@ impl ScrubTargets {
     }
 }
 
+/// Byte patterns a journal line must contain to concern a scrub: every target
+/// id and msgid in the form serde_json writes it. A line holding none of them
+/// cannot be a targeted record, so it is never parsed. Matching uses a rolling
+/// hash per pattern length, with a byte comparison to confirm each hit.
+/// Patterns of one length, by rolling hash.
+type NeedleTable = HashMap<u64, Vec<Vec<u8>>>;
+struct NeedleSet {
+    groups: Vec<(usize, u64, NeedleTable)>,
+    /// An empty pattern would match everything; parse every line instead.
+    match_all: bool,
+}
+impl NeedleSet {
+    const BASE: u64 = 0x0000_0100_0000_01b3;
+    fn hash(bytes: &[u8]) -> u64 {
+        bytes.iter().fold(0u64, |hash, byte| {
+            hash.wrapping_mul(Self::BASE)
+                .wrapping_add(u64::from(*byte) + 1)
+        })
+    }
+    fn new(targets: &ScrubTargets) -> Self {
+        let escaped = |text: &str| {
+            let quoted = serde_json::to_string(text).unwrap_or_default();
+            quoted
+                .get(1..quoted.len().saturating_sub(1))
+                .unwrap_or_default()
+                .as_bytes()
+                .to_vec()
+        };
+        let mut by_len: HashMap<usize, NeedleTable> = HashMap::new();
+        let mut match_all = false;
+        for text in targets.ids.iter().chain(targets.msgids.keys()) {
+            let needle = escaped(text);
+            if needle.is_empty() {
+                match_all = true;
+                continue;
+            }
+            let bucket = by_len.entry(needle.len()).or_default();
+            let list = bucket.entry(Self::hash(&needle)).or_default();
+            if !list.contains(&needle) {
+                list.push(needle);
+            }
+        }
+        let groups = by_len
+            .into_iter()
+            .map(|(len, table)| {
+                let pow = (1..len).fold(1u64, |pow, _| pow.wrapping_mul(Self::BASE));
+                (len, pow, table)
+            })
+            .collect();
+        Self { groups, match_all }
+    }
+    fn found_in(&self, haystack: &[u8]) -> bool {
+        if self.match_all {
+            return true;
+        }
+        for (len, pow, table) in &self.groups {
+            let len = *len;
+            if haystack.len() < len {
+                continue;
+            }
+            let mut hash = Self::hash(&haystack[..len]);
+            let mut at = 0;
+            loop {
+                if table
+                    .get(&hash)
+                    .is_some_and(|list| list.iter().any(|n| n[..] == haystack[at..at + len]))
+                {
+                    return true;
+                }
+                if at + len == haystack.len() {
+                    break;
+                }
+                hash = hash
+                    .wrapping_sub((u64::from(haystack[at]) + 1).wrapping_mul(*pow))
+                    .wrapping_mul(Self::BASE)
+                    .wrapping_add(u64::from(haystack[at + len]) + 1);
+                at += 1;
+            }
+        }
+        false
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Journal lines (or reassembled records) the scrubber parsed as JSON.
+    static SCRUB_PARSES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+fn note_scrub_parse() {
+    #[cfg(test)]
+    SCRUB_PARSES.with(|count| count.set(count.get() + 1));
+}
+
 struct HashingWriter<W: Write> {
     inner: W,
     digest: Sha256,
@@ -906,6 +999,8 @@ fn rewrite_journal(
     out: &mut dyn Write,
     stop_at_first: bool,
 ) -> Result<bool, String> {
+    const CHUNK_PREFIX: &[u8] = b"{\"event\":\"chunk\"";
+    let needles = NeedleSet::new(targets);
     struct Run {
         id: String,
         parts: usize,
@@ -949,6 +1044,14 @@ fn rewrite_journal(
             copy_rest_of_line(&mut reader, out).map_err(io)?;
             continue;
         }
+        // Only chunk frames can extend a run, and only a line holding a target
+        // can be one to scrub; every other line is carried over unparsed.
+        if !bytes.starts_with(CHUNK_PREFIX) && !needles.found_in(&bytes) {
+            flush_run(&mut run, out)?;
+            out.write_all(&bytes).map_err(io)?;
+            continue;
+        }
+        note_scrub_parse();
         match serde_json::from_slice::<JournalLine>(&bytes) {
             Ok(JournalLine::Event(event)) => {
                 flush_run(&mut run, out)?;
@@ -1028,6 +1131,11 @@ fn rewrite_journal(
                     let complete = run.take().expect("run completes");
                     if complete.bytes.len() == total
                         && line_digest(&complete.bytes) == sha256
+                        && needles.found_in(&complete.bytes)
+                        && {
+                            note_scrub_parse();
+                            true
+                        }
                         && let Ok(JournalEvent::Upsert { record }) =
                             serde_json::from_slice::<JournalEvent>(&complete.bytes)
                         && needs_scrub(targets, &record)
@@ -2923,6 +3031,56 @@ mod tests {
         assert!(scrub_journal_file(&path, &targets).unwrap().is_none());
         assert_eq!(fs::read(&path).unwrap(), after_bytes);
         assert!(!path.with_extension("jsonl.scrub").exists());
+    }
+
+    #[test]
+    fn unrelated_journal_lines_are_never_parsed_or_rewritten() {
+        let root = Scratch::new();
+        let path = root.0.join("big.jsonl");
+        let unrelated: Vec<_> = (0..500)
+            .map(|index| {
+                upsert(&record(
+                    "#a",
+                    &format!("body {index}"),
+                    &format!("m{index}"),
+                ))
+            })
+            .collect();
+        write_journal(&path, &unrelated);
+        let before = fs::read(&path).unwrap();
+
+        let mut targets = ScrubTargets::default();
+        targets.ids.insert(new_record_id());
+        targets
+            .msgids
+            .insert("absent-msgid".into(), vec![conversation("#a")]);
+        SCRUB_PARSES.with(|count| count.set(0));
+        assert!(scrub_journal_file(&path, &targets).unwrap().is_none());
+        assert_eq!(SCRUB_PARSES.with(|count| count.get()), 0);
+        assert_eq!(fs::read(&path).unwrap(), before);
+        assert!(!path.with_extension("jsonl.scrub").exists());
+
+        // With one real target only the lines that mention it are parsed, and a
+        // msgid needing JSON escapes is still found.
+        let odd = record("#a", "hunter2-odd-marker", "q\"uote\\and\u{e9}\n");
+        let mut events = unrelated;
+        events.insert(250, upsert(&odd));
+        write_journal(&root.0.join("two.jsonl"), &events);
+        let mut targets = ScrubTargets::default();
+        targets.ids.insert(odd.id.clone());
+        targets
+            .msgids
+            .insert(odd.msgid.clone().unwrap(), vec![odd.conversation.clone()]);
+        SCRUB_PARSES.with(|count| count.set(0));
+        let digest = scrub_journal_file(&root.0.join("two.jsonl"), &targets)
+            .unwrap()
+            .unwrap();
+        let parsed = SCRUB_PARSES.with(|count| count.get());
+        assert!(parsed <= 2, "parsed {parsed} lines for one targeted record");
+        let after = fs::read(root.0.join("two.jsonl")).unwrap();
+        assert_eq!(hex_digest(&digest), line_digest(&after));
+        assert!(!contains(&after, "hunter2-odd-marker"));
+        assert_eq!(lines(&after).len(), 501);
     }
 
     #[test]
