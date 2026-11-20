@@ -406,9 +406,6 @@ commercially, provided you give appropriate credit to the Linefeed project
 (https://github.com/faratech/linefeed), link to the license, and indicate
 if changes were made.
 
-The vendored `vendor/wayland-scanner` crate retains its upstream MIT
-license (see `vendor/wayland-scanner/LICENSE.txt`).
-
 ## Contributing
 
 Contributions are welcome! Please feel free to submit issues and pull requests.

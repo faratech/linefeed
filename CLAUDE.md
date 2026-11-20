@@ -102,14 +102,6 @@ expects `aarch64-w64-mingw32-*`, `x86_64-w64-mingw32-*`, and
 static CRT linking. macOS cannot be cross-compiled from Linux (no Apple
 SDK, and mimalloc compiles C) — macOS builds run only in CI.
 
-## Vendored Dependencies
-
-`vendor/wayland-scanner` is a compatibility-preserving copy of the published
-crate with only its XML parser advanced past RUSTSEC-2026-0194/0195, wired
-in via `[patch.crates-io]` in Cargo.toml. Remove the patch once crates.io
-publishes a wayland-scanner using quick-xml >= 0.41. It retains its
-upstream MIT license (the project itself is CC BY 4.0).
-
 ## Architecture
 
 ```
