@@ -1634,6 +1634,11 @@ impl App {
             return;
         }
         self.sessions[index].select_conversation(key.conversation);
+        // The status window has no read-position report of its own, so
+        // showing it in a focused session is what marks its lines seen.
+        if key.conversation.is_none() && self.sessions[index].window_focused {
+            self.sessions[index].server_unread = 0;
+        }
         self.last_current
             .insert(key.conn, self.sessions[index].current_conversation);
         if self.windows.get(&key).is_some_and(|w| !w.detached) {
@@ -6815,6 +6820,50 @@ mod tests {
         assert_eq!(app.sessions.len(), 3);
         assert!(app.session_index(saved).is_some());
         assert!(!app.show_settings);
+    }
+
+    #[test]
+    fn activating_the_status_window_clears_its_unread_badge() {
+        let mut app = test_app();
+        assert!(app.sessions[0].open_query("alice"));
+        app.sync_windows();
+        let status = WindowKey::new(app.sessions[0].id, None);
+        let alice = target_key(&app, app.sessions[0].id, "alice");
+        app.user_activate(alice);
+        app.sessions[0].set_window_focused(true);
+        app.sessions[0].add_server_message(ChatMessage::system("notice"));
+        assert_eq!(app.sessions[0].server_unread, 1);
+
+        app.user_activate(status);
+
+        assert_eq!(app.sessions[0].server_unread, 0);
+        // It stays clear while the status window is the one being read.
+        app.sessions[0].add_server_message(ChatMessage::system("another"));
+        assert_eq!(app.sessions[0].server_unread, 0);
+
+        // An unfocused session keeps its badge until focus returns.
+        app.user_activate(alice);
+        app.sessions[0].set_window_focused(false);
+        app.sessions[0].add_server_message(ChatMessage::system("later"));
+        app.user_activate(status);
+        assert_eq!(app.sessions[0].server_unread, 1);
+    }
+
+    #[test]
+    fn next_unread_includes_a_status_window_with_unread_lines() {
+        let mut app = test_app();
+        assert!(app.sessions[0].open_query("alice"));
+        app.sync_windows();
+        let status = WindowKey::new(app.sessions[0].id, None);
+        let alice = target_key(&app, app.sessions[0].id, "alice");
+        app.user_activate(alice);
+        app.sessions[0].set_window_focused(true);
+        app.sessions[0].add_server_message(ChatMessage::system("notice"));
+        assert_eq!(app.sessions[0].server_unread, 1);
+
+        app.cycle_unread();
+
+        assert_eq!(app.windows.active, Some(status));
     }
 
     #[test]

@@ -308,14 +308,17 @@ impl App {
             .unwrap_or(0);
         for offset in 1..=order.len() {
             let key = order[(current + offset) % order.len()];
-            if key
-                .conversation
-                .and_then(|id| {
-                    self.session_index(key.conn)
-                        .and_then(|index| self.sessions[index].conversation_channel(id))
-                })
-                .is_some_and(|channel| channel.unread > 0)
-            {
+            let unread = self.session_index(key.conn).is_some_and(|index| {
+                let session = &self.sessions[index];
+                match key.conversation {
+                    // The status window counts its own lines separately.
+                    None => session.server_unread > 0,
+                    Some(id) => session
+                        .conversation_channel(id)
+                        .is_some_and(|channel| channel.unread > 0),
+                }
+            });
+            if unread {
                 self.user_activate(key);
                 if let Some(ctx) = &self.ui_ctx {
                     self.focus_active_viewport(ctx);
