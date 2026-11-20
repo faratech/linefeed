@@ -6653,13 +6653,15 @@ impl Session {
             }
 
             RPL_BANLIST => {
-                // Format: 367 <nick> <channel> <banmask> <setter> <timestamp>
-                if let (Some(channel), Some(mask), Some(setter), Some(ts_str)) =
-                    (params.get(1), params.get(2), params.get(3), params.get(4))
-                {
-                    let ts: u64 = ts_str.parse().unwrap_or(0);
+                // Format: 367 <nick> <channel> <banmask> [<setter> <timestamp>]
+                // RFC 1459/2812 define only the channel and mask; an entry
+                // dropped here would make 368 present an authoritative empty
+                // list.
+                if let (Some(channel), Some(mask)) = (params.get(1), params.get(2)) {
+                    let setter = params.get(3).cloned().unwrap_or_default();
+                    let ts: u64 = params.get(4).and_then(|v| v.parse().ok()).unwrap_or(0);
                     if let Some(ch) = self.channel_mut(channel) {
-                        ch.record_mode_list_reply('b', mask.clone(), setter.clone(), ts);
+                        ch.record_mode_list_reply('b', mask.clone(), setter, ts);
                     }
                 }
             }
@@ -12245,6 +12247,29 @@ pub(crate) mod tests {
             app.conversations["#room"].mode_lists[&'I'][0].mask,
             "account:*"
         );
+    }
+
+    #[test]
+    fn ban_list_entries_without_setter_or_time_are_kept() {
+        let mut app = test_app();
+        app.conversations.insert("#room".into(), Channel::new());
+        app.handle_numeric(RPL_BANLIST, &["me".into(), "#room".into(), "*!*@bad.host".into()]);
+        app.handle_numeric(
+            RPL_BANLIST,
+            &["me".into(), "#room".into(), "*!*@worse.host".into(), "op".into()],
+        );
+        app.handle_numeric(RPL_ENDOFBANLIST, &["me".into(), "#room".into()]);
+
+        let channel = &app.conversations["#room"];
+        let bans: Vec<_> = channel
+            .bans
+            .iter()
+            .map(|ban| (ban.mask.as_str(), ban.set_by.as_str(), ban.set_time))
+            .collect();
+        assert_eq!(bans, [("*!*@bad.host", "", 0), ("*!*@worse.host", "op", 0)]);
+        assert_eq!(channel.mode_lists[&'b'].len(), 2);
+        assert!(channel.ban_list_complete);
+        assert!(channel.mode_lists_complete.contains(&'b'));
     }
 
     #[test]

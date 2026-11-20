@@ -1218,15 +1218,18 @@ impl Session {
                                     for ban in &ch.bans {
                                         ui.horizontal(|ui| {
                                             ui.label(RichText::new(&ban.mask).monospace());
-                                            ui.label(
-                                                RichText::new(format!(
-                                                    "by {} on {}",
-                                                    ban.set_by,
-                                                    format_timestamp(ban.set_time)
-                                                ))
-                                                .small()
-                                                .color(Color32::GRAY),
-                                            );
+                                            // RFC 1459 servers omit setter and time.
+                                            if !ban.set_by.is_empty() || ban.set_time != 0 {
+                                                ui.label(
+                                                    RichText::new(format!(
+                                                        "by {} on {}",
+                                                        ban.set_by,
+                                                        format_timestamp(ban.set_time)
+                                                    ))
+                                                    .small()
+                                                    .color(Color32::GRAY),
+                                                );
+                                            }
                                         });
                                     }
                                 });
