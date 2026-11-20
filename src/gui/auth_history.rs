@@ -1440,4 +1440,85 @@ mod tests {
         app.run_timed_tasks();
         assert_eq!(joins_of(&drain(&mut rx)), vec!["#room".to_string()]);
     }
+
+    const TWO_LOGINS: &str = "/ns IDENTIFY first-password\n/msg AuthServ AUTH acct second-password\n/oper u p";
+
+    fn start_with_held_second_login() -> (Session, mpsc::UnboundedReceiver<IrcCommand>) {
+        let (mut app, mut rx) = app(TWO_LOGINS);
+        feed(&mut app, ":srv 001 me :Welcome");
+        app.run_timed_tasks();
+        app.run_timed_tasks();
+        let commands = drain(&mut rx);
+        assert!(commands.iter().any(
+            |command| matches!(command, IrcCommand::Privmsg(target, _) if target == "NickServ")
+        ));
+        assert!(!commands.iter().any(
+            |command| matches!(command, IrcCommand::Privmsg(target, _) if target == "AuthServ")
+        ));
+        assert!(app.pending_auto_perform.is_some());
+        (app, rx)
+    }
+
+    #[test]
+    fn unfinished_auto_perform_does_not_run_on_the_next_connection_attempt() {
+        let (mut app, _old) = start_with_held_second_login();
+        app.mark_connection_lost();
+        app.begin_connection_attempt();
+        assert!(app.pending_auto_perform.is_none());
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        app.test_set_connecting(tx, None);
+        app.run_timed_tasks();
+        app.run_timed_tasks();
+        assert!(drain(&mut rx).is_empty());
+        // The new registration rebuilds the queue, and each line runs once.
+        feed(&mut app, ":srv 001 me :Welcome");
+        let mut commands = Vec::new();
+        for _ in 0..3 {
+            app.run_timed_tasks();
+            commands.extend(drain(&mut rx));
+            if app.account_history.awaiting {
+                feed(&mut app, ":srv 401 me NickServ :No such nick");
+            }
+        }
+        let count = |service: &str| {
+            commands
+                .iter()
+                .flat_map(|command| match command {
+                    IrcCommand::ClientChat { commands, .. } => commands.clone(),
+                    other => vec![other.clone()],
+                })
+                .filter(|command| matches!(command,
+                    IrcCommand::Privmsg(target, _) if target == service))
+                .count()
+        };
+        assert_eq!(count("NickServ"), 1);
+        assert_eq!(count("AuthServ"), 1);
+    }
+
+    #[test]
+    fn unfinished_auto_perform_is_not_drained_while_not_registered() {
+        let (mut app, mut rx) = start_with_held_second_login();
+        app.mark_connection_lost();
+        app.account_history.attempt_started = Some(Instant::now() - Duration::from_secs(31));
+        app.run_timed_tasks();
+        app.run_timed_tasks();
+        assert!(drain(&mut rx).is_empty());
+        let (tx, mut connecting_rx) = mpsc::unbounded_channel();
+        app.test_set_connecting(tx, None);
+        app.account_history = Default::default();
+        app.run_timed_tasks();
+        assert!(drain(&mut connecting_rx).is_empty());
+    }
+
+    #[test]
+    fn manual_disconnect_does_not_leave_auto_perform_noise() {
+        let (mut app, mut rx) = start_with_held_second_login();
+        app.request_manual_disconnect(None);
+        drain(&mut rx);
+        let before = app.server_messages.len();
+        app.run_timed_tasks();
+        app.run_timed_tasks();
+        assert!(drain(&mut rx).is_empty());
+        assert_eq!(app.server_messages.len(), before);
+    }
 }

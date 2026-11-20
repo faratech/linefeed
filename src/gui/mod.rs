@@ -1253,7 +1253,11 @@ impl Session {
         self.expire_typing();
         self.run_macro_jobs(std::time::Instant::now());
         // Serialize login commands until the preceding attempt is answered.
-        if let Some(mut commands) = self.pending_auto_perform.take() {
+        // Only a registered connection runs them: an unfinished queue belongs
+        // to the connection that produced it and is cleared with its state.
+        if self.is_connected()
+            && let Some(mut commands) = self.pending_auto_perform.take()
+        {
             if let Some(command) = commands.first().cloned()
                 && self.auto_perform_can_run(&command)
             {
@@ -1964,6 +1968,9 @@ impl Session {
         self.message_ui = Default::default();
         self.macro_jobs.clear();
         self.reset_history_authentication();
+        // Auto-perform lines still waiting behind a login belong to the old
+        // socket; the next 001 rebuilds the queue from the configuration.
+        self.pending_auto_perform = None;
         self.pending_cycles.clear();
         // Recovery membership was captured before retiring the old socket,
         // excluding its unconfirmed PARTs. Its acknowledgments cannot arrive
