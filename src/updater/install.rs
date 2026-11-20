@@ -62,14 +62,16 @@ enum DirPolicy {
 /// mode seen after that. Anyone-writable is refused outright: that is what
 /// would let another account swap the binary. Read/execute bits for others
 /// are tolerated only when the filesystem demonstrably ignores chmod (the
-/// call is refused as unsupported, or succeeds and changes nothing).
+/// call is refused as unsupported, or succeeds and changes nothing). A
+/// directory that is not ours is never acceptable.
 #[cfg(unix)]
 fn staging_mode_acceptable(
+    owned_by_us: bool,
     before: u32,
     chmod: Result<(), io::ErrorKind>,
     after: Option<u32>,
 ) -> bool {
-    if before & 0o022 != 0 {
+    if !owned_by_us || before & 0o022 != 0 {
         return false;
     }
     if before & 0o077 == 0 {
@@ -143,7 +145,8 @@ fn ensure_dir(path: &Path, policy: DirPolicy) -> io::Result<()> {
                 use std::os::unix::fs::{MetadataExt, PermissionsExt};
                 let not_private =
                     || io::Error::other("Update directory is not private to this user");
-                if meta.uid() != unsafe { libc::geteuid() } {
+                let owned_by_us = meta.uid() == unsafe { libc::geteuid() };
+                if !owned_by_us {
                     return Err(not_private());
                 }
                 let before = meta.permissions().mode();
@@ -165,7 +168,13 @@ fn ensure_dir(path: &Path, policy: DirPolicy) -> io::Result<()> {
                     } else {
                         (Ok(()), Some(before))
                     };
-                    if !staging_mode_acceptable(before, chmod, after) {
+                    if !staging_mode_acceptable(owned_by_us, before, chmod, after) {
+                        if before & 0o022 != 0 {
+                            return Err(io::Error::other(
+                                "Update deferred: the staging directory next to the \
+                                 program can be written to by other users",
+                            ));
+                        }
                         return Err(not_private());
                     }
                 }
@@ -2549,46 +2558,87 @@ mod tests {
     fn staging_directory_tolerates_read_only_modes_only_where_chmod_is_ignored() {
         use std::io::ErrorKind::{NotFound, PermissionDenied, Unsupported};
         // Private stays acceptable without any probing.
-        assert!(staging_mode_acceptable(0o40700, Ok(()), Some(0o40700)));
+        assert!(staging_mode_acceptable(
+            true,
+            0o40700,
+            Ok(()),
+            Some(0o40700)
+        ));
         // Group/other writable is never acceptable, whatever chmod said: that
         // is the binary-swap risk.
         for before in [0o40777, 0o40775, 0o40757, 0o40722] {
-            assert!(!staging_mode_acceptable(before, Ok(()), Some(before)));
+            assert!(!staging_mode_acceptable(true, before, Ok(()), Some(before)));
             assert!(!staging_mode_acceptable(
+                true,
                 before,
                 Err(PermissionDenied),
                 Some(before)
             ));
-            assert!(!staging_mode_acceptable(before, Ok(()), Some(0o40700)));
+            assert!(!staging_mode_acceptable(
+                true,
+                before,
+                Ok(()),
+                Some(0o40700)
+            ));
         }
         // Read/execute for others on a filesystem that ignores chmod: either
         // the call is refused as unsupported or it succeeds and changes
         // nothing.
-        assert!(staging_mode_acceptable(0o40755, Ok(()), Some(0o40755)));
         assert!(staging_mode_acceptable(
+            true,
+            0o40755,
+            Ok(()),
+            Some(0o40755)
+        ));
+        assert!(staging_mode_acceptable(
+            true,
             0o40755,
             Err(PermissionDenied),
             Some(0o40755)
         ));
         assert!(staging_mode_acceptable(
+            true,
             0o40755,
             Err(Unsupported),
             Some(0o40755)
         ));
         assert!(staging_mode_acceptable(
+            true,
             0o40755,
             Err(io::ErrorKind::InvalidInput),
             Some(0o40755)
         ));
         // A real filesystem that took the chmod is private afterwards.
-        assert!(staging_mode_acceptable(0o40755, Ok(()), Some(0o40700)));
+        assert!(staging_mode_acceptable(
+            true,
+            0o40755,
+            Ok(()),
+            Some(0o40700)
+        ));
         // Any other failure, or a directory we cannot re-stat, is refused.
         assert!(!staging_mode_acceptable(
+            true,
             0o40755,
             Err(NotFound),
             Some(0o40755)
         ));
-        assert!(!staging_mode_acceptable(0o40755, Ok(()), None));
+        assert!(!staging_mode_acceptable(true, 0o40755, Ok(()), None));
+        // A directory owned by someone else is refused whatever its mode or
+        // chmod said (EPERM is what chmod returns for another user's files).
+        for before in [0o40700, 0o40755] {
+            assert!(!staging_mode_acceptable(
+                false,
+                before,
+                Err(PermissionDenied),
+                Some(before)
+            ));
+            assert!(!staging_mode_acceptable(
+                false,
+                before,
+                Ok(()),
+                Some(before)
+            ));
+        }
     }
 
     #[cfg(unix)]
