@@ -157,6 +157,9 @@ pub(crate) struct TargetWindow {
     pub persist: PersistKey,
     /// Shown in its own OS window instead of inside the main window.
     pub detached: bool,
+    /// A floating window minimized into the conversation list: not drawn
+    /// until it is activated again.
+    pub minimized: bool,
     /// Last known outer rect as a floating child window.
     pub child_rect: Option<Rect>,
     /// A one-shot placement (tile/cascade) applied on the next frame.
@@ -168,11 +171,17 @@ pub(crate) struct TargetWindow {
 }
 
 impl TargetWindow {
+    /// Drawn among the floating windows: neither detached nor minimized.
+    pub(crate) fn on_desk(&self) -> bool {
+        !self.detached && !self.minimized
+    }
+
     fn new(key: WindowKey, persist: PersistKey, saved: Option<&SavedWindow>) -> Self {
         let mut window = Self {
             key,
             persist,
             detached: false,
+            minimized: false,
             child_rect: None,
             pending_place: None,
             os_pos: None,
@@ -181,6 +190,7 @@ impl TargetWindow {
         };
         if let Some(saved) = saved {
             window.detached = saved.detached;
+            window.minimized = saved.minimized;
             window.child_rect = saved.child_rect.map(rect_from_array);
             window.os_pos = saved.os_pos.map(|[x, y]| Pos2::new(x, y));
             window.os_size = saved.os_size.map(|[w, h]| Vec2::new(w, h));
@@ -193,6 +203,7 @@ impl TargetWindow {
             key: self.persist.clone(),
             child_rect: self.child_rect.map(rect_to_array),
             detached: self.detached,
+            minimized: self.minimized,
             os_pos: self.os_pos.map(|p| [p.x, p.y]),
             os_size: self.os_size.map(|s| [s.x, s.y]),
         }
@@ -274,6 +285,7 @@ impl WindowManager {
         if let Some(window) = self.get_mut(key) {
             if let Some(saved) = source_placement {
                 window.detached = saved.detached;
+                window.minimized = saved.minimized;
                 window.child_rect = saved.child_rect.map(rect_from_array);
                 window.pending_place = window.child_rect;
                 window.os_pos = saved.os_pos.map(|p| Pos2::new(p[0], p[1]));
@@ -465,15 +477,16 @@ impl WindowManager {
         }
     }
 
+    /// Windows a tile or cascade lays out: attached and not minimized.
     fn attached_count(&self) -> usize {
-        self.windows.iter().filter(|w| !w.detached).count()
+        self.windows.iter().filter(|w| w.on_desk()).count()
     }
 
     fn apply_placements(&mut self, rects: Vec<Rect>) {
         let active = self.active;
         // The active window goes last so it ends up on top of a cascade.
         let mut order: Vec<usize> = (0..self.windows.len())
-            .filter(|&i| !self.windows[i].detached)
+            .filter(|&i| self.windows[i].on_desk())
             .collect();
         if let Some(active) = &active
             && let Some(pos) = order.iter().position(|&i| &self.windows[i].key == active)
@@ -717,6 +730,8 @@ pub(crate) struct SavedWindow {
     #[serde(default)]
     pub detached: bool,
     #[serde(default)]
+    pub minimized: bool,
+    #[serde(default)]
     pub os_pos: Option<[f32; 2]>,
     #[serde(default)]
     pub os_size: Option<[f32; 2]>,
@@ -808,6 +823,24 @@ mod tests {
         // Measured as a share of each side: a third of the way across a
         // wide window is still nearer the left than the top at mid height.
         assert_eq!(at(500.0, 450.0), SidebarDock::Left);
+    }
+
+    #[test]
+    fn a_minimized_window_stays_minimized_across_a_restart_and_is_not_tiled() {
+        let mut manager = WindowManager::default();
+        manager.sync(&[present(1, "net", None), present(1, "net", Some("#a"))]);
+        manager.windows[1].minimized = true;
+        let json = serde_json::to_string(&manager.layout()).unwrap();
+        let mut restored =
+            WindowManager::from_layout(serde_json::from_str::<LayoutFile>(&json).unwrap());
+        restored.sync(&[present(1, "net", None), present(1, "net", Some("#a"))]);
+        assert!(restored.windows[1].minimized);
+        assert!(!restored.windows[0].minimized);
+        let area = Rect::from_min_size(Pos2::ZERO, Vec2::new(1000.0, 800.0));
+        restored.tile(area);
+        // The one window still showing fills the area alone.
+        let tiled = restored.windows[0].child_rect.unwrap();
+        assert!(tiled.width() > 900.0 && tiled.height() > 700.0, "{tiled:?}");
     }
 
     #[test]

@@ -174,6 +174,10 @@ pub(crate) fn maximize_button_id(key: &WindowKey) -> Id {
     Id::unique(("linefeed_snap_maximize", key.conn, key.conversation))
 }
 
+pub(crate) fn minimize_button_id(key: &WindowKey) -> Id {
+    Id::unique(("linefeed_snap_minimize", key.conn, key.conversation))
+}
+
 pub(crate) fn close_button_id(key: &WindowKey) -> Id {
     Id::unique(("linefeed_snap_close", key.conn, key.conversation))
 }
@@ -204,6 +208,7 @@ pub(crate) fn assist_choice_id(zone: usize, key: &WindowKey) -> Id {
 pub(crate) enum CaptionAction {
     Close,
     Maximize,
+    Minimize,
     Detach,
 }
 
@@ -394,10 +399,11 @@ impl App {
         let close_rect =
             Rect::from_min_size(Pos2::new(rect.right() - button.x, rect.top()), button);
         let max_rect = close_rect.translate(Vec2::new(-button.x, 0.0));
+        let min_rect = max_rect.translate(Vec2::new(-button.x, 0.0));
         let glyph = Vec2::splat(10.0);
         let title_rect = Rect::from_min_max(
             Pos2::new(rect.left() + 6.0, rect.top()),
-            Pos2::new(max_rect.left() - 4.0, rect.bottom()),
+            Pos2::new(min_rect.left() - 4.0, rect.bottom()),
         );
         let title = RichText::new(self.window_title(key));
         let title = if active { title.strong() } else { title };
@@ -410,11 +416,26 @@ impl App {
             },
         );
 
+        let minimize = ui
+            .interact(min_rect, minimize_button_id(key), Sense::click())
+            .on_hover_text("Minimize to the conversation list");
         let maximize = ui.interact(max_rect, maximize_button_id(key), Sense::click());
         let close = ui
             .interact(close_rect, close_button_id(key), Sense::click())
             .on_hover_text("Close (Ctrl+W)");
         let stroke = Stroke::new(1.2, visuals.text_color());
+        if minimize.hovered() {
+            ui.painter()
+                .rect_filled(min_rect, 2.0, visuals.widgets.hovered.bg_fill);
+        }
+        let center = min_rect.center();
+        ui.painter().line_segment(
+            [
+                Pos2::new(center.x - glyph.x / 2.0, center.y),
+                Pos2::new(center.x + glyph.x / 2.0, center.y),
+            ],
+            stroke,
+        );
         if maximize.hovered() {
             ui.painter()
                 .rect_filled(max_rect, 2.0, visuals.widgets.hovered.bg_fill);
@@ -450,6 +471,9 @@ impl App {
 
         let mut action = None;
         caption.context_menu(|ui| {
+            if ui.button("Minimize").clicked() {
+                action = Some(CaptionAction::Minimize);
+            }
             if ui.button("Maximize").clicked() {
                 action = Some(CaptionAction::Maximize);
             }
@@ -462,6 +486,8 @@ impl App {
         });
         if close.clicked() {
             action = Some(CaptionAction::Close);
+        } else if minimize.clicked() {
+            action = Some(CaptionAction::Minimize);
         } else if maximize.clicked() || caption.double_clicked() {
             action = Some(CaptionAction::Maximize);
         }

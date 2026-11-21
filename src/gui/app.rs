@@ -1700,8 +1700,34 @@ impl App {
                 None => self.pending_focus = Some(key),
             }
         }
+        // Activating a minimized window, from the conversation list or any
+        // other way, brings it back.
+        if let Some(window) = self.windows.get_mut(&key) {
+            window.minimized = false;
+        }
         self.windows.active = Some(key);
         self.windows.dirty = true;
+    }
+
+    /// Minimize a floating window into the conversation list. When it was
+    /// the active one, the next window still showing takes over.
+    pub(crate) fn minimize_window(&mut self, key: WindowKey) {
+        match self.windows.get_mut(&key) {
+            Some(window) if !window.detached => window.minimized = true,
+            _ => return,
+        }
+        self.windows.dirty = true;
+        if self.windows.active != Some(key) {
+            return;
+        }
+        let order = self.ordered_windows();
+        let start = order.iter().position(|k| *k == key).unwrap_or(0);
+        let next = (1..order.len())
+            .map(|step| order[(start + step) % order.len()])
+            .find(|k| self.windows.get(k).is_some_and(|w| w.on_desk()));
+        if let Some(next) = next {
+            self.activate(next);
+        }
     }
 
     fn finish_frame(&mut self) {
@@ -2848,8 +2874,12 @@ impl App {
                 };
                 let mentions = channel.map_or(0, |channel| channel.unread_mentions());
                 let detached = windows.get(&key).is_some_and(|w| w.detached);
-                let selected = windows.active.as_ref() == Some(&key);
-                let mut text = if selected || unread > 0 {
+                let minimized = windows.get(&key).is_some_and(|w| w.minimized)
+                    && windows.mode == LayoutMode::Floating;
+                let selected = windows.active.as_ref() == Some(&key) && !minimized;
+                let mut text = if minimized {
+                    RichText::new(name).color(palette.faint)
+                } else if selected || unread > 0 {
                     super::widgets::strong(name).color(palette.text)
                 } else {
                     RichText::new(name).color(palette.muted)
@@ -2891,6 +2921,8 @@ impl App {
                 };
                 if detached {
                     response = response.on_hover_text("In its own window");
+                } else if minimized {
+                    response = response.on_hover_text("Minimized: click to restore");
                 }
                 if selected && *sidebar_scrolled != Some(key) {
                     response.scroll_to_me(None);
@@ -3127,7 +3159,7 @@ impl App {
             .windows
             .windows
             .iter()
-            .filter(|w| !w.detached)
+            .filter(|w| w.on_desk())
             .map(|w| w.key)
             .collect();
         let pressed_at = ctx.input(|i| {
@@ -3141,6 +3173,7 @@ impl App {
         let mut close = Vec::new();
         let mut maximize = None;
         let mut detach = None;
+        let mut minimize = None;
         let cascade = super::windows::cascade_rects(area, keys.len().max(1));
         for (n, key) in keys.iter().enumerate() {
             let title = self.window_title(key);
@@ -3186,6 +3219,7 @@ impl App {
                 match shown.inner.flatten() {
                     Some(CaptionAction::Close) => close.push(key),
                     Some(CaptionAction::Maximize) => maximize = Some(key),
+                    Some(CaptionAction::Minimize) => minimize = Some(key),
                     Some(CaptionAction::Detach) => detach = Some(key),
                     None => {}
                 }
@@ -3217,12 +3251,15 @@ impl App {
         if let Some(key) = detach {
             self.toggle_detached(key);
         }
+        if let Some(key) = minimize {
+            self.minimize_window(*key);
+        }
         // The active window is always the front one. egui raises a window on
         // its first visible frame and on a click; a click also makes that
         // window active (above), so this only overrides windows appearing
         // on their own, which must not cover the one the user is typing in.
         if let Some(active) = self.windows.active
-            && self.windows.get(&active).is_some_and(|w| !w.detached)
+            && self.windows.get(&active).is_some_and(|w| w.on_desk())
         {
             ctx.move_to_top(egui::LayerId::new(
                 egui::Order::Middle,
@@ -7874,6 +7911,52 @@ mod tests {
             "{}",
             app.windows.sidebar.width
         );
+    }
+
+    #[test]
+    fn a_minimized_window_waits_in_the_list_until_it_is_picked() {
+        let (mut app, _rx_a, _rx_b) = two_networks();
+        let rust = target_key(&app, app.sessions[0].id, "#rust");
+        app.user_activate(rust);
+        app.windows.mode = LayoutMode::Floating;
+        app.tile_request = Some(TileRequest::Tile);
+        let ctx = egui::Context::default();
+        settled(&mut app, &ctx, 1360.0);
+        let button = ctx
+            .read_response(snap::minimize_button_id(&rust))
+            .expect("a minimize button on the caption")
+            .rect;
+        let painted = click(&mut app, &ctx, 1360.0, button.center());
+        assert!(app.windows.get(&rust).unwrap().minimized);
+        assert_ne!(app.windows.active, Some(rust), "the next window took over");
+        assert!(
+            app.windows
+                .get(&app.windows.active.unwrap())
+                .unwrap()
+                .on_desk()
+        );
+        assert!(
+            ctx.read_response(snap::caption_id(&rust)).is_none(),
+            "a minimized window is not drawn"
+        );
+        // Its row stays in the list, dimmed.
+        let row = painted
+            .texts
+            .iter()
+            .find(|(text, rect, _)| text == "#rust" && rect.right() < 400.0)
+            .expect("#rust row");
+        assert_eq!(row.2, super::super::theme::palette(&ctx).faint);
+
+        // Tile lays out only the windows still showing.
+        app.tile_request = Some(TileRequest::Tile);
+        settled(&mut app, &ctx, 1360.0);
+        assert!(app.windows.get(&rust).unwrap().minimized);
+
+        // Picking the row brings it back as the active window.
+        click(&mut app, &ctx, 1360.0, row.1.center());
+        assert!(!app.windows.get(&rust).unwrap().minimized);
+        assert_eq!(app.windows.active, Some(rust));
+        assert!(ctx.read_response(snap::caption_id(&rust)).is_some());
     }
 
     struct Painted {
