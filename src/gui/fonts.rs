@@ -160,7 +160,16 @@ mod tests {
 
     #[test]
     fn each_family_lists_its_own_face_then_the_shared_fallbacks() {
-        let defs = definitions(&plan(), |_| Some(vec![0u8; 4]));
+        // A plan with every face: the platform's own may leave one out
+        // (macOS has no separate semibold file).
+        let every_face = FontPlan {
+            proportional: &["p"],
+            semibold: &["sb"],
+            monospace: &["m"],
+            symbols: &["sy"],
+            emoji: &["e"],
+        };
+        let defs = definitions(&every_face, |_| Some(vec![0u8; 4]));
         let prop = &defs.families[&egui::FontFamily::Proportional];
         let mono = &defs.families[&egui::FontFamily::Monospace];
         let semi = &defs.families[&semibold()];
