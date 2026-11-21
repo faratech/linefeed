@@ -1,0 +1,130 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Linefeed settings, Display</title>
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+<style>
+body{margin:0}
+a{color:#6CA8FF}a:hover{color:#9CC4FF}
+.lf{--bg:#1B1E23;--panel:#22262C;--raise:#2B3038;--line:#343A44;--text:#E4E7EB;--muted:#A3ABB8;--faint:#98A1AF;--on-accent:#0E1116}
+.lf button,.lf select,.lf input{font:inherit}
+.lf button,.lf label{cursor:pointer}
+.lf fieldset{margin:0;padding:0;border:0;min-width:0}
+</style>
+</helmet>
+<div class="lf" style="display: flex; flex-direction: column; min-height: 660px; background: var(--bg); color: var(--text); font-family: Inter, system-ui, sans-serif; font-size: 15px; line-height: 1.5">
+
+<header style="display: flex; align-items: center; gap: 12px; padding: 6px 8px 6px 20px; background: var(--panel); border-bottom: 1px solid var(--line)">
+<h1 style="flex: 1 1 auto; margin: 0; font-size: 18px; font-weight: 600">Settings</h1>
+<button type="button" aria-label="Close settings" style="display: flex; align-items: center; justify-content: center; width: 44px; min-height: 44px; border: 0; border-radius: 10px; background: transparent; color: var(--muted)">
+<svg aria-hidden="true" width="14" height="14" viewBox="0 0 14 14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M3 3l8 8M11 3l-8 8"></path></svg>
+</button>
+</header>
+
+<div style="display: flex; flex-wrap: wrap; flex: 1 1 auto">
+<nav aria-label="Settings sections" style="flex: 1 1 176px; box-sizing: border-box; padding: 12px 8px; background: var(--panel); border-right: 1px solid var(--line); display: flex; flex-direction: column; gap: 2px">
+<button type="button" style="min-height: 44px; padding: 0 12px; border: 0; border-radius: 8px; background: transparent; color: var(--muted); text-align: left">Connection</button>
+<button type="button" aria-current="page" style="min-height: 44px; padding: 0 12px; border: 0; border-radius: 8px; background: {{accentTint}}; color: var(--text); font-weight: 600; text-align: left">Display</button>
+<button type="button" style="min-height: 44px; padding: 0 12px; border: 0; border-radius: 8px; background: transparent; color: var(--muted); text-align: left">Behavior</button>
+<button type="button" style="min-height: 44px; padding: 0 12px; border: 0; border-radius: 8px; background: transparent; color: var(--muted); text-align: left">About</button>
+</nav>
+
+<main style="flex: 999 1 420px; min-width: 0; box-sizing: border-box; padding: 20px 24px; display: flex; flex-direction: column; gap: 20px">
+
+<fieldset>
+<legend style="padding: 0; margin-bottom: 6px; font-weight: 600">Theme</legend>
+<div style="display: flex; flex-wrap: wrap; gap: 8px">
+<label style="display: flex; align-items: center; gap: 8px; min-height: 44px; padding: 0 14px; border: 1px solid {{accent}}; border-radius: 10px; background: {{accentTint}}"><input type="radio" name="theme" defaultChecked="{{yes}}" style="accent-color: {{accent}}">Dark</label>
+<label style="display: flex; align-items: center; gap: 8px; min-height: 44px; padding: 0 14px; border: 1px solid var(--line); border-radius: 10px"><input type="radio" name="theme" style="accent-color: {{accent}}">Light</label>
+<label style="display: flex; align-items: center; gap: 8px; min-height: 44px; padding: 0 14px; border: 1px solid var(--line); border-radius: 10px"><input type="radio" name="theme" style="accent-color: {{accent}}">Match the system</label>
+</div>
+</fieldset>
+
+<div>
+<label for="text-size" style="display: block; margin-bottom: 6px; font-weight: 600">Text size</label>
+<div style="display: flex; flex-wrap: wrap; align-items: center; gap: 12px">
+<span style="color: var(--muted); font-size: 13px">Smaller</span>
+<input id="text-size" type="range" min="12" max="22" step="1" defaultValue="15" style="flex: 1 1 200px; min-height: 44px; accent-color: {{accent}}">
+<span style="color: var(--muted); font-size: 18px">Larger</span>
+<span style="min-width: 52px; font-variant-numeric: tabular-nums">15 px</span>
+</div>
+</div>
+
+<div style="display: flex; flex-wrap: wrap; gap: 20px 32px">
+<fieldset style="flex: 1 1 240px">
+<legend style="padding: 0; margin-bottom: 6px; font-weight: 600">Spacing</legend>
+<div style="display: flex; flex-wrap: wrap; gap: 8px">
+<label style="display: flex; align-items: center; gap: 8px; min-height: 44px; padding: 0 14px; border: 1px solid {{accent}}; border-radius: 10px; background: {{accentTint}}"><input type="radio" name="spacing" defaultChecked="{{yes}}" style="accent-color: {{accent}}">Comfortable</label>
+<label style="display: flex; align-items: center; gap: 8px; min-height: 44px; padding: 0 14px; border: 1px solid var(--line); border-radius: 10px"><input type="radio" name="spacing" style="accent-color: {{accent}}">Compact</label>
+</div>
+</fieldset>
+<fieldset style="flex: 1 1 240px">
+<legend style="padding: 0; margin-bottom: 6px; font-weight: 600">Message font</legend>
+<div style="display: flex; flex-wrap: wrap; gap: 8px">
+<label style="display: flex; align-items: center; gap: 8px; min-height: 44px; padding: 0 14px; border: 1px solid {{accent}}; border-radius: 10px; background: {{accentTint}}"><input type="radio" name="font" defaultChecked="{{yes}}" style="accent-color: {{accent}}">Proportional</label>
+<label style="display: flex; align-items: center; gap: 8px; min-height: 44px; padding: 0 14px; border: 1px solid var(--line); border-radius: 10px; font-family: ui-monospace, Menlo, Consolas, monospace"><input type="radio" name="font" style="accent-color: {{accent}}">Monospace</label>
+</div>
+</fieldset>
+</div>
+
+<div style="display: flex; flex-wrap: wrap; align-items: center; gap: 8px 16px">
+<label for="timestamps" style="font-weight: 600">Timestamps</label>
+<select id="timestamps" defaultValue="short" style="min-height: 44px; padding: 0 12px; border: 1px solid var(--line); border-radius: 10px; background: var(--panel); color: var(--text)">
+<option value="short">14:05</option>
+<option value="long">14:05:32</option>
+<option value="full">11-20 14:05</option>
+<option value="off">Hidden</option>
+</select>
+</div>
+
+<div style="display: flex; flex-direction: column">
+<label style="display: flex; align-items: center; gap: 10px; min-height: 44px"><input type="checkbox" defaultChecked="{{yes}}" style="width: 18px; height: 18px; accent-color: {{accent}}">Give each nickname its own color</label>
+<label style="display: flex; align-items: center; gap: 10px; min-height: 44px"><input type="checkbox" style="width: 18px; height: 18px; accent-color: {{accent}}">Hide join, part and quit lines</label>
+</div>
+
+<div>
+<div style="margin-bottom: 6px; color: var(--muted); font-size: 12.5px; font-weight: 600; letter-spacing: .04em; text-transform: uppercase">Preview</div>
+<div style="display: flex; flex-direction: column; gap: 6px; padding: 12px 0; border: 1px solid var(--line); border-radius: 10px">
+<div style="display: grid; grid-template-columns: 48px 72px minmax(0, 1fr); column-gap: 12px; align-items: baseline; padding: 2px 14px">
+<span style="color: var(--faint); font-size: 12.5px; font-variant-numeric: tabular-nums">14:05</span>
+<span style="text-align: right; font-weight: 600; color: #5ED0C0">bob</span>
+<span style="overflow-wrap: anywhere">This is how messages will look.</span>
+</div>
+<div style="display: grid; grid-template-columns: 48px 72px minmax(0, 1fr); column-gap: 12px; align-items: baseline; padding: 2px 14px">
+<span style="color: var(--faint); font-size: 12.5px; font-variant-numeric: tabular-nums">14:06</span>
+<span style="text-align: right; font-weight: 600; color: #C39BFF">carol</span>
+<span style="overflow-wrap: anywhere">Changes here apply as soon as you pick them.</span>
+</div>
+</div>
+</div>
+
+</main>
+</div>
+
+<footer style="display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 8px; padding: 10px 16px; background: var(--panel); border-top: 1px solid var(--line)">
+<button type="button" style="min-height: 44px; padding: 0 18px; border: 1px solid var(--line); border-radius: 10px; background: transparent; color: var(--text)">Cancel</button>
+<button type="button" style="min-height: 44px; padding: 0 20px; border: 0; border-radius: 10px; background: {{accent}}; color: var(--on-accent); font-weight: 600">Save &amp; Close</button>
+</footer>
+</div>
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props='{"accent":{"editor":"color","options":["#6CA8FF","#5ED0C0","#C39BFF"],"default":"#6CA8FF"},"$preview":{"width":880,"height":660}}'>
+class Component extends DCLogic {
+renderVals() {
+const accent = this.props.accent ?? '#6CA8FF';
+const tint = (hex, alpha) => {
+if (!/^#[0-9a-fA-F]{6}$/.test(hex)) return 'transparent';
+const n = parseInt(hex.slice(1), 16);
+return 'rgba(' + (n >> 16) + ',' + ((n >> 8) & 255) + ',' + (n & 255) + ',' + alpha + ')';
+};
+return { accent: accent, accentTint: tint(accent, 0.2), yes: true };
+}
+}
+</script>
+</body>
+</html>

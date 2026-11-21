@@ -9,6 +9,7 @@ mod commands;
 mod connection;
 mod conversations;
 mod dialogs;
+pub(crate) mod fonts;
 mod formatting;
 mod helpers;
 #[cfg(test)]
@@ -18,9 +19,11 @@ mod logging;
 mod message_ui;
 mod search;
 mod snap;
+pub(crate) mod theme;
 mod types;
 mod uploads;
 mod view;
+mod widgets;
 mod windows;
 pub(crate) mod workspace;
 
@@ -38,7 +41,7 @@ pub use app::App;
 pub(crate) use app::MAIN_WINDOW_TITLE;
 pub(crate) use conversations::ConversationId;
 use conversations::ConversationStore;
-use formatting::{nick_color, render_segments};
+use formatting::{SegmentStyle, render_segments, with_mentions};
 use helpers::{
     ctcp_action_text, epoch_time_formatted, format_ctcp_time, format_timestamp,
     local_utc_offset_secs, mask_matches, parse_ctcp, truncate_chars,
@@ -195,7 +198,7 @@ pub struct UpdateSession {
     /// the top-level (active) session.
     others: Vec<UpdateSession>,
     /// Where the top-level session stood among `others`, so a restart keeps
-    /// the networks in their order (switchbar, Alt+N).
+    /// the networks in their order (sidebar, Alt+N).
     active_position: usize,
 }
 
@@ -515,27 +518,6 @@ const COMMAND_COMPLETIONS: &[&str] = &[
     "/whowas",
 ];
 
-fn style_with_font_size(mut style: egui::Style, font_size: f32) -> egui::Style {
-    let font_size = font_size.clamp(10.0, 24.0);
-    for (text_style, size) in [
-        (egui::TextStyle::Small, font_size * 0.85),
-        (egui::TextStyle::Body, font_size),
-        (egui::TextStyle::Button, font_size),
-        (egui::TextStyle::Monospace, font_size),
-        (egui::TextStyle::Heading, font_size * 1.35),
-    ] {
-        if let Some(font_id) = style.text_styles.get_mut(&text_style) {
-            font_id.size = size;
-        }
-    }
-    style
-}
-
-pub(crate) fn apply_font_size(ctx: &egui::Context, font_size: f32) {
-    let style = style_with_font_size((*ctx.global_style()).clone(), font_size);
-    ctx.set_global_style(style);
-}
-
 pub struct Session {
     pub(crate) upload_settings: uploads::UploadSettings,
     pub(crate) upload_discovery: uploads::UploadDiscovery,
@@ -590,7 +572,6 @@ pub struct Session {
     pub(crate) attention: attention::AttentionSettings,
     pub(crate) view_is_active: bool,
     pub(crate) reading_conversation: Option<ConversationId>,
-    pub join_channel: String,
 
     /// Identifies this session to the window manager; never reused.
     pub(crate) id: windows::ConnId,
@@ -651,6 +632,8 @@ pub struct Session {
 
     // User list selection
     pub selected_user: Option<String>,
+    /// The drawn window's people-list choice (see `TargetView`).
+    pub(crate) people_hidden: Option<bool>,
 
     // Connection options
     pub auto_join_channels: String,
@@ -788,7 +771,7 @@ pub struct Session {
     /// and CASEMAPPING refresh so sender_is_self costs one canonicalize of
     /// the incoming nick (the held-nick side is precomputed).
     self_nick_keys: Vec<String>,
-    /// Memoized switchbar tab order with the fingerprint it was sorted
+    /// Memoized sidebar tab order with the fingerprint it was sorted
     /// under: the order is rebuilt every frame, but the tab set (and the
     /// casemapping that orders it) rarely changes.
     tab_order_cache: std::cell::RefCell<Option<(u64, Vec<Option<ConversationId>>)>>,
@@ -854,7 +837,6 @@ impl Session {
             attention: settings.attention.clone(),
             view_is_active: false,
             reading_conversation: None,
-            join_channel: String::new(),
 
             id: 0,
             profile_id: None,
@@ -890,6 +872,7 @@ impl Session {
             tab_completion: None,
 
             selected_user: None,
+            people_hidden: None,
 
             auto_join_channels: settings.auto_join_channels,
             set_invisible: settings.set_invisible,
@@ -1756,7 +1739,7 @@ impl Session {
             referenced.insert(self.network_support.canonicalize(name));
             referenced.extend(
                 channel
-                    .users
+                    .users()
                     .iter()
                     .map(|user| self.network_support.canonicalize(&user.nick)),
             );
@@ -3969,7 +3952,7 @@ mod connection_lifecycle_tests {
             app.handle_numeric(RPL_ENDOFNAMES, &["me".into(), "#chan".into()]);
 
             let nicks: Vec<&str> = app.conversations["#chan"]
-                .users
+                .users()
                 .iter()
                 .map(|user| user.nick.as_str())
                 .collect();
@@ -4114,17 +4097,63 @@ fn ident_contains(haystack_key: &str, needle_key: &str) -> bool {
     })
 }
 
+/// What shapes every row of one scrollback this frame.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct RowLayout {
+    /// The message area is narrow: the nick and time go on a line of their
+    /// own above the text instead of in columns beside it.
+    pub stacked: bool,
+    /// Width of the time column; zero when timestamps are hidden.
+    pub time_width: f32,
+}
+
+/// One row's place in the scrollback.
+#[derive(Clone, Copy)]
+pub(crate) struct RowContext<'a> {
+    pub my_nick: &'a str,
+    pub layout: RowLayout,
+    /// False when the row continues a run of messages from one sender.
+    pub show_nick: bool,
+    /// The row is the first unread one: "New messages" is drawn above it.
+    pub marker: bool,
+}
+
+/// Message rows narrower than this stack the nick above the text.
+const STACK_BELOW_WIDTH: f32 = 520.0;
+const NICK_COLUMN: f32 = 108.0;
+const COLUMN_GAP: f32 = 12.0;
+
+/// Whether `msg` goes on under `previous` without repeating the nick: the
+/// same sender speaking again, with nothing but ordinary messages involved.
+fn continues_previous(previous: Option<&ChatMessage>, msg: &ChatMessage) -> bool {
+    previous.is_some_and(|previous| {
+        !msg.is_system
+            && !msg.is_action
+            && !previous.is_system
+            && !previous.is_action
+            && msg.reply_to.is_none()
+            && msg.oper == previous.oper
+            && msg.sender.eq_ignore_ascii_case(&previous.sender)
+    })
+}
+
 /// Hash of every input that shapes a scrollback row's height: the content
-/// width and the two font sizes used by message rows. A change in any of them
-/// invalidates all cached row heights.
-fn row_layout_key(ui: &egui::Ui, content_width: f32) -> u64 {
+/// width, the font sizes and family used by message rows, and the row
+/// arrangement. A change in any of them invalidates all cached row heights.
+fn row_layout_key(ui: &egui::Ui, content_width: f32, layout: RowLayout) -> u64 {
     let body = ui.style().text_styles[&egui::TextStyle::Body]
         .size
         .to_bits();
     let mono = ui.style().text_styles[&egui::TextStyle::Monospace]
         .size
         .to_bits();
-    (content_width.to_bits() as u64) ^ (body as u64).rotate_left(32) ^ (mono as u64).rotate_left(17)
+    let arrangement = (layout.time_width.to_bits() as u64) << 2
+        | (layout.stacked as u64) << 1
+        | (theme::metrics(ui.ctx()).message_font == theme::MessageFont::Monospace) as u64;
+    (content_width.to_bits() as u64)
+        ^ (body as u64).rotate_left(32)
+        ^ (mono as u64).rotate_left(17)
+        ^ arrangement.wrapping_mul(0xc2b2_ae3d_27d4_eb4f)
 }
 
 /// How far below the scroll area's clip rect scratch measurement rows are
@@ -4148,12 +4177,17 @@ const SCRATCH_MEASURE_OFFSET: f32 = 100_000.0;
 fn row_height(
     ui: &mut egui::Ui,
     msg: &ChatMessage,
-    my_nick: &str,
+    row: &RowContext,
     content_width: f32,
     layout_key: u64,
     stats: &mut ScrollbackStats,
 ) -> f32 {
-    let layout_key = layout_key ^ msg.presentation_revision.wrapping_mul(0x9e3779b97f4a7c15);
+    // The marker adds a line above the row, and a stacked row is a line
+    // taller when it shows its nick.
+    let place = (row.marker as u64) | ((row.layout.stacked && row.show_nick) as u64) << 1;
+    let layout_key = layout_key
+        ^ msg.presentation_revision.wrapping_mul(0x9e3779b97f4a7c15)
+        ^ place.wrapping_mul(0x1656_67b1_9e37_79f9);
     let cached = msg.row_height.get();
     if cached.key == layout_key && cached.height > 0.0 {
         return cached.height;
@@ -4166,7 +4200,7 @@ fn row_height(
     let scratch_rect = egui::Rect::from_min_size(scratch_origin, egui::vec2(content_width, 0.0));
     let mut scratch = ui.new_child(egui::UiBuilder::new().max_rect(scratch_rect));
     scratch.disable();
-    draw_chat_row(&mut scratch, msg, my_nick);
+    draw_chat_row(&mut scratch, msg, row);
     let h = scratch.min_rect().height();
     msg.row_height.set(RowHeightEntry {
         key: layout_key,
@@ -4184,116 +4218,291 @@ fn message_ref_names(reference: &identity::MessageRef, message: &ChatMessage) ->
             .is_some_and(|id| message.msgid.as_ref() == Some(id))
 }
 
-/// Draw one scrollback row: timestamp, optional indicator, nick, body.
+/// A fixed-size cell of a row, laid out by `layout`.
+fn row_cell(
+    ui: &mut egui::Ui,
+    width: f32,
+    height: f32,
+    layout: egui::Layout,
+    add: impl FnOnce(&mut egui::Ui),
+) {
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(width, height), egui::Sense::hover());
+    let mut cell = ui.new_child(egui::UiBuilder::new().max_rect(rect).layout(layout));
+    add(&mut cell);
+}
+
+/// "New messages" between two rules, above the first unread row.
+fn draw_new_messages_marker(ui: &mut egui::Ui, palette: &theme::Palette) {
+    let size = egui::TextStyle::Small.resolve(ui.style()).size;
+    let galley = ui.painter().layout_no_wrap(
+        "New messages".to_owned(),
+        egui::FontId::new(size, fonts::semibold()),
+        palette.accent,
+    );
+    let (rect, _) = ui.allocate_exact_size(
+        egui::vec2(ui.available_width(), galley.size().y + 8.0),
+        egui::Sense::hover(),
+    );
+    let rule = egui::Stroke::new(1.0, palette.accent.gamma_multiply(0.5));
+    let text_left = rect.center().x - galley.size().x / 2.0;
+    let text_right = text_left + galley.size().x;
+    let y = rect.center().y;
+    ui.painter()
+        .hline(rect.left() + 16.0..=text_left - 12.0, y, rule);
+    ui.painter()
+        .hline(text_right + 12.0..=rect.right() - 16.0, y, rule);
+    ui.painter().galley(
+        egui::pos2(text_left, y - galley.size().y / 2.0),
+        galley,
+        palette.accent,
+    );
+}
+
+/// How wide a time column must be for this message's timestamp format,
+/// whatever its digits.
+pub(crate) fn time_width_of(ui: &egui::Ui, sample: &ChatMessage) -> f32 {
+    let time = row_time(sample);
+    if time.is_empty() {
+        return 0.0;
+    }
+    let widest: String = time
+        .chars()
+        .map(|c| if c.is_ascii_digit() { '0' } else { c })
+        .collect();
+    let font = egui::TextStyle::Small.resolve(ui.style());
+    ui.painter()
+        .layout_no_wrap(widest, font, Color32::PLACEHOLDER)
+        .size()
+        .x
+        .ceil()
+        + 2.0
+}
+
+/// The time as shown in a row: the stored text without its brackets.
+fn row_time(msg: &ChatMessage) -> &str {
+    msg.timestamp.trim_matches(|c| c == '[' || c == ']')
+}
+
+/// Draw one scrollback row: time, nick and text in columns, or stacked in
+/// a narrow message area. A row that mentions the user is filled.
 fn draw_chat_row(
     ui: &mut egui::Ui,
     msg: &ChatMessage,
-    my_nick: &str,
+    row: &RowContext,
 ) -> Option<message_ui::MessageAction> {
+    let palette = theme::palette(ui.ctx());
+    let metrics = theme::metrics(ui.ctx());
     let mut action = None;
+    // A row is as tall as its text, not as tall as a control.
+    ui.spacing_mut().interact_size.y = 0.0;
+    ui.spacing_mut().item_spacing = egui::Vec2::ZERO;
+    if row.marker {
+        draw_new_messages_marker(ui, &palette);
+    }
     // Current nick only, matching the other display gates (#170): held-nick
     // styling would misattribute a stranger who picked up a nick we
     // vacated, and misattribution is not the safe direction for display.
-    let is_own_msg = !msg.is_system && msg.sender.eq_ignore_ascii_case(my_nick);
-
-    let mut render_row = |ui: &mut egui::Ui| {
-        if let Some(reply_to) = &msg.reply_to {
-            ui.horizontal(|ui| {
-                ui.add_space(18.0);
-                if ui
-                    .link(
-                        RichText::new(format!(
-                            "↪ {}",
-                            msg.reply_preview
-                                .as_deref()
-                                .unwrap_or("Message unavailable · view context")
-                        ))
-                        .small(),
-                    )
-                    .clicked()
-                {
-                    action = Some(message_ui::MessageAction::Reveal(reply_to.clone()));
-                }
-            });
-        }
-        ui.horizontal(|ui| {
-            if msg.is_highlight {
-                ui.label(RichText::new("*").color(Color32::YELLOW).strong());
-            }
-
-            ui.label(
-                RichText::new(&msg.timestamp)
-                    .color(Color32::GRAY)
-                    .monospace(),
-            );
-
-            if msg.is_system {
-                render_segments(ui, msg.render_segments(), Color32::GRAY);
-            } else if msg.is_action {
-                let action_color = if msg.is_highlight {
-                    Color32::YELLOW
-                } else if is_own_msg {
-                    Color32::from_rgb(100, 180, 220)
-                } else {
-                    Color32::from_rgb(150, 100, 200)
-                };
-                let sender = msg.oper.as_ref().map_or_else(
-                    || msg.sender.clone(),
-                    |oper| format!("{} [{}]", msg.sender, oper),
-                );
-                ui.label(RichText::new(format!("* {sender} ")).color(action_color));
-                render_segments(ui, msg.render_segments(), action_color);
-            } else {
-                let sender = msg.oper.as_ref().map_or_else(
-                    || msg.sender.clone(),
-                    |oper| format!("{} [{}]", msg.sender, oper),
-                );
-                let nick_style = if is_own_msg {
-                    RichText::new(format!("<{sender}>")).color(Color32::from_rgb(100, 200, 255))
-                } else {
-                    RichText::new(format!("<{sender}>")).color(nick_color(&msg.sender))
-                };
-                ui.label(nick_style);
-
-
-                let text_color = if msg.is_highlight {
-                    Color32::YELLOW
-                } else if is_own_msg {
-                    Color32::from_rgb(200, 210, 220)
-                } else {
-                    Color32::WHITE
-                };
-                render_segments(ui, msg.render_segments(), text_color);
-            }
-            match &msg.delivery {
-                message_ui::MessageDelivery::Queued{..}=>{ui.label(RichText::new("Queued").small().color(Color32::GRAY));},
-                message_ui::MessageDelivery::Uncertain=>{ui.label(RichText::new("Delivery uncertain").small().color(Color32::YELLOW)).on_hover_text("The connection ended before this send was confirmed. It will not be sent again automatically.");},
-                _=>{}
-            }
-        });
+    let is_own_msg = !msg.is_system && msg.sender.eq_ignore_ascii_case(row.my_nick);
+    let sender = msg.oper.as_ref().map_or_else(
+        || msg.sender.clone(),
+        |oper| format!("{} [{}]", msg.sender, oper),
+    );
+    let nick_color = if is_own_msg {
+        palette.accent
+    } else if metrics.color_nicks {
+        palette.nick(&msg.sender)
+    } else {
+        palette.text
+    };
+    let names_sender = !msg.is_system && !msg.is_action && row.show_nick;
+    let side = if row.layout.stacked { 14.0 } else { 16.0 };
+    let time = |ui: &mut egui::Ui| {
+        ui.label(RichText::new(row_time(msg)).small().color(palette.faint));
     };
 
-    // Only highlighted/own rows pay for a Frame (a nested Ui with its own
-    // layout pass); plain rows - the overwhelming majority - are laid out
-    // directly. Frame::NONE adds no margin, so heights match measurement.
+    let mut body = |ui: &mut egui::Ui| {
+        ui.set_min_width(ui.available_width());
+        ui.add_space(2.0);
+        ui.horizontal_top(|ui| {
+            let line = ui.text_style_height(&egui::TextStyle::Body);
+            ui.add_space(side);
+            if !row.layout.stacked {
+                if row.layout.time_width > 0.0 {
+                    row_cell(
+                        ui,
+                        row.layout.time_width,
+                        line,
+                        egui::Layout::left_to_right(egui::Align::Center),
+                        time,
+                    );
+                    ui.add_space(COLUMN_GAP);
+                }
+                let (cell, response) =
+                    ui.allocate_exact_size(egui::vec2(NICK_COLUMN, line), egui::Sense::hover());
+                if names_sender {
+                    // Set against the column's right edge, and cut with an
+                    // ellipsis where the nick is longer than the column.
+                    let size = egui::TextStyle::Body.resolve(ui.style()).size;
+                    let mut job = egui::text::LayoutJob::simple_singleline(
+                        sender.clone(),
+                        egui::FontId::new(size, fonts::semibold()),
+                        nick_color,
+                    );
+                    job.wrap = egui::text::TextWrapping {
+                        max_width: NICK_COLUMN,
+                        max_rows: 1,
+                        break_anywhere: true,
+                        overflow_character: Some('…'),
+                    };
+                    job.halign = egui::Align::RIGHT;
+                    let galley = ui.painter().layout_job(job);
+                    if galley.elided {
+                        response.on_hover_text(&sender);
+                    }
+                    ui.painter().galley(
+                        egui::pos2(cell.right(), cell.center().y - galley.size().y / 2.0),
+                        galley,
+                        nick_color,
+                    );
+                }
+                ui.add_space(COLUMN_GAP);
+            }
+            ui.vertical(|ui| {
+                ui.set_width((ui.available_width() - side).max(40.0));
+                if row.layout.stacked && names_sender {
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 8.0;
+                        ui.label(widgets::strong(&sender).color(nick_color));
+                        if row.layout.time_width > 0.0 {
+                            time(ui);
+                        }
+                    });
+                }
+                draw_row_text(
+                    ui,
+                    msg,
+                    row,
+                    &sender,
+                    nick_color,
+                    &palette,
+                    &metrics,
+                    &mut action,
+                );
+            });
+        });
+        ui.add_space(2.0);
+    };
+    // Only rows that mention the user pay for a Frame (a nested Ui with its
+    // own layout pass); plain rows - the overwhelming majority - are laid
+    // out directly. Frame::NONE adds no margin, so heights match measurement.
     if msg.is_highlight {
         egui::Frame::NONE
-            .fill(Color32::from_rgb(60, 40, 20))
-            .show(ui, render_row);
-    } else if is_own_msg {
-        egui::Frame::NONE
-            .fill(Color32::from_rgb(25, 35, 45))
-            .show(ui, render_row);
+            .fill(palette.mention_row)
+            .show(ui, &mut body);
     } else {
-        render_row(ui);
+        body(ui);
+    }
+    action
+}
+
+/// The text column of a row: a reply quote, the message itself, how its
+/// delivery stands, and its reactions.
+#[allow(clippy::too_many_arguments)]
+fn draw_row_text(
+    ui: &mut egui::Ui,
+    msg: &ChatMessage,
+    row: &RowContext,
+    sender: &str,
+    nick_color: Color32,
+    palette: &theme::Palette,
+    metrics: &theme::Metrics,
+    action: &mut Option<message_ui::MessageAction>,
+) {
+    let monospace = metrics.message_font == theme::MessageFont::Monospace;
+    if monospace {
+        let font = egui::TextStyle::Monospace.resolve(ui.style());
+        ui.style_mut().override_font_id = Some(font);
+    }
+    if let Some(reply_to) = &msg.reply_to
+        && ui
+            .link(
+                RichText::new(format!(
+                    "↪ {}",
+                    msg.reply_preview
+                        .as_deref()
+                        .unwrap_or("Message unavailable · view context")
+                ))
+                .small(),
+            )
+            .clicked()
+    {
+        *action = Some(message_ui::MessageAction::Reveal(reply_to.clone()));
+    }
+    let style = |color| SegmentStyle {
+        color,
+        ground: if msg.is_highlight {
+            palette.mention_row
+        } else {
+            palette.bg
+        },
+        link: palette.accent,
+        bold: (!monospace).then(fonts::semibold),
+    };
+    if msg.is_system {
+        ui.scope(|ui| {
+            ui.style_mut().override_text_style = Some(egui::TextStyle::Small);
+            render_segments(ui, msg.render_segments(), &style(palette.muted), None);
+        });
+    } else if msg.is_action {
+        let italic: Vec<_> = msg
+            .render_segments()
+            .iter()
+            .cloned()
+            .map(|mut segment| {
+                segment.italic = true;
+                segment
+            })
+            .collect();
+        render_segments(
+            ui,
+            &italic,
+            &style(palette.text),
+            Some(
+                RichText::new(format!("* {sender} "))
+                    .italics()
+                    .color(nick_color),
+            ),
+        );
+    } else if msg.is_highlight {
+        let marked = with_mentions(msg.render_segments(), row.my_nick, palette.mention);
+        render_segments(ui, &marked, &style(palette.text), None);
+    } else {
+        render_segments(ui, msg.render_segments(), &style(palette.text), None);
+    }
+    match &msg.delivery {
+        message_ui::MessageDelivery::Queued { .. } => {
+            ui.label(RichText::new("Queued").small().color(palette.muted));
+        }
+        message_ui::MessageDelivery::Uncertain => {
+            ui.label(
+                RichText::new("Delivery uncertain")
+                    .small()
+                    .color(palette.mention),
+            )
+            .on_hover_text(
+                "The connection ended before this send was confirmed. It will not be sent again automatically.",
+            );
+        }
+        _ => {}
     }
     if !msg.reactions.is_empty() {
         ui.horizontal_wrapped(|ui| {
+            ui.spacing_mut().item_spacing.x = 6.0;
             for group in &msg.reactions {
                 let own = group
                     .actors
                     .iter()
-                    .any(|actor| actor.eq_ignore_ascii_case(my_nick));
+                    .any(|actor| actor.eq_ignore_ascii_case(row.my_nick));
                 if ui
                     .selectable_label(
                         own,
@@ -4302,7 +4511,7 @@ fn draw_chat_row(
                     .on_hover_text(group.actors.join(", "))
                     .clicked()
                 {
-                    action = Some(message_ui::MessageAction::React(
+                    *action = Some(message_ui::MessageAction::React(
                         msg.message_key.clone(),
                         group.emoji.clone(),
                     ));
@@ -4310,7 +4519,6 @@ fn draw_chat_row(
             }
         });
     }
-    action
 }
 
 /// Statistics from one virtualized scrollback pass.
@@ -4781,7 +4989,7 @@ impl Session {
         channel.joined |= retired.joined;
         channel.history_loaded |= retired.history_loaded;
         channel.merge_metadata_from(&retired);
-        channel.merge_users(retired.users);
+        channel.merge_users(retired.into_users());
         if self.max_scrollback > 0 {
             while channel.messages.len() > self.max_scrollback {
                 channel.messages.pop_front();
@@ -8617,7 +8825,7 @@ impl Session {
         {
             let prefix_key = self.network_support.canonicalize(prefix);
             let mut matches: Vec<String> = channel
-                .users
+                .users()
                 .iter()
                 .filter(|user| {
                     self.network_support
@@ -8750,6 +8958,15 @@ impl Session {
         }
     }
 
+    /// Width of the rows' time column: wide enough for this timestamp
+    /// format with any digits, or zero when timestamps are hidden.
+    fn time_column_width(&self, ui: &egui::Ui, msgs: &VecDeque<ChatMessage>) -> f32 {
+        if self.timestamp_format == "off" {
+            return 0.0;
+        }
+        msgs.back().map_or(0.0, |sample| time_width_of(ui, sample))
+    }
+
     /// Draw the active view's message scrollback, virtualized: only the rows
     /// intersecting the viewport (plus one straddler below) are laid out
     /// visibly each frame. Row heights are cached per message and invalidated
@@ -8842,8 +9059,37 @@ impl Session {
                     return;
                 }
                 let content_width = ui.available_width();
-                let spacing = ui.spacing().item_spacing;
-                let layout_key = row_layout_key(ui, content_width);
+                let gap = theme::metrics(ui.ctx()).row_gap;
+                let layout = RowLayout {
+                    stacked: content_width < STACK_BELOW_WIDTH,
+                    time_width: self.time_column_width(ui, msgs),
+                };
+                let layout_key = row_layout_key(ui, content_width, layout);
+                // The row "New messages" is drawn above: the one after the
+                // last read row, when a row follows it.
+                let marker_index = if unread_from_start {
+                    Some(0)
+                } else {
+                    self.timeline
+                        .borrow()
+                        .entry_read_boundary
+                        .as_ref()
+                        .and_then(|reference| {
+                            msgs.iter()
+                                .position(|msg| message_ref_names(reference, msg))
+                        })
+                        .map(|read| read + 1)
+                        .filter(|first_unread| *first_unread < msgs.len())
+                };
+                let row_at = |index: usize, msg: &ChatMessage| RowContext {
+                    my_nick: &my_nick,
+                    layout,
+                    show_nick: !continues_previous(
+                        index.checked_sub(1).and_then(|before| msgs.get(before)),
+                        msg,
+                    ),
+                    marker: marker_index == Some(index),
+                };
 
                 // Pass 1 (arithmetic on warm cache): cumulative offsets to
                 // find the first row intersecting the viewport top and the
@@ -8854,8 +9100,14 @@ impl Session {
                 let mut first_idx = msgs.len();
                 let mut first_y = 0.0f32;
                 for (i, msg) in msgs.iter().enumerate() {
-                    let height =
-                        row_height(ui, msg, &my_nick, content_width, layout_key, &mut stats);
+                    let height = row_height(
+                        ui,
+                        msg,
+                        &row_at(i, msg),
+                        content_width,
+                        layout_key,
+                        &mut stats,
+                    );
                     if reveal.as_ref().is_some_and(|key| key == &msg.message_key)
                         || (restore
                             && restore_anchor
@@ -8892,9 +9144,9 @@ impl Session {
                     if bottom <= viewport.max.y {
                         last_visible = Some(msg);
                     }
-                    y = bottom + spacing.y;
+                    y = bottom + gap;
                 }
-                ui.set_height((y - spacing.y).max(0.0));
+                ui.set_height((y - gap).max(0.0));
                 if first_idx == msgs.len() {
                     // The viewport sits past the end of the content (a
                     // transient state mid-scroll, e.g. right after scrollback
@@ -8902,16 +9154,22 @@ impl Session {
                     // the viewport bottom for this frame rather than flashing
                     // an empty area; egui re-clamps the offset next frame.
                     let mut yy = viewport.max.y;
-                    for msg in msgs.iter().rev() {
-                        let h =
-                            row_height(ui, msg, &my_nick, content_width, layout_key, &mut stats);
+                    for (i, msg) in msgs.iter().enumerate().rev() {
+                        let h = row_height(
+                            ui,
+                            msg,
+                            &row_at(i, msg),
+                            content_width,
+                            layout_key,
+                            &mut stats,
+                        );
                         let top = yy - h;
                         first_idx -= 1;
                         first_y = top;
                         if top <= viewport.min.y {
                             break;
                         }
-                        yy = top - spacing.y;
+                        yy = top - gap;
                     }
                 }
 
@@ -8938,46 +9196,20 @@ impl Session {
                 // the content-space viewport.
                 let mut cy = first_y;
                 ui.scope_builder(egui::UiBuilder::new().max_rect(band), |rows_ui| {
-                    for msg in msgs.iter().skip(first_idx) {
+                    rows_ui.spacing_mut().item_spacing.y = gap;
+                    for (i, msg) in msgs.iter().enumerate().skip(first_idx) {
                         if cy > viewport.max.y {
                             break;
                         }
                         // Warm cache at this point: pass 1 measured everything.
-                        cy += msg.row_height.get().height + spacing.y;
+                        cy += msg.row_height.get().height + gap;
+                        let context = row_at(i, msg);
                         let row = rows_ui.scope_builder(
                             egui::UiBuilder::new()
                                 .id_salt((&msg.message_key, "row"))
                                 .sense(egui::Sense::click()),
-                            |ui| draw_chat_row(ui, msg, &my_nick),
+                            |ui| draw_chat_row(ui, msg, &context),
                         );
-                        // Under the newest row the marker would introduce nothing.
-                        let divider = !msgs.back().is_some_and(|newest| std::ptr::eq(newest, msg))
-                            && self
-                                .timeline
-                                .borrow()
-                                .entry_read_boundary
-                                .as_ref()
-                                .is_some_and(|reference| message_ref_names(reference, msg));
-                        if divider || (unread_from_start && msg.message_key == msgs[0].message_key)
-                        {
-                            let y = if divider {
-                                row.response.rect.bottom()
-                            } else {
-                                row.response.rect.top()
-                            };
-                            rows_ui.painter().hline(
-                                rows_ui.max_rect().x_range(),
-                                y,
-                                egui::Stroke::new(1.0, Color32::YELLOW),
-                            );
-                            rows_ui.painter().text(
-                                egui::pos2(rows_ui.max_rect().right() - 4.0, y),
-                                egui::Align2::RIGHT_BOTTOM,
-                                "Unread messages",
-                                egui::FontId::proportional(10.0),
-                                Color32::YELLOW,
-                            );
-                        }
                         if let Some(action) = row.inner {
                             self.timeline.borrow_mut().actions.push(action);
                         }
@@ -9155,7 +9387,7 @@ impl Session {
         total
     }
 
-    /// The switchbar's tab order, borrowing the channel names: this runs
+    /// The sidebar's tab order, borrowing the channel names: this runs
     /// every frame, so it must neither clone every name nor build a
     /// canonical key per name just to compare them.
     fn ordered_tab_names(&self) -> Vec<Option<&str>> {
@@ -9474,15 +9706,6 @@ pub(crate) mod tests {
             );
         });
         assert!(!logs.contains("swordfish"), "{logs}");
-    }
-
-    #[test]
-    fn configured_font_size_updates_body_and_monospace_styles() {
-        let style = style_with_font_size(egui::Style::default(), 20.0);
-        assert_eq!(style.text_styles[&egui::TextStyle::Body].size, 20.0);
-        assert_eq!(style.text_styles[&egui::TextStyle::Monospace].size, 20.0);
-        assert_eq!(style.text_styles[&egui::TextStyle::Small].size, 17.0);
-        assert_eq!(style.text_styles[&egui::TextStyle::Heading].size, 27.0);
     }
 
     #[test]
@@ -9880,6 +10103,74 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn the_row_layout_key_follows_the_arrangement_and_the_message_font() {
+        let ctx = egui::Context::default();
+        let columns = RowLayout {
+            stacked: false,
+            time_width: 40.0,
+        };
+        let key = |layout: RowLayout| {
+            let mut key = 0;
+            ctx.run_ui(egui::RawInput::default(), |ui| {
+                key = row_layout_key(ui, 600.0, layout);
+            })
+            .textures_delta
+            .clear();
+            key
+        };
+        let base = key(columns);
+        assert_eq!(base, key(columns), "stable for the same inputs");
+        assert_ne!(
+            base,
+            key(RowLayout {
+                stacked: true,
+                ..columns
+            })
+        );
+        assert_ne!(
+            base,
+            key(RowLayout {
+                time_width: 0.0,
+                ..columns
+            })
+        );
+        theme::apply(
+            &ctx,
+            &theme::DisplayPrefs {
+                message_font: theme::MessageFont::Monospace,
+                ..theme::DisplayPrefs::default()
+            },
+        );
+        // The font size stays at the default, so only the family differs.
+        let default_size = key(columns);
+        theme::apply(&ctx, &theme::DisplayPrefs::default());
+        assert_ne!(
+            default_size,
+            key(columns),
+            "the message font is part of the key"
+        );
+    }
+
+    #[test]
+    fn a_run_continues_only_for_the_same_sender_speaking_plainly() {
+        let message = |sender: &str| ChatMessage::new_fmt(sender, "text", "short");
+        let bob = message("bob");
+        assert!(continues_previous(Some(&bob), &message("BOB")));
+        assert!(!continues_previous(Some(&bob), &message("carol")));
+        assert!(!continues_previous(None, &bob));
+        let system = ChatMessage::system("joined");
+        assert!(!continues_previous(Some(&system), &bob));
+        assert!(!continues_previous(Some(&bob), &system));
+        let mut action = message("bob");
+        action.is_action = true;
+        assert!(!continues_previous(Some(&bob), &action));
+        assert!(!continues_previous(Some(&action), &bob));
+        let mut reply = message("bob");
+        reply.reply_to = Some("id".into());
+        assert!(!continues_previous(Some(&bob), &reply));
+    }
+
+    #[test]
     fn row_measurement_tracks_wrapping_heights() {
         let ctx = egui::Context::default();
         let short_msg = ChatMessage::system("hi");
@@ -9891,7 +10182,17 @@ pub(crate) mod tests {
         ctx.run_ui(egui::RawInput::default(), |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {
                 let width = 120.0;
-                let key = row_layout_key(ui, width);
+                let layout = RowLayout {
+                    stacked: true,
+                    time_width: 40.0,
+                };
+                let row = RowContext {
+                    my_nick: "me",
+                    layout,
+                    show_nick: true,
+                    marker: false,
+                };
+                let key = row_layout_key(ui, width, layout);
                 let mut stats = ScrollbackStats {
                     drawn: 0,
                     measured: 0,
@@ -9899,8 +10200,8 @@ pub(crate) mod tests {
                 };
                 // Narrow width forces the long message to wrap over lines;
                 // the measured advance must reflect that.
-                let h_short = row_height(ui, &short_msg, "me", width, key, &mut stats);
-                let h_long = row_height(ui, &long_msg, "me", width, key, &mut stats);
+                let h_short = row_height(ui, &short_msg, &row, width, key, &mut stats);
+                let h_long = row_height(ui, &long_msg, &row, width, key, &mut stats);
                 heights = Some((h_short, h_long));
             });
         })
@@ -11068,8 +11369,8 @@ pub(crate) mod tests {
             }
             app.handle_numeric(RPL_ENDOFNAMES, &["me".into(), name.into()]);
         }
-        assert_eq!(app.conversations["#a"].users.len(), USERS);
-        assert_eq!(app.conversations["#b"].users.len(), USERS);
+        assert_eq!(app.conversations["#a"].users().len(), USERS);
+        assert_eq!(app.conversations["#b"].users().len(), USERS);
 
         // 366 queued a WHOX for each channel; answer #a's for every member.
         let token = app
@@ -13186,7 +13487,7 @@ pub(crate) mod tests {
         app.handle_incoming_message(msg);
 
         let ch = &app.conversations["#chan"];
-        assert!(ch.users.is_empty());
+        assert!(ch.users().is_empty());
         assert!(ch.messages.iter().any(|m| {
             m.content
                 .contains("You were kicked from #chan by alice (bye)")

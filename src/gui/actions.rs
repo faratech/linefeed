@@ -337,6 +337,7 @@ impl super::App {
                 let response = ui.add_enabled(
                     interactive,
                     egui::TextEdit::singleline(&mut self.window_switcher.query)
+                        .align(egui::Align2::LEFT_CENTER)
                         .id(input_id)
                         .hint_text("Search conversations and networks…")
                         .desired_width(ui.available_width()),

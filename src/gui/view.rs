@@ -4,56 +4,56 @@
 //! `current_conversation` pointed at the window's target and the window's input
 //! state swapped in (see `app::with_window_view`).
 
-use egui::{Color32, RichText, ScrollArea, TextEdit};
+use egui::{RichText, ScrollArea, TextEdit};
 
-use super::formatting::render_irc_text;
-use super::{Session, UserMode, commands};
+use super::{Session, commands};
 use crate::irc::IrcCommand;
+
+/// The people button's label: "1 person", "12 people".
+fn people_label(count: usize) -> String {
+    if count == 1 {
+        "1 person".to_owned()
+    } else {
+        format!("{count} people")
+    }
+}
 
 impl Session {
     /// Connection status for the toolbar: state dot, nick, network, lag and
     /// away message.
-    pub(crate) fn draw_status_summary(&self, ui: &mut egui::Ui, network_label: &str) {
-        if self.is_connected() {
-            if self.away_status.is_some() {
-                ui.label(RichText::new("●").color(Color32::from_rgb(255, 200, 0)));
+    /// The one-line connection summary for the top bar, and whether it
+    /// reports something the user should notice (an unencrypted or
+    /// unverified link).
+    pub(crate) fn status_line(&self, network_label: &str) -> (String, bool) {
+        use crate::irc::client::{AuthenticationStatus, TlsStatus};
+        if !self.is_connected() {
+            let text = if self.is_connecting() {
+                format!("Connecting to {network_label}...")
             } else {
-                ui.label(RichText::new("●").color(Color32::GREEN));
-            }
-            ui.label(&self.my_nick);
-            ui.label("@");
-            ui.label(network_label);
-            self.draw_account_security_status(ui);
-
-            if let Some(lag) = self.lag_ms {
-                let lag_color = if lag < 100 {
-                    Color32::GREEN
-                } else if lag < 300 {
-                    Color32::YELLOW
-                } else {
-                    Color32::from_rgb(255, 100, 100)
-                };
-                ui.label(
-                    RichText::new(format!("({}ms)", lag))
-                        .color(lag_color)
-                        .small(),
-                );
-            }
-
-            if let Some(away_msg) = &self.away_status {
-                ui.separator();
-                ui.label(
-                    RichText::new(format!("Away: {}", away_msg))
-                        .color(Color32::from_rgb(255, 200, 0)),
-                );
-            }
-        } else if self.is_connecting() {
-            ui.label(RichText::new("●").color(Color32::YELLOW));
-            ui.label(format!("Connecting to {network_label}..."));
-        } else {
-            ui.label(RichText::new("●").color(Color32::RED));
-            ui.label("Disconnected");
+                "Disconnected".to_owned()
+            };
+            return (text, false);
         }
+        let (security, warning) = match self.connection_status.tls {
+            TlsStatus::Verified => ("Encrypted", false),
+            TlsStatus::Unverified => ("Encrypted, certificate not checked", true),
+            TlsStatus::Negotiating => ("Securing…", false),
+            TlsStatus::Plaintext => ("Not encrypted", true),
+        };
+        let mut parts = vec![security.to_owned()];
+        parts.push(match &self.connection_status.authentication {
+            AuthenticationStatus::LoggedIn { account } => format!("signed in as {account}"),
+            AuthenticationStatus::Authenticated => "signed in".to_owned(),
+            AuthenticationStatus::Authenticating => "signing in…".to_owned(),
+            _ => "not signed in".to_owned(),
+        });
+        if let Some(lag) = self.lag_ms {
+            parts.push(format!("{lag} ms"));
+        }
+        if let Some(away) = &self.away_status {
+            parts.push(format!("away: {away}"));
+        }
+        (parts.join(" · "), warning)
     }
 
     pub(crate) fn draw_account_security_status(&self, ui: &mut egui::Ui) {
@@ -68,11 +68,12 @@ impl Session {
             _ => "Connected · not authenticated".into(),
         };
         ui.label(RichText::new(auth).small()).on_hover_text(self.connection_status.sasl_mechanism.map_or_else(||"Account status is confirmed by server account events or a correlated self-WHOIS.".into(),|mechanism|format!("SASL used on this connection: {mechanism:?}\nAccount status is confirmed by the server.")));
+        let palette = super::theme::palette(ui.ctx());
         let (tls, color) = match self.connection_status.tls {
-            TlsStatus::Verified => ("TLS verified", Color32::GREEN),
-            TlsStatus::Unverified => ("TLS unverified", Color32::YELLOW),
-            TlsStatus::Negotiating => ("TLS negotiating", Color32::YELLOW),
-            TlsStatus::Plaintext => ("Plaintext", Color32::YELLOW),
+            TlsStatus::Verified => ("TLS verified", palette.online),
+            TlsStatus::Unverified => ("TLS unverified", palette.mention),
+            TlsStatus::Negotiating => ("TLS negotiating", palette.mention),
+            TlsStatus::Plaintext => ("Plaintext", palette.mention),
         };
         let endpoint = self
             .connection_status
@@ -91,21 +92,13 @@ impl Session {
         ui.label(RichText::new(tls).small().color(color)).on_hover_text(format!("Effective endpoint: {endpoint}\nUnverified TLS means certificate validation was explicitly bypassed."));
     }
 
-    /// The "#channel [+]" join box.
-    pub(crate) fn draw_join_box(&mut self, ui: &mut egui::Ui) {
-        // Laid out right to left in the toolbar: button first.
-        let clicked = ui.button("Join").clicked();
-        let response = ui.add(
-            TextEdit::singleline(&mut self.join_channel)
-                .hint_text("#channel")
-                .desired_width(110.0),
-        );
-        let entered = response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-        if (clicked || entered) && !self.join_channel.trim().is_empty() {
-            let channel = self.normalize_channel_name(self.join_channel.trim());
-            self.send_join(channel, None);
-            self.join_channel.clear();
+    /// Join the channel typed into the sidebar's join row.
+    pub(crate) fn join_typed_channel(&mut self, text: &str) {
+        if text.trim().is_empty() {
+            return;
         }
+        let channel = self.normalize_channel_name(text.trim());
+        self.send_join(channel, None);
     }
 
     /// Open the Channel Info dialog for `channel`, asking for fresh modes.
@@ -120,10 +113,17 @@ impl Session {
     /// to the space the window gives it and nothing has a minimum width
     /// beyond it, so a floating window keeps the size it was tiled to or
     /// dragged to instead of growing to fit its content.
-    pub(crate) fn draw_target(&mut self, ui: &mut egui::Ui) {
+    pub(crate) fn draw_target(
+        &mut self,
+        ui: &mut egui::Ui,
+        network_label: &str,
+        narrow: bool,
+        controls: &mut dyn FnMut(&mut egui::Ui),
+    ) {
         let salt = (self.id, self.current_conversation);
+        let palette = super::theme::palette(ui.ctx());
         self.capture_upload_drop(ui);
-        self.draw_target_header(ui);
+        self.draw_target_header(ui, network_label, narrow, controls);
         if self.timeline.borrow().restore_pending {
             ui.horizontal_wrapped(|ui| {
                 ui.label(egui::RichText::new("Restoring saved reading position…").small());
@@ -139,53 +139,110 @@ impl Session {
         }
         if let Some(channel_name) = self.current_target_name().map(str::to_string)
             && self.is_channel_name(&channel_name)
+            && self.people_visible(narrow)
         {
             egui::Panel::right(("users", salt))
+                .frame(egui::Frame::side_top_panel(ui.style()).fill(palette.panel))
                 .resizable(true)
-                .default_size(140.0)
-                .min_size(80.0)
-                .max_size((ui.available_width() * 0.35).max(80.0))
+                .default_size(208.0)
+                .min_size(140.0)
+                .max_size((ui.available_width() * 0.35).max(140.0))
                 .show(ui, |ui| self.draw_user_list(ui, &channel_name));
         }
+        // Messages and the composer sit on the chat ground; the people
+        // list is a panel beside them.
         egui::Panel::bottom(("input", salt))
+            .frame(egui::Frame::side_top_panel(ui.style()).fill(palette.bg))
             .show_separator_line(true)
             .show(ui, |ui| self.draw_input_row(ui));
-        egui::CentralPanel::default().show(ui, |ui| {
-            let available_height = ui.available_height();
-            self.draw_scrollback(ui, available_height);
-        });
+        let chat_ground = egui::Frame::central_panel(ui.style()).fill(palette.bg);
+        egui::CentralPanel::default()
+            .frame(chat_ground)
+            .show(ui, |ui| {
+                let available_height = ui.available_height();
+                self.draw_scrollback(ui, available_height);
+            });
     }
 
-    fn draw_target_header(&self, ui: &mut egui::Ui) {
-        let Some(channel_name) = self.current_target_name() else {
-            return;
+    /// Whether this window shows its people list: the user's own choice,
+    /// or by default everywhere but in a narrow window.
+    pub(crate) fn people_visible(&self, narrow: bool) -> bool {
+        !self.people_hidden.unwrap_or(narrow)
+    }
+
+    /// One row heading the window: its name, the topic on a single line, a
+    /// button that shows or hides the people list, and the window's own
+    /// controls at the right.
+    fn draw_target_header(
+        &mut self,
+        ui: &mut egui::Ui,
+        network_label: &str,
+        narrow: bool,
+        controls: &mut dyn FnMut(&mut egui::Ui),
+    ) {
+        let palette = super::theme::palette(ui.ctx());
+        let target = self.current_target_name().map(str::to_owned);
+        let channel = target
+            .as_deref()
+            .and_then(|name| self.conversations.get(name));
+        let is_channel = target
+            .as_deref()
+            .is_some_and(|name| self.is_channel_name(name));
+        let name = target.as_deref().unwrap_or("Status").to_owned();
+        // What follows the name: the topic, or the network for the status
+        // window.
+        let detail = match (&target, channel) {
+            (None, _) => Some(network_label.to_owned()),
+            (Some(_), Some(channel)) => channel
+                .topic
+                .as_deref()
+                .map(super::formatting::strip_irc_formatting),
+            _ => None,
         };
-        let Some(channel) = self.conversations.get(channel_name) else {
-            return;
-        };
-        if self.is_channel_name(channel_name) && !channel.modes.is_empty() {
-            ui.horizontal_wrapped(|ui| {
-                ui.label(RichText::new(channel_name).strong());
-                ui.label(
-                    RichText::new(format!("[{}]", channel.modes))
-                        .color(Color32::from_rgb(150, 150, 150)),
-                );
-                ui.label(
-                    RichText::new(format!("({} users)", channel.users.len()))
-                        .small()
-                        .color(Color32::GRAY),
-                );
+        let modes = channel
+            .filter(|channel| is_channel && !channel.modes.is_empty())
+            .map(|channel| format!("Modes: {}", channel.modes));
+        let people = channel.filter(|_| is_channel).map(|channel| {
+            let away = channel.away_count();
+            let hover = if away > 0 {
+                format!("{away} away. Show or hide the people list")
+            } else {
+                "Show or hide the people list".to_owned()
+            };
+            (people_label(channel.users().len()), hover)
+        });
+        let mut toggle_people = false;
+        ui.horizontal(|ui| {
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                controls(ui);
+                if let Some((label, hover)) = &people
+                    && ui.small_button(label).on_hover_text(hover).clicked()
+                {
+                    toggle_people = true;
+                }
+                ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                    let heading = egui::TextStyle::Heading.resolve(ui.style()).size;
+                    // A long name is cut rather than run over the buttons;
+                    // the topic gets whatever width is left.
+                    let response = super::widgets::truncated(
+                        ui,
+                        super::widgets::strong(&name)
+                            .size(heading)
+                            .color(palette.text),
+                    );
+                    if let Some(modes) = &modes {
+                        response.on_hover_text(modes);
+                    }
+                    if let Some(detail) = detail {
+                        super::widgets::truncated(ui, RichText::new(detail).color(palette.muted));
+                    }
+                });
             });
+        });
+        if toggle_people {
+            self.people_hidden = Some(self.people_visible(narrow));
         }
-        if let Some(topic) = &channel.topic {
-            ui.horizontal_wrapped(|ui| {
-                ui.label(RichText::new("Topic:").strong());
-                render_irc_text(ui, topic, Color32::WHITE);
-            });
-        }
-        if self.is_channel_name(channel_name) || channel.topic.is_some() {
-            ui.separator();
-        }
+        ui.separator();
     }
 
     fn draw_user_list(&mut self, ui: &mut egui::Ui, channel_name: &str) {
@@ -196,58 +253,82 @@ impl Session {
         let mut kick_nick: Option<(String, String)> = None;
 
         if let Some(channel) = self.conversations.get(channel_name) {
-            let away_count = channel.away_count();
-            if away_count > 0 {
-                ui.heading(format!(
-                    "Users ({}, {} away)",
-                    channel.users.len(),
-                    away_count
-                ));
-            } else {
-                ui.heading(format!("Users ({})", channel.users.len()));
-            }
-            ui.separator();
+            let palette = super::theme::palette(ui.ctx());
+            let rows = channel.people_rows();
             let current_selected = self.selected_user.clone();
             let mut new_selected: Option<String> = current_selected.clone();
 
             // Row virtualization: only the visible slice is built each frame,
-            // which matters for channels with thousands of users.
-            let row_height = ui.text_style_height(&egui::TextStyle::Body);
+            // which matters for channels with thousands of users. Headings
+            // are rows of the same height as people, so every row is uniform.
+            let row_height = super::theme::control_height(ui);
             ScrollArea::vertical()
                 .id_salt(("user_list", self.id, self.current_conversation))
-                .show_rows(ui, row_height, channel.users.len(), |ui, row_range| {
-                    for user in &channel.users[row_range] {
+                .auto_shrink([false, false])
+                .show_rows(ui, row_height, rows.len(), |ui, row_range| {
+                    for row in &rows[row_range] {
+                        let user = match row {
+                            super::types::PeopleRow::Group { label, count } => {
+                                let (rect, _) = ui.allocate_exact_size(
+                                    egui::vec2(ui.available_width(), row_height),
+                                    egui::Sense::hover(),
+                                );
+                                let mut heading = ui.new_child(
+                                    egui::UiBuilder::new()
+                                        .max_rect(rect.shrink2(egui::vec2(10.0, 0.0)))
+                                        .layout(egui::Layout::left_to_right(egui::Align::Center)),
+                                );
+                                super::widgets::section_label(
+                                    &mut heading,
+                                    &format!("{label} · {count}"),
+                                );
+                                continue;
+                            }
+                            super::types::PeopleRow::Person(position) => {
+                                let Some(user) = channel.users().get(*position) else {
+                                    continue;
+                                };
+                                user
+                            }
+                        };
                         let nick = &user.nick;
                         let is_selected = current_selected.as_ref() == Some(nick);
                         let is_away = user.is_away();
-                        let base_color = match user.mode {
-                            UserMode::Owner => Color32::from_rgb(255, 100, 100),
-                            UserMode::Admin => Color32::from_rgb(255, 150, 100),
-                            UserMode::Op => Color32::from_rgb(100, 200, 100),
-                            UserMode::HalfOp => Color32::from_rgb(100, 200, 200),
-                            UserMode::Voice => Color32::from_rgb(200, 200, 100),
-                            UserMode::Normal => Color32::WHITE,
-                        };
-                        let color = if is_away {
-                            Color32::from_rgb(
-                                base_color.r() / 2,
-                                base_color.g() / 2,
-                                base_color.b() / 2,
-                            )
-                        } else {
-                            base_color
-                        };
-                        let state = match (is_away, user.bot) {
-                            (true, true) => " (away, bot)",
-                            (true, false) => " (away)",
-                            (false, true) => " (bot)",
+                        let note = match (is_away, user.bot) {
+                            (true, true) => "away, bot",
+                            (true, false) => "away",
+                            (false, true) => "bot",
                             (false, false) => "",
                         };
-                        let display_text = format!("{}{nick}{state}", user.prefix());
-                        let response = ui.selectable_label(
-                            is_selected,
-                            RichText::new(display_text).color(color),
-                        );
+                        let response = super::widgets::list_row(ui, is_selected, nick, |ui| {
+                            // Away is a ring, present a filled dot: told
+                            // apart by shape, not by colour alone.
+                            let dot = if is_away {
+                                palette.faint
+                            } else {
+                                palette.online
+                            };
+                            super::widgets::dot(ui, dot, !is_away);
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    if !note.is_empty() {
+                                        ui.label(RichText::new(note).small().color(palette.faint));
+                                    }
+                                    ui.with_layout(
+                                        egui::Layout::left_to_right(egui::Align::Center),
+                                        |ui| {
+                                            let color =
+                                                if is_away { palette.faint } else { palette.text };
+                                            super::widgets::truncated(
+                                                ui,
+                                                RichText::new(nick).color(color),
+                                            );
+                                        },
+                                    );
+                                },
+                            );
+                        });
                         if let Some(away_msg) = &user.away {
                             response
                                 .clone()
@@ -355,10 +436,22 @@ impl Session {
                 }
             });
         }
+        let palette = super::theme::palette(ui.ctx());
+        let metrics = super::theme::metrics(ui.ctx());
         if self.attention.show_typing {
+            // The line keeps its height when nobody types, so the composer
+            // does not jump as people start and stop.
+            let (line, _) = ui
+                .allocate_exact_size(egui::vec2(ui.available_width(), 20.0), egui::Sense::hover());
             let label = self.typing_label();
             if !label.is_empty() {
-                ui.label(RichText::new(label).small().color(Color32::GRAY));
+                ui.painter().text(
+                    line.left_center() + egui::vec2(4.0, 0.0),
+                    egui::Align2::LEFT_CENTER,
+                    label,
+                    egui::TextStyle::Small.resolve(ui.style()),
+                    palette.muted,
+                );
                 ui.ctx()
                     .request_repaint_after(std::time::Duration::from_secs(1));
             }
@@ -390,24 +483,39 @@ impl Session {
                 history_down = Self::consume_plain_composer_key(ui, egui::Key::ArrowDown);
             }
         }
-        let input_font = egui::TextStyle::Monospace.resolve(ui.style());
+        let input_font = match metrics.message_font {
+            super::theme::MessageFont::Proportional => egui::TextStyle::Body,
+            super::theme::MessageFont::Monospace => egui::TextStyle::Monospace,
+        }
+        .resolve(ui.style());
         let line_height = ui.fonts_mut(|fonts| fonts.row_height(&input_font))
             + ui.spacing().extra_text_line_spacing;
-        let max_height = line_height * 4.0 + 8.0;
+        let control_height = super::theme::control_height(ui);
+        let max_height = (line_height * 4.0 + 8.0).max(control_height);
+        let hint = self.current_target_name().map_or_else(
+            || "Type a message…".to_owned(),
+            |target| format!("Message {target}"),
+        );
+        let narrow = super::app::narrow(ui.ctx());
         let output = ui
             .scope_builder(
                 egui::UiBuilder::new().scope_id(input_id.with("row")),
                 |ui| {
                     ui.horizontal_top(|ui| {
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
+                            let send_button = egui::Button::new(
+                                super::widgets::strong("Send").color(palette.on_accent),
+                            )
+                            .fill(palette.accent);
                             if ui
-                                .button("Send")
+                                .add(send_button)
                                 .on_hover_text("Enter sends; Shift+Enter adds a line")
                                 .clicked()
                             {
                                 send = true;
                             }
-                            ui.menu_button("Format", |ui| {
+                            let format_label = if narrow { "Aa" } else { "Format" };
+                            let format = ui.menu_button(format_label, |ui| {
                                 for (label, code) in [
                                     ("Bold", '\x02'),
                                     ("Underline", '\x1f'),
@@ -425,6 +533,9 @@ impl Session {
                                     ui.close();
                                 }
                             });
+                            if narrow {
+                                format.response.on_hover_text("Text formatting");
+                            }
                             // The panel starts at its previous height. Allow the
                             // draft to grow, then shrink the viewport to its text.
                             ui.set_max_height(max_height);
@@ -437,8 +548,10 @@ impl Session {
                                     TextEdit::multiline(&mut self.input_text)
                                         .id(input_id)
                                         .font(input_font.clone())
-                                        .hint_text("Type a message…")
-                                        .align(egui::Align2::LEFT_TOP)
+                                        .hint_text(hint.as_str())
+                                        .background_color(palette.panel)
+                                        .min_size(egui::vec2(0.0, control_height))
+                                        .align(egui::Align2::LEFT_CENTER)
                                         .desired_rows(1)
                                         .desired_width(ui.available_width())
                                         .show(ui)
@@ -451,6 +564,13 @@ impl Session {
                 },
             )
             .inner;
+        if metrics.density == super::theme::Density::Comfortable {
+            ui.label(
+                RichText::new("Enter sends. Shift+Enter starts a new line.")
+                    .small()
+                    .color(palette.faint),
+            );
+        }
         if std::mem::take(&mut self.input_focus_request) {
             output.response.request_focus();
             if let Some(cursor) = self.composer.cursor {
@@ -524,6 +644,14 @@ impl Session {
 #[cfg(test)]
 mod composer_tests {
     use super::*;
+    use egui::Color32;
+
+    #[test]
+    fn the_people_button_counts_one_person_and_several_people() {
+        assert_eq!(people_label(1), "1 person");
+        assert_eq!(people_label(0), "0 people");
+        assert_eq!(people_label(12), "12 people");
+    }
     use crate::gui::{Channel, Settings};
     use tokio::sync::mpsc;
     fn frame(
@@ -621,6 +749,184 @@ mod composer_tests {
         }
     }
 
+    /// One frame of the composer at this size: its height, the texts it
+    /// painted with their colours, and its filled rectangles.
+    #[allow(clippy::type_complexity)]
+    fn painted(
+        session: &mut Session,
+        ctx: &egui::Context,
+        size: egui::Vec2,
+    ) -> (
+        f32,
+        Vec<(String, egui::Rect, Color32)>,
+        Vec<(egui::Rect, Color32)>,
+    ) {
+        fn collect(
+            shape: &egui::Shape,
+            texts: &mut Vec<(String, egui::Rect, Color32)>,
+            fills: &mut Vec<(egui::Rect, Color32)>,
+        ) {
+            match shape {
+                egui::Shape::Text(text) => {
+                    let color = text
+                        .galley
+                        .job
+                        .sections
+                        .first()
+                        .map(|section| section.format.color)
+                        .filter(|color| *color != Color32::PLACEHOLDER)
+                        .unwrap_or(text.fallback_color);
+                    texts.push((
+                        text.galley.text().to_string(),
+                        text.galley.rect.translate(text.pos.to_vec2()),
+                        color,
+                    ));
+                }
+                egui::Shape::Rect(rect) => fills.push((rect.rect, rect.fill)),
+                egui::Shape::Vec(shapes) => shapes.iter().for_each(|s| collect(s, texts, fills)),
+                _ => {}
+            }
+        }
+        let mut height = 0.0;
+        let mut output = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)),
+                ..Default::default()
+            },
+            |ui| {
+                egui::Panel::bottom("test_composer").show(ui, |ui| {
+                    height = ui
+                        .scope(|ui| session.draw_input_row(ui))
+                        .response
+                        .rect
+                        .height();
+                });
+            },
+        );
+        output.textures_delta.clear();
+        let (mut texts, mut fills) = (Vec::new(), Vec::new());
+        for clipped in &output.shapes {
+            collect(&clipped.shape, &mut texts, &mut fills);
+        }
+        (height, texts, fills)
+    }
+
+    fn room_session() -> Session {
+        let mut session = Session::with_settings(Settings {
+            nickname: "me".into(),
+            logging_enabled: false,
+            logging_load_history: false,
+            ..Settings::default()
+        });
+        let mut channel = Channel::new();
+        channel.joined = true;
+        session.conversations.insert("#room".into(), channel);
+        session.current_conversation = session.id_for_target("#room");
+        session
+    }
+
+    #[test]
+    fn the_composer_names_its_target_in_the_hint() {
+        let ctx = egui::Context::default();
+        let size = egui::vec2(640.0, 240.0);
+        let mut session = room_session();
+        let (_, texts, _) = painted(&mut session, &ctx, size);
+        assert!(
+            texts.iter().any(|(text, _, _)| text == "Message #room"),
+            "{texts:?}"
+        );
+        session.current_conversation = None;
+        let (_, texts, _) = painted(&mut session, &ctx, size);
+        assert!(texts.iter().any(|(text, _, _)| text == "Type a message…"));
+    }
+
+    #[test]
+    fn send_is_the_accent_button_as_tall_as_a_control() {
+        use crate::gui::theme::{self, DisplayPrefs};
+        let ctx = egui::Context::default();
+        theme::apply(&ctx, &DisplayPrefs::default());
+        let palette = theme::palette(&ctx);
+        let mut session = room_session();
+        let size = egui::vec2(640.0, 240.0);
+        painted(&mut session, &ctx, size);
+        let (_, texts, fills) = painted(&mut session, &ctx, size);
+        let (_, send, color) = texts
+            .iter()
+            .find(|(text, _, _)| text == "Send")
+            .expect("a Send button")
+            .clone();
+        assert_eq!(color, palette.on_accent);
+        let button = fills
+            .iter()
+            .find(|(rect, fill)| *fill == palette.accent && rect.contains_rect(send))
+            .expect("Send is filled with the accent")
+            .0;
+        assert_eq!(button.height(), 44.0);
+        // The last one painted: the panel behind the composer has the same
+        // colour in this test.
+        let field = fills
+            .iter()
+            .rev()
+            .find(|(rect, fill)| *fill == palette.panel && rect.width() > 300.0)
+            .expect("the message field is filled with the panel colour")
+            .0;
+        assert!(field.height() >= 44.0, "{field:?}");
+        assert!(
+            (field.center().y - button.center().y).abs() < 2.0,
+            "field and Send line up: {field:?} vs {button:?}"
+        );
+        assert!(texts.iter().any(|(text, _, color)| text
+            == "Enter sends. Shift+Enter starts a new line."
+            && *color == palette.faint));
+    }
+
+    #[test]
+    fn the_hint_line_is_left_out_of_the_compact_spacing() {
+        use crate::gui::theme::{self, Density, DisplayPrefs};
+        let ctx = egui::Context::default();
+        theme::apply(
+            &ctx,
+            &DisplayPrefs {
+                density: Density::Compact,
+                ..DisplayPrefs::default()
+            },
+        );
+        let mut session = room_session();
+        let (_, texts, _) = painted(&mut session, &ctx, egui::vec2(640.0, 240.0));
+        assert!(
+            !texts
+                .iter()
+                .any(|(text, _, _)| text.starts_with("Enter sends."))
+        );
+    }
+
+    #[test]
+    fn the_typing_line_reserves_its_height_when_nobody_types() {
+        let ctx = egui::Context::default();
+        let size = egui::vec2(640.0, 240.0);
+        let mut session = room_session();
+        painted(&mut session, &ctx, size);
+        let (quiet, texts, _) = painted(&mut session, &ctx, size);
+        assert!(!texts.iter().any(|(text, _, _)| text.contains("typing")));
+        let typing =
+            crate::irc::IrcMessage::parse("@+typing=active :alice!u@h TAGMSG #room").unwrap();
+        session.observe_tagmsg(&typing, "#room", false);
+        let (typed, texts, _) = painted(&mut session, &ctx, size);
+        assert!(
+            texts.iter().any(|(text, _, _)| text == "alice is typing…"),
+            "{texts:?}"
+        );
+        assert_eq!(
+            typed, quiet,
+            "the composer does not jump when someone types"
+        );
+
+        // With typing indicators off there is no line to reserve.
+        session.attention.show_typing = false;
+        let (off, _, _) = painted(&mut session, &ctx, size);
+        assert!(off < quiet - 15.0, "{off} vs {quiet}");
+    }
+
     #[test]
     fn composer_starts_on_one_row_and_bounds_long_drafts() {
         for width in [320.0, 640.0] {
@@ -630,7 +936,17 @@ mod composer_tests {
                     session.conversations.insert(target.into(), Channel::new());
                     session.current_conversation = session.id_for_target(target);
                 }
+                // The compact composer on its own: no typing line, no hint.
+                session.attention.show_typing = false;
                 let ctx = egui::Context::default();
+                crate::gui::theme::apply(
+                    &ctx,
+                    &crate::gui::theme::DisplayPrefs {
+                        density: crate::gui::theme::Density::Compact,
+                        font_size: 14.0,
+                        ..Default::default()
+                    },
+                );
                 let size = egui::vec2(width, 240.0);
                 let mut measure = |text: &str| {
                     session.input_text = text.into();

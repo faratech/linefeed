@@ -58,26 +58,6 @@ fn irc_color(code: usize) -> Option<Color32> {
     }
 }
 
-/// Curated palette of distinct, readable colors for nick coloring
-const NICK_COLORS: [Color32; 16] = [
-    Color32::from_rgb(255, 100, 100), // Light red
-    Color32::from_rgb(100, 255, 100), // Light green
-    Color32::from_rgb(100, 200, 255), // Light blue
-    Color32::from_rgb(255, 200, 100), // Orange/gold
-    Color32::from_rgb(255, 100, 255), // Pink/magenta
-    Color32::from_rgb(100, 255, 255), // Cyan
-    Color32::from_rgb(255, 255, 100), // Yellow
-    Color32::from_rgb(200, 150, 255), // Light purple
-    Color32::from_rgb(255, 150, 150), // Salmon
-    Color32::from_rgb(150, 255, 200), // Mint
-    Color32::from_rgb(150, 200, 255), // Sky blue
-    Color32::from_rgb(255, 200, 150), // Peach
-    Color32::from_rgb(200, 255, 150), // Lime
-    Color32::from_rgb(255, 150, 200), // Rose
-    Color32::from_rgb(150, 255, 255), // Aqua
-    Color32::from_rgb(255, 220, 180), // Tan
-];
-
 /// A span of text with optional formatting
 #[derive(Clone, Debug)]
 struct TextSpan {
@@ -92,14 +72,6 @@ struct TextSpan {
     monospace: bool,
     /// A reset (`\x0F`) came between the previous span and this one.
     after_reset: bool,
-}
-
-/// Get a consistent color for a nick based on hash
-pub fn nick_color(nick: &str) -> Color32 {
-    let hash: u32 = nick
-        .bytes()
-        .fold(0, |acc, b| acc.wrapping_add(b as u32).wrapping_mul(31));
-    NICK_COLORS[(hash as usize) % NICK_COLORS.len()]
 }
 
 /// Consume exactly six hex digits (`RRGGBB`) from the front of `chars`. When
@@ -718,78 +690,227 @@ fn link_target(text: &str) -> String {
     }
 }
 
-/// Render pre-parsed segments (see `layout_irc_text`).
-pub fn render_segments(ui: &mut egui::Ui, segments: &[RenderSegment], default_color: Color32) {
-    ui.horizontal_wrapped(|ui| {
-        ui.spacing_mut().item_spacing.x = 0.0;
-        for span in segments {
-            let mut color = span.fg_color.unwrap_or(default_color);
-            let mut bg_color = span.bg_color;
-            if span.reverse {
-                let old_color = color;
-                color = bg_color.unwrap_or(Color32::BLACK);
-                bg_color = Some(old_color);
-            }
-
-            if span.is_url {
-                // Render as clickable hyperlink
-                let url = link_target(&span.text);
-                ui.hyperlink_to(
-                    RichText::new(&span.text)
-                        .color(Color32::from_rgb(100, 150, 255))
-                        .underline(),
-                    &url,
-                );
-            } else {
-                // Render as regular text with formatting
-                // For bold, brighten the color slightly to make it more visible
-                let effective_color = if span.bold {
-                    let r = (color.r() as u16 + 40).min(255) as u8;
-                    let g = (color.g() as u16 + 40).min(255) as u8;
-                    let b = (color.b() as u16 + 40).min(255) as u8;
-                    Color32::from_rgb(r, g, b)
-                } else {
-                    color
-                };
-
-                let mut rich_text = RichText::new(&span.text).color(effective_color);
-
-                if span.bold {
-                    rich_text = rich_text.strong();
-                }
-                if span.underline {
-                    rich_text = rich_text.underline();
-                }
-                if span.italic {
-                    rich_text = rich_text.italics();
-                }
-                if span.strikethrough {
-                    rich_text = rich_text.strikethrough();
-                }
-                if span.monospace {
-                    rich_text = rich_text.monospace();
-                }
-
-                if let Some(bg) = bg_color {
-                    rich_text = rich_text.background_color(bg);
-                }
-
-                ui.label(rich_text);
-            }
-        }
-    });
+/// How a run of segments is drawn.
+pub(crate) struct SegmentStyle {
+    /// The colour of text that sets none of its own.
+    pub color: Color32,
+    /// What the text is drawn on. IRC colours too close to it are nudged
+    /// until they read.
+    pub ground: Color32,
+    pub link: Color32,
+    /// The family bold text is set in; `None` emphasises it by colour.
+    pub bold: Option<egui::FontFamily>,
 }
 
-/// Render IRC formatted text with colors, bold, underline, italic, and clickable URLs.
-/// Parses on every call: use only for rarely-rendered or frequently-changing text
-/// (message scrollback goes through the per-message cache instead).
-pub fn render_irc_text(ui: &mut egui::Ui, text: &str, default_color: Color32) {
-    render_segments(ui, &layout_irc_text(text), default_color);
+/// `segments` with every whole-word occurrence of `nick` split out and
+/// coloured, so a row that mentions the user shows where. Links and
+/// segments that do not mention the nick are left as they are.
+pub(crate) fn with_mentions(
+    segments: &[RenderSegment],
+    nick: &str,
+    color: Color32,
+) -> Vec<RenderSegment> {
+    let is_nick_char = |c: char| {
+        c.is_ascii_alphanumeric()
+            || matches!(
+                c,
+                '-' | '_' | '[' | ']' | '\\' | '`' | '^' | '{' | '}' | '|' | '~'
+            )
+    };
+    let mut out = Vec::with_capacity(segments.len());
+    for segment in segments {
+        let mut rest = segment.text.as_str();
+        let mut pieces: Vec<(&str, bool)> = Vec::new();
+        if !segment.is_url && !nick.is_empty() {
+            let mut searched = 0;
+            while let Some(found) = rest
+                .get(searched..)
+                .and_then(|tail| {
+                    tail.char_indices().find_map(|(at, _)| {
+                        tail.get(at..at + nick.len())
+                            .filter(|word| word.eq_ignore_ascii_case(nick))
+                            .map(|_| at)
+                    })
+                })
+                .map(|at| searched + at)
+            {
+                let end = found + nick.len();
+                let before = rest[..found].chars().next_back();
+                let after = rest[end..].chars().next();
+                if before.is_some_and(is_nick_char) || after.is_some_and(is_nick_char) {
+                    searched = end;
+                    continue;
+                }
+                if found > 0 {
+                    pieces.push((&rest[..found], false));
+                }
+                pieces.push((&rest[found..end], true));
+                rest = &rest[end..];
+                searched = 0;
+            }
+        }
+        if pieces.is_empty() {
+            out.push(segment.clone());
+            continue;
+        }
+        if !rest.is_empty() {
+            pieces.push((rest, false));
+        }
+        for (text, mention) in pieces {
+            let mut piece = segment.clone();
+            piece.text = text.to_owned();
+            if mention {
+                piece.fg_color = Some(color);
+                piece.bold = true;
+            }
+            out.push(piece);
+        }
+    }
+    out
+}
+
+/// The text colour and background a segment is drawn with. A colour chosen
+/// for someone else's ground must still read on what it lands on here: our
+/// row ground, the segment's own background, or after reverse video the
+/// colour that became the background.
+fn segment_colors(span: &RenderSegment, style: &SegmentStyle) -> (Color32, Option<Color32>) {
+    let mut color = span.fg_color.unwrap_or(style.color);
+    let mut background = span.bg_color;
+    if span.reverse {
+        let foreground = color;
+        color = background.unwrap_or(style.ground);
+        background = Some(foreground);
+    }
+    let lands_on = background.unwrap_or(style.ground);
+    if span.fg_color.is_some() || background.is_some() {
+        color = super::theme::readable_on(color, lands_on, 3.0);
+    }
+    (color, background)
+}
+
+/// Render pre-parsed segments (see `layout_irc_text`) as one wrapping run,
+/// after an optional `prefix` such as an action's "* nick".
+pub(crate) fn render_segments(
+    ui: &mut egui::Ui,
+    segments: &[RenderSegment],
+    style: &SegmentStyle,
+    prefix: Option<RichText>,
+) {
+    ui.horizontal_wrapped(|ui| {
+        ui.spacing_mut().item_spacing.x = 0.0;
+        if let Some(prefix) = prefix {
+            ui.label(prefix);
+        }
+        for span in segments {
+            let (color, bg_color) = segment_colors(span, style);
+
+            if span.is_url {
+                let url = link_target(&span.text);
+                ui.hyperlink_to(
+                    RichText::new(&span.text).color(style.link).underline(),
+                    &url,
+                );
+                continue;
+            }
+            let mut rich_text = RichText::new(&span.text).color(color);
+            if span.bold {
+                rich_text = match &style.bold {
+                    Some(family) if !span.monospace => rich_text.family(family.clone()),
+                    _ => rich_text.strong(),
+                };
+            }
+            if span.underline {
+                rich_text = rich_text.underline();
+            }
+            if span.italic {
+                rich_text = rich_text.italics();
+            }
+            if span.strikethrough {
+                rich_text = rich_text.strikethrough();
+            }
+            if span.monospace {
+                rich_text = rich_text.monospace();
+            }
+            if let Some(bg) = bg_color {
+                rich_text = rich_text.background_color(bg);
+            }
+            ui.label(rich_text);
+        }
+    });
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn style_on(ground: Color32, text: Color32) -> SegmentStyle {
+        SegmentStyle {
+            color: text,
+            ground,
+            link: text,
+            bold: None,
+        }
+    }
+
+    #[test]
+    fn reversed_and_backgrounded_text_reads_on_the_background_it_gets() {
+        use crate::gui::theme::{Palette, contrast};
+        for palette in [Palette::dark(), Palette::light()] {
+            let style = style_on(palette.bg, palette.text);
+            for wire in [
+                "\x16\x0308reversed yellow",
+                "\x16\x0300reversed white",
+                "\x16reversed plain",
+                "\x0300,08white on yellow",
+                "\x0308,00yellow on white",
+                "\x0301,01black on black",
+            ] {
+                for segment in layout_irc_text(wire) {
+                    let (text, background) = segment_colors(&segment, &style);
+                    let ground = background.unwrap_or(style.ground);
+                    assert!(
+                        contrast(text, ground) >= 3.0,
+                        "{wire:?} on {:?}: {text:?} on {ground:?}",
+                        palette.bg
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn plain_and_readable_coloured_text_keeps_its_colour() {
+        use crate::gui::theme::Palette;
+        let palette = Palette::dark();
+        let style = style_on(palette.bg, palette.text);
+        let plain = &layout_irc_text("plain")[0];
+        assert_eq!(segment_colors(plain, &style), (palette.text, None));
+        let yellow = &layout_irc_text("\x0308yellow")[0];
+        assert_eq!(
+            segment_colors(yellow, &style),
+            (yellow.fg_color.unwrap(), None),
+            "yellow already reads on the dark ground"
+        );
+    }
+
+    #[test]
+    fn mentions_are_split_out_at_nick_boundaries_only() {
+        let color = Color32::from_rgb(1, 2, 3);
+        let segments = layout_irc_text("me: hi Me, meme and some me");
+        let split = with_mentions(&segments, "me", color);
+        let marked: Vec<&str> = split
+            .iter()
+            .filter(|segment| segment.fg_color == Some(color))
+            .map(|segment| segment.text.as_str())
+            .collect();
+        assert_eq!(marked, ["me", "Me", "me"]);
+        let text: String = split.iter().map(|segment| segment.text.as_str()).collect();
+        assert_eq!(text, "me: hi Me, meme and some me");
+        assert!(split.iter().all(|segment| !segment.text.is_empty()));
+        // Nothing to mark: the segments come back unchanged.
+        assert_eq!(with_mentions(&segments, "bob", color).len(), segments.len());
+        assert_eq!(with_mentions(&segments, "", color).len(), segments.len());
+    }
 
     #[test]
     fn reverse_control_is_not_italic() {

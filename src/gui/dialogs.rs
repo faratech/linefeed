@@ -49,7 +49,16 @@ fn settings_help(ui: &mut egui::Ui, text: &str) -> egui::Response {
     ui.allocate_ui_with_layout(
         Vec2::new(ui.available_width().min(visible_width), 0.0),
         egui::Layout::top_down(egui::Align::Min),
-        |ui| ui.add(egui::Label::new(RichText::new(text).small().color(Color32::GRAY)).wrap()),
+        |ui| {
+            ui.add(
+                egui::Label::new(
+                    RichText::new(text)
+                        .small()
+                        .color(super::theme::palette(ui.ctx()).muted),
+                )
+                .wrap(),
+            )
+        },
     )
     .inner
 }
@@ -298,14 +307,22 @@ impl Session {
         ui.horizontal_wrapped(|ui| {
             ui.label("Server:");
             endpoint_edited |= ui
-                .add(TextEdit::singleline(&mut self.server_host).desired_width(200.0))
+                .add(
+                    TextEdit::singleline(&mut self.server_host)
+                        .align(egui::Align2::LEFT_CENTER)
+                        .desired_width(200.0),
+                )
                 .changed();
         });
 
         ui.horizontal_wrapped(|ui| {
             ui.label("Port:");
             endpoint_edited |= ui
-                .add(TextEdit::singleline(&mut self.server_port).desired_width(80.0))
+                .add(
+                    TextEdit::singleline(&mut self.server_port)
+                        .align(egui::Align2::LEFT_CENTER)
+                        .desired_width(80.0),
+                )
                 .changed();
             endpoint_edited |= ui.checkbox(&mut self.use_tls, "Use TLS").changed();
         });
@@ -313,7 +330,7 @@ impl Session {
             self.note_unprofiled_endpoint_edit();
         }
         if let Some(error) = self.connection_error() {
-            ui.label(RichText::new(error).color(Color32::RED));
+            ui.label(RichText::new(error).color(super::theme::palette(ui.ctx()).danger));
         }
 
         if self.use_tls {
@@ -330,23 +347,36 @@ impl Session {
 
         ui.horizontal_wrapped(|ui| {
             ui.label("Nickname:");
-            ui.add(TextEdit::singleline(&mut self.nickname).desired_width(150.0));
+            ui.add(
+                TextEdit::singleline(&mut self.nickname)
+                    .align(egui::Align2::LEFT_CENTER)
+                    .desired_width(150.0),
+            );
         });
 
         ui.horizontal_wrapped(|ui| {
             ui.label("Username:");
-            ui.add(TextEdit::singleline(&mut self.username).desired_width(150.0));
+            ui.add(
+                TextEdit::singleline(&mut self.username)
+                    .align(egui::Align2::LEFT_CENTER)
+                    .desired_width(150.0),
+            );
         });
 
         ui.horizontal_wrapped(|ui| {
             ui.label("Real name:");
-            ui.add(TextEdit::singleline(&mut self.realname).desired_width(200.0));
+            ui.add(
+                TextEdit::singleline(&mut self.realname)
+                    .align(egui::Align2::LEFT_CENTER)
+                    .desired_width(200.0),
+            );
         });
 
         ui.horizontal_wrapped(|ui| {
             ui.label("Password:");
             ui.add(
                 TextEdit::singleline(&mut self.password)
+                    .align(egui::Align2::LEFT_CENTER)
                     .password(true)
                     .desired_width(150.0),
             );
@@ -359,13 +389,18 @@ impl Session {
 
         ui.horizontal_wrapped(|ui| {
             ui.label("SASL User:");
-            ui.add(TextEdit::singleline(&mut self.sasl_username).desired_width(150.0));
+            ui.add(
+                TextEdit::singleline(&mut self.sasl_username)
+                    .align(egui::Align2::LEFT_CENTER)
+                    .desired_width(150.0),
+            );
         });
 
         ui.horizontal_wrapped(|ui| {
             ui.label("SASL Pass:");
             ui.add(
                 TextEdit::singleline(&mut self.sasl_password)
+                    .align(egui::Align2::LEFT_CENTER)
                     .password(true)
                     .desired_width(150.0),
             );
@@ -401,6 +436,7 @@ impl Session {
             ui.label("Client cert:");
             ui.add(
                 TextEdit::singleline(&mut self.tls_client_cert_path)
+                    .align(egui::Align2::LEFT_CENTER)
                     .desired_width(260.0)
                     .hint_text("PEM: certificate(s), or combined with a PKCS#8 key"),
             );
@@ -409,6 +445,7 @@ impl Session {
             ui.label("Client key:");
             ui.add(
                 TextEdit::singleline(&mut self.tls_client_key_path)
+                    .align(egui::Align2::LEFT_CENTER)
                     .desired_width(260.0)
                     .hint_text("optional PKCS#8 PEM; defaults to cert file"),
             );
@@ -418,7 +455,7 @@ impl Session {
             ui.label(
                 RichText::new("Auto prefers SCRAM-SHA-256 when advertised, then PLAIN.")
                     .small()
-                    .color(Color32::GRAY),
+                    .color(super::theme::palette(ui.ctx()).muted),
             );
         }
 
@@ -442,7 +479,11 @@ impl Session {
         if favorites_ui.show_save_dialog {
             ui.horizontal_wrapped(|ui| {
                 ui.label("Name:");
-                ui.add(TextEdit::singleline(&mut favorites_ui.new_name).desired_width(150.0));
+                ui.add(
+                    TextEdit::singleline(&mut favorites_ui.new_name)
+                        .align(egui::Align2::LEFT_CENTER)
+                        .desired_width(150.0),
+                );
                 if ui.button("Save").clicked()
                     && let Some(mut favorite) = self.form_as_favorite(&favorites_ui.new_name)
                 {
@@ -499,37 +540,92 @@ impl Session {
         true
     }
 
-    fn settings_tab_display(&mut self, ui: &mut egui::Ui, font_size: &mut f32) {
-        ui.heading("Timestamps");
-        ui.add_space(4.0);
+    /// The Display tab: how the window looks and reads. Every choice
+    /// applies as soon as it is made.
+    fn settings_tab_display(
+        &mut self,
+        ui: &mut egui::Ui,
+        display: &mut super::theme::DisplayPrefs,
+    ) {
+        use super::theme::{Density, MessageFont, ThemeChoice};
+        let before = *display;
 
-        ui.horizontal(|ui| {
-            ui.label("Format:");
-            egui::ComboBox::from_id_salt("timestamp_format")
-                .selected_text(match self.timestamp_format.as_str() {
-                    "short" => "HH:MM",
-                    "long" => "HH:MM:SS",
-                    "full" => "MM-DD HH:MM",
-                    _ => "HH:MM",
-                })
-                .show_ui(ui, |ui| {
-                    ui.selectable_value(&mut self.timestamp_format, "short".to_string(), "HH:MM");
-                    ui.selectable_value(&mut self.timestamp_format, "long".to_string(), "HH:MM:SS");
-                    ui.selectable_value(
-                        &mut self.timestamp_format,
-                        "full".to_string(),
-                        "MM-DD HH:MM",
-                    );
-                });
+        ui.heading("Appearance");
+        ui.add_space(4.0);
+        ui.horizontal_wrapped(|ui| {
+            ui.label("Theme:");
+            for (choice, label) in [
+                (ThemeChoice::Dark, "Dark"),
+                (ThemeChoice::Light, "Light"),
+                (ThemeChoice::System, "Match the system"),
+            ] {
+                ui.radio_value(&mut display.theme, choice, label);
+            }
         });
-        ChatMessage::configure_default_timestamp_format(&self.timestamp_format);
+        ui.horizontal_wrapped(|ui| {
+            ui.label("Text size:");
+            ui.add(
+                egui::Slider::new(&mut display.font_size, 10.0..=24.0)
+                    .step_by(1.0)
+                    .fixed_decimals(0)
+                    .suffix(" px"),
+            );
+        });
+        ui.horizontal_wrapped(|ui| {
+            ui.label("Spacing:");
+            ui.radio_value(&mut display.density, Density::Comfortable, "Comfortable");
+            ui.radio_value(&mut display.density, Density::Compact, "Compact");
+        });
+        ui.horizontal_wrapped(|ui| {
+            ui.label("Message font:");
+            ui.radio_value(
+                &mut display.message_font,
+                MessageFont::Proportional,
+                "Proportional",
+            );
+            ui.radio_value(
+                &mut display.message_font,
+                MessageFont::Monospace,
+                "Monospace",
+            );
+        });
+        if *display != before {
+            super::theme::apply(ui.ctx(), display);
+        }
 
         ui.add_space(8.0);
         ui.heading("Messages");
         ui.add_space(4.0);
-
-        ui.checkbox(&mut self.hide_join_part, "Hide join/part/quit messages");
-
+        ui.horizontal(|ui| {
+            ui.label("Timestamps:");
+            const FORMATS: [(&str, &str); 4] = [
+                ("short", "14:05"),
+                ("long", "14:05:32"),
+                ("full", "11-20 14:05"),
+                ("off", "Hidden"),
+            ];
+            let selected = FORMATS
+                .iter()
+                .find(|(format, _)| *format == self.timestamp_format)
+                .map_or("14:05", |(_, label)| label);
+            egui::ComboBox::from_id_salt("timestamp_format")
+                .selected_text(selected)
+                .show_ui(ui, |ui| {
+                    for (format, label) in FORMATS {
+                        ui.selectable_value(&mut self.timestamp_format, format.to_owned(), label);
+                    }
+                });
+        });
+        // New messages keep getting a time while it is hidden, so it is
+        // there when timestamps are shown again.
+        ChatMessage::configure_default_timestamp_format(&self.timestamp_format);
+        if ui
+            .checkbox(&mut display.color_nicks, "Give each nickname its own color")
+            .changed()
+        {
+            super::theme::apply(ui.ctx(), display);
+        }
+        ui.checkbox(&mut self.hide_join_part, "Hide join, part and quit lines");
         ui.horizontal(|ui| {
             ui.label("Max scrollback:");
             let mut lines = self.max_scrollback as i32;
@@ -543,28 +639,7 @@ impl Session {
         });
 
         ui.add_space(8.0);
-        ui.heading("Font");
-        ui.add_space(4.0);
-
-        ui.horizontal(|ui| {
-            ui.label("Size:");
-            let changed = ui
-                .add(
-                    egui::DragValue::new(font_size)
-                        .speed(0.5)
-                        .range(10.0..=24.0),
-                )
-                .changed();
-            if changed {
-                super::apply_font_size(ui.ctx(), *font_size);
-            }
-            ui.label("px");
-        });
-        ui.label(
-            RichText::new("Applied immediately and saved for restart")
-                .small()
-                .color(Color32::GRAY),
-        );
+        self.draw_display_preview(ui);
 
         ui.add_space(8.0);
         ui.heading("Highlights");
@@ -573,14 +648,56 @@ impl Session {
         ui.label("Extra highlight words (comma-separated):");
         ui.add(
             TextEdit::singleline(&mut self.highlight_words)
+                .align(egui::Align2::LEFT_CENTER)
                 .desired_width(300.0)
                 .hint_text("urgent, alert, your-other-nick"),
         );
         ui.label(
             RichText::new("Your nick is always highlighted")
                 .small()
-                .color(Color32::GRAY),
+                .color(super::theme::palette(ui.ctx()).muted),
         );
+    }
+
+    /// Two sample rows drawn exactly as the chat draws them, so a choice
+    /// can be judged before leaving Settings.
+    fn draw_display_preview(&self, ui: &mut egui::Ui) {
+        let palette = super::theme::palette(ui.ctx());
+        super::widgets::section_label(ui, "Preview");
+        egui::Frame::NONE
+            .fill(palette.bg)
+            .stroke(egui::Stroke::new(1.0, palette.line))
+            .corner_radius(10)
+            .inner_margin(egui::Margin::symmetric(0, 8))
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                let gap = super::theme::metrics(ui.ctx()).row_gap;
+                ui.spacing_mut().item_spacing.y = gap;
+                let samples = [
+                    ("bob", "This is how messages will look."),
+                    ("carol", "Changes here apply as soon as you pick them."),
+                ]
+                .map(|(nick, text)| ChatMessage::new_fmt(nick, text, &self.timestamp_format));
+                let layout = super::RowLayout {
+                    stacked: ui.available_width() < 520.0,
+                    time_width: if self.timestamp_format == "off" {
+                        0.0
+                    } else {
+                        super::time_width_of(ui, &samples[0])
+                    },
+                };
+                for sample in &samples {
+                    let row = super::RowContext {
+                        my_nick: &self.my_nick,
+                        layout,
+                        show_nick: true,
+                        marker: false,
+                    };
+                    ui.scope(|ui| {
+                        super::draw_chat_row(ui, sample, &row);
+                    });
+                }
+            });
     }
 
     fn draw_on_connect_settings(&mut self, ui: &mut egui::Ui) {
@@ -591,6 +708,7 @@ impl Session {
             ui.label("Auto-join:");
             ui.add(
                 TextEdit::singleline(&mut self.auto_join_channels)
+                    .align(egui::Align2::LEFT_CENTER)
                     .desired_width(200.0)
                     .hint_text("#chan1, #chan2"),
             );
@@ -600,11 +718,19 @@ impl Session {
 
         ui.horizontal_wrapped(|ui| {
             ui.label("Pre-connect away:");
-            ui.add(TextEdit::singleline(&mut self.pre_away_message).desired_width(220.0));
+            ui.add(
+                TextEdit::singleline(&mut self.pre_away_message)
+                    .align(egui::Align2::LEFT_CENTER)
+                    .desired_width(220.0),
+            );
         });
         ui.horizontal_wrapped(|ui| {
             ui.label("Persistence profile:");
-            ui.add(TextEdit::singleline(&mut self.persistence_profile).desired_width(180.0));
+            ui.add(
+                TextEdit::singleline(&mut self.persistence_profile)
+                    .align(egui::Align2::LEFT_CENTER)
+                    .desired_width(180.0),
+            );
         });
 
         ui.add_space(8.0);
@@ -696,7 +822,11 @@ impl Session {
             ui.horizontal(|ui| {
                 ui.add_space(20.0);
                 ui.label("Message:");
-                ui.add(TextEdit::singleline(&mut self.auto_away_message).desired_width(180.0));
+                ui.add(
+                    TextEdit::singleline(&mut self.auto_away_message)
+                        .align(egui::Align2::LEFT_CENTER)
+                        .desired_width(180.0),
+                );
             });
         }
 
@@ -718,7 +848,7 @@ impl Session {
         ui.label(
             RichText::new("Logs: ~/.config/linefeed/logs/")
                 .small()
-                .color(Color32::GRAY),
+                .color(super::theme::palette(ui.ctx()).muted),
         );
 
         ui.add_space(8.0);
@@ -729,6 +859,7 @@ impl Session {
             ui.label("Quit:");
             ui.add(
                 TextEdit::singleline(&mut self.quit_message)
+                    .align(egui::Align2::LEFT_CENTER)
                     .desired_width(200.0)
                     .hint_text("Linefeed"),
             );
@@ -737,6 +868,7 @@ impl Session {
             ui.label("Part:");
             ui.add(
                 TextEdit::singleline(&mut self.part_message)
+                    .align(egui::Align2::LEFT_CENTER)
                     .desired_width(200.0)
                     .hint_text("Leaving"),
             );
@@ -770,14 +902,16 @@ impl Session {
             ui.label(
                 RichText::new("No users ignored")
                     .italics()
-                    .color(Color32::GRAY),
+                    .color(super::theme::palette(ui.ctx()).muted),
             );
             ui.label("Use /ignore <nick|mask> to add.");
         } else {
             let ignore_display = self.ignore_list.join(", ");
             ui.horizontal_wrapped(|ui| {
                 ui.label("Ignored:");
-                ui.label(RichText::new(&ignore_display).color(Color32::GRAY));
+                ui.label(
+                    RichText::new(&ignore_display).color(super::theme::palette(ui.ctx()).muted),
+                );
             });
             ui.label("Use /unignore <nick> to remove.");
         }
@@ -853,7 +987,9 @@ impl Session {
                 ui.horizontal(|ui| {
                     ui.label("Filter:");
                     ui.add(
-                        TextEdit::singleline(&mut self.channel_list_filter).desired_width(150.0),
+                        TextEdit::singleline(&mut self.channel_list_filter)
+                            .align(egui::Align2::LEFT_CENTER)
+                            .desired_width(150.0),
                     );
                     ui.add_space(8.0);
                     ui.label(format!(
@@ -864,7 +1000,7 @@ impl Session {
                     if self.channel_list.is_empty() && !self.channel_list_loading {
                         ui.label(
                             RichText::new("(No channels found - server may be restricting /list)")
-                                .color(Color32::GOLD)
+                                .color(super::theme::palette(ui.ctx()).mention)
                                 .small(),
                         );
                     }
@@ -902,7 +1038,9 @@ impl Session {
                         .add_sized(
                             [channel_width, 16.0],
                             egui::Button::new(
-                                RichText::new(chan_text).strong().color(Color32::WHITE),
+                                RichText::new(chan_text)
+                                    .strong()
+                                    .color(super::theme::palette(ui.ctx()).text),
                             ),
                         )
                         .clicked()
@@ -924,7 +1062,9 @@ impl Session {
                         .add_sized(
                             [users_width, 16.0],
                             egui::Button::new(
-                                RichText::new(users_text).strong().color(Color32::WHITE),
+                                RichText::new(users_text)
+                                    .strong()
+                                    .color(super::theme::palette(ui.ctx()).text),
                             ),
                         )
                         .clicked()
@@ -946,7 +1086,9 @@ impl Session {
                         .add_sized(
                             [topic_width, 16.0],
                             egui::Button::new(
-                                RichText::new(topic_text).strong().color(Color32::WHITE),
+                                RichText::new(topic_text)
+                                    .strong()
+                                    .color(super::theme::palette(ui.ctx()).text),
                             ),
                         )
                         .clicked()
@@ -986,16 +1128,16 @@ impl Session {
 
                             // Alternate row background
                             let bg_color = if is_selected {
-                                Color32::from_rgb(60, 80, 120)
+                                super::theme::palette(ui.ctx()).active_row()
                             } else if row_idx % 2 == 0 {
                                 Color32::TRANSPARENT
                             } else {
-                                Color32::from_rgba_unmultiplied(255, 255, 255, 8)
+                                super::theme::palette(ui.ctx()).raise.gamma_multiply(0.5)
                             };
                             let text_color = if is_selected {
-                                Color32::WHITE
+                                super::theme::palette(ui.ctx()).text
                             } else {
-                                Color32::from_rgb(180, 210, 255)
+                                super::theme::palette(ui.ctx()).accent
                             };
 
                             ui.horizontal(|ui| {
@@ -1034,7 +1176,7 @@ impl Session {
                                             egui::Label::new(
                                                 RichText::new(&channel_topic)
                                                     .small()
-                                                    .color(Color32::GRAY),
+                                                    .color(super::theme::palette(ui.ctx()).muted),
                                             )
                                             .wrap_mode(egui::TextWrapMode::Wrap),
                                         );
@@ -1055,7 +1197,7 @@ impl Session {
                                     [users_width, row_height],
                                     egui::Label::new(
                                         RichText::new(format!("{}", entry.user_count))
-                                            .color(Color32::LIGHT_GREEN),
+                                            .color(super::theme::palette(ui.ctx()).online),
                                     ),
                                 );
 
@@ -1063,7 +1205,8 @@ impl Session {
                                 ui.add_sized(
                                     [topic_width, row_height],
                                     egui::Label::new(
-                                        RichText::new(&entry.topic_clean).color(Color32::GRAY),
+                                        RichText::new(&entry.topic_clean)
+                                            .color(super::theme::palette(ui.ctx()).muted),
                                     )
                                     .truncate(),
                                 );
@@ -1138,7 +1281,10 @@ impl Session {
                     ui.horizontal(|ui| {
                         ui.label(RichText::new(&channel_name).strong().size(16.0));
                         if !ch.modes.is_empty() {
-                            ui.label(RichText::new(format!("({})", ch.modes)).color(Color32::GRAY));
+                            ui.label(
+                                RichText::new(format!("({})", ch.modes))
+                                    .color(super::theme::palette(ui.ctx()).muted),
+                            );
                         }
                     });
                     ui.separator();
@@ -1149,7 +1295,7 @@ impl Session {
                         .show(ui, |ui| {
                             // User count
                             ui.label("Users:");
-                            ui.label(format!("{}", ch.users.len()));
+                            ui.label(format!("{}", ch.users().len()));
                             ui.end_row();
 
                             // Created
@@ -1188,11 +1334,15 @@ impl Session {
                             ui.label(
                                 RichText::new(format!("Set by {} on {}", setter, time_str))
                                     .small()
-                                    .color(Color32::GRAY),
+                                    .color(super::theme::palette(ui.ctx()).muted),
                             );
                         }
                     } else {
-                        ui.label(RichText::new("No topic set").italics().color(Color32::GRAY));
+                        ui.label(
+                            RichText::new("No topic set")
+                                .italics()
+                                .color(super::theme::palette(ui.ctx()).muted),
+                        );
                     }
 
                     ui.separator();
@@ -1206,7 +1356,9 @@ impl Session {
                             if ch.bans.is_empty() {
                                 if ch.ban_list_complete {
                                     ui.label(
-                                        RichText::new("No bans").italics().color(Color32::GRAY),
+                                        RichText::new("No bans")
+                                            .italics()
+                                            .color(super::theme::palette(ui.ctx()).muted),
                                     );
                                 } else {
                                     if ui.button("Load Ban List").clicked() {
@@ -1227,7 +1379,7 @@ impl Session {
                                                         format_timestamp(ban.set_time)
                                                     ))
                                                     .small()
-                                                    .color(Color32::GRAY),
+                                                    .color(super::theme::palette(ui.ctx()).muted),
                                                 );
                                             }
                                         });
@@ -1255,7 +1407,7 @@ impl Session {
                                         ui.label(
                                             RichText::new("No entries")
                                                 .italics()
-                                                .color(Color32::GRAY),
+                                                .color(super::theme::palette(ui.ctx()).muted),
                                         );
                                     } else if ui.button(format!("Load +{mode} List")).clicked() {
                                         load_mode_lists.push(mode);
@@ -1275,11 +1427,9 @@ impl Session {
                                                             format_timestamp(entry.set_time)
                                                         )
                                                     };
-                                                    ui.label(
-                                                        RichText::new(detail)
-                                                            .small()
-                                                            .color(Color32::GRAY),
-                                                    );
+                                                    ui.label(RichText::new(detail).small().color(
+                                                        super::theme::palette(ui.ctx()).muted,
+                                                    ));
                                                 }
                                             });
                                         }
@@ -1291,12 +1441,12 @@ impl Session {
                     ui.separator();
 
                     // User list section (stable id_salt: see ban list above).
-                    egui::CollapsingHeader::new(format!("Users ({})", ch.users.len()))
+                    egui::CollapsingHeader::new(format!("Users ({})", ch.users().len()))
                         .id_salt("channel_info_users")
                         .show(ui, |ui| {
                             ScrollArea::vertical().max_height(150.0).show(ui, |ui| {
                                 ui.horizontal_wrapped(|ui| {
-                                    for user in &ch.users {
+                                    for user in ch.users() {
                                         let prefix = user.prefix();
                                         let state = match (user.is_away(), user.bot) {
                                             (true, true) => " (away, bot)",
@@ -1429,7 +1579,7 @@ impl Session {
                         for (idx, (code, name, color)) in colors.iter().enumerate() {
                             // Use contrasting border for visibility
                             let border = if *code == 0 || *code == 15 {
-                                Color32::DARK_GRAY
+                                super::theme::palette(ui.ctx()).line
                             } else {
                                 Color32::TRANSPARENT
                             };
@@ -1478,7 +1628,7 @@ impl Session {
                 ui.label(
                     RichText::new("Shortcuts: Ctrl+B Bold, Ctrl+U Underline, Ctrl+I Italic")
                         .small()
-                        .color(Color32::GRAY),
+                        .color(super::theme::palette(ui.ctx()).muted),
                 );
             });
 
@@ -1537,7 +1687,7 @@ impl App {
                 });
                 ui.separator();
                 if let Some(error) = self.sessions[active].connection_error() {
-                    ui.colored_label(Color32::RED, error);
+                    ui.colored_label(super::theme::palette(ui.ctx()).danger, error);
                 }
                 let roomy = ctx.content_rect().height() > 450.0;
                 let footer_height = if roomy {
@@ -1574,7 +1724,11 @@ impl App {
                                         favorites_ui,
                                     )
                                 }
-                                1 => session.settings_tab_display(ui, &mut settings.font_size),
+                                1 => {
+                                    let mut display = settings.display();
+                                    session.settings_tab_display(ui, &mut display);
+                                    settings.set_display(display);
+                                }
                                 2 => session.settings_tab_behavior(
                                     ui,
                                     &mut settings.notifications_enabled,
@@ -1592,12 +1746,12 @@ impl App {
                             "Save stores connection defaults without reconnecting. Favorites have their own save buttons.",
                         )
                         .small()
-                        .color(Color32::GRAY),
+                        .color(super::theme::palette(ui.ctx()).muted),
                     );
                 }
                 if roomy {
                     ui.label(RichText::new("Global preferences apply immediately. Cancel discards connection edits.")
-                        .small().color(Color32::GRAY));
+                        .small().color(super::theme::palette(ui.ctx()).muted));
                 }
                 ui.horizontal_wrapped(|ui| {
                     if self.settings_tab == 0 {
@@ -1720,7 +1874,7 @@ impl App {
             ui.label(
                 RichText::new("Built with Rust + egui")
                     .small()
-                    .color(Color32::GRAY),
+                    .color(super::theme::palette(ui.ctx()).muted),
             );
             ui.add_space(20.0);
             ui.label(
@@ -1793,7 +1947,7 @@ impl App {
                     ui.label("Preparing to restart…");
                 }
                 Status::Error(message) => {
-                    ui.colored_label(Color32::LIGHT_RED, message);
+                    ui.colored_label(super::theme::palette(ui.ctx()).danger, message);
                 }
             }
             if let Some(offer) = &self.updater.offer {

@@ -1,0 +1,106 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Linefeed in a narrow window</title>
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+<style>
+body{margin:0}
+a{color:#6CA8FF}a:hover{color:#9CC4FF}
+.lf{--bg:#1B1E23;--panel:#22262C;--raise:#2B3038;--line:#343A44;--text:#E4E7EB;--muted:#A3ABB8;--faint:#98A1AF;--mention:#F2A65A;--mention-bg:rgba(242,166,90,.13);--on-accent:#0E1116}
+.lf button{font:inherit;cursor:pointer}
+.lf input{font:inherit}
+</style>
+</helmet>
+<div class="lf" style="display: flex; flex-direction: column; min-height: 760px; background: var(--bg); color: var(--text); font-family: Inter, system-ui, sans-serif; font-size: 15px; line-height: 1.5">
+
+<header style="display: flex; flex-wrap: wrap; align-items: center; gap: 6px; padding: 6px 10px; background: var(--panel); border-bottom: 1px solid var(--line)">
+<button type="button" style="display: flex; align-items: center; gap: 8px; min-height: 44px; flex: 1 1 200px; min-width: 0; padding: 0 12px; border: 1px solid var(--line); border-radius: 10px; background: var(--raise); color: var(--text); text-align: left">
+<span aria-hidden="true" style="width: 10px; height: 10px; border-radius: 50%; background: #5BC98C"></span>
+<span style="flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap"><strong style="font-weight: 600">#linefeed</strong> <span style="color: var(--muted)">on Libera</span></span>
+<span style="min-width: 22px; padding: 0 6px; border-radius: 11px; background: {{accent}}; color: var(--on-accent); font-size: 12.5px; font-weight: 700; text-align: center">19</span>
+<span style="min-width: 22px; padding: 0 6px; border-radius: 11px; background: var(--mention); color: var(--on-accent); font-size: 12.5px; font-weight: 700; text-align: center">@ 1</span>
+<svg aria-hidden="true" width="14" height="14" viewBox="0 0 14 14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M3 5l4 4 4-4"></path></svg>
+</button>
+<button type="button" aria-label="Search saved history" style="display: flex; align-items: center; justify-content: center; width: 44px; min-height: 44px; border: 0; border-radius: 10px; background: transparent; color: var(--text)">
+<svg aria-hidden="true" width="18" height="18" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"><circle cx="7" cy="7" r="4.5"></circle><path d="M10.5 10.5L14 14"></path></svg>
+</button>
+<button type="button" style="display: flex; align-items: center; gap: 8px; min-height: 44px; padding: 0 12px; border: 0; border-radius: 10px; background: transparent; color: var(--text)">Activity
+<span style="min-width: 22px; padding: 0 6px; border-radius: 11px; background: var(--mention); color: var(--on-accent); font-size: 12.5px; font-weight: 700; text-align: center">2</span>
+</button>
+<button type="button" aria-label="More: Window and Settings" style="display: flex; align-items: center; justify-content: center; width: 44px; min-height: 44px; border: 0; border-radius: 10px; background: transparent; color: var(--text)">
+<svg aria-hidden="true" width="18" height="18" viewBox="0 0 18 18" fill="currentColor"><circle cx="4" cy="9" r="1.6"></circle><circle cx="9" cy="9" r="1.6"></circle><circle cx="14" cy="9" r="1.6"></circle></svg>
+</button>
+</header>
+
+<div style="display: flex; align-items: center; gap: 8px; padding: 4px 6px 4px 14px; border-bottom: 1px solid var(--line)">
+<p style="flex: 1 1 auto; min-width: 0; margin: 0; color: var(--muted); font-size: 14px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap">Linefeed IRC client · questions and release notes</p>
+<button type="button" style="min-height: 44px; padding: 0 12px; border: 0; border-radius: 10px; background: transparent; color: var(--muted); white-space: nowrap">12 people</button>
+</div>
+
+<main style="flex: 1 1 auto; display: flex; flex-direction: column; justify-content: flex-end; gap: 10px; padding: 12px 0">
+<div style="align-self: center; padding: 2px 12px; border-radius: 12px; background: var(--raise); color: var(--muted); font-size: 12.5px; font-weight: 600">Today</div>
+<div style="padding: 0 14px">
+<div style="display: flex; align-items: baseline; gap: 8px"><span style="font-weight: 600; color: #5ED0C0">bob</span><span style="color: var(--faint); font-size: 12.5px; font-variant-numeric: tabular-nums">14:02</span></div>
+<div style="overflow-wrap: anywhere">Yes. The controls are back on the right and the status is on the left.</div>
+<div style="overflow-wrap: anywhere">It is one row whenever the window is wide enough.</div>
+</div>
+<div style="padding: 0 14px; color: var(--muted); font-size: 13.5px">carol joined</div>
+<div style="padding: 0 14px">
+<div style="display: flex; align-items: baseline; gap: 8px"><span style="font-weight: 600; color: #C39BFF">carol</span><span style="color: var(--faint); font-size: 12.5px; font-variant-numeric: tabular-nums">14:06</span></div>
+<div style="overflow-wrap: anywhere">Can someone look at the unread line? It used to stay in every window.</div>
+</div>
+<div style="padding: 0 14px">
+<div style="display: flex; align-items: baseline; gap: 8px"><span style="font-weight: 600; color: #F28FB5">dave</span><span style="color: var(--faint); font-size: 12.5px; font-variant-numeric: tabular-nums">14:07</span></div>
+<div style="overflow-wrap: anywhere">It only marks what was unread when you open the window now.</div>
+</div>
+<div style="display: flex; align-items: center; gap: 12px; padding: 0 14px; color: {{accent}}; font-size: 12.5px; font-weight: 600">
+<span aria-hidden="true" style="flex: 1 1 auto; height: 1px; background: {{accentSoft}}"></span>
+<span>New messages</span>
+<span aria-hidden="true" style="flex: 1 1 auto; height: 1px; background: {{accentSoft}}"></span>
+</div>
+<div style="padding: 6px 14px; background: var(--mention-bg)">
+<div style="display: flex; align-items: baseline; gap: 8px"><span style="font-weight: 600; color: #B7D36B">erin</span><span style="color: var(--faint); font-size: 12.5px; font-variant-numeric: tabular-nums">14:21</span></div>
+<div style="overflow-wrap: anywhere"><strong style="color: var(--mention)">alice</strong>, could you try the new build when you have a minute?</div>
+</div>
+<div style="padding: 0 14px">
+<div style="display: flex; align-items: baseline; gap: 8px"><span style="font-weight: 600; color: #F2A65A">frank</span><span style="color: var(--faint); font-size: 12.5px; font-variant-numeric: tabular-nums">14:22</span></div>
+<div style="overflow-wrap: anywhere">I can test it on Windows as well.</div>
+</div>
+<div style="padding: 0 14px">
+<div style="display: flex; align-items: baseline; gap: 8px"><span style="font-weight: 600; color: #5ED0C0">bob</span><span style="color: var(--faint); font-size: 12.5px; font-variant-numeric: tabular-nums">14:25</span></div>
+<div style="overflow-wrap: anywhere">Thanks, both of you.</div>
+</div>
+</main>
+
+<div style="padding: 0 10px 12px">
+<p style="margin: 0 4px 6px; min-height: 20px; color: var(--muted); font-size: 13px">carol is typing…</p>
+<div style="display: flex; align-items: flex-end; gap: 8px">
+<label for="message-narrow" style="position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0)">Message #linefeed</label>
+<input id="message-narrow" type="text" placeholder="Message #linefeed" style="flex: 1 1 auto; min-width: 0; box-sizing: border-box; min-height: 44px; padding: 0 14px; border: 1px solid var(--line); border-radius: 10px; background: var(--panel); color: var(--text)">
+<button type="button" aria-label="Text formatting" style="min-width: 44px; min-height: 44px; padding: 0 10px; border: 1px solid var(--line); border-radius: 10px; background: transparent; color: var(--text); font-weight: 600">Aa</button>
+<button type="button" style="min-height: 44px; padding: 0 18px; border: 0; border-radius: 10px; background: {{accent}}; color: var(--on-accent); font-weight: 600">Send</button>
+</div>
+</div>
+</div>
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props='{"accent":{"editor":"color","options":["#6CA8FF","#5ED0C0","#C39BFF"],"default":"#6CA8FF"},"$preview":{"width":640,"height":760}}'>
+class Component extends DCLogic {
+renderVals() {
+const accent = this.props.accent ?? '#6CA8FF';
+const tint = (hex, alpha) => {
+if (!/^#[0-9a-fA-F]{6}$/.test(hex)) return hex;
+const n = parseInt(hex.slice(1), 16);
+return 'rgba(' + (n >> 16) + ',' + ((n >> 8) & 255) + ',' + (n & 255) + ',' + alpha + ')';
+};
+return { accent: accent, accentSoft: tint(accent, 0.5) };
+}
+}
+</script>
+</body>
+</html>

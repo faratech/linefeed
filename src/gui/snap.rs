@@ -8,8 +8,8 @@
 use std::time::Duration;
 
 use egui::{
-    Align, Align2, Color32, Id, LayerId, Layout, Order, Pos2, Rect, RichText, Sense, Stroke,
-    StrokeKind, UiBuilder, Vec2,
+    Align, Align2, Id, LayerId, Layout, Order, Pos2, Rect, RichText, Sense, Stroke, StrokeKind,
+    UiBuilder, Vec2,
 };
 
 use super::app::App;
@@ -420,7 +420,7 @@ impl App {
             .rect_stroke(max_rect.shrink(5.5), 0.0, stroke, StrokeKind::Middle);
         if close.hovered() {
             ui.painter()
-                .rect_filled(close_rect, 2.0, Color32::from_rgb(196, 43, 28));
+                .rect_filled(close_rect, 2.0, super::theme::palette(ui.ctx()).danger);
         }
         let cross = close_rect.shrink(6.0);
         ui.painter()
@@ -657,8 +657,11 @@ impl App {
                 size.x * pivot.x().to_factor(),
                 size.y * pivot.y().to_factor(),
             );
+        // The size is given up front: a new area is otherwise assumed to be
+        // much wider for its first frame and pushed left to stay on screen.
         let shown = egui::Area::new(id)
             .order(Order::Tooltip)
+            .default_size(size)
             .fixed_pos(min)
             .show(ctx, |ui| {
                 frame

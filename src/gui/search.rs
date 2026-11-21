@@ -403,6 +403,7 @@ impl App {
                         changed |= ui
                             .add(
                                 egui::TextEdit::singleline(&mut self.search.query.sender)
+                                    .align(egui::Align2::LEFT_CENTER)
                                     .desired_width(110.0),
                             )
                             .changed();
@@ -410,6 +411,7 @@ impl App {
                         changed |= ui
                             .add(
                                 egui::TextEdit::singleline(&mut self.search.from)
+                                    .align(egui::Align2::LEFT_CENTER)
                                     .desired_width(95.0)
                                     .hint_text("YYYY-MM-DD"),
                             )
@@ -418,6 +420,7 @@ impl App {
                         changed |= ui
                             .add(
                                 egui::TextEdit::singleline(&mut self.search.until)
+                                    .align(egui::Align2::LEFT_CENTER)
                                     .desired_width(95.0)
                                     .hint_text("YYYY-MM-DD"),
                             )
@@ -428,6 +431,7 @@ impl App {
                         changed |= ui
                             .add(
                                 egui::TextEdit::singleline(&mut self.search.query.network_pattern)
+                                    .align(egui::Align2::LEFT_CENTER)
                                     .desired_width(150.0)
                                     .hint_text("host, account or network ID"),
                             )
@@ -438,6 +442,7 @@ impl App {
                                 egui::TextEdit::singleline(
                                     self.search.query.target.get_or_insert_with(String::new),
                                 )
+                                .align(egui::Align2::LEFT_CENTER)
                                 .desired_width(120.0)
                                 .hint_text("#channel or nick"),
                             )
@@ -468,10 +473,10 @@ impl App {
                         ctx.request_repaint_after(Duration::from_millis(100));
                     }
                     if let Some(error) = &status.error {
-                        ui.colored_label(egui::Color32::YELLOW, error);
+                        ui.colored_label(super::theme::palette(ui.ctx()).mention, error);
                     }
                     if let Some(error) = &self.search.error {
-                        ui.colored_label(egui::Color32::RED, error);
+                        ui.colored_label(super::theme::palette(ui.ctx()).danger, error);
                     }
                     if self.search.pending {
                         ui.spinner();
@@ -565,7 +570,7 @@ impl App {
                         reference.conversation.target
                     ));
                     if let Some(error) = &self.search.context_error {
-                        ui.colored_label(egui::Color32::RED, error);
+                        ui.colored_label(super::theme::palette(ui.ctx()).danger, error);
                     }
                     if self.search.context_pending {
                         ui.spinner();
@@ -624,7 +629,7 @@ impl App {
                                     egui::Label::new(if selected {
                                         egui::RichText::new(text)
                                             .strong()
-                                            .color(egui::Color32::LIGHT_BLUE)
+                                            .color(super::theme::palette(ui.ctx()).accent)
                                     } else {
                                         egui::RichText::new(text)
                                     })

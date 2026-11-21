@@ -71,6 +71,15 @@ pub struct App {
     next_workspace_restore: u64,
     pub(crate) archive: super::archive::ArchiveService,
     pub(crate) search: super::search::SearchUi,
+    /// What is typed in the top bar's search field.
+    toolbar_search: String,
+    /// The network whose "Join a channel" row is a text field right now,
+    /// what is typed in it, and whether it still has to take the focus.
+    join_row: Option<ConnId>,
+    join_text: String,
+    join_focus: bool,
+    /// The active window the conversation list last scrolled to.
+    sidebar_scrolled: Option<WindowKey>,
     pub(crate) automation: super::automation::AutomationUi,
     pub(crate) window_switcher: super::actions::WindowSwitcher,
     pub(crate) sessions: Vec<Session>,
@@ -151,7 +160,7 @@ pub struct App {
     /// When the App started: the persisted active window is only restored
     /// while startup auto-joins are still arriving.
     started: Instant,
-    /// The user has picked a window (click, switchbar, shortcut, typing a
+    /// The user has picked a window (click, sidebar, shortcut, typing a
     /// /query): the persisted active window no longer applies.
     user_activated: bool,
     /// The window to return to if a "New connection" status window is
@@ -419,6 +428,11 @@ impl App {
             archive: Default::default(),
             uploads: Default::default(),
             search: Default::default(),
+            toolbar_search: String::new(),
+            join_row: None,
+            join_text: String::new(),
+            join_focus: false,
+            sidebar_scrolled: None,
             next_conn: 1,
             settings,
             updater: crate::updater::Controller::default(),
@@ -554,8 +568,21 @@ impl App {
         self.settings.automatic_updates
     }
 
-    pub fn font_size(&self) -> f32 {
-        self.settings.font_size
+    /// With "Match the system" chosen, switch between the dark and light
+    /// palettes when the operating system does.
+    fn follow_system_theme(&self, ctx: &egui::Context) {
+        if self.settings.theme != super::theme::ThemeChoice::System {
+            return;
+        }
+        let system_dark = ctx.system_theme() != Some(egui::Theme::Light);
+        if system_dark != super::theme::palette(ctx).dark {
+            self.apply_display(ctx);
+        }
+    }
+
+    /// Put the saved display choices (theme, spacing, fonts) into effect.
+    pub fn apply_display(&self, ctx: &egui::Context) {
+        super::theme::apply(ctx, &self.settings.display());
     }
 
     /// Network and application background work both need a visible-window
@@ -675,10 +702,11 @@ impl App {
     // ----- frame ----------------------------------------------------------
 
     /// The full frame: pump every session, run timers and lifecycles, then
-    /// draw the toolbar, switchbar, windows, detached windows and dialogs.
+    /// draw the top bar, sidebar, windows, detached windows and dialogs.
     pub fn ui(&mut self, root_ui: &mut egui::Ui) {
         self.ui_ctx = Some(root_ui.ctx().clone());
         let ctx = root_ui.ctx().clone();
+        self.follow_system_theme(&ctx);
         self.observe_root_input(&ctx);
         self.tick(&ctx, true);
         self.handle_shortcuts(&ctx);
@@ -686,13 +714,24 @@ impl App {
         self.show_window_switcher(&ctx);
 
         egui::Panel::top("toolbar").show(root_ui, |ui| self.draw_toolbar(ui));
-        egui::Panel::top("switchbar").show(root_ui, |ui| self.draw_switchbar(ui));
-        let central = egui::CentralPanel::default().show(root_ui, |ui| {
-            if self.windows.mode == LayoutMode::Maximized {
-                self.draw_maximized(ui);
-            }
-            ui.max_rect()
-        });
+        if !narrow(&ctx) {
+            egui::Panel::left("sidebar")
+                .resizable(true)
+                .default_size(248.0)
+                .min_size(180.0)
+                .max_size(360.0)
+                .show(root_ui, |ui| self.draw_sidebar(ui));
+        }
+        let chat_ground =
+            egui::Frame::central_panel(&ctx.global_style()).fill(super::theme::palette(&ctx).bg);
+        let central = egui::CentralPanel::default()
+            .frame(chat_ground)
+            .show(root_ui, |ui| {
+                if self.windows.mode == LayoutMode::Maximized {
+                    self.draw_maximized(ui);
+                }
+                ui.max_rect()
+            });
         if self.windows.mode == LayoutMode::Floating {
             self.draw_floating(&ctx, central.inner);
         }
@@ -799,7 +838,7 @@ impl App {
         }
         // The user is working in the main window while a detached window is
         // the active one: the window the main window shows becomes active
-        // (a click on a particular window or switchbar entry overrides this
+        // (a click on a particular window or sidebar row overrides this
         // later in the frame).
         if acted_here
             && (!embedded_child_keyboard || ctx.input(|input| input.pointer.any_pressed()))
@@ -1688,7 +1727,7 @@ impl App {
 
     // ----- ordering, shortcuts, closing ----------------------------------
 
-    /// Every window in switchbar order: sessions in creation order, each
+    /// Every window in sidebar order: sessions in creation order, each
     /// with its status window first and then its tabs sorted by name.
     pub(crate) fn ordered_windows(&self) -> Vec<WindowKey> {
         let mut keys = Vec::new();
@@ -2238,12 +2277,12 @@ impl App {
         }
     }
 
-    // ----- toolbar and switchbar ------------------------------------------
+    // ----- top bar and sidebar ---------------------------------------------
 
-    /// Name and connection status at the left, the controls at the right.
-    /// What does not fit beside them moves down: first the status line, and
-    /// in a window too narrow for the controls beside the name, everything
-    /// wraps.
+    /// The connection and its status at the left, search and the window
+    /// controls at the right. What does not fit beside them moves down:
+    /// first the status line, and in a window too narrow for the controls
+    /// beside the connection button, everything wraps.
     fn draw_toolbar(&mut self, ui: &mut egui::Ui) {
         let fit_id = ui.scope_id().with("fit");
         let previous: Option<ToolbarFit> = ui.ctx().data(|data| data.get_temp(fit_id));
@@ -2252,13 +2291,10 @@ impl App {
         let rows = toolbar_rows(previous, available, spacing);
         let mut fit = previous.unwrap_or_default();
         fit.rows = rows;
-        let active = self.active_index();
-        let label = self.network_label(&self.sessions[active]);
         if rows == ToolbarRows::Wrapped {
             ui.horizontal_wrapped(|ui| {
-                ui.heading("Linefeed");
-                ui.separator();
-                self.sessions[active].draw_status_summary(ui, &label);
+                self.draw_bar_lead(ui);
+                self.draw_status_line(ui);
             });
             let row = ui.spacing().interact_size.y;
             let controls = ui
@@ -2277,11 +2313,10 @@ impl App {
             }
         } else {
             ui.horizontal(|ui| {
-                fit.heading = ui.heading("Linefeed").rect.width();
+                fit.connection = self.draw_bar_lead(ui).rect.width();
                 if rows == ToolbarRows::One {
-                    ui.separator();
                     fit.status = ui
-                        .scope(|ui| self.sessions[active].draw_status_summary(ui, &label))
+                        .scope(|ui| self.draw_status_line(ui))
                         .response
                         .rect
                         .width();
@@ -2294,7 +2329,7 @@ impl App {
             if rows == ToolbarRows::Two {
                 fit.status = ui
                     .horizontal_wrapped(|ui| {
-                        self.sessions[active].draw_status_summary(ui, &label);
+                        self.draw_status_line(ui);
                         ui.min_rect().width()
                     })
                     .inner;
@@ -2310,127 +2345,447 @@ impl App {
         }
     }
 
-    /// The toolbar's controls, in a right-to-left layout: the first one
-    /// drawn sits at the right edge.
-    fn draw_toolbar_controls(&mut self, ui: &mut egui::Ui) {
-        if ui.button("Settings").clicked() {
-            let conn = self.sessions[self.active_index()].id;
-            self.open_settings(conn);
-        }
-        ui.menu_button("Window", |ui| {
-            if ui.button("Tile").clicked() {
-                self.tile_request = Some(TileRequest::Tile);
-                self.windows.mode = LayoutMode::Floating;
-                ui.close();
-            }
-            if ui.button("Cascade").clicked() {
-                self.tile_request = Some(TileRequest::Cascade);
-                self.windows.mode = LayoutMode::Floating;
-                ui.close();
-            }
-            let label = match self.windows.mode {
-                LayoutMode::Maximized => "Restore windows (Ctrl+M)",
-                LayoutMode::Floating => "Maximize (Ctrl+M)",
-            };
-            if ui.button(label).clicked() {
-                self.toggle_maximized();
-                ui.close();
-            }
-            ui.separator();
-            if ui.button("New connection...").clicked() {
-                self.new_connection();
-                ui.close();
-            }
-            ui.separator();
-            if ui.button("File sharing…").clicked() {
-                self.claim_global_dialogs(None);
-                self.uploads.open = true;
-                ui.close();
-            }
-        });
-        let count = self.activity.items.iter().filter(|item| !item.read).count();
-        let activity_label = if count == 0 {
-            "Activity".into()
+    /// What the top bar starts with: the connection button, or in a narrow
+    /// window the switcher that stands in for the sidebar.
+    fn draw_bar_lead(&mut self, ui: &mut egui::Ui) -> egui::Response {
+        if narrow(ui.ctx()) {
+            self.draw_switcher_button(ui)
         } else {
-            format!("Activity ({count})")
-        };
-        if ui.button(activity_label).clicked() {
-            self.toggle_activity(None);
-        }
-        if ui
-            .button("Search")
-            .on_hover_text("Search saved history (Ctrl+F)")
-            .clicked()
-        {
-            self.open_search(self.active_index(), String::new(), false);
-        }
-        ui.separator();
-        let active = self.active_index();
-        if !self.sessions[active].is_connected() && !self.sessions[active].is_connecting() {
-            if ui.button("Connect").clicked() {
-                self.sessions[active].show_connect_dialog = true;
-                self.open_connection_settings(self.sessions[active].id);
-            }
-        } else if self.sessions[active].is_connected() && ui.button("Disconnect").clicked() {
-            let quit = self.quit_reason();
-            self.sessions[active].request_manual_disconnect(Some(quit));
-        }
-        let session = &mut self.sessions[active];
-        if session.is_connected() {
-            session.draw_join_box(ui);
+            self.draw_connection_button(ui)
         }
     }
 
-    fn draw_switchbar(&mut self, ui: &mut egui::Ui) {
+    /// The colour of a connection's status dot.
+    fn connection_dot(session: &Session, palette: &super::theme::Palette) -> Color32 {
+        if session.is_connected() && session.away_status.is_none() {
+            palette.online
+        } else if session.is_connected() || session.is_connecting() {
+            palette.mention
+        } else {
+            palette.danger
+        }
+    }
+
+    /// The active connection as one button: a status dot, the network and
+    /// the nickname. Its menu connects or disconnects and shows the account
+    /// and transport details.
+    fn draw_connection_button(&mut self, ui: &mut egui::Ui) -> egui::Response {
+        let palette = super::theme::palette(ui.ctx());
+        let active = self.active_index();
+        let label = self.network_label(&self.sessions[active]);
+        let session = &self.sessions[active];
+        let font = egui::TextStyle::Button.resolve(ui.style());
+        let format = |font_id: egui::FontId, color| egui::TextFormat {
+            font_id,
+            color,
+            ..Default::default()
+        };
+        let mut title = egui::text::LayoutJob::default();
+        title.append(
+            "● ",
+            0.0,
+            format(font.clone(), Self::connection_dot(session, &palette)),
+        );
+        title.append(
+            &label,
+            0.0,
+            format(
+                egui::FontId::new(font.size, super::fonts::semibold()),
+                palette.text,
+            ),
+        );
+        if session.is_connected() {
+            title.append(
+                &format!("  {}", session.my_nick),
+                0.0,
+                format(font.clone(), palette.muted),
+            );
+        }
+        title.append("  ▾", 0.0, format(font, palette.muted));
+        ui.menu_button(title, |ui| self.connection_menu(ui))
+            .response
+    }
+
+    /// Connect or disconnect the active connection, open another one, and
+    /// the account and transport details.
+    fn connection_menu(&mut self, ui: &mut egui::Ui) {
+        let active = self.active_index();
+        let connected = self.sessions[active].is_connected();
+        if connected {
+            if ui.button("Disconnect").clicked() {
+                let quit = self.quit_reason();
+                self.sessions[active].request_manual_disconnect(Some(quit));
+                ui.close();
+            }
+        } else if !self.sessions[active].is_connecting() && ui.button("Connect").clicked() {
+            self.sessions[active].show_connect_dialog = true;
+            self.open_connection_settings(self.sessions[active].id);
+            ui.close();
+        }
+        if ui.button("New connection...").clicked() {
+            self.new_connection();
+            ui.close();
+        }
+        if connected {
+            ui.separator();
+            self.sessions[active].draw_account_security_status(ui);
+        }
+    }
+
+    /// In a window too narrow for the sidebar: one button naming the active
+    /// conversation, whose menu lists every conversation and then the
+    /// connection's own entries.
+    fn draw_switcher_button(&mut self, ui: &mut egui::Ui) -> egui::Response {
+        let palette = super::theme::palette(ui.ctx());
+        let active = self.active_index();
+        let label = self.network_label(&self.sessions[active]);
+        let session = &self.sessions[active];
+        let name = self
+            .windows
+            .active
+            .and_then(|key| key.conversation)
+            .and_then(|id| session.target_name(id))
+            .unwrap_or("Status")
+            .to_owned();
+        let (unread, mentions) = self.unread_elsewhere();
+        let font = egui::TextStyle::Button.resolve(ui.style());
+        let semibold = egui::FontId::new(font.size, super::fonts::semibold());
+        let format = |font_id: egui::FontId, color| egui::TextFormat {
+            font_id,
+            color,
+            ..Default::default()
+        };
+        let mut title = egui::text::LayoutJob::default();
+        title.append(
+            "● ",
+            0.0,
+            format(font.clone(), Self::connection_dot(session, &palette)),
+        );
+        title.append(&name, 0.0, format(semibold.clone(), palette.text));
+        title.append(
+            &format!(" on {label}"),
+            0.0,
+            format(font.clone(), palette.muted),
+        );
+        if mentions > 0 {
+            title.append(
+                &format!("  @ {mentions}"),
+                0.0,
+                format(semibold, palette.mention),
+            );
+        } else if unread > 0 {
+            title.append(
+                &format!("  {unread}"),
+                0.0,
+                format(semibold, palette.accent),
+            );
+        }
+        title.append("  ▾", 0.0, format(font, palette.muted));
+        // The menu closes only when something is picked or on a click
+        // outside it, so the join field can be opened and typed into.
+        let (response, menu) = egui::containers::menu::MenuButton::new(title)
+            .config(
+                egui::containers::menu::MenuConfig::new()
+                    .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside),
+            )
+            .ui(ui, |ui| {
+                ui.set_min_width(240.0);
+                let mut picked = false;
+                egui::ScrollArea::vertical()
+                    .max_height(420.0)
+                    .show(ui, |ui| picked = self.draw_conversation_rows(ui));
+                ui.separator();
+                self.connection_menu(ui);
+                if picked {
+                    ui.close();
+                }
+            });
+        if menu.is_none() {
+            // A join field left open goes away with the menu.
+            self.join_row = None;
+        }
+        response
+    }
+
+    /// One quiet line saying how the active connection stands; an
+    /// unencrypted or unverified link is called out in the mention colour.
+    fn draw_status_line(&self, ui: &mut egui::Ui) {
+        let palette = super::theme::palette(ui.ctx());
+        let active = self.active_index();
+        let label = self.network_label(&self.sessions[active]);
+        let (text, warning) = self.sessions[active].status_line(&label);
+        let color = if warning {
+            palette.mention
+        } else {
+            palette.muted
+        };
+        ui.label(RichText::new(text).small().color(color));
+    }
+
+    /// The top bar's controls, in a right-to-left layout: the first one
+    /// drawn sits at the right edge.
+    fn draw_toolbar_controls(&mut self, ui: &mut egui::Ui) {
+        ui.scope(|ui| {
+            // Flat until hovered: the bar is not a row of boxes.
+            let inactive = &mut ui.visuals_mut().widgets.inactive;
+            inactive.weak_bg_fill = Color32::TRANSPARENT;
+            inactive.bg_stroke = egui::Stroke::NONE;
+            if ui.button("Settings").clicked() {
+                let conn = self.sessions[self.active_index()].id;
+                self.open_settings(conn);
+            }
+            ui.menu_button("Window", |ui| {
+                if ui.button("Tile").clicked() {
+                    self.tile_request = Some(TileRequest::Tile);
+                    self.windows.mode = LayoutMode::Floating;
+                    ui.close();
+                }
+                if ui.button("Cascade").clicked() {
+                    self.tile_request = Some(TileRequest::Cascade);
+                    self.windows.mode = LayoutMode::Floating;
+                    ui.close();
+                }
+                let label = match self.windows.mode {
+                    LayoutMode::Maximized => "Restore windows (Ctrl+M)",
+                    LayoutMode::Floating => "Maximize (Ctrl+M)",
+                };
+                if ui.button(label).clicked() {
+                    self.toggle_maximized();
+                    ui.close();
+                }
+                ui.separator();
+                if ui.button("New connection...").clicked() {
+                    self.new_connection();
+                    ui.close();
+                }
+                ui.separator();
+                if ui.button("File sharing…").clicked() {
+                    self.claim_global_dialogs(None);
+                    self.uploads.open = true;
+                    ui.close();
+                }
+            });
+            let unread = self.activity.items.iter().filter(|item| !item.read).count();
+            let count = (unread > 0).then(|| unread.to_string());
+            let mention = super::theme::palette(ui.ctx()).mention;
+            if super::widgets::badge_button(
+                ui,
+                "Activity",
+                count.as_deref().map(|count| (count, mention)),
+            )
+            .clicked()
+            {
+                self.toggle_activity(None);
+            }
+        });
+        let height = super::theme::control_height(ui);
+        let width = ui.available_width().clamp(120.0, 280.0);
+        let response = ui.add(
+            egui::TextEdit::singleline(&mut self.toolbar_search)
+                .hint_text("Search history (Ctrl+F)")
+                .desired_width(width)
+                .min_size(egui::vec2(0.0, height))
+                .align(egui::Align2::LEFT_CENTER),
+        );
+        if response.lost_focus()
+            && ui.input(|input| input.key_pressed(egui::Key::Enter))
+            && !self.toolbar_search.trim().is_empty()
+        {
+            let query = std::mem::take(&mut self.toolbar_search);
+            self.open_search(self.active_index(), query.trim().to_owned(), false);
+        }
+    }
+
+    /// Unread messages and mentions in every window but the active one,
+    /// for the narrow window's switcher button.
+    fn unread_elsewhere(&self) -> (usize, usize) {
+        let (mut unread, mut mentions) = (0, 0);
+        for session in &self.sessions {
+            for target in session.ordered_tabs() {
+                if self.windows.active == Some(WindowKey::new(session.id, target)) {
+                    continue;
+                }
+                match target.and_then(|id| session.conversation_channel(id)) {
+                    Some(channel) => {
+                        unread += channel.unread;
+                        mentions += channel.unread_mentions();
+                    }
+                    None if target.is_none() => unread += session.server_unread,
+                    None => {}
+                }
+            }
+        }
+        (unread, mentions)
+    }
+
+    /// The conversation list down the left side of the window.
+    fn draw_sidebar(&mut self, ui: &mut egui::Ui) {
+        egui::ScrollArea::vertical()
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                self.draw_conversation_rows(ui);
+            });
+    }
+
+    /// Every network's conversations as rows: the active one filled, unread
+    /// ones emphasised with a count, mentions marked. Returns whether a
+    /// conversation was picked, so a menu showing the rows can close.
+    ///
+    /// The rows are drawn straight from the sessions and borrow their names
+    /// from them: nothing is gathered or copied per frame but the network
+    /// labels.
+    fn draw_conversation_rows(&mut self, ui: &mut egui::Ui) -> bool {
+        let palette = super::theme::palette(ui.ctx());
         let mut clicked = None;
         let mut close = None;
         let mut toggle_detach = None;
         let mut info = None;
-        ui.horizontal_wrapped(|ui| {
-            for (n, session) in self.sessions.iter().enumerate() {
-                if n > 0 {
-                    ui.separator();
-                }
-                let label = self.network_label(session);
-                ui.label(RichText::new(format!("{label}:")).strong());
-                for target in session.ordered_tabs() {
-                    let key = WindowKey::new(session.id, target);
-                    let detached = self.windows.get(&key).is_some_and(|w| w.detached);
-                    let text = switchbar_text(session, target, detached);
-                    let selected = self.windows.active.as_ref() == Some(&key);
-                    let mut response = ui.selectable_label(selected, text);
-                    if detached {
-                        response = response.on_hover_text("In its own window");
-                    }
-                    if response.clicked() {
-                        clicked = Some(key);
-                    }
-                    response.context_menu(|ui| {
-                        let detach_label = if detached { "Reattach" } else { "Detach" };
-                        if ui.button(detach_label).clicked() {
-                            toggle_detach = Some(key);
-                            ui.close();
+        let mut join = None;
+        let labels: Vec<String> = self
+            .sessions
+            .iter()
+            .map(|session| self.network_label(session))
+            .collect();
+        let App {
+            sessions,
+            windows,
+            join_row,
+            join_text,
+            join_focus,
+            sidebar_scrolled,
+            ..
+        } = self;
+        for (index, (session, label)) in sessions.iter().zip(&labels).enumerate() {
+            if index > 0 {
+                ui.add_space(10.0);
+            }
+            let connected = session.is_connected();
+            ui.horizontal(|ui| {
+                ui.add_space(10.0);
+                let dot = if session.is_connecting() || session.away_status.is_some() {
+                    palette.mention
+                } else if connected {
+                    palette.online
+                } else {
+                    palette.danger
+                };
+                super::widgets::dot(ui, dot, true);
+                super::widgets::section_label(ui, label);
+            });
+            for target in session.ordered_tabs() {
+                let key = WindowKey::new(session.id, target);
+                let name = match target {
+                    None => "Status",
+                    Some(id) => match session.target_name(id) {
+                        Some(name) => name,
+                        None => continue,
+                    },
+                };
+                let channel = target.and_then(|id| session.conversation_channel(id));
+                let unread = match target {
+                    None => session.server_unread,
+                    Some(_) => channel.map_or(0, |channel| channel.unread),
+                };
+                let mentions = channel.map_or(0, |channel| channel.unread_mentions());
+                let detached = windows.get(&key).is_some_and(|w| w.detached);
+                let selected = windows.active.as_ref() == Some(&key);
+                let mut response = super::widgets::list_row(ui, selected, name, |ui| {
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if mentions > 0 {
+                            super::widgets::badge(ui, &format!("@ {mentions}"), palette.mention);
+                        } else if unread > 0 {
+                            super::widgets::badge(ui, &unread.to_string(), palette.accent);
                         }
-                        if let Some(name) = target.and_then(|id| session.target_name(id))
-                            && session.is_channel_name(name)
-                            && ui.button("Channel Info").clicked()
-                        {
-                            info = Some(key);
-                            ui.close();
-                        }
-                        let close_label = match target.and_then(|id| session.target_name(id)) {
-                            None => "Disconnect and close",
-                            Some(name) if session.tab_close_needs_part(name) => "Part",
-                            Some(_) => "Close",
-                        };
-                        if ui.button(close_label).clicked() {
-                            close = Some(key);
-                            ui.close();
-                        }
+                        ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                            let mut text = if selected || unread > 0 {
+                                super::widgets::strong(name).color(palette.text)
+                            } else {
+                                RichText::new(name).color(palette.muted)
+                            };
+                            // Detached windows are set in italics: a marker
+                            // glyph would depend on the fonts installed.
+                            if detached {
+                                text = text.italics();
+                            }
+                            super::widgets::truncated(ui, text);
+                        });
                     });
+                });
+                if detached {
+                    response = response.on_hover_text("In its own window");
+                }
+                if selected && *sidebar_scrolled != Some(key) {
+                    response.scroll_to_me(None);
+                    *sidebar_scrolled = Some(key);
+                }
+                if response.clicked() {
+                    clicked = Some(key);
+                }
+                response.context_menu(|ui| {
+                    let detach_label = if detached { "Reattach" } else { "Detach" };
+                    if ui.button(detach_label).clicked() {
+                        toggle_detach = Some(key);
+                        ui.close();
+                    }
+                    if target.is_some()
+                        && session.is_channel_name(name)
+                        && ui.button("Channel Info").clicked()
+                    {
+                        info = Some(key);
+                        ui.close();
+                    }
+                    let close_label = match target {
+                        None => "Disconnect and close",
+                        Some(_) if session.tab_close_needs_part(name) => "Part",
+                        Some(_) => "Close",
+                    };
+                    if ui.button(close_label).clicked() {
+                        close = Some(key);
+                        ui.close();
+                    }
+                });
+            }
+            if !connected {
+                // No field waits for a reconnect.
+                if *join_row == Some(session.id) {
+                    *join_row = None;
+                }
+                continue;
+            }
+            if *join_row == Some(session.id) {
+                let height = super::theme::control_height(ui);
+                let response = ui.add(
+                    egui::TextEdit::singleline(join_text)
+                        .hint_text("#channel")
+                        .desired_width(f32::INFINITY)
+                        .min_size(egui::vec2(0.0, height))
+                        .align(egui::Align2::LEFT_CENTER),
+                );
+                if std::mem::take(join_focus) {
+                    response.request_focus();
+                } else if response.lost_focus() {
+                    // Enter joins; Escape or a click elsewhere cancels.
+                    if ui.input(|input| input.key_pressed(egui::Key::Enter)) {
+                        join = Some((index, std::mem::take(join_text)));
+                    }
+                    *join_row = None;
+                    join_text.clear();
+                }
+            } else {
+                let response = super::widgets::list_row(ui, false, "Join a channel", |ui| {
+                    ui.label(RichText::new("+").color(palette.muted));
+                    ui.label(RichText::new("Join a channel").color(palette.muted));
+                });
+                if response.clicked() {
+                    *join_row = Some(session.id);
+                    join_text.clear();
+                    *join_focus = true;
                 }
             }
-        });
+        }
+        if let Some((index, text)) = join {
+            self.sessions[index].join_typed_channel(&text);
+        }
         if let Some(key) = clicked {
             self.user_activate(key);
             self.focus_detached(ui.ctx(), &key);
@@ -2447,6 +2802,7 @@ impl App {
         if let Some(key) = close {
             self.request_close(key);
         }
+        clicked.is_some()
     }
 
     pub(crate) fn toggle_detached(&mut self, key: &WindowKey) {
@@ -2523,40 +2879,35 @@ impl App {
             });
             return;
         };
-        let title = self.window_title(&key);
         let mut action = None;
         let mut restore = None;
-        ui.horizontal(|ui| {
-            ui.label(RichText::new(&title).strong());
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui
-                    .small_button("✕")
-                    .on_hover_text("Close (Ctrl+W)")
-                    .clicked()
-                {
-                    action = Some(WindowAction::Close);
-                }
-                if ui
-                    .small_button("Detach")
-                    .on_hover_text("Open in its own window")
-                    .clicked()
-                {
-                    action = Some(WindowAction::Detach);
-                }
-                // Resting on it opens the snap layouts, as on a floating
-                // window's maximize button.
-                let response = ui.small_button("Restore");
-                if response.clicked() {
-                    action = Some(WindowAction::Restore);
-                }
-                restore = Some(response);
-            });
+        // The window's controls close the header row the window draws.
+        self.draw_window_contents(ui, &key, &mut |ui| {
+            if ui
+                .small_button("✕")
+                .on_hover_text("Close (Ctrl+W)")
+                .clicked()
+            {
+                action = Some(WindowAction::Close);
+            }
+            if ui
+                .small_button("Detach")
+                .on_hover_text("Open in its own window")
+                .clicked()
+            {
+                action = Some(WindowAction::Detach);
+            }
+            // Resting on it opens the snap layouts, as on a floating
+            // window's maximize button.
+            let response = ui.small_button("Restore");
+            if response.clicked() {
+                action = Some(WindowAction::Restore);
+            }
+            restore = Some(response);
         });
         if let Some(restore) = restore {
             self.track_maximize_hover(ui.ctx(), &key, &restore);
         }
-        ui.separator();
-        self.draw_window_contents(ui, &key);
         match action {
             Some(WindowAction::Close) => self.request_close(key),
             Some(WindowAction::Detach) => self.toggle_detached(&key),
@@ -2640,7 +2991,7 @@ impl App {
             };
             let shown = window.show(ctx, |ui| {
                 let action = self.draw_caption(ui, key, active);
-                self.draw_window_contents(ui, key);
+                self.draw_window_contents(ui, key, &mut |_| {});
                 action
             });
             if let Some(shown) = shown {
@@ -2790,7 +3141,7 @@ impl App {
                     });
                 }
                 egui::CentralPanel::default().show(ui, |ui| {
-                    self.draw_window_contents(ui, &key);
+                    self.draw_window_contents(ui, &key, &mut |_| {});
                 });
                 self.draw_activity(ui.ctx(), Some(key));
                 self.show_detached_window_dialogs(ui.ctx(), &key);
@@ -2889,7 +3240,14 @@ impl App {
 
     /// Draw one window's contents (topic, user list, scrollback, input) for
     /// its session, with the window's input line swapped in.
-    pub(crate) fn draw_window_contents(&mut self, ui: &mut egui::Ui, key: &WindowKey) {
+    /// Draw one window's header, people list, scrollback and input line.
+    /// `controls` adds the window's own buttons at the right of its header.
+    pub(crate) fn draw_window_contents(
+        &mut self,
+        ui: &mut egui::Ui,
+        key: &WindowKey,
+        controls: &mut dyn FnMut(&mut egui::Ui),
+    ) {
         let Some(index) = self.session_index(key.conn) else {
             return;
         };
@@ -2900,6 +3258,8 @@ impl App {
             return;
         }
         let view_is_active = self.windows.active == Some(*key);
+        let network = self.network_label(&self.sessions[index]);
+        let narrow = narrow(ui.ctx());
         let App {
             sessions, windows, ..
         } = self;
@@ -2916,7 +3276,7 @@ impl App {
                     s.show_channel_info,
                 );
                 s.view_is_active = view_is_active;
-                s.draw_target(ui);
+                s.draw_target(ui, &network, narrow, controls);
                 s.handle_message_actions();
                 (
                     !before.0 && s.show_color_picker,
@@ -3570,11 +3930,11 @@ pub(crate) fn detached_viewport_id(key: &WindowKey) -> egui::ViewportId {
 /// How the toolbar is arranged in the width at hand.
 #[derive(Clone, Copy, Debug, Default, PartialEq, PartialOrd)]
 enum ToolbarRows {
-    /// Too narrow for the controls beside the name: everything wraps.
+    /// Too narrow for the controls beside the connection: everything wraps.
     Wrapped,
-    /// The controls share the name's row; the status line goes below.
+    /// The controls share the connection's row; the status line goes below.
     Two,
-    /// Name and status at the left, controls at the right.
+    /// Connection and status at the left, controls at the right.
     #[default]
     One,
 }
@@ -3583,7 +3943,7 @@ enum ToolbarRows {
 #[derive(Clone, Copy, Debug, Default)]
 struct ToolbarFit {
     rows: ToolbarRows,
-    heading: f32,
+    connection: f32,
     status: f32,
     controls: f32,
 }
@@ -3602,9 +3962,9 @@ fn toolbar_rows(fit: Option<ToolbarFit>, available: f32, spacing: f32) -> Toolba
         let slack = if rows > fit.rows { SLACK } else { 0.0 };
         width + slack <= available
     };
-    // Name, separator, status and controls, with a gap between each.
-    let one_row = fit.heading + fit.status + fit.controls + 4.0 * spacing;
-    let two_rows = fit.heading + fit.controls + spacing;
+    // Connection, status and controls, with room for the gaps between.
+    let one_row = fit.connection + fit.status + fit.controls + 4.0 * spacing;
+    let two_rows = fit.connection + fit.controls + spacing;
     if fits(ToolbarRows::One, one_row) {
         ToolbarRows::One
     } else if fits(ToolbarRows::Two, two_rows) {
@@ -3614,59 +3974,10 @@ fn toolbar_rows(fit: Option<ToolbarFit>, available: f32, spacing: f32) -> Toolba
     }
 }
 
-/// Switchbar button text, coloured like the old sidebar: unread channels
-/// green, unread queries orange, unread status yellow, queries light blue.
-fn switchbar_text(session: &Session, target: Option<ConversationId>, detached: bool) -> RichText {
-    let text = switchbar_label(session, target);
-    // Detached windows are set in italics: a marker glyph would depend on
-    // the fonts installed.
-    if detached { text.italics() } else { text }
-}
-
-fn switchbar_label(session: &Session, target: Option<ConversationId>) -> RichText {
-    let marker = "";
-    match target {
-        None => {
-            let unread = session.server_unread;
-            let label = if unread > 0 {
-                format!("Status ({unread}){marker}")
-            } else {
-                format!("Status{marker}")
-            };
-            if unread > 0 {
-                RichText::new(label)
-                    .strong()
-                    .color(Color32::from_rgb(255, 255, 100))
-            } else {
-                RichText::new(label)
-            }
-        }
-        Some(id) => {
-            let Some(name) = session.target_name(id) else {
-                return RichText::new("");
-            };
-            let unread = session
-                .conversation_channel(id)
-                .map(|c| c.unread)
-                .unwrap_or(0);
-            let is_query = !session.is_channel_name(name);
-            let label = if unread > 0 {
-                format!("{name} ({unread}){marker}")
-            } else {
-                format!("{name}{marker}")
-            };
-            match (unread > 0, is_query) {
-                (true, true) => RichText::new(label)
-                    .strong()
-                    .color(Color32::from_rgb(255, 150, 50)),
-                (true, false) => RichText::new(label)
-                    .strong()
-                    .color(Color32::from_rgb(100, 255, 100)),
-                (false, true) => RichText::new(label).color(Color32::from_rgb(150, 200, 255)),
-                (false, false) => RichText::new(label),
-            }
-        }
-    }
+/// Whether the window is too narrow for the sidebar: the top bar then
+/// carries a switcher button instead, and the people list starts hidden.
+pub(crate) fn narrow(ctx: &egui::Context) -> bool {
+    ctx.content_rect().width() < 720.0
 }
 
 /// Run `f` with `session` pointed at `target` and the window's input line,
@@ -3719,6 +4030,7 @@ fn swap_view(session: &mut Session, view: &mut TargetView) {
     std::mem::swap(&mut session.history_temp, &mut view.history_temp);
     std::mem::swap(&mut session.tab_completion, &mut view.tab_completion);
     std::mem::swap(&mut session.selected_user, &mut view.selected_user);
+    std::mem::swap(&mut session.people_hidden, &mut view.people_hidden);
     std::mem::swap(
         &mut session.input_focus_request,
         &mut view.input_focus_request,
@@ -4799,7 +5111,7 @@ mod tests {
     }
 
     #[test]
-    fn switchbar_order_matches_ctrl_tab_order() {
+    fn sidebar_order_matches_ctrl_tab_order() {
         let (mut app, _rx_a, _rx_b) = two_networks();
         feed(&mut app, 0, ":me!u@h JOIN #alpha");
         app.sync_windows();
@@ -5935,7 +6247,7 @@ mod tests {
     }
 
     #[test]
-    fn a_maximized_frame_draws_the_active_window_and_the_switchbar() {
+    fn a_maximized_frame_draws_the_active_window_and_the_sidebar() {
         let (mut app, _rx_a, _rx_b) = two_networks();
         feed(&mut app, 1, ":bob!u@h PRIVMSG #debian :apt is fine");
         let debian = target_key(&app, app.sessions[1].id, "#debian");
@@ -5945,10 +6257,7 @@ mod tests {
         let output = frame(&mut app, &ctx);
         let texts = texts(&output);
         assert!(texts.iter().any(|t| t.contains("apt is fine")), "{texts:?}");
-        assert!(
-            texts.iter().any(|t| t.contains("#rust")),
-            "switchbar missing"
-        );
+        assert!(texts.iter().any(|t| t.contains("#rust")), "sidebar missing");
     }
 
     #[test]
@@ -5992,7 +6301,7 @@ mod tests {
         app.layout_dirty_since = None;
         app.windows.dirty = false;
 
-        // A restored minimized-size window: the toolbar and switchbar leave
+        // A restored minimized-size window: the top bar and sidebar leave
         // the chat area no height.
         for size in [egui::vec2(160.0, 30.0), egui::vec2(1024.0, 60.0)] {
             for _ in 0..3 {
@@ -6589,7 +6898,7 @@ mod tests {
         let ctx = egui::Context::default();
         let mut time = floating_windows(&mut app, &ctx);
         let key = app.windows.active.unwrap();
-        let placed = egui::Rect::from_min_max(egui::pos2(300.0, 200.0), egui::pos2(700.0, 600.0));
+        let placed = egui::Rect::from_min_max(egui::pos2(400.0, 200.0), egui::pos2(800.0, 600.0));
         app.windows.place(&key, placed);
         for _ in 0..3 {
             pointer_frame(&mut app, &ctx, time, vec![]);
@@ -6660,7 +6969,7 @@ mod tests {
         ));
         frame(&mut app, &ctx);
         let area = app.windows.area.unwrap();
-        assert!(area.width() > 900.0, "area not followed while maximized");
+        assert!(area.width() > 700.0, "area not followed while maximized");
         let key = app.windows.active.unwrap();
         let target = snap::SnapTarget::layout(area, 0, 0);
         app.snap_window(&key, target.clone());
@@ -7143,63 +7452,128 @@ mod tests {
         assert_eq!(app.sessions[0].server_unread, 1);
     }
 
-    /// Where each painted text landed after a few frames at this width.
-    fn text_rects_at_width(app: &mut App, width: f32) -> Vec<(String, egui::Rect)> {
-        fn collect(shape: &egui::Shape, out: &mut Vec<(String, egui::Rect)>) {
+    /// What one frame painted: every text with its rectangle and colour,
+    /// and every filled rectangle.
+    struct Painted {
+        texts: Vec<(String, egui::Rect, Color32)>,
+        fills: Vec<(egui::Rect, Color32)>,
+        /// Centre, fill and outline width of every circle.
+        circles: Vec<(egui::Pos2, Color32, f32)>,
+    }
+
+    impl Painted {
+        fn text(&self, text: &str) -> (egui::Rect, Color32) {
+            self.texts
+                .iter()
+                .find(|(painted, _, _)| painted == text)
+                .map(|(_, rect, color)| (*rect, *color))
+                .unwrap_or_else(|| panic!("{text:?} was not painted: {:?}", self.strings()))
+        }
+
+        fn containing(&self, part: &str) -> (String, egui::Rect, Color32) {
+            self.texts
+                .iter()
+                .find(|(painted, _, _)| painted.contains(part))
+                .cloned()
+                .unwrap_or_else(|| panic!("no text with {part:?}: {:?}", self.strings()))
+        }
+
+        fn has(&self, text: &str) -> bool {
+            self.texts.iter().any(|(painted, _, _)| painted == text)
+        }
+
+        fn strings(&self) -> Vec<&str> {
+            self.texts
+                .iter()
+                .map(|(text, _, _)| text.as_str())
+                .collect()
+        }
+    }
+
+    /// Run one frame of the app at this window width and collect what it
+    /// painted.
+    fn paint(app: &mut App, ctx: &egui::Context, width: f32, events: Vec<egui::Event>) -> Painted {
+        fn collect(shape: &egui::Shape, out: &mut Painted) {
             match shape {
-                egui::Shape::Text(text) => out.push((
-                    text.galley.text().to_string(),
-                    egui::Rect::from_min_size(text.pos, text.galley.size()),
-                )),
+                egui::Shape::Text(text) => {
+                    let color = text
+                        .galley
+                        .job
+                        .sections
+                        .first()
+                        .map(|section| section.format.color)
+                        .filter(|color| *color != Color32::PLACEHOLDER)
+                        .unwrap_or(text.fallback_color);
+                    // A right-aligned galley extends to the left of its
+                    // position.
+                    out.texts.push((
+                        text.galley.text().to_string(),
+                        text.galley.rect.translate(text.pos.to_vec2()),
+                        color,
+                    ));
+                }
+                egui::Shape::Rect(rect) => out.fills.push((rect.rect, rect.fill)),
+                egui::Shape::Circle(circle) => {
+                    out.circles
+                        .push((circle.center, circle.fill, circle.stroke.width));
+                }
                 egui::Shape::Vec(shapes) => shapes.iter().for_each(|s| collect(s, out)),
                 _ => {}
             }
         }
-        let ctx = egui::Context::default();
-        let mut out = Vec::new();
-        for _ in 0..3 {
-            let mut output = ctx.run_ui(
-                egui::RawInput {
-                    screen_rect: Some(egui::Rect::from_min_size(
-                        egui::Pos2::ZERO,
-                        egui::vec2(width, 768.0),
-                    )),
-                    ..Default::default()
-                },
-                |ui| app.ui(ui),
-            );
-            output.textures_delta.clear();
-            out.clear();
-            for clipped in &output.shapes {
-                collect(&clipped.shape, &mut out);
-            }
+        let mut output = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(width, 768.0),
+                )),
+                events,
+                ..Default::default()
+            },
+            |ui| app.ui(ui),
+        );
+        output.textures_delta.clear();
+        let mut painted = Painted {
+            texts: Vec::new(),
+            fills: Vec::new(),
+            circles: Vec::new(),
+        };
+        for clipped in &output.shapes {
+            collect(&clipped.shape, &mut painted);
         }
-        out
+        painted
     }
 
-    fn rect_of(rects: &[(String, egui::Rect)], text: &str) -> egui::Rect {
-        rects
-            .iter()
-            .find(|(painted, _)| painted == text)
-            .unwrap_or_else(|| panic!("{text:?} was not painted"))
-            .1
+    /// `paint` after enough frames for measured layouts to settle.
+    fn settled(app: &mut App, ctx: &egui::Context, width: f32) -> Painted {
+        paint(app, ctx, width, Vec::new());
+        paint(app, ctx, width, Vec::new());
+        paint(app, ctx, width, Vec::new())
     }
 
-    const TOOLBAR_CONTROLS: [&str; 6] = [
-        "Join",
-        "Disconnect",
-        "Search",
-        "Activity",
-        "Window",
-        "Settings",
-    ];
+    fn click(app: &mut App, ctx: &egui::Context, width: f32, pos: egui::Pos2) -> Painted {
+        let button = |pressed| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        paint(
+            app,
+            ctx,
+            width,
+            vec![egui::Event::PointerMoved(pos), button(true)],
+        );
+        paint(app, ctx, width, vec![button(false)]);
+        settled(app, ctx, width)
+    }
 
     #[test]
     fn the_toolbar_arrangement_needs_slack_to_grow_but_none_to_shrink() {
         let fit = |rows| {
             Some(ToolbarFit {
                 rows,
-                heading: 100.0,
+                connection: 100.0,
                 status: 400.0,
                 controls: 600.0,
             })
@@ -7222,7 +7596,7 @@ mod tests {
             toolbar_rows(fit(ToolbarRows::Two), 1156.0, 8.0),
             ToolbarRows::One
         );
-        // Name and controls need 100 + 600 + 8 = 708.
+        // The connection button and the controls need 100 + 600 + 8 = 708.
         assert_eq!(
             toolbar_rows(fit(ToolbarRows::Two), 708.0, 8.0),
             ToolbarRows::Two
@@ -7242,76 +7616,1275 @@ mod tests {
     }
 
     #[test]
-    fn a_wide_toolbar_is_one_row_with_the_controls_at_the_right() {
+    fn the_top_bar_puts_connection_left_and_search_activity_window_settings_right() {
         let (mut app, _rx_a, _rx_b) = two_networks();
-        let rects = text_rects_at_width(&mut app, 1600.0);
-        let name = rect_of(&rects, "Linefeed");
-        let status = rect_of(&rects, "Connected · not authenticated");
-        assert!(name.left() < 20.0, "{name:?}");
-        let mut left = status.right();
-        for control in TOOLBAR_CONTROLS {
-            let rect = rect_of(&rects, control);
+        let ctx = egui::Context::default();
+        let painted = settled(&mut app, &ctx, 1360.0);
+        let label = app.network_label(&app.sessions[app.active_index()]);
+        let (_, connection, _) = painted.containing(&label);
+        assert!(connection.left() < 40.0, "{connection:?}");
+        let mut left = 680.0;
+        for text in ["Search history (Ctrl+F)", "Activity", "Window", "Settings"] {
+            let (rect, _) = painted.text(text);
+            assert!(rect.left() > left, "{text} follows in order: {rect:?}");
             assert!(
-                (rect.center().y - status.center().y).abs() < 6.0,
-                "{control} shares the status row: {rect:?} vs {status:?}"
+                (rect.center().y - connection.center().y).abs() < 8.0,
+                "{text} shares the connection's row: {rect:?} vs {connection:?}"
             );
-            assert!(rect.left() > left, "{control} follows in order: {rect:?}");
             left = rect.right();
         }
-        assert!(
-            left > 1600.0 - 24.0,
-            "Settings ends at the right edge: {left}"
-        );
-        assert!(
-            rect_of(&rects, "Join").left() > 800.0,
-            "the controls sit in the right half, not beside the name"
-        );
+        assert!(left > 1360.0 - 32.0, "Settings ends at the right: {left}");
+        for gone in ["Linefeed", "Disconnect", "Connect", "Join", "Search"] {
+            assert!(!painted.has(gone), "{gone} is no longer on the bar");
+        }
     }
 
     #[test]
-    fn a_default_width_toolbar_keeps_the_controls_right_and_moves_status_below() {
+    fn disconnect_and_new_connection_live_in_the_connection_menu() {
         let (mut app, _rx_a, _rx_b) = two_networks();
-        let rects = text_rects_at_width(&mut app, 1024.0);
-        let name = rect_of(&rects, "Linefeed");
-        let settings = rect_of(&rects, "Settings");
-        let status = rect_of(&rects, "Connected · not authenticated");
-        assert!(settings.right() > 1024.0 - 24.0, "{settings:?}");
-        assert!(
-            (settings.center().y - name.center().y).abs() < 8.0,
-            "the controls share the name's row: {settings:?} vs {name:?}"
-        );
-        assert!(
-            status.top() > settings.bottom() - 2.0,
-            "the status line is the second row: {status:?} vs {settings:?}"
-        );
-        for control in TOOLBAR_CONTROLS {
-            let rect = rect_of(&rects, control);
+        let ctx = egui::Context::default();
+        let painted = settled(&mut app, &ctx, 1360.0);
+        let label = app.network_label(&app.sessions[app.active_index()]);
+        let (_, connection, _) = painted.containing(&label);
+        let painted = click(&mut app, &ctx, 1360.0, connection.center());
+        assert!(painted.has("Disconnect"), "{:?}", painted.strings());
+        assert!(painted.has("New connection..."));
+
+        let (disconnect, _) = painted.text("Disconnect");
+        click(&mut app, &ctx, 1360.0, disconnect.center());
+        let active = app.active_index();
+        assert!(!app.sessions[active].is_connected() || app.sessions[active].is_closing());
+    }
+
+    #[test]
+    fn the_status_line_says_whether_the_connection_is_encrypted_and_signed_in() {
+        use crate::irc::client::{AuthenticationStatus, TlsStatus};
+        let (mut app, _rx_a, _rx_b) = two_networks();
+        let ctx = egui::Context::default();
+        let active = app.active_index();
+        app.sessions[active].connection_status.tls = TlsStatus::Plaintext;
+        let painted = settled(&mut app, &ctx, 1360.0);
+        let (text, _, color) = painted.containing("Not encrypted");
+        assert_eq!(color, super::super::theme::palette(&ctx).mention, "{text}");
+
+        app.sessions[active].connection_status.tls = TlsStatus::Verified;
+        app.sessions[active].connection_status.authentication = AuthenticationStatus::LoggedIn {
+            account: "alice".into(),
+        };
+        app.sessions[active].lag_ms = Some(45);
+        let painted = settled(&mut app, &ctx, 1360.0);
+        let (text, _, color) = painted.containing("Encrypted");
+        assert_eq!(text, "Encrypted · signed in as alice · 45 ms");
+        assert_eq!(color, super::super::theme::palette(&ctx).muted);
+    }
+
+    #[test]
+    fn top_bar_controls_are_as_tall_as_the_spacing_setting_says() {
+        use super::super::theme::{self, Density, DisplayPrefs};
+        let (mut app, _rx_a, _rx_b) = two_networks();
+        let ctx = egui::Context::default();
+        for (density, height) in [(Density::Comfortable, 44.0), (Density::Compact, 32.0)] {
+            theme::apply(
+                &ctx,
+                &DisplayPrefs {
+                    density,
+                    ..DisplayPrefs::default()
+                },
+            );
+            let painted = settled(&mut app, &ctx, 1360.0);
+            let (hint, _) = painted.text("Search history (Ctrl+F)");
+            let field = painted
+                .fills
+                .iter()
+                .find(|(rect, fill)| *fill == theme::palette(&ctx).bg && rect.contains_rect(hint))
+                .unwrap_or_else(|| panic!("no search field behind {hint:?}"))
+                .0;
+            assert_eq!(field.height(), height);
             assert!(
-                rect.left() > name.right() && rect.right() <= 1024.0,
-                "{control}: {rect:?}"
+                field.width() <= 280.0 && field.width() >= 200.0,
+                "{field:?}"
             );
         }
     }
 
     #[test]
-    fn a_narrow_toolbar_wraps_inside_the_window() {
+    fn enter_in_the_search_field_opens_history_search() {
         let (mut app, _rx_a, _rx_b) = two_networks();
-        let rects = text_rects_at_width(&mut app, 640.0);
-        for text in TOOLBAR_CONTROLS
-            .into_iter()
-            .chain(["Linefeed", "Connected · not authenticated"])
-        {
-            let rect = rect_of(&rects, text);
+        let ctx = egui::Context::default();
+        let painted = settled(&mut app, &ctx, 1360.0);
+        let (hint, _) = painted.text("Search history (Ctrl+F)");
+        click(&mut app, &ctx, 1360.0, hint.center());
+        paint(
+            &mut app,
+            &ctx,
+            1360.0,
+            vec![egui::Event::Text("apt".into())],
+        );
+        assert!(!app.search.open);
+        paint(
+            &mut app,
+            &ctx,
+            1360.0,
+            vec![egui::Event::Key {
+                key: egui::Key::Enter,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        );
+        assert!(app.search.open);
+        assert!(app.toolbar_search.is_empty(), "the field is cleared");
+    }
+
+    #[test]
+    fn a_narrow_top_bar_wraps_inside_the_window_and_widens_back_to_one_row() {
+        let (mut app, _rx_a, _rx_b) = two_networks();
+        let ctx = egui::Context::default();
+        let painted = settled(&mut app, &ctx, 640.0);
+        let label = app.network_label(&app.sessions[app.active_index()]);
+        for text in ["Activity", "Window", "Settings"] {
+            let (rect, _) = painted.text(text);
             assert!(
                 rect.left() >= 0.0 && rect.right() <= 640.0,
-                "{text} stays inside a 640 px window: {rect:?}"
+                "{text}: {rect:?}"
             );
         }
-        // Widening again restores the single row.
-        let rects = text_rects_at_width(&mut app, 1600.0);
-        let status = rect_of(&rects, "Connected · not authenticated");
-        let settings = rect_of(&rects, "Settings");
-        assert!((settings.center().y - status.center().y).abs() < 6.0);
+        let (_, connection, _) = painted.containing(&label);
+        assert!(connection.right() <= 640.0, "{connection:?}");
+
+        let painted = settled(&mut app, &ctx, 1600.0);
+        let (_, status, _) = painted.containing("signed in");
+        let (settings, _) = painted.text("Settings");
+        assert!((settings.center().y - status.center().y).abs() < 8.0);
+    }
+
+    /// The sidebar's row labels, top to bottom.
+    fn sidebar_rows(painted: &Painted) -> Vec<String> {
+        let mut rows: Vec<(f32, String)> = painted
+            .texts
+            .iter()
+            .filter(|(text, rect, _)| {
+                rect.right() <= 248.0
+                    && rect.top() > 30.0
+                    && (text == "Status" || text.starts_with('#'))
+            })
+            .map(|(text, rect, _)| (rect.top(), text.clone()))
+            .collect();
+        rows.sort_by(|a, b| a.0.total_cmp(&b.0));
+        rows.into_iter().map(|(_, text)| text).collect()
+    }
+
+    #[test]
+    fn the_sidebar_lists_every_window_in_ctrl_tab_order() {
+        let (mut app, _rx_a, _rx_b) = two_networks();
+        feed(&mut app, 0, ":me!u@h JOIN #alpha");
+        app.sync_windows();
+        let ctx = egui::Context::default();
+        let painted = settled(&mut app, &ctx, 1360.0);
+        assert_eq!(
+            sidebar_rows(&painted),
+            ["Status", "#alpha", "#rust", "Status", "#debian"]
+        );
+        // Each network is headed by its name.
+        let first = app.network_label(&app.sessions[0]).to_uppercase();
+        let second = app.network_label(&app.sessions[1]).to_uppercase();
+        let (heading_a, _) = painted.text(&first);
+        let (heading_b, _) = painted.text(&second);
+        let (rust, _) = painted.text("#rust");
+        assert!(heading_a.top() < rust.top() && rust.top() < heading_b.top());
+    }
+
+    #[test]
+    fn sidebar_badges_show_unread_counts_and_mark_mentions() {
+        let (mut app, _rx_a, _rx_b) = two_networks();
+        let debian = target_key(&app, app.sessions[1].id, "#debian");
+        app.user_activate(debian);
+        let ctx = egui::Context::default();
+        settled(&mut app, &ctx, 1360.0);
+        for text in ["one", "two", "three"] {
+            feed(&mut app, 0, &format!(":bob!u@h PRIVMSG #rust :{text}"));
+        }
+        let painted = settled(&mut app, &ctx, 1360.0);
+        let (rust, _) = painted.text("#rust");
+        let (count, _) = painted.text("3");
+        assert!(
+            (count.center().y - rust.center().y).abs() < 8.0,
+            "{count:?}"
+        );
+        assert!(count.right() <= 248.0 && count.left() > rust.right());
+        let accent = super::super::theme::palette(&ctx).accent;
+        assert!(
+            painted
+                .fills
+                .iter()
+                .any(|(rect, fill)| *fill == accent && rect.contains_rect(count))
+        );
+
+        feed(&mut app, 0, ":bob!u@h PRIVMSG #rust :me: are you there?");
+        let painted = settled(&mut app, &ctx, 1360.0);
+        let (mention, _) = painted.text("@ 1");
+        let mention_fill = super::super::theme::palette(&ctx).mention;
+        assert!(
+            painted
+                .fills
+                .iter()
+                .any(|(rect, fill)| *fill == mention_fill && rect.contains_rect(mention))
+        );
+        assert!(
+            !painted.has("4"),
+            "a mention badge replaces the plain count"
+        );
+    }
+
+    #[test]
+    fn clicking_a_sidebar_row_activates_its_window() {
+        let (mut app, _rx_a, _rx_b) = two_networks();
+        let rust = target_key(&app, app.sessions[0].id, "#rust");
+        let debian = target_key(&app, app.sessions[1].id, "#debian");
+        app.user_activate(rust);
+        let ctx = egui::Context::default();
+        let painted = settled(&mut app, &ctx, 1360.0);
+        let (row, _) = painted.text("#debian");
+        click(&mut app, &ctx, 1360.0, row.center());
+        assert_eq!(app.windows.active, Some(debian));
+    }
+
+    #[test]
+    fn a_long_channel_name_is_cut_inside_the_sidebar() {
+        let (mut app, _rx_a, _rx_b) = two_networks();
+        let long = format!("#{}", "x".repeat(200));
+        feed(&mut app, 0, &format!(":me!u@h JOIN {long}"));
+        app.sync_windows();
+        let ctx = egui::Context::default();
+        let painted = settled(&mut app, &ctx, 1360.0);
+        let (_, row, _) = painted.containing("#xxxx");
+        assert!(row.right() <= 248.0, "{row:?}");
+        // The panel kept its width: the search field is where it was.
+        let (hint, _) = painted.text("Search history (Ctrl+F)");
+        assert!(hint.left() > 680.0);
+    }
+
+    #[test]
+    fn the_active_row_is_scrolled_into_view() {
+        let (mut app, _rx_a, _rx_b) = two_networks();
+        for n in 0..80 {
+            assert!(app.sessions[0].open_query(&format!("q{n:02}")));
+        }
+        app.sync_windows();
+        let in_sidebar = |painted: &Painted| {
+            painted
+                .texts
+                .iter()
+                .find(|(text, rect, _)| text == "q79" && rect.right() <= 248.0)
+                .map(|(_, rect, _)| *rect)
+        };
+        let ctx = egui::Context::default();
+        // The list scrolls over a few frames.
+        let after_scrolling = |app: &mut App| {
+            for _ in 0..60 {
+                paint(app, &ctx, 1360.0, Vec::new());
+            }
+            settled(app, &ctx, 1360.0)
+        };
+        let status = WindowKey::new(app.sessions[0].id, None);
+        app.user_activate(status);
+        let painted = after_scrolling(&mut app);
+        assert!(
+            in_sidebar(&painted).is_none(),
+            "the last row starts below the window"
+        );
+        let last = target_key(&app, app.sessions[0].id, "q79");
+        app.user_activate(last);
+        let painted = after_scrolling(&mut app);
+        let row = in_sidebar(&painted).expect("the active row is in view");
+        assert!(row.top() > 30.0 && row.bottom() <= 768.0, "{row:?}");
+    }
+
+    #[test]
+    fn below_720_px_the_sidebar_becomes_a_switcher_button() {
+        let (mut app, _rx_a, _rx_b) = two_networks();
+        let rust = target_key(&app, app.sessions[0].id, "#rust");
+        app.user_activate(rust);
+        let ctx = egui::Context::default();
+        let painted = settled(&mut app, &ctx, 640.0);
+        assert!(
+            !painted.has("Join a channel"),
+            "no sidebar: {:?}",
+            painted.strings()
+        );
+        assert!(!painted.has("#debian"));
+        let label = app.network_label(&app.sessions[0]);
+        let (title, switcher, _) = painted.containing(&format!("#rust on {label}"));
+        assert!(switcher.top() < 60.0, "{title}: {switcher:?}");
+
+        let painted = click(&mut app, &ctx, 640.0, switcher.center());
+        assert!(painted.has("#debian") && painted.has("Join a channel"));
+        assert!(painted.has("Disconnect"));
+        let (row, _) = painted.text("#debian");
+        click(&mut app, &ctx, 640.0, row.center());
+        let debian = target_key(&app, app.sessions[1].id, "#debian");
+        assert_eq!(app.windows.active, Some(debian));
+    }
+
+    #[test]
+    fn join_a_channel_sends_a_join() {
+        let (mut app, mut rx_a, _rx_b) = two_networks();
+        let ctx = egui::Context::default();
+        let painted = settled(&mut app, &ctx, 1360.0);
+        drain(&mut rx_a);
+        let (join, _) = painted.text("Join a channel");
+        click(&mut app, &ctx, 1360.0, join.center());
+        paint(
+            &mut app,
+            &ctx,
+            1360.0,
+            vec![egui::Event::Text("new".into())],
+        );
+        paint(
+            &mut app,
+            &ctx,
+            1360.0,
+            vec![egui::Event::Key {
+                key: egui::Key::Enter,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+        );
+        let sent = drain(&mut rx_a);
+        assert!(sent.iter().any(|line| line == "JOIN #new"), "{sent:?}");
+        let painted = settled(&mut app, &ctx, 1360.0);
+        assert!(painted.has("Join a channel"), "the row is back to a button");
+    }
+
+    /// `two_networks()` with a topic and a second member in #rust, which is
+    /// the active window.
+    fn rust_with_topic(topic: &str) -> (App, WindowKey) {
+        let (mut app, _rx_a, _rx_b) = two_networks();
+        feed(&mut app, 0, &format!(":srv 332 me #rust :{topic}"));
+        feed(&mut app, 0, ":srv 353 me = #rust :me bob");
+        feed(&mut app, 0, ":srv 366 me #rust :End of /NAMES list.");
+        feed(&mut app, 0, ":bob!u@h PRIVMSG #rust :hello marker");
+        let rust = target_key(&app, app.sessions[0].id, "#rust");
+        app.user_activate(rust);
+        (app, rust)
+    }
+
+    #[test]
+    fn the_header_shows_name_topic_and_people_count_on_one_row() {
+        let (mut app, _rust) = rust_with_topic("Rust talk");
+        let ctx = egui::Context::default();
+        let painted = settled(&mut app, &ctx, 1360.0);
+        let name = painted
+            .texts
+            .iter()
+            .find(|(text, rect, _)| text == "#rust" && rect.left() > 248.0)
+            .expect("the header names the conversation")
+            .1;
+        let (topic, _) = painted.text("Rust talk");
+        let (people, _) = painted.text("2 people");
+        for (what, rect) in [("topic", topic), ("people", people)] {
+            assert!(
+                (rect.center().y - name.center().y).abs() < 8.0,
+                "{what} shares the name's row: {rect:?} vs {name:?}"
+            );
+        }
+        assert!(name.right() <= topic.left() && topic.right() <= people.left());
+        let (close, _) = painted.text("✕");
+        assert!((close.center().y - name.center().y).abs() < 8.0);
+        assert!(close.right() > 1360.0 - 32.0);
+        let strings = painted.strings();
+        assert!(
+            !strings.iter().any(|text| text.starts_with("#rust @ ")),
+            "{strings:?}"
+        );
+        assert!(!strings.contains(&"Topic:"), "{strings:?}");
+    }
+
+    #[test]
+    fn a_long_topic_is_cut_to_one_line() {
+        // The first scrollback row sits right under the header.
+        let ctx = egui::Context::default();
+        let (mut app, _rust) = rust_with_topic("Rust talk");
+        let short = settled(&mut app, &ctx, 1360.0).containing("Now talking").1;
+        let ctx = egui::Context::default();
+        let (mut app, _rust) = rust_with_topic(&"long topic ".repeat(60));
+        let painted = settled(&mut app, &ctx, 1360.0);
+        let long = painted.containing("Now talking").1;
+        assert_eq!(long.top(), short.top(), "the header kept its height");
+        let (people, _) = painted.text("2 people");
+        let header_topic = painted
+            .texts
+            .iter()
+            .find(|(text, rect, _)| {
+                text.contains("long topic long topic")
+                    && (rect.center().y - people.center().y).abs() < 8.0
+            })
+            .expect("the topic is on the header row")
+            .1;
+        assert!(
+            header_topic.right() <= people.left(),
+            "{header_topic:?} vs {people:?}"
+        );
+    }
+
+    fn people_list_shown(painted: &Painted) -> bool {
+        painted
+            .texts
+            .iter()
+            .any(|(text, rect, _)| text == "bob" && rect.left() > 700.0)
+    }
+
+    #[test]
+    fn the_people_button_hides_and_shows_the_list() {
+        let (mut app, _rust) = rust_with_topic("Rust talk");
+        let ctx = egui::Context::default();
+        let painted = settled(&mut app, &ctx, 1360.0);
+        assert!(people_list_shown(&painted), "{:?}", painted.strings());
+        let (people, _) = painted.text("2 people");
+        let painted = click(&mut app, &ctx, 1360.0, people.center());
+        assert!(!people_list_shown(&painted));
+        let (people, _) = painted.text("2 people");
+        let painted = click(&mut app, &ctx, 1360.0, people.center());
+        assert!(people_list_shown(&painted));
+    }
+
+    #[test]
+    fn the_people_list_starts_hidden_in_a_narrow_window() {
+        let (mut app, _rust) = rust_with_topic("Rust talk");
+        let ctx = egui::Context::default();
+        let painted = settled(&mut app, &ctx, 640.0);
+        assert!(
+            !painted
+                .texts
+                .iter()
+                .any(|(text, rect, _)| text == "bob" && rect.left() > 400.0),
+            "{:?}",
+            painted.strings()
+        );
+        let (people, _) = painted.text("2 people");
+        let painted = click(&mut app, &ctx, 640.0, people.center());
+        assert!(
+            painted
+                .texts
+                .iter()
+                .any(|(text, rect, _)| text == "bob" && rect.left() > 400.0)
+        );
+    }
+
+    #[test]
+    fn the_status_window_is_headed_by_status_and_its_network() {
+        let (mut app, _rx_a, _rx_b) = two_networks();
+        let status = WindowKey::new(app.sessions[0].id, None);
+        app.user_activate(status);
+        let ctx = egui::Context::default();
+        let painted = settled(&mut app, &ctx, 1360.0);
+        let label = app.network_label(&app.sessions[0]);
+        let name = painted
+            .texts
+            .iter()
+            .find(|(text, rect, _)| text == "Status" && rect.left() > 248.0)
+            .expect("the header names the status window")
+            .1;
+        let network = painted
+            .texts
+            .iter()
+            .find(|(text, rect, _)| *text == label && rect.left() > name.right())
+            .expect("and its network")
+            .1;
+        assert!((network.center().y - name.center().y).abs() < 8.0);
+    }
+
+    #[test]
+    fn the_chat_area_has_its_own_ground() {
+        let (mut app, _rust) = rust_with_topic("Rust talk");
+        let ctx = egui::Context::default();
+        let painted = settled(&mut app, &ctx, 1360.0);
+        let bg = super::super::theme::palette(&ctx).bg;
+        assert!(
+            painted
+                .fills
+                .iter()
+                .any(|(rect, fill)| *fill == bg && rect.width() > 500.0 && rect.height() > 400.0),
+            "the chat area is not filled with the bg colour"
+        );
+    }
+
+    /// #rust as the active, already drawn window, then these messages.
+    fn rust_with_messages(lines: &[(&str, &str)]) -> (App, egui::Context) {
+        let (mut app, _rx_a, _rx_b) = two_networks();
+        let rust = target_key(&app, app.sessions[0].id, "#rust");
+        app.user_activate(rust);
+        let ctx = egui::Context::default();
+        settled(&mut app, &ctx, 1360.0);
+        for (nick, text) in lines {
+            feed(&mut app, 0, &format!(":{nick}!u@h PRIVMSG #rust :{text}"));
+        }
+        (app, ctx)
+    }
+
+    fn is_time(text: &str) -> bool {
+        let bytes = text.as_bytes();
+        bytes.len() == 5
+            && bytes[2] == b':'
+            && [0, 1, 3, 4].iter().all(|i| bytes[*i].is_ascii_digit())
+    }
+
+    /// What was painted in the message area: right of the sidebar, left of
+    /// the people list, below the header.
+    fn chat_texts(painted: &Painted) -> Vec<(String, egui::Rect, Color32)> {
+        painted
+            .texts
+            .iter()
+            // On screen: rows being measured are laid out far below it.
+            .filter(|(_, rect, _)| {
+                rect.left() > 248.0
+                    && rect.right() < 1100.0
+                    && rect.top() > 60.0
+                    && rect.bottom() <= 768.0
+            })
+            .cloned()
+            .collect()
+    }
+
+    fn chat_text(painted: &Painted, text: &str) -> (egui::Rect, Color32) {
+        chat_texts(painted)
+            .into_iter()
+            .find(|(painted, _, _)| painted == text)
+            .map(|(_, rect, color)| (rect, color))
+            .unwrap_or_else(|| panic!("{text:?} is not in the chat: {:?}", painted.strings()))
+    }
+
+    #[test]
+    fn a_run_of_messages_from_one_person_shows_the_nick_once() {
+        let (mut app, ctx) =
+            rust_with_messages(&[("bob", "one"), ("bob", "two"), ("carol", "three")]);
+        let painted = settled(&mut app, &ctx, 1360.0);
+        let count = |nick: &str| {
+            chat_texts(&painted)
+                .iter()
+                .filter(|(text, _, _)| text == nick)
+                .count()
+        };
+        assert_eq!(count("bob"), 1, "{:?}", painted.strings());
+        assert_eq!(count("carol"), 1);
+        assert_eq!(
+            chat_text(&painted, "one").0.left(),
+            chat_text(&painted, "two").0.left()
+        );
+    }
+
+    #[test]
+    fn a_system_row_breaks_a_run() {
+        let (mut app, ctx) = rust_with_messages(&[("bob", "one")]);
+        feed(&mut app, 0, ":dave!u@h JOIN #rust");
+        feed(&mut app, 0, ":bob!u@h PRIVMSG #rust :two");
+        let painted = settled(&mut app, &ctx, 1360.0);
+        let bobs = chat_texts(&painted)
+            .iter()
+            .filter(|(text, _, _)| text == "bob")
+            .count();
+        assert_eq!(bobs, 2, "{:?}", painted.strings());
+    }
+
+    #[test]
+    fn time_nick_and_text_sit_in_their_columns() {
+        let (mut app, ctx) = rust_with_messages(&[("bob", "one"), ("carol", "three")]);
+        let painted = settled(&mut app, &ctx, 1360.0);
+        let (bob, _) = chat_text(&painted, "bob");
+        let (carol, _) = chat_text(&painted, "carol");
+        assert!(
+            (bob.right() - carol.right()).abs() < 1.0,
+            "nicks end together: {bob:?} {carol:?}"
+        );
+        let (one, _) = chat_text(&painted, "one");
+        let (three, _) = chat_text(&painted, "three");
+        assert_eq!(one.left(), three.left());
+        assert!(
+            (one.left() - bob.right() - 12.0).abs() < 1.5,
+            "{one:?} after {bob:?}"
+        );
+        assert!(
+            (one.center().y - bob.center().y).abs() < 4.0,
+            "nick and text share a line"
+        );
+        let times: Vec<egui::Rect> = chat_texts(&painted)
+            .into_iter()
+            .filter(|(text, _, _)| is_time(text))
+            .map(|(_, rect, _)| rect)
+            .collect();
+        assert!(times.len() >= 2, "{:?}", painted.strings());
+        assert!(times.iter().all(|time| time.left() == times[0].left()));
+        assert!(
+            times
+                .iter()
+                .all(|time| time.right() < carol.left().min(bob.left()))
+        );
+        let palette = super::super::theme::palette(&ctx);
+        assert_eq!(chat_text(&painted, "one").1, palette.text);
+        let time_color = chat_texts(&painted)
+            .into_iter()
+            .find(|(text, _, _)| is_time(text))
+            .unwrap()
+            .2;
+        assert_eq!(time_color, palette.faint);
+    }
+
+    #[test]
+    fn hiding_timestamps_removes_the_time_column() {
+        let (mut app, ctx) = rust_with_messages(&[("bob", "one")]);
+        let with_time = chat_text(&settled(&mut app, &ctx, 1360.0), "one").0;
+        app.sessions[0].timestamp_format = "off".into();
+        let painted = settled(&mut app, &ctx, 1360.0);
+        assert!(
+            !chat_texts(&painted)
+                .iter()
+                .any(|(text, _, _)| is_time(text))
+        );
+        let without = chat_text(&painted, "one").0;
+        assert!(
+            without.left() < with_time.left() - 40.0,
+            "{without:?} vs {with_time:?}"
+        );
+    }
+
+    #[test]
+    fn a_highlighted_row_is_filled_and_only_the_nick_is_coloured() {
+        let (mut app, ctx) = rust_with_messages(&[("bob", "me: hello there")]);
+        let painted = settled(&mut app, &ctx, 1360.0);
+        let palette = super::super::theme::palette(&ctx);
+        let (mention, color) = chat_text(&painted, "me");
+        assert_eq!(color, palette.mention);
+        let (rest, color) = chat_text(&painted, ": hello there");
+        assert_eq!(color, palette.text);
+        assert!(
+            painted
+                .fills
+                .iter()
+                .any(|(rect, fill)| *fill == palette.mention_row
+                    && rect.contains_rect(mention)
+                    && rect.contains_rect(rest)
+                    && rect.width() > 600.0),
+            "the row is not filled across the chat"
+        );
+    }
+
+    #[test]
+    fn irc_coloured_text_is_kept_readable_on_the_light_theme() {
+        use super::super::theme::{self, DisplayPrefs, ThemeChoice};
+        let (mut app, ctx) = rust_with_messages(&[]);
+        theme::apply(
+            &ctx,
+            &DisplayPrefs {
+                theme: ThemeChoice::Light,
+                ..DisplayPrefs::default()
+            },
+        );
+        feed(&mut app, 0, ":bob!u@h PRIVMSG #rust :\x0300white words");
+        let painted = settled(&mut app, &ctx, 1360.0);
+        let (_, color) = chat_text(&painted, "white words");
+        let bg = theme::palette(&ctx).bg;
+        assert!(theme::contrast(color, bg) >= 3.0, "{color:?} on {bg:?}");
+    }
+
+    #[test]
+    fn a_long_nick_is_cut_inside_its_column() {
+        let long = "n".repeat(60);
+        let (mut app, ctx) = rust_with_messages(&[("bob", "short"), (long.as_str(), "long")]);
+        let painted = settled(&mut app, &ctx, 1360.0);
+        let (bob, _) = chat_text(&painted, "bob");
+        let nick = chat_texts(&painted)
+            .into_iter()
+            .find(|(text, _, _)| text.starts_with("nnnn"))
+            .expect("the long nick")
+            .1;
+        assert!(
+            nick.width() <= 108.0 && (nick.right() - bob.right()).abs() < 1.0,
+            "{nick:?}"
+        );
+        assert_eq!(
+            chat_text(&painted, "long").0.left(),
+            chat_text(&painted, "short").0.left()
+        );
+    }
+
+    #[test]
+    fn rows_stack_when_the_chat_area_is_narrow() {
+        let (mut app, _rust) = rust_with_topic("Rust talk");
+        let ctx = egui::Context::default();
+        let painted = settled(&mut app, &ctx, 640.0);
+        let (people, _) = painted.text("2 people");
+        let painted = click(&mut app, &ctx, 640.0, people.center());
+        let nick = painted
+            .texts
+            .iter()
+            .find(|(text, rect, _)| text == "bob" && rect.left() < 300.0 && rect.top() > 60.0)
+            .expect("bob's message row")
+            .1;
+        let (text, _) = painted.text("hello marker");
+        assert!(
+            nick.bottom() <= text.top() + 2.0,
+            "nick above text: {nick:?} {text:?}"
+        );
+        assert!((nick.left() - text.left()).abs() < 2.0);
+    }
+
+    #[test]
+    fn the_people_list_is_grouped_by_role_with_counts() {
+        let (mut app, _rx_a, _rx_b) = two_networks();
+        feed(
+            &mut app,
+            0,
+            ":srv 353 me = #rust :@bob +carol +dave erin me",
+        );
+        feed(&mut app, 0, ":srv 366 me #rust :End of /NAMES list.");
+        let rust = target_key(&app, app.sessions[0].id, "#rust");
+        app.user_activate(rust);
+        let ctx = egui::Context::default();
+        let painted = settled(&mut app, &ctx, 1360.0);
+        let listed: Vec<(f32, &str)> = {
+            let mut rows: Vec<(f32, &str)> = painted
+                .texts
+                .iter()
+                .filter(|(_, rect, _)| rect.left() > 1100.0 && rect.top() > 60.0)
+                .map(|(text, rect, _)| (rect.top(), text.as_str()))
+                .collect();
+            rows.sort_by(|a, b| a.0.total_cmp(&b.0));
+            rows
+        };
+        let texts: Vec<&str> = listed.iter().map(|(_, text)| *text).collect();
+        assert_eq!(
+            texts,
+            [
+                "OPERATORS · 1",
+                "bob",
+                "VOICED · 2",
+                "carol",
+                "dave",
+                "MEMBERS · 2",
+                "erin",
+                "me"
+            ]
+        );
+        assert!(
+            !painted
+                .strings()
+                .iter()
+                .any(|text| text.starts_with("Users ("))
+        );
+    }
+
+    #[test]
+    fn a_channel_with_5000_users_draws_only_the_visible_people() {
+        let (mut app, _rx_a, _rx_b) = two_networks();
+        for chunk in (0..5000).collect::<Vec<u32>>().chunks(40) {
+            let names: Vec<String> = chunk.iter().map(|n| format!("u{n:04}")).collect();
+            feed(
+                &mut app,
+                0,
+                &format!(":srv 353 me = #rust :{}", names.join(" ")),
+            );
+        }
+        feed(&mut app, 0, ":srv 366 me #rust :End of /NAMES list.");
+        let rust = target_key(&app, app.sessions[0].id, "#rust");
+        app.user_activate(rust);
+        let ctx = egui::Context::default();
+        let painted = settled(&mut app, &ctx, 1360.0);
+        let drawn = painted
+            .texts
+            .iter()
+            .filter(|(text, rect, _)| {
+                text.starts_with('u') && text.len() == 5 && rect.left() > 1100.0
+            })
+            .count();
+        assert!(drawn > 5 && drawn < 80, "{drawn} people rows drawn");
+        assert!(painted.has("5000 people"), "{:?}", &painted.strings()[..12]);
+    }
+
+    #[test]
+    fn away_people_are_marked_by_shape_and_note() {
+        let (mut app, _rust) = rust_with_topic("Rust talk");
+        app.sessions[0]
+            .conversations
+            .get_mut("#rust")
+            .unwrap()
+            .set_user_away("bob", Some("gone fishing".into()));
+        let ctx = egui::Context::default();
+        let painted = settled(&mut app, &ctx, 1360.0);
+        let palette = super::super::theme::palette(&ctx);
+        let row = |nick: &str| {
+            painted
+                .texts
+                .iter()
+                .find(|(text, rect, _)| text == nick && rect.left() > 1100.0)
+                .unwrap_or_else(|| panic!("{nick} in the people list"))
+                .clone()
+        };
+        let dot_beside = |rect: egui::Rect| {
+            painted
+                .circles
+                .iter()
+                .find(|(center, _, _)| {
+                    (center.y - rect.center().y).abs() < 6.0
+                        && center.x < rect.left()
+                        && center.x > 1100.0
+                })
+                .copied()
+                .expect("a status dot beside the nick")
+        };
+        let (_, bob, bob_color) = row("bob");
+        let (_, fill, outline) = dot_beside(bob);
+        assert_eq!(
+            (fill, outline),
+            (Color32::TRANSPARENT, 2.0),
+            "away is a ring"
+        );
+        assert_eq!(bob_color, palette.faint);
+        let note = painted
+            .texts
+            .iter()
+            .find(|(text, rect, _)| {
+                text == "away" && (rect.center().y - bob.center().y).abs() < 6.0
+            })
+            .expect("an away note on bob's row");
+        assert!(note.1.left() > bob.right());
+
+        let (_, me, me_color) = row("me");
+        let (_, fill, outline) = dot_beside(me);
+        assert_eq!(
+            (fill, outline),
+            (palette.online, 0.0),
+            "present is a filled dot"
+        );
+        assert_eq!(me_color, palette.text);
+    }
+
+    /// The app with its Settings window open on the Display tab.
+    fn display_settings() -> (App, egui::Context) {
+        let (mut app, _rx_a, _rx_b) = two_networks();
+        let rust = target_key(&app, app.sessions[0].id, "#rust");
+        app.user_activate(rust);
+        feed(&mut app, 0, ":bob!u@h PRIVMSG #rust :hello marker");
+        let conn = app.sessions[0].id;
+        app.open_settings(conn);
+        app.settings_tab = 1;
+        let ctx = egui::Context::default();
+        // The window fades in; draw until it is fully opaque.
+        for _ in 0..40 {
+            paint(&mut app, &ctx, 1360.0, Vec::new());
+        }
+        (app, ctx)
+    }
+
+    fn click_text(app: &mut App, ctx: &egui::Context, text: &str) -> Painted {
+        let painted = settled(app, ctx, 1360.0);
+        let (rect, _) = painted.text(text);
+        click(app, ctx, 1360.0, rect.center())
+    }
+
+    #[test]
+    fn choosing_light_applies_it_at_once() {
+        use super::super::theme::{self, Palette, ThemeChoice};
+        let (mut app, ctx) = display_settings();
+        assert_eq!(theme::palette(&ctx).bg, Palette::dark().bg);
+        click_text(&mut app, &ctx, "Light");
+        assert_eq!(app.settings.theme, ThemeChoice::Light);
+        assert_eq!(theme::palette(&ctx).bg, Palette::light().bg);
+        assert!(app.show_settings, "the window stays open");
+    }
+
+    #[test]
+    fn display_choices_are_saved_and_survive_cancel_like_other_global_preferences() {
+        use super::super::theme::{Density, MessageFont, ThemeChoice};
+        let (mut app, ctx) = display_settings();
+        click_text(&mut app, &ctx, "Compact");
+        click_text(&mut app, &ctx, "Monospace");
+        click_text(&mut app, &ctx, "Give each nickname its own color");
+        click_text(&mut app, &ctx, "Match the system");
+        click_text(&mut app, &ctx, "Cancel");
+        assert!(!app.show_settings);
+        assert_eq!(
+            (
+                app.settings.theme,
+                app.settings.density,
+                app.settings.message_font,
+                app.settings.color_nicks
+            ),
+            (
+                ThemeChoice::System,
+                Density::Compact,
+                MessageFont::Monospace,
+                false
+            )
+        );
+        assert_eq!(
+            ctx.global_style().spacing.interact_size.y,
+            32.0,
+            "the compact spacing is in force"
+        );
+    }
+
+    #[test]
+    fn hidden_timestamps_can_be_chosen_and_stop_being_drawn() {
+        let (mut app, ctx) = display_settings();
+        let painted = settled(&mut app, &ctx, 1360.0);
+        assert!(
+            chat_texts(&painted)
+                .iter()
+                .any(|(text, _, _)| is_time(text))
+        );
+        // Open the timestamp choices, then pick "Hidden".
+        let painted = settled(&mut app, &ctx, 1360.0);
+        let combo = painted
+            .texts
+            .iter()
+            .find(|(text, rect, _)| text == "14:05" && rect.top() > 60.0)
+            .expect("the timestamp choice shows an example")
+            .1;
+        click(&mut app, &ctx, 1360.0, combo.center());
+        click_text(&mut app, &ctx, "Hidden");
+        assert_eq!(app.sessions[0].timestamp_format, "off");
+        click_text(&mut app, &ctx, "Save & Close");
+        assert_eq!(app.settings.timestamp_format, "off");
+        let painted = settled(&mut app, &ctx, 1360.0);
+        assert!(
+            !chat_texts(&painted)
+                .iter()
+                .any(|(text, _, _)| is_time(text))
+        );
+        // New messages still get a time, for when it is shown again.
+        feed(&mut app, 0, ":bob!u@h PRIVMSG #rust :later");
+        let message = app.sessions[0].conversations["#rust"]
+            .messages
+            .back()
+            .unwrap();
+        assert!(!message.timestamp.is_empty());
+    }
+
+    #[test]
+    fn the_display_tab_shows_a_live_preview() {
+        let (mut app, ctx) = display_settings();
+        let painted = settled(&mut app, &ctx, 1360.0);
+        for text in [
+            "This is how messages will look.",
+            "Changes here apply as soon as you pick them.",
+        ] {
+            assert!(painted.has(text), "{:?}", painted.strings());
+        }
+        for label in [
+            "Dark",
+            "Light",
+            "Match the system",
+            "Comfortable",
+            "Compact",
+            "Proportional",
+            "Monospace",
+            "Hide join, part and quit lines",
+        ] {
+            assert!(painted.has(label), "{label} is offered");
+        }
+    }
+
+    #[test]
+    fn match_the_system_follows_the_system_theme() {
+        use super::super::theme::{self, ThemeChoice};
+        let (mut app, _rx_a, _rx_b) = two_networks();
+        app.settings.theme = ThemeChoice::System;
+        let ctx = egui::Context::default();
+        let frame_with = |app: &mut App, system: egui::Theme| {
+            let mut output = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(1024.0, 768.0),
+                    )),
+                    system_theme: Some(system),
+                    ..Default::default()
+                },
+                |ui| app.ui(ui),
+            );
+            output.textures_delta.clear();
+        };
+        frame_with(&mut app, egui::Theme::Light);
+        frame_with(&mut app, egui::Theme::Light);
+        assert!(!theme::palette(&ctx).dark);
+        frame_with(&mut app, egui::Theme::Dark);
+        frame_with(&mut app, egui::Theme::Dark);
+        assert!(theme::palette(&ctx).dark);
+    }
+
+    /// On-screen texts whose colour reads on none of the palette's grounds.
+    /// Text on an accent fill, and the half-transparent hint and disabled
+    /// texts, are not judged.
+    fn unreadable_texts(app: &mut App, ctx: &egui::Context) -> Vec<(String, Color32)> {
+        use super::super::theme;
+        let painted = settled(app, ctx, 1360.0);
+        let palette = theme::palette(ctx);
+        let grounds = [
+            palette.bg,
+            palette.panel,
+            palette.raise,
+            palette.mention_row,
+            palette.active_row(),
+        ];
+        painted
+            .texts
+            .iter()
+            .filter(|(text, rect, color)| {
+                // A status dot is a mark, not text to read.
+                !text.trim().is_empty()
+                    && !text.starts_with('●')
+                    && rect.bottom() <= 768.0
+                    && color.a() == 255
+                    && *color != palette.on_accent
+                    && !grounds
+                        .iter()
+                        .any(|ground| theme::contrast(*color, *ground) >= 4.5)
+            })
+            .map(|(text, _, color)| (text.clone(), *color))
+            .collect()
+    }
+
+    #[test]
+    fn every_text_reads_on_its_ground_in_both_themes() {
+        use super::super::theme::{self, DisplayPrefs, ThemeChoice};
+        for choice in [ThemeChoice::Dark, ThemeChoice::Light] {
+            let (mut app, ctx) = display_settings();
+            app.settings.theme = choice;
+            theme::apply(
+                &ctx,
+                &DisplayPrefs {
+                    theme: choice,
+                    ..DisplayPrefs::default()
+                },
+            );
+            feed(&mut app, 0, ":bob!u@h PRIVMSG #rust :me: a mention");
+            feed(&mut app, 0, ":carol!u@h JOIN #rust");
+            for tab in 0..4 {
+                app.settings_tab = tab;
+                let unreadable = unreadable_texts(&mut app, &ctx);
+                assert!(
+                    unreadable.is_empty(),
+                    "{choice:?}, Settings tab {tab}: {unreadable:?}"
+                );
+            }
+            // The main window on its own.
+            app.cancel_settings_window();
+            let unreadable = unreadable_texts(&mut app, &ctx);
+            assert!(
+                unreadable.is_empty(),
+                "{choice:?}, main window: {unreadable:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn text_in_a_single_line_field_is_centred_in_the_taller_field() {
+        use super::super::theme::{self, DisplayPrefs};
+        let (mut app, ctx) = display_settings();
+        theme::apply(&ctx, &DisplayPrefs::default());
+        app.settings_tab = 0;
+        let painted = settled(&mut app, &ctx, 1360.0);
+        let host = app.sessions[0].server_host.clone();
+        let text = painted
+            .texts
+            .iter()
+            .find(|(text, rect, _)| *text == host && rect.top() > 60.0 && rect.left() > 300.0)
+            .expect("the server field shows the host")
+            .1;
+        let field = painted
+            .fills
+            .iter()
+            .rev()
+            .find(|(rect, fill)| {
+                *fill == theme::palette(&ctx).bg && rect.contains_rect(text) && rect.width() < 400.0
+            })
+            .expect("the field behind the host")
+            .0;
+        assert_eq!(field.height(), 44.0);
+        assert!(
+            (text.center().y - field.center().y).abs() < 2.0,
+            "{text:?} in {field:?}"
+        );
+    }
+
+    #[test]
+    fn a_long_conversation_name_is_cut_in_the_header() {
+        for width in [1360.0, 900.0, 640.0] {
+            let (mut app, _rx_a, _rx_b) = two_networks();
+            let long = format!("#{}", "w".repeat(60));
+            feed(&mut app, 0, &format!(":me!u@h JOIN {long}"));
+            feed(&mut app, 0, &format!(":srv 332 me {long} :A topic"));
+            app.sync_windows();
+            let key = target_key(&app, app.sessions[0].id, &long);
+            app.user_activate(key);
+            let ctx = egui::Context::default();
+            let painted = settled(&mut app, &ctx, width);
+            let (_, people, _) = painted.containing(" people");
+            let name = painted
+                .texts
+                .iter()
+                .find(|(text, rect, _)| {
+                    text.starts_with("#www") && (rect.center().y - people.center().y).abs() < 10.0
+                })
+                .unwrap_or_else(|| panic!("{width}: the header names the channel"))
+                .1;
+            assert!(
+                name.right() <= people.left(),
+                "{width}: the name stops before the buttons: {name:?} vs {people:?}"
+            );
+        }
+    }
+
+    fn enter() -> egui::Event {
+        egui::Event::Key {
+            key: egui::Key::Enter,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        }
+    }
+
+    #[test]
+    fn joining_from_the_narrow_switcher_sends_a_join() {
+        let (mut app, mut rx_a, _rx_b) = two_networks();
+        let rust = target_key(&app, app.sessions[0].id, "#rust");
+        app.user_activate(rust);
+        let ctx = egui::Context::default();
+        let painted = settled(&mut app, &ctx, 640.0);
+        drain(&mut rx_a);
+        let label = app.network_label(&app.sessions[0]);
+        let (_, switcher, _) = painted.containing(&format!("#rust on {label}"));
+        let painted = click(&mut app, &ctx, 640.0, switcher.center());
+        let (join, _) = painted.text("Join a channel");
+        let painted = click(&mut app, &ctx, 640.0, join.center());
+        assert!(
+            painted.has("#channel"),
+            "the join field opens inside the menu: {:?}",
+            painted.strings()
+        );
+        paint(&mut app, &ctx, 640.0, vec![egui::Event::Text("new".into())]);
+        paint(&mut app, &ctx, 640.0, vec![enter()]);
+        let sent = drain(&mut rx_a);
+        assert!(sent.iter().any(|line| line == "JOIN #new"), "{sent:?}");
+    }
+
+    #[test]
+    fn a_join_field_does_not_outlive_its_menu_or_its_connection() {
+        let (mut app, _rx_a, _rx_b) = two_networks();
+        let ctx = egui::Context::default();
+        // Narrow: open the join field in the switcher menu, then click away.
+        let painted = settled(&mut app, &ctx, 640.0);
+        let label = app.network_label(&app.sessions[app.active_index()]);
+        let (_, switcher, _) = painted.containing(&format!(" on {label}"));
+        let painted = click(&mut app, &ctx, 640.0, switcher.center());
+        let (join, _) = painted.text("Join a channel");
+        click(&mut app, &ctx, 640.0, join.center());
+        assert!(app.join_row.is_some());
+        click(&mut app, &ctx, 640.0, egui::pos2(500.0, 600.0));
+        settled(&mut app, &ctx, 640.0);
+        assert_eq!(
+            app.join_row, None,
+            "closing the menu puts the join row away"
+        );
+
+        // Wide: a field open for a network that then disconnects.
+        let painted = settled(&mut app, &ctx, 1360.0);
+        let (join, _) = painted.text("Join a channel");
+        click(&mut app, &ctx, 1360.0, join.center());
+        let conn = app.join_row.expect("the join field is open");
+        let index = app.session_index(conn).unwrap();
+        app.sessions[index].test_set_disconnected();
+        settled(&mut app, &ctx, 1360.0);
+        assert_eq!(app.join_row, None, "no field waits for a reconnect");
+    }
+
+    #[test]
+    fn placeholder_text_reads_on_its_field_in_both_themes() {
+        use super::super::theme::{self, DisplayPrefs, ThemeChoice};
+        for choice in [ThemeChoice::Dark, ThemeChoice::Light] {
+            let (mut app, _rust) = rust_with_topic("Rust talk");
+            let ctx = egui::Context::default();
+            theme::apply(
+                &ctx,
+                &DisplayPrefs {
+                    theme: choice,
+                    ..DisplayPrefs::default()
+                },
+            );
+            let painted = settled(&mut app, &ctx, 1360.0);
+            let palette = theme::palette(&ctx);
+            for (hint, ground) in [
+                ("Search history (Ctrl+F)", palette.bg),
+                ("Message #rust", palette.panel),
+            ] {
+                let (_, color) = painted.text(hint);
+                assert_eq!(
+                    color.a(),
+                    255,
+                    "{choice:?}: {hint} is drawn in a solid colour"
+                );
+                assert!(
+                    theme::contrast(color, ground) >= 4.5,
+                    "{choice:?}: {hint} {color:?} on {ground:?}"
+                );
+            }
+        }
+    }
+
+    /// The colour of the topmost opaque fill painted behind `rect`.
+    fn ground_behind(painted: &Painted, rect: egui::Rect) -> Color32 {
+        painted
+            .fills
+            .iter()
+            .rev()
+            .find(|(fill_rect, fill)| fill.a() == 255 && fill_rect.contains_rect(rect))
+            .map(|(_, fill)| *fill)
+            .expect("something is painted behind the text")
+    }
+
+    #[test]
+    fn messages_and_the_composer_sit_on_the_chat_ground_and_people_on_the_panel() {
+        let (mut app, _rust) = rust_with_topic("Rust talk");
+        let ctx = egui::Context::default();
+        let painted = settled(&mut app, &ctx, 1360.0);
+        let palette = super::super::theme::palette(&ctx);
+        let (message, _) = painted.text("hello marker");
+        assert_eq!(ground_behind(&painted, message), palette.bg);
+        let person = painted
+            .texts
+            .iter()
+            .find(|(text, rect, _)| text == "bob" && rect.left() > 700.0)
+            .expect("bob in the people list")
+            .1;
+        assert_eq!(ground_behind(&painted, person), palette.panel);
+    }
+
+    #[test]
+    fn the_unread_marker_has_room_of_its_own() {
+        let (mut app, _rx_a, _rx_b) = two_networks();
+        let rust = target_key(&app, app.sessions[0].id, "#rust");
+        let status = WindowKey::new(app.sessions[0].id, None);
+        app.user_activate(rust);
+        let ctx = egui::Context::default();
+        feed(&mut app, 0, ":bob!u@h PRIVMSG #rust :one");
+        settled(&mut app, &ctx, 1360.0);
+        app.user_activate(status);
+        settled(&mut app, &ctx, 1360.0);
+        feed(&mut app, 0, ":bob!u@h PRIVMSG #rust :two");
+        app.user_activate(rust);
+        let painted = paint(&mut app, &ctx, 1360.0, Vec::new());
+        let (marker, color) = chat_text(&painted, "New messages");
+        assert_eq!(color, super::super::theme::palette(&ctx).accent);
+        let (one, _) = chat_text(&painted, "one");
+        let (two, _) = chat_text(&painted, "two");
+        assert!(
+            one.bottom() <= marker.top() && marker.bottom() <= two.top(),
+            "{one:?} {marker:?} {two:?}"
+        );
     }
 
     fn focus_frame(app: &mut App, ctx: &egui::Context, focused: bool) -> egui::FullOutput {
@@ -7337,7 +8910,7 @@ mod tests {
         for _ in 0..3 {
             output = focus_frame(app, ctx, focused);
         }
-        texts(&output).iter().any(|text| text == "Unread messages")
+        texts(&output).iter().any(|text| text == "New messages")
     }
 
     #[test]
