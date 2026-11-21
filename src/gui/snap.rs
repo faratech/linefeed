@@ -374,7 +374,9 @@ impl App {
         key: &WindowKey,
         active: bool,
     ) -> Option<CaptionAction> {
-        let height = ui.spacing().interact_size.y + 4.0;
+        // A title strip sized from the text, not from the control height:
+        // Comfortable's 44 px controls would make it a second header row.
+        let height = (ui.text_style_height(&egui::TextStyle::Body) + 10.0).clamp(24.0, 32.0);
         let (rect, _) =
             ui.allocate_exact_size(Vec2::new(ui.available_width(), height), Sense::hover());
         let caption = ui.interact(rect, caption_id(key), Sense::click_and_drag());
@@ -386,12 +388,13 @@ impl App {
         };
         ui.painter().rect_filled(rect, 3.0, fill);
 
-        let button = Vec2::splat(height - 4.0);
-        let close_rect = Rect::from_center_size(
-            Pos2::new(rect.right() - button.x / 2.0 - 2.0, rect.center().y),
-            button,
-        );
-        let max_rect = close_rect.translate(Vec2::new(-(button.x + 2.0), 0.0));
+        // Caption buttons as on a Windows title bar: wider than tall, the
+        // caption's full height, with a 10 px glyph in the middle.
+        let button = Vec2::new(40.0, height);
+        let close_rect =
+            Rect::from_min_size(Pos2::new(rect.right() - button.x, rect.top()), button);
+        let max_rect = close_rect.translate(Vec2::new(-button.x, 0.0));
+        let glyph = Vec2::splat(10.0);
         let title_rect = Rect::from_min_max(
             Pos2::new(rect.left() + 6.0, rect.top()),
             Pos2::new(max_rect.left() - 4.0, rect.bottom()),
@@ -416,13 +419,17 @@ impl App {
             ui.painter()
                 .rect_filled(max_rect, 2.0, visuals.widgets.hovered.bg_fill);
         }
-        ui.painter()
-            .rect_stroke(max_rect.shrink(5.5), 0.0, stroke, StrokeKind::Middle);
+        ui.painter().rect_stroke(
+            Rect::from_center_size(max_rect.center(), glyph),
+            0.0,
+            stroke,
+            StrokeKind::Middle,
+        );
         if close.hovered() {
             ui.painter()
                 .rect_filled(close_rect, 2.0, super::theme::palette(ui.ctx()).danger);
         }
-        let cross = close_rect.shrink(6.0);
+        let cross = Rect::from_center_size(close_rect.center(), glyph);
         ui.painter()
             .line_segment([cross.left_top(), cross.right_bottom()], stroke);
         ui.painter()

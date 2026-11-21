@@ -6718,6 +6718,40 @@ mod tests {
         time
     }
 
+    /// The caption of a floating window is a compact title strip whatever
+    /// the control height: 44 px Comfortable controls must not turn its
+    /// maximize and close buttons into 44 px squares with 33 px glyphs.
+    #[test]
+    fn floating_window_captions_stay_compact_with_comfortable_controls() {
+        use super::super::theme::{self, DisplayPrefs};
+        let (mut app, _rx_a, _rx_b) = two_networks();
+        let ctx = egui::Context::default();
+        theme::apply(&ctx, &DisplayPrefs::default());
+        floating_windows(&mut app, &ctx);
+        let key = app.windows.active.unwrap();
+        let caption = ctx.read_response(snap::caption_id(&key)).unwrap().rect;
+        let maximize = ctx
+            .read_response(snap::maximize_button_id(&key))
+            .unwrap()
+            .rect;
+        let close = ctx.read_response(snap::close_button_id(&key)).unwrap().rect;
+        assert!(caption.height() <= 32.0, "caption {caption:?}");
+        for button in [maximize, close] {
+            assert!(button.height() <= caption.height(), "{button:?}");
+            assert!(button.width() <= 46.0, "{button:?}");
+        }
+        assert!(maximize.right() <= close.left(), "{maximize:?} {close:?}");
+        // The glyphs are drawn in the buttons' middle, about 10 px across.
+        let painted = paint(&mut app, &ctx, 1024.0, Vec::new());
+        let outline = painted
+            .fills
+            .iter()
+            .filter(|(rect, _)| maximize.contains_rect(*rect) && rect.width() < maximize.width())
+            .map(|(rect, _)| rect.width())
+            .fold(0.0f32, f32::max);
+        assert!(outline <= 12.0, "maximize glyph {outline} wide");
+    }
+
     #[test]
     fn resting_on_the_maximize_button_offers_layouts_that_snap_the_window() {
         let (mut app, _rx_a, _rx_b) = two_networks();
