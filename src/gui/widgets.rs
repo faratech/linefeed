@@ -125,6 +125,105 @@ pub(crate) fn list_row(
     response
 }
 
+/// Widest a chip's text is drawn before it is cut with an ellipsis.
+pub(crate) const CHIP_MAX_TEXT: f32 = 220.0;
+
+/// A list row sized to its contents, for a list laid out across the window:
+/// `text`, then an optional count badge. `label` names it to assistive
+/// technology and shows on hover when the text was cut.
+pub(crate) fn chip(
+    ui: &mut egui::Ui,
+    selected: bool,
+    label: &str,
+    text: egui::RichText,
+    badge: Option<(&str, Color32)>,
+) -> egui::Response {
+    let palette = theme::palette(ui.ctx());
+    let height = theme::control_height(ui);
+    let galley = egui::WidgetText::from(text).into_galley(
+        ui,
+        Some(egui::TextWrapMode::Truncate),
+        CHIP_MAX_TEXT,
+        egui::TextStyle::Button,
+    );
+    let small = egui::TextStyle::Small.resolve(ui.style()).size;
+    let badge = badge.map(|(count, fill)| {
+        let galley = ui.painter().layout_no_wrap(
+            count.to_owned(),
+            egui::FontId::new(small, fonts::semibold()),
+            palette.on_accent,
+        );
+        let width = (galley.size().x + 12.0).max(22.0);
+        (galley, fill, width)
+    });
+    let padding = 12.0;
+    let badge_room = badge.as_ref().map_or(0.0, |(_, _, width)| width + 8.0);
+    let size = egui::vec2(padding * 2.0 + galley.size().x + badge_room, height);
+    let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click());
+    response.widget_info(|| egui::WidgetInfo::selected(egui::Role::Button, true, selected, label));
+    if selected {
+        ui.painter().rect_filled(rect, 8.0, palette.active_row());
+    } else if response.hovered() {
+        ui.painter().rect_filled(rect, 8.0, palette.raise);
+    }
+    focus_ring(ui, &response, rect, 8.0);
+    let cut = galley.elided;
+    ui.painter().galley(
+        egui::pos2(
+            rect.left() + padding,
+            rect.center().y - galley.size().y / 2.0,
+        ),
+        galley,
+        palette.text,
+    );
+    if let Some((galley, fill, width)) = badge {
+        let pill = egui::Rect::from_min_size(
+            egui::pos2(rect.right() - padding - width, rect.center().y - 11.0),
+            egui::vec2(width, 22.0),
+        );
+        ui.painter().rect_filled(pill, 11.0, fill);
+        ui.painter().galley(
+            pill.center() - galley.size() / 2.0,
+            galley,
+            palette.on_accent,
+        );
+    }
+    if cut {
+        response.on_hover_text(label)
+    } else {
+        response
+    }
+}
+
+/// A handle to drag something by: six dots in a `size` box. Dots rather
+/// than a glyph, which would depend on the fonts installed.
+pub(crate) fn grip(ui: &mut egui::Ui, size: egui::Vec2, label: &str) -> egui::Response {
+    let palette = theme::palette(ui.ctx());
+    let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click_and_drag());
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, label));
+    let color = if response.hovered() || response.dragged() {
+        palette.text
+    } else {
+        palette.faint
+    };
+    // Two rows of three across a wide handle, three rows of two in a tall one.
+    let (cols, rows) = if size.x >= size.y { (3, 2) } else { (2, 3) };
+    let step = 5.0;
+    let origin =
+        rect.center() - egui::vec2((cols - 1) as f32 * step, (rows - 1) as f32 * step) / 2.0;
+    for col in 0..cols {
+        for row in 0..rows {
+            ui.painter().circle_filled(
+                origin + egui::vec2(col as f32 * step, row as f32 * step),
+                1.5,
+                color,
+            );
+        }
+    }
+    focus_ring(ui, &response, rect, 6.0);
+    response
+}
+
 /// One line of text, cut with an ellipsis where it does not fit. The full
 /// text shows on hover when it was cut.
 pub(crate) fn truncated(ui: &mut egui::Ui, text: egui::RichText) -> egui::Response {
@@ -132,13 +231,18 @@ pub(crate) fn truncated(ui: &mut egui::Ui, text: egui::RichText) -> egui::Respon
 }
 
 /// The heading of a group in a list.
+/// Cut with an ellipsis where it does not fit, so a long network name
+/// cannot hold a narrow list open.
 pub(crate) fn section_label(ui: &mut egui::Ui, text: &str) {
     let palette = theme::palette(ui.ctx());
-    ui.label(
-        egui::RichText::new(text.to_uppercase())
-            .small()
-            .family(fonts::semibold())
-            .color(palette.muted),
+    ui.add(
+        egui::Label::new(
+            egui::RichText::new(text.to_uppercase())
+                .small()
+                .family(fonts::semibold())
+                .color(palette.muted),
+        )
+        .truncate(),
     );
 }
 

@@ -157,6 +157,9 @@ pub(crate) struct TargetWindow {
     pub persist: PersistKey,
     /// Shown in its own OS window instead of inside the main window.
     pub detached: bool,
+    /// A floating window minimized into the conversation list: not drawn
+    /// until it is activated again.
+    pub minimized: bool,
     /// Last known outer rect as a floating child window.
     pub child_rect: Option<Rect>,
     /// A one-shot placement (tile/cascade) applied on the next frame.
@@ -168,11 +171,17 @@ pub(crate) struct TargetWindow {
 }
 
 impl TargetWindow {
+    /// Drawn among the floating windows: neither detached nor minimized.
+    pub(crate) fn on_desk(&self) -> bool {
+        !self.detached && !self.minimized
+    }
+
     fn new(key: WindowKey, persist: PersistKey, saved: Option<&SavedWindow>) -> Self {
         let mut window = Self {
             key,
             persist,
             detached: false,
+            minimized: false,
             child_rect: None,
             pending_place: None,
             os_pos: None,
@@ -181,6 +190,7 @@ impl TargetWindow {
         };
         if let Some(saved) = saved {
             window.detached = saved.detached;
+            window.minimized = saved.minimized;
             window.child_rect = saved.child_rect.map(rect_from_array);
             window.os_pos = saved.os_pos.map(|[x, y]| Pos2::new(x, y));
             window.os_size = saved.os_size.map(|[w, h]| Vec2::new(w, h));
@@ -193,6 +203,7 @@ impl TargetWindow {
             key: self.persist.clone(),
             child_rect: self.child_rect.map(rect_to_array),
             detached: self.detached,
+            minimized: self.minimized,
             os_pos: self.os_pos.map(|p| [p.x, p.y]),
             os_size: self.os_size.map(|s| [s.x, s.y]),
         }
@@ -225,6 +236,8 @@ pub(crate) struct WindowManager {
     /// A merge adopted a destination view before the source first appeared.
     /// Its following metadata event may still carry the source's saved place.
     adopted: std::collections::HashSet<WindowKey>,
+    /// Where the conversation list is docked and its size.
+    pub sidebar: SidebarLayout,
 }
 
 impl WindowManager {
@@ -244,6 +257,7 @@ impl WindowManager {
             area: layout.area.map(rect_from_array),
             last_present: Vec::new(),
             adopted: Default::default(),
+            sidebar: layout.sidebar.sanitized(),
         }
     }
 
@@ -271,6 +285,7 @@ impl WindowManager {
         if let Some(window) = self.get_mut(key) {
             if let Some(saved) = source_placement {
                 window.detached = saved.detached;
+                window.minimized = saved.minimized;
                 window.child_rect = saved.child_rect.map(rect_from_array);
                 window.pending_place = window.child_rect;
                 window.os_pos = saved.os_pos.map(|p| Pos2::new(p[0], p[1]));
@@ -462,15 +477,16 @@ impl WindowManager {
         }
     }
 
+    /// Windows a tile or cascade lays out: attached and not minimized.
     fn attached_count(&self) -> usize {
-        self.windows.iter().filter(|w| !w.detached).count()
+        self.windows.iter().filter(|w| w.on_desk()).count()
     }
 
     fn apply_placements(&mut self, rects: Vec<Rect>) {
         let active = self.active;
         // The active window goes last so it ends up on top of a cascade.
         let mut order: Vec<usize> = (0..self.windows.len())
-            .filter(|&i| !self.windows[i].detached)
+            .filter(|&i| self.windows[i].on_desk())
             .collect();
         if let Some(active) = &active
             && let Some(pos) = order.iter().position(|&i| &self.windows[i].key == active)
@@ -531,6 +547,7 @@ impl WindowManager {
             windows,
             area: self.area.map(rect_to_array),
             auto_connect: Vec::new(),
+            sidebar: self.sidebar,
         }
     }
 }
@@ -611,6 +628,100 @@ fn rect_from_array([x, y, w, h]: [f32; 4]) -> Rect {
     Rect::from_min_size(Pos2::new(x, y), Vec2::new(w, h))
 }
 
+/// The edge of the main window the conversation list is docked to.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) enum SidebarDock {
+    #[default]
+    Left,
+    Right,
+    Top,
+    Bottom,
+}
+
+impl SidebarDock {
+    pub(crate) const ALL: [SidebarDock; 4] = [Self::Left, Self::Right, Self::Top, Self::Bottom];
+
+    /// Docked to a side, the list runs down the window; docked to the top
+    /// or bottom it is a strip across it.
+    pub(crate) fn vertical(self) -> bool {
+        matches!(self, Self::Left | Self::Right)
+    }
+
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Left => "Left",
+            Self::Right => "Right",
+            Self::Top => "Top",
+            Self::Bottom => "Bottom",
+        }
+    }
+
+    /// The edge of `area` nearest to `pointer`, where a dragged list docks.
+    pub(crate) fn nearest(area: Rect, pointer: Pos2) -> Self {
+        // Measured as a share of the area, so a wide window does not make
+        // the top and bottom edges win everywhere.
+        let x = ((pointer.x - area.left()) / area.width().max(1.0)).clamp(0.0, 1.0);
+        let y = ((pointer.y - area.top()) / area.height().max(1.0)).clamp(0.0, 1.0);
+        [
+            (x, Self::Left),
+            (1.0 - x, Self::Right),
+            (y, Self::Top),
+            (1.0 - y, Self::Bottom),
+        ]
+        .into_iter()
+        .min_by(|a, b| a.0.total_cmp(&b.0))
+        .map_or(Self::Left, |(_, dock)| dock)
+    }
+}
+
+/// Where the conversation list sits and how big the user made it.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub(crate) struct SidebarLayout {
+    pub dock: SidebarDock,
+    /// Width when docked to a side, in points.
+    pub width: f32,
+    /// Height when docked to the top or bottom, in points; 0 means one row.
+    pub height: f32,
+}
+
+impl Default for SidebarLayout {
+    fn default() -> Self {
+        Self {
+            dock: SidebarDock::Left,
+            width: SIDEBAR_DEFAULT_WIDTH,
+            height: 0.0,
+        }
+    }
+}
+
+/// Default width of the conversation list docked to a side.
+pub(crate) const SIDEBAR_DEFAULT_WIDTH: f32 = 248.0;
+/// Narrowest the list docked to a side can be made.
+pub(crate) const SIDEBAR_MIN_WIDTH: f32 = 120.0;
+
+impl SidebarLayout {
+    /// A layout.json written by hand (or by a bug) cannot make the list
+    /// vanish or swallow the window: sizes are finite and within reason.
+    fn sanitized(self) -> Self {
+        let width = if self.width.is_finite() {
+            self.width.clamp(SIDEBAR_MIN_WIDTH, 4000.0)
+        } else {
+            SIDEBAR_DEFAULT_WIDTH
+        };
+        let height = if self.height.is_finite() {
+            self.height.clamp(0.0, 4000.0)
+        } else {
+            0.0
+        };
+        Self {
+            dock: self.dock,
+            width,
+            height,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub(crate) struct SavedWindow {
     pub key: PersistKey,
@@ -618,6 +729,8 @@ pub(crate) struct SavedWindow {
     pub child_rect: Option<[f32; 4]>,
     #[serde(default)]
     pub detached: bool,
+    #[serde(default)]
+    pub minimized: bool,
     #[serde(default)]
     pub os_pos: Option<[f32; 2]>,
     #[serde(default)]
@@ -640,6 +753,8 @@ pub(crate) struct LayoutFile {
     /// `derived_profile_id`. An older version that rewrites settings.json
     /// drops their `auto_connect` (and `id`); it comes back from here.
     pub auto_connect: Vec<String>,
+    /// Where the conversation list is docked and its size.
+    pub sidebar: SidebarLayout,
 }
 
 impl LayoutFile {
@@ -693,6 +808,77 @@ impl LayoutFile {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_dragged_list_docks_to_the_nearest_edge() {
+        let area = Rect::from_min_size(Pos2::ZERO, Vec2::new(1600.0, 900.0));
+        let at = |x, y| SidebarDock::nearest(area, Pos2::new(x, y));
+        assert_eq!(at(40.0, 450.0), SidebarDock::Left);
+        assert_eq!(at(1560.0, 450.0), SidebarDock::Right);
+        assert_eq!(at(800.0, 30.0), SidebarDock::Top);
+        assert_eq!(at(800.0, 870.0), SidebarDock::Bottom);
+        // Outside the area counts as its nearest edge.
+        assert_eq!(at(-50.0, 450.0), SidebarDock::Left);
+        assert_eq!(at(800.0, 2000.0), SidebarDock::Bottom);
+        // Measured as a share of each side: a third of the way across a
+        // wide window is still nearer the left than the top at mid height.
+        assert_eq!(at(500.0, 450.0), SidebarDock::Left);
+    }
+
+    #[test]
+    fn a_minimized_window_stays_minimized_across_a_restart_and_is_not_tiled() {
+        let mut manager = WindowManager::default();
+        manager.sync(&[present(1, "net", None), present(1, "net", Some("#a"))]);
+        manager.windows[1].minimized = true;
+        let json = serde_json::to_string(&manager.layout()).unwrap();
+        let mut restored =
+            WindowManager::from_layout(serde_json::from_str::<LayoutFile>(&json).unwrap());
+        restored.sync(&[present(1, "net", None), present(1, "net", Some("#a"))]);
+        assert!(restored.windows[1].minimized);
+        assert!(!restored.windows[0].minimized);
+        let area = Rect::from_min_size(Pos2::ZERO, Vec2::new(1000.0, 800.0));
+        restored.tile(area);
+        // The one window still showing fills the area alone.
+        let tiled = restored.windows[0].child_rect.unwrap();
+        assert!(tiled.width() > 900.0 && tiled.height() > 700.0, "{tiled:?}");
+    }
+
+    #[test]
+    fn the_sidebar_layout_is_saved_with_the_layout_and_sanitized_on_load() {
+        let mut manager = WindowManager::default();
+        assert_eq!(manager.sidebar, SidebarLayout::default());
+        manager.sidebar = SidebarLayout {
+            dock: SidebarDock::Bottom,
+            width: 500.0,
+            height: 140.0,
+        };
+        let json = serde_json::to_string(&manager.layout()).unwrap();
+        let restored =
+            WindowManager::from_layout(serde_json::from_str::<LayoutFile>(&json).unwrap());
+        assert_eq!(restored.sidebar, manager.sidebar);
+
+        // A layout written by 0.2.x has no sidebar entry: the default.
+        let old: LayoutFile = serde_json::from_str(r#"{"version":1,"mode":"Floating"}"#).unwrap();
+        assert_eq!(
+            WindowManager::from_layout(old).sidebar,
+            SidebarLayout::default()
+        );
+
+        // Nonsense sizes cannot hide the list or fill the window with it.
+        let bad: LayoutFile =
+            serde_json::from_str(r#"{"sidebar":{"dock":"Right","width":3.0,"height":-20.0}}"#)
+                .unwrap();
+        let sidebar = WindowManager::from_layout(bad).sidebar;
+        assert_eq!(sidebar.dock, SidebarDock::Right);
+        assert_eq!(sidebar.width, SIDEBAR_MIN_WIDTH);
+        assert_eq!(sidebar.height, 0.0);
+        let mut huge = LayoutFile::default();
+        huge.sidebar.width = f32::INFINITY;
+        assert_eq!(
+            WindowManager::from_layout(huge).sidebar.width,
+            SIDEBAR_DEFAULT_WIDTH
+        );
+    }
 
     fn key(conn: ConnId, target: Option<&str>) -> WindowKey {
         WindowKey::new(

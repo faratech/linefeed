@@ -546,6 +546,7 @@ impl Session {
         &mut self,
         ui: &mut egui::Ui,
         display: &mut super::theme::DisplayPrefs,
+        sidebar_dock: &mut super::windows::SidebarDock,
     ) {
         use super::theme::{Density, MessageFont, ThemeChoice};
         let before = *display;
@@ -592,6 +593,15 @@ impl Session {
         if *display != before {
             super::theme::apply(ui.ctx(), display);
         }
+
+        ui.horizontal_wrapped(|ui| {
+            ui.label("Conversation list:");
+            for dock in super::windows::SidebarDock::ALL {
+                ui.radio_value(sidebar_dock, dock, dock.label());
+            }
+        })
+        .response
+        .on_hover_text("You can also drag the list by its handle to an edge of the window");
 
         ui.add_space(8.0);
         ui.heading("Messages");
@@ -1713,6 +1723,7 @@ impl App {
                                 sessions,
                                 settings,
                                 favorites_ui,
+                                windows,
                                 ..
                             } = &mut *self;
                             let session = &mut sessions[active];
@@ -1726,8 +1737,13 @@ impl App {
                                 }
                                 1 => {
                                     let mut display = settings.display();
-                                    session.settings_tab_display(ui, &mut display);
+                                    let mut dock = windows.sidebar.dock;
+                                    session.settings_tab_display(ui, &mut display, &mut dock);
                                     settings.set_display(display);
+                                    if dock != windows.sidebar.dock {
+                                        windows.sidebar.dock = dock;
+                                        windows.dirty = true;
+                                    }
                                 }
                                 2 => session.settings_tab_behavior(
                                     ui,
