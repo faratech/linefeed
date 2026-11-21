@@ -1056,7 +1056,9 @@ pub struct Channel {
     pub modes: String,            // Channel modes like "+nt"
     pub mode_params: Vec<String>, // Mode parameters (limit, key, etc.)
     pub created: Option<u64>,     // Channel creation timestamp
-    pub users: Vec<ChannelUser>,
+    /// Private so that every change passes `users_changed`; read through
+    /// `users()`.
+    users: Vec<ChannelUser>,
     pub messages: VecDeque<ChatMessage>,
     pub unread: usize,
     pub key: Option<String>, // Channel key for auto-rejoin
@@ -1082,6 +1084,8 @@ pub struct Channel {
     /// instead of a case-mapped scan. `users` is only mutated inside
     /// `Channel`, which keeps this in step with every reorder.
     user_index: HashMap<String, usize>,
+    /// Derived from `users`; cleared by `users_changed`.
+    people_index: std::cell::OnceCell<PeopleIndex>,
     names_snapshot: Option<Vec<ChannelUser>>,
     /// Canonical nick key -> position in `names_snapshot`.
     names_index: HashMap<String, usize>,
@@ -1093,19 +1097,26 @@ pub struct Channel {
 }
 
 /// One row of a channel's people list.
-pub(crate) enum PeopleRow<'a> {
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) enum PeopleRow {
     /// The heading of a role with how many people hold it.
-    Group {
-        label: &'static str,
-        count: usize,
-    },
-    Person(&'a ChannelUser),
+    Group { label: &'static str, count: usize },
+    /// A person, by position in the channel's `users`.
+    Person(usize),
 }
 
-impl Channel {
-    /// The people list as rows: each role that has someone, highest first,
-    /// headed by its name and count, then its people in the channel's order.
-    pub(crate) fn people_rows(&self) -> Vec<PeopleRow<'_>> {
+/// The people list's rows and what the header says about them, worked out
+/// from the user list once and kept until that list changes.
+#[derive(Debug, Clone, Default)]
+struct PeopleIndex {
+    rows: Vec<PeopleRow>,
+    away: usize,
+}
+
+impl PeopleIndex {
+    /// Each role that has someone, highest first, headed by its name and
+    /// count, then its people in the user list's order.
+    fn of(users: &[ChannelUser]) -> Self {
         const GROUPS: [(UserMode, &str); 6] = [
             (UserMode::Owner, "Owners"),
             (UserMode::Admin, "Admins"),
@@ -1114,21 +1125,55 @@ impl Channel {
             (UserMode::Voice, "Voiced"),
             (UserMode::Normal, "Members"),
         ];
-        let mut rows = Vec::with_capacity(self.users.len() + GROUPS.len());
-        for (mode, label) in GROUPS {
-            let count = self.users.iter().filter(|user| user.mode == mode).count();
-            if count == 0 {
+        let mut members: [Vec<usize>; 6] = Default::default();
+        let mut away = 0;
+        for (position, user) in users.iter().enumerate() {
+            if let Some(group) = GROUPS.iter().position(|(mode, _)| *mode == user.mode) {
+                members[group].push(position);
+            }
+            away += user.is_away() as usize;
+        }
+        let mut rows = Vec::with_capacity(users.len() + GROUPS.len());
+        for ((_, label), people) in GROUPS.iter().zip(members) {
+            if people.is_empty() {
                 continue;
             }
-            rows.push(PeopleRow::Group { label, count });
-            rows.extend(
-                self.users
-                    .iter()
-                    .filter(|user| user.mode == mode)
-                    .map(PeopleRow::Person),
-            );
+            rows.push(PeopleRow::Group {
+                label,
+                count: people.len(),
+            });
+            rows.extend(people.into_iter().map(PeopleRow::Person));
         }
-        rows
+        Self { rows, away }
+    }
+}
+
+impl Channel {
+    fn people(&self) -> &PeopleIndex {
+        self.people_index
+            .get_or_init(|| PeopleIndex::of(&self.users))
+    }
+
+    /// Everyone in the channel, highest role first, then by nickname.
+    pub(crate) fn users(&self) -> &[ChannelUser] {
+        &self.users
+    }
+
+    /// The members of a channel that is being merged into another.
+    pub(crate) fn into_users(self) -> Vec<ChannelUser> {
+        self.users
+    }
+
+    /// The people list as rows, grouped by role. Built when first asked for
+    /// after the user list changed, not on every frame.
+    pub(crate) fn people_rows(&self) -> &[PeopleRow] {
+        &self.people().rows
+    }
+
+    /// Every change to `users` goes through here, so what was worked out
+    /// from the old list is dropped.
+    fn users_changed(&mut self) {
+        self.people_index.take();
     }
 
     /// How many of the unread messages mention the user.
@@ -1165,6 +1210,7 @@ impl Channel {
             prefix_modes: "qaohv".to_string(),
             prefix_symbols: "~&@%+".to_string(),
             user_index: HashMap::new(),
+            people_index: std::cell::OnceCell::new(),
             names_snapshot: None,
             names_index: HashMap::new(),
             mode_parameters: HashMap::new(),
@@ -1210,6 +1256,7 @@ impl Channel {
         for user in &mut self.users {
             user.refresh_display_mode(&self.prefix_modes, &self.prefix_symbols);
         }
+        self.users_changed();
         if let Some(snapshot) = &mut self.names_snapshot {
             for user in snapshot {
                 user.refresh_display_mode(&self.prefix_modes, &self.prefix_symbols);
@@ -1416,6 +1463,7 @@ impl Channel {
         let key = self.case_mapping.canonicalize(clean_nick);
         if let Some(pos) = self.user_index.get(&key).copied() {
             if !letters.is_empty() {
+                self.users_changed();
                 for letter in &letters {
                     self.users[pos].add_status_mode(
                         *letter,
@@ -1454,9 +1502,11 @@ impl Channel {
         }
         self.users.insert(pos, user);
         self.user_index.insert(key, pos);
+        self.users_changed();
     }
 
     fn remove_user_at(&mut self, pos: usize) -> ChannelUser {
+        self.users_changed();
         let user = self.users.remove(pos);
         self.user_index
             .remove(&self.case_mapping.canonicalize(&user.nick));
@@ -1800,6 +1850,7 @@ impl Channel {
     pub fn clear_users(&mut self) {
         self.departed.clear();
         self.users.clear();
+        self.users_changed();
         self.user_index.clear();
         self.names_snapshot = None;
         self.names_index.clear();
@@ -1858,6 +1909,8 @@ impl Channel {
 
     fn get_user_mut(&mut self, nick: &str) -> Option<&mut ChannelUser> {
         let pos = self.user_position(nick)?;
+        // The caller may change the mode or the away state.
+        self.users_changed();
         self.users.get_mut(pos)
     }
 
@@ -1866,6 +1919,7 @@ impl Channel {
         // allocate two Strings per comparison; computing each key once makes
         // this one allocation per user regardless of list size. The keys then
         // become the lookup index, so no second pass is needed.
+        self.users_changed();
         let mapping = self.case_mapping;
         let users = std::mem::take(&mut self.users);
         let mut keyed: Vec<(usize, String, ChannelUser)> = users
@@ -1934,6 +1988,7 @@ impl Channel {
         let key = self.case_mapping.canonicalize(&identity.nick);
         if let Some(pos) = self.user_index.get(&key).copied() {
             copy_identity(&mut self.users[pos], identity);
+            self.users_changed();
         }
         if let Some(snapshot) = self.names_snapshot.as_mut()
             && let Some(slot) = self.names_index.get(&key).copied()
@@ -1944,7 +1999,7 @@ impl Channel {
 
     /// Get count of away users
     pub fn away_count(&self) -> usize {
-        self.users.iter().filter(|u| u.is_away()).count()
+        self.people().away
     }
 }
 
@@ -1997,12 +2052,85 @@ mod tests {
     fn people(channel: &Channel) -> Vec<String> {
         channel
             .people_rows()
-            .into_iter()
+            .iter()
             .map(|row| match row {
                 PeopleRow::Group { label, count } => format!("[{label} {count}]"),
-                PeopleRow::Person(user) => user.nick.clone(),
+                PeopleRow::Person(index) => channel.users[*index].nick.clone(),
             })
             .collect()
+    }
+
+    #[test]
+    fn the_people_index_follows_every_change_to_the_user_list() {
+        fn check(channel: &Channel, step: &str) {
+            assert_eq!(
+                channel.people_rows(),
+                PeopleIndex::of(&channel.users).rows.as_slice(),
+                "after {step}"
+            );
+            assert_eq!(
+                channel.away_count(),
+                channel.users.iter().filter(|user| user.is_away()).count(),
+                "away count after {step}"
+            );
+        }
+        let mut channel = Channel::new();
+        check(&channel, "nothing");
+        channel.add_user("bob", UserMode::Op);
+        check(&channel, "add_user");
+        channel.add_user("carol", UserMode::Normal);
+        channel.add_user("dave", UserMode::Normal);
+        check(&channel, "more users");
+        channel.add_user_status_mode("carol", 'v');
+        check(&channel, "add_user_status_mode");
+        channel.remove_user_status_mode("carol", 'v');
+        check(&channel, "remove_user_status_mode");
+        channel.remove_user_mode("bob", UserMode::Op);
+        check(&channel, "remove_user_mode");
+        channel.set_user_away("carol", Some("gone".into()));
+        check(&channel, "set_user_away");
+        assert_eq!(channel.away_count(), 1);
+        channel.rename_user("carol", "carla");
+        check(&channel, "rename_user");
+        channel.remove_user("bob");
+        check(&channel, "remove_user");
+        channel.merge_users(vec![ChannelUser::new("erin".into(), UserMode::Voice)]);
+        check(&channel, "merge_users");
+        channel.set_prefix_schema("qaohv", "~&@%+");
+        check(&channel, "set_prefix_schema");
+        channel.apply_user_identity(&KnownUser {
+            nick: "erin".into(),
+            username: Some("e".into()),
+            hostname: Some("host".into()),
+            account: None,
+            realname: None,
+            away: Some("lunch".into()),
+            bot: false,
+            online: true,
+        });
+        check(&channel, "apply_user_identity");
+        channel.begin_user_burst();
+        channel.add_user_burst_modes("zed", &[UserMode::Owner]);
+        channel.finish_user_burst();
+        check(&channel, "a NAMES burst");
+        channel.clear_users();
+        check(&channel, "clear_users");
+        assert!(channel.people_rows().is_empty());
+    }
+
+    #[test]
+    fn the_people_index_is_built_once_until_the_users_change() {
+        let mut channel = Channel::new();
+        channel.add_user("bob", UserMode::Op);
+        let built = channel.people_rows().as_ptr();
+        assert_eq!(built, channel.people_rows().as_ptr(), "reused, not rebuilt");
+        assert_eq!(channel.away_count(), 0);
+        assert_eq!(built, channel.people_rows().as_ptr());
+        channel.add_user("carol", UserMode::Normal);
+        assert_eq!(
+            people(&channel),
+            ["[Operators 1]", "bob", "[Members 1]", "carol"]
+        );
     }
 
     #[test]

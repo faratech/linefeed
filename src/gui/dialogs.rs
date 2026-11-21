@@ -1295,7 +1295,7 @@ impl Session {
                         .show(ui, |ui| {
                             // User count
                             ui.label("Users:");
-                            ui.label(format!("{}", ch.users.len()));
+                            ui.label(format!("{}", ch.users().len()));
                             ui.end_row();
 
                             // Created
@@ -1441,12 +1441,12 @@ impl Session {
                     ui.separator();
 
                     // User list section (stable id_salt: see ban list above).
-                    egui::CollapsingHeader::new(format!("Users ({})", ch.users.len()))
+                    egui::CollapsingHeader::new(format!("Users ({})", ch.users().len()))
                         .id_salt("channel_info_users")
                         .show(ui, |ui| {
                             ScrollArea::vertical().max_height(150.0).show(ui, |ui| {
                                 ui.horizontal_wrapped(|ui| {
-                                    for user in &ch.users {
+                                    for user in ch.users() {
                                         let prefix = user.prefix();
                                         let state = match (user.is_away(), user.bot) {
                                             (true, true) => " (away, bot)",

@@ -209,7 +209,7 @@ impl Session {
             } else {
                 "Show or hide the people list".to_owned()
             };
-            (people_label(channel.users.len()), hover)
+            (people_label(channel.users().len()), hover)
         });
         let mut toggle_people = false;
         ui.horizontal(|ui| {
@@ -284,7 +284,12 @@ impl Session {
                                 );
                                 continue;
                             }
-                            super::types::PeopleRow::Person(user) => *user,
+                            super::types::PeopleRow::Person(position) => {
+                                let Some(user) = channel.users().get(*position) else {
+                                    continue;
+                                };
+                                user
+                            }
                         };
                         let nick = &user.nick;
                         let is_selected = current_selected.as_ref() == Some(nick);
@@ -295,7 +300,7 @@ impl Session {
                             (false, true) => "bot",
                             (false, false) => "",
                         };
-                        let response = super::widgets::list_row(ui, is_selected, |ui| {
+                        let response = super::widgets::list_row(ui, is_selected, nick, |ui| {
                             // Away is a ring, present a filled dot: told
                             // apart by shape, not by colour alone.
                             let dot = if is_away {

@@ -57,9 +57,11 @@ pub(crate) fn badge_button(
     let width =
         padding * 2.0 + text.size().x + pill.as_ref().map_or(0.0, |(_, _, width)| 8.0 + width);
     let (rect, response) = ui.allocate_exact_size(egui::vec2(width, height), egui::Sense::click());
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, label));
     if response.hovered() {
         ui.painter().rect_filled(rect, 10.0, palette.raise);
     }
+    focus_ring(ui, &response, rect, 10.0);
     let text_pos = egui::pos2(rect.left() + padding, rect.center().y - text.size().y / 2.0);
     let text_width = text.size().x;
     ui.painter().galley(text_pos, text, palette.text);
@@ -78,12 +80,26 @@ pub(crate) fn badge_button(
     response
 }
 
+/// The outline a hand-painted control shows while it has the keyboard
+/// focus, so that Tab can be followed by eye.
+fn focus_ring(ui: &egui::Ui, response: &egui::Response, rect: egui::Rect, radius: f32) {
+    if response.has_focus() {
+        ui.painter().rect_stroke(
+            rect,
+            radius,
+            egui::Stroke::new(2.0, theme::palette(ui.ctx()).accent),
+            egui::StrokeKind::Inside,
+        );
+    }
+}
+
 /// One clickable row of a list, as wide as the space it is in and as tall
 /// as a control. `add` lays its contents out left to right; labels inside
-/// do not take the click.
+/// do not take the click. `label` names the row to assistive technology.
 pub(crate) fn list_row(
     ui: &mut egui::Ui,
     selected: bool,
+    label: &str,
     add: impl FnOnce(&mut egui::Ui),
 ) -> egui::Response {
     let palette = theme::palette(ui.ctx());
@@ -92,11 +108,13 @@ pub(crate) fn list_row(
         egui::vec2(ui.available_width(), height),
         egui::Sense::click(),
     );
+    response.widget_info(|| egui::WidgetInfo::selected(egui::Role::Button, true, selected, label));
     if selected {
         ui.painter().rect_filled(rect, 8.0, palette.active_row());
     } else if response.hovered() {
         ui.painter().rect_filled(rect, 8.0, palette.raise);
     }
+    focus_ring(ui, &response, rect, 8.0);
     let mut content = ui.new_child(
         egui::UiBuilder::new()
             .max_rect(rect.shrink2(egui::vec2(10.0, 0.0)))
@@ -199,7 +217,7 @@ mod tests {
             let mut measured = None;
             frame(&ctx, Vec::new(), |ui| {
                 let width = ui.available_width();
-                let response = list_row(ui, false, |ui| {
+                let response = list_row(ui, false, "row", |ui| {
                     ui.label("row");
                 });
                 measured = Some((response.rect.width(), width, response.rect.height()));
@@ -216,7 +234,7 @@ mod tests {
         let active = Palette::dark().active_row();
         for selected in [true, false] {
             let output = frame(&ctx, Vec::new(), |ui| {
-                list_row(ui, selected, |ui| {
+                list_row(ui, selected, "row", |ui| {
                     ui.label("row");
                 });
             });
@@ -232,7 +250,7 @@ mod tests {
         let ctx = egui::Context::default();
         let mut label_pos = egui::Pos2::ZERO;
         frame(&ctx, Vec::new(), |ui| {
-            list_row(ui, false, |ui| {
+            list_row(ui, false, "row", |ui| {
                 label_pos = ui.label("row label").rect.center();
             });
         });
@@ -248,7 +266,7 @@ mod tests {
             vec![press(false)],
         ] {
             frame(&ctx, events, |ui| {
-                clicked |= list_row(ui, false, |ui| {
+                clicked |= list_row(ui, false, "row", |ui| {
                     ui.label("row label");
                 })
                 .clicked();
@@ -329,6 +347,76 @@ mod tests {
             });
         }
         assert!(clicked);
+    }
+
+    fn key(key: egui::Key) -> egui::Event {
+        egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        }
+    }
+
+    /// Whether the frame painted a 2 px accent outline: the focus ring.
+    fn focus_ring(output: &egui::FullOutput) -> bool {
+        let accent = Palette::dark().accent;
+        shapes(output).iter().any(|shape| {
+            matches!(shape, egui::Shape::Rect(rect)
+                if rect.stroke.color == accent && rect.stroke.width == 2.0)
+        })
+    }
+
+    #[test]
+    fn a_list_row_takes_keyboard_focus_shows_a_ring_and_answers_enter() {
+        let ctx = egui::Context::default();
+        theme::apply(&ctx, &DisplayPrefs::default());
+        let row = |ui: &mut egui::Ui| {
+            list_row(ui, false, "bob", |ui| {
+                ui.label("bob");
+            })
+        };
+        let output = frame(&ctx, Vec::new(), |ui| {
+            row(ui);
+        });
+        assert!(!focus_ring(&output), "no ring without focus");
+        // Tab moves the keyboard focus onto the row.
+        frame(&ctx, vec![key(egui::Key::Tab)], |ui| {
+            row(ui);
+        });
+        let output = frame(&ctx, Vec::new(), |ui| {
+            row(ui);
+        });
+        assert!(focus_ring(&output), "the focused row is outlined");
+        let mut activated = false;
+        frame(&ctx, vec![key(egui::Key::Enter)], |ui| {
+            activated |= row(ui).clicked();
+        });
+        assert!(activated, "Enter activates the focused row");
+    }
+
+    #[test]
+    fn a_badge_button_takes_keyboard_focus_and_shows_a_ring() {
+        let ctx = egui::Context::default();
+        theme::apply(&ctx, &DisplayPrefs::default());
+        let button = |ui: &mut egui::Ui| badge_button(ui, "Activity", None);
+        let output = frame(&ctx, Vec::new(), |ui| {
+            button(ui);
+        });
+        assert!(!focus_ring(&output));
+        frame(&ctx, vec![key(egui::Key::Tab)], |ui| {
+            button(ui);
+        });
+        let output = frame(&ctx, Vec::new(), |ui| {
+            button(ui);
+        });
+        assert!(focus_ring(&output), "the focused button is outlined");
+        let mut activated = false;
+        frame(&ctx, vec![key(egui::Key::Space)], |ui| {
+            activated |= button(ui).clicked();
+        });
+        assert!(activated, "Space activates the focused button");
     }
 
     #[test]

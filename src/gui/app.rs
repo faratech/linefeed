@@ -2447,13 +2447,7 @@ impl App {
             .and_then(|id| session.target_name(id))
             .unwrap_or("Status")
             .to_owned();
-        let (mut unread, mut mentions) = (0, 0);
-        for network in self.sidebar_model() {
-            for row in network.rows.iter().filter(|row| !row.selected) {
-                unread += row.unread;
-                mentions += row.mentions;
-            }
-        }
+        let (unread, mentions) = self.unread_elsewhere();
         let font = egui::TextStyle::Button.resolve(ui.style());
         let semibold = egui::FontId::new(font.size, super::fonts::semibold());
         let format = |font_id: egui::FontId, color| egui::TextFormat {
@@ -2602,49 +2596,26 @@ impl App {
         }
     }
 
-    /// Everything the conversation list shows, gathered before drawing so
-    /// that drawing is free to change the app's own state.
-    fn sidebar_model(&self) -> Vec<SidebarNetwork> {
-        self.sessions
-            .iter()
-            .enumerate()
-            .map(|(index, session)| SidebarNetwork {
-                index,
-                conn: session.id,
-                label: self.network_label(session),
-                connected: session.is_connected(),
-                busy: session.is_connecting() || session.away_status.is_some(),
-                rows: session
-                    .ordered_tabs()
-                    .into_iter()
-                    .filter_map(|target| {
-                        let key = WindowKey::new(session.id, target);
-                        let name = match target {
-                            None => "Status",
-                            Some(id) => session.target_name(id)?,
-                        };
-                        let channel = target.and_then(|id| session.conversation_channel(id));
-                        Some(SidebarRow {
-                            key,
-                            name: name.to_owned(),
-                            unread: match target {
-                                None => session.server_unread,
-                                Some(_) => channel.map_or(0, |channel| channel.unread),
-                            },
-                            mentions: channel.map_or(0, |channel| channel.unread_mentions()),
-                            detached: self.windows.get(&key).is_some_and(|w| w.detached),
-                            selected: self.windows.active.as_ref() == Some(&key),
-                            is_channel: target.is_some() && session.is_channel_name(name),
-                            close_label: match target {
-                                None => "Disconnect and close",
-                                Some(_) if session.tab_close_needs_part(name) => "Part",
-                                Some(_) => "Close",
-                            },
-                        })
-                    })
-                    .collect(),
-            })
-            .collect()
+    /// Unread messages and mentions in every window but the active one,
+    /// for the narrow window's switcher button.
+    fn unread_elsewhere(&self) -> (usize, usize) {
+        let (mut unread, mut mentions) = (0, 0);
+        for session in &self.sessions {
+            for target in session.ordered_tabs() {
+                if self.windows.active == Some(WindowKey::new(session.id, target)) {
+                    continue;
+                }
+                match target.and_then(|id| session.conversation_channel(id)) {
+                    Some(channel) => {
+                        unread += channel.unread;
+                        mentions += channel.unread_mentions();
+                    }
+                    None if target.is_none() => unread += session.server_unread,
+                    None => {}
+                }
+            }
+        }
+        (unread, mentions)
     }
 
     /// The conversation list down the left side of the window.
@@ -2659,6 +2630,10 @@ impl App {
     /// Every network's conversations as rows: the active one filled, unread
     /// ones emphasised with a count, mentions marked. Returns whether a
     /// conversation was picked, so a menu showing the rows can close.
+    ///
+    /// The rows are drawn straight from the sessions and borrow their names
+    /// from them: nothing is gathered or copied per frame but the network
+    /// labels.
     fn draw_conversation_rows(&mut self, ui: &mut egui::Ui) -> bool {
         let palette = super::theme::palette(ui.ctx());
         let mut clicked = None;
@@ -2666,110 +2641,145 @@ impl App {
         let mut toggle_detach = None;
         let mut info = None;
         let mut join = None;
-        for (position, network) in self.sidebar_model().into_iter().enumerate() {
-            if position > 0 {
+        let labels: Vec<String> = self
+            .sessions
+            .iter()
+            .map(|session| self.network_label(session))
+            .collect();
+        let App {
+            sessions,
+            windows,
+            join_row,
+            join_text,
+            join_focus,
+            sidebar_scrolled,
+            ..
+        } = self;
+        for (index, (session, label)) in sessions.iter().zip(&labels).enumerate() {
+            if index > 0 {
                 ui.add_space(10.0);
             }
+            let connected = session.is_connected();
             ui.horizontal(|ui| {
                 ui.add_space(10.0);
-                let dot = if !network.connected && !network.busy {
-                    palette.danger
-                } else if network.busy {
+                let dot = if session.is_connecting() || session.away_status.is_some() {
                     palette.mention
-                } else {
+                } else if connected {
                     palette.online
+                } else {
+                    palette.danger
                 };
                 super::widgets::dot(ui, dot, true);
-                super::widgets::section_label(ui, &network.label);
+                super::widgets::section_label(ui, label);
             });
-            for row in &network.rows {
-                let mut response = super::widgets::list_row(ui, row.selected, |ui| {
+            for target in session.ordered_tabs() {
+                let key = WindowKey::new(session.id, target);
+                let name = match target {
+                    None => "Status",
+                    Some(id) => match session.target_name(id) {
+                        Some(name) => name,
+                        None => continue,
+                    },
+                };
+                let channel = target.and_then(|id| session.conversation_channel(id));
+                let unread = match target {
+                    None => session.server_unread,
+                    Some(_) => channel.map_or(0, |channel| channel.unread),
+                };
+                let mentions = channel.map_or(0, |channel| channel.unread_mentions());
+                let detached = windows.get(&key).is_some_and(|w| w.detached);
+                let selected = windows.active.as_ref() == Some(&key);
+                let mut response = super::widgets::list_row(ui, selected, name, |ui| {
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if row.mentions > 0 {
-                            super::widgets::badge(
-                                ui,
-                                &format!("@ {}", row.mentions),
-                                palette.mention,
-                            );
-                        } else if row.unread > 0 {
-                            super::widgets::badge(ui, &row.unread.to_string(), palette.accent);
+                        if mentions > 0 {
+                            super::widgets::badge(ui, &format!("@ {mentions}"), palette.mention);
+                        } else if unread > 0 {
+                            super::widgets::badge(ui, &unread.to_string(), palette.accent);
                         }
                         ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
-                            let mut text = if row.selected || row.unread > 0 {
-                                super::widgets::strong(&row.name).color(palette.text)
+                            let mut text = if selected || unread > 0 {
+                                super::widgets::strong(name).color(palette.text)
                             } else {
-                                RichText::new(&row.name).color(palette.muted)
+                                RichText::new(name).color(palette.muted)
                             };
                             // Detached windows are set in italics: a marker
                             // glyph would depend on the fonts installed.
-                            if row.detached {
+                            if detached {
                                 text = text.italics();
                             }
                             super::widgets::truncated(ui, text);
                         });
                     });
                 });
-                if row.detached {
+                if detached {
                     response = response.on_hover_text("In its own window");
                 }
-                if row.selected && self.sidebar_scrolled != Some(row.key) {
+                if selected && *sidebar_scrolled != Some(key) {
                     response.scroll_to_me(None);
-                    self.sidebar_scrolled = Some(row.key);
+                    *sidebar_scrolled = Some(key);
                 }
                 if response.clicked() {
-                    clicked = Some(row.key);
+                    clicked = Some(key);
                 }
                 response.context_menu(|ui| {
-                    let detach_label = if row.detached { "Reattach" } else { "Detach" };
+                    let detach_label = if detached { "Reattach" } else { "Detach" };
                     if ui.button(detach_label).clicked() {
-                        toggle_detach = Some(row.key);
+                        toggle_detach = Some(key);
                         ui.close();
                     }
-                    if row.is_channel && ui.button("Channel Info").clicked() {
-                        info = Some(row.key);
+                    if target.is_some()
+                        && session.is_channel_name(name)
+                        && ui.button("Channel Info").clicked()
+                    {
+                        info = Some(key);
                         ui.close();
                     }
-                    if ui.button(row.close_label).clicked() {
-                        close = Some(row.key);
+                    let close_label = match target {
+                        None => "Disconnect and close",
+                        Some(_) if session.tab_close_needs_part(name) => "Part",
+                        Some(_) => "Close",
+                    };
+                    if ui.button(close_label).clicked() {
+                        close = Some(key);
                         ui.close();
                     }
                 });
             }
-            if !network.connected {
+            if !connected {
                 // No field waits for a reconnect.
-                if self.join_row == Some(network.conn) {
-                    self.join_row = None;
+                if *join_row == Some(session.id) {
+                    *join_row = None;
                 }
                 continue;
             }
-            if self.join_row == Some(network.conn) {
+            if *join_row == Some(session.id) {
                 let height = super::theme::control_height(ui);
                 let response = ui.add(
-                    egui::TextEdit::singleline(&mut self.join_text)
+                    egui::TextEdit::singleline(join_text)
                         .hint_text("#channel")
                         .desired_width(f32::INFINITY)
                         .min_size(egui::vec2(0.0, height))
                         .align(egui::Align2::LEFT_CENTER),
                 );
-                if std::mem::take(&mut self.join_focus) {
+                if std::mem::take(join_focus) {
                     response.request_focus();
                 } else if response.lost_focus() {
                     // Enter joins; Escape or a click elsewhere cancels.
                     if ui.input(|input| input.key_pressed(egui::Key::Enter)) {
-                        join = Some((network.index, std::mem::take(&mut self.join_text)));
+                        join = Some((index, std::mem::take(join_text)));
                     }
-                    self.join_row = None;
-                    self.join_text.clear();
+                    *join_row = None;
+                    join_text.clear();
                 }
             } else {
-                let response = super::widgets::list_row(ui, false, |ui| {
+                let response = super::widgets::list_row(ui, false, "Join a channel", |ui| {
                     ui.label(RichText::new("+").color(palette.muted));
                     ui.label(RichText::new("Join a channel").color(palette.muted));
                 });
                 if response.clicked() {
-                    self.join_row = Some(network.conn);
-                    self.join_text.clear();
-                    self.join_focus = true;
+                    *join_row = Some(session.id);
+                    join_text.clear();
+                    *join_focus = true;
                 }
             }
         }
@@ -3968,30 +3978,6 @@ fn toolbar_rows(fit: Option<ToolbarFit>, available: f32, spacing: f32) -> Toolba
 /// carries a switcher button instead, and the people list starts hidden.
 pub(crate) fn narrow(ctx: &egui::Context) -> bool {
     ctx.content_rect().width() < 720.0
-}
-
-/// One network's part of the conversation list.
-struct SidebarNetwork {
-    /// Position in `App::sessions`.
-    index: usize,
-    conn: ConnId,
-    label: String,
-    connected: bool,
-    /// Connecting, or connected but away.
-    busy: bool,
-    rows: Vec<SidebarRow>,
-}
-
-/// One conversation in the list.
-struct SidebarRow {
-    key: WindowKey,
-    name: String,
-    unread: usize,
-    mentions: usize,
-    detached: bool,
-    selected: bool,
-    is_channel: bool,
-    close_label: &'static str,
 }
 
 /// Run `f` with `session` pointed at `target` and the window's input line,

@@ -1739,7 +1739,7 @@ impl Session {
             referenced.insert(self.network_support.canonicalize(name));
             referenced.extend(
                 channel
-                    .users
+                    .users()
                     .iter()
                     .map(|user| self.network_support.canonicalize(&user.nick)),
             );
@@ -3952,7 +3952,7 @@ mod connection_lifecycle_tests {
             app.handle_numeric(RPL_ENDOFNAMES, &["me".into(), "#chan".into()]);
 
             let nicks: Vec<&str> = app.conversations["#chan"]
-                .users
+                .users()
                 .iter()
                 .map(|user| user.nick.as_str())
                 .collect();
@@ -4989,7 +4989,7 @@ impl Session {
         channel.joined |= retired.joined;
         channel.history_loaded |= retired.history_loaded;
         channel.merge_metadata_from(&retired);
-        channel.merge_users(retired.users);
+        channel.merge_users(retired.into_users());
         if self.max_scrollback > 0 {
             while channel.messages.len() > self.max_scrollback {
                 channel.messages.pop_front();
@@ -8825,7 +8825,7 @@ impl Session {
         {
             let prefix_key = self.network_support.canonicalize(prefix);
             let mut matches: Vec<String> = channel
-                .users
+                .users()
                 .iter()
                 .filter(|user| {
                     self.network_support
@@ -11369,8 +11369,8 @@ pub(crate) mod tests {
             }
             app.handle_numeric(RPL_ENDOFNAMES, &["me".into(), name.into()]);
         }
-        assert_eq!(app.conversations["#a"].users.len(), USERS);
-        assert_eq!(app.conversations["#b"].users.len(), USERS);
+        assert_eq!(app.conversations["#a"].users().len(), USERS);
+        assert_eq!(app.conversations["#b"].users().len(), USERS);
 
         // 366 queued a WHOX for each channel; answer #a's for every member.
         let token = app
@@ -13487,7 +13487,7 @@ pub(crate) mod tests {
         app.handle_incoming_message(msg);
 
         let ch = &app.conversations["#chan"];
-        assert!(ch.users.is_empty());
+        assert!(ch.users().is_empty());
         assert!(ch.messages.iter().any(|m| {
             m.content
                 .contains("You were kicked from #chan by alice (bye)")
