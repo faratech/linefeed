@@ -154,6 +154,9 @@ pub struct App {
     pub tray_hidden: bool,
     /// Tile/Cascade chosen from the Window menu, applied with the chat area.
     tile_request: Option<TileRequest>,
+    /// The edge the conversation list would dock to, while its handle is
+    /// being dragged.
+    sidebar_drag: Option<super::windows::SidebarDock>,
     /// Restored unsent input, placed into the session's selected window once
     /// that window exists.
     pending_inputs: Vec<(ConnId, Option<ConversationId>, String)>,
@@ -466,6 +469,7 @@ impl App {
             settings_writable: true,
             tray_hidden: false,
             tile_request: None,
+            sidebar_drag: None,
             pending_inputs: Vec::new(),
             started: Instant::now(),
             user_activated: false,
@@ -713,14 +717,11 @@ impl App {
         self.show_dialogs(&ctx);
         self.show_window_switcher(&ctx);
 
-        egui::Panel::top("toolbar").show(root_ui, |ui| self.draw_toolbar(ui));
+        let toolbar = egui::Panel::top("toolbar").show(root_ui, |ui| self.draw_toolbar(ui));
         if !narrow(&ctx) {
-            egui::Panel::left("sidebar")
-                .resizable(true)
-                .default_size(248.0)
-                .min_size(180.0)
-                .max_size(360.0)
-                .show(root_ui, |ui| self.draw_sidebar(ui));
+            self.show_sidebar(root_ui, &ctx, toolbar.response.rect.bottom());
+        } else {
+            self.sidebar_drag = None;
         }
         let chat_ground =
             egui::Frame::central_panel(&ctx.global_style()).fill(super::theme::palette(&ctx).bg);
@@ -2509,7 +2510,7 @@ impl App {
                 let mut picked = false;
                 egui::ScrollArea::vertical()
                     .max_height(420.0)
-                    .show(ui, |ui| picked = self.draw_conversation_rows(ui));
+                    .show(ui, |ui| picked = self.draw_conversation_rows(ui, false));
                 ui.separator();
                 self.connection_menu(ui);
                 if picked {
@@ -2635,12 +2636,153 @@ impl App {
     }
 
     /// The conversation list down the left side of the window.
-    fn draw_sidebar(&mut self, ui: &mut egui::Ui) {
-        egui::ScrollArea::vertical()
-            .auto_shrink([false, false])
-            .show(ui, |ui| {
-                self.draw_conversation_rows(ui);
-            });
+    /// The conversation list, docked to the edge the user chose and as big
+    /// as they made it. `top` is where the space below the top bar starts.
+    fn show_sidebar(&mut self, root_ui: &mut egui::Ui, ctx: &egui::Context, top: f32) {
+        use super::windows::{SIDEBAR_MIN_WIDTH, SidebarDock};
+        let screen = ctx.content_rect();
+        let layout = self.windows.sidebar;
+        let vertical = layout.dock.vertical();
+        // One row of chips and the panel's margins: the shortest a strip
+        // across the window can be.
+        let row = ctx.global_style().spacing.interact_size.y + 16.0;
+        let (min, max, wanted) = if vertical {
+            (
+                SIDEBAR_MIN_WIDTH,
+                (screen.width() * 0.5).max(SIDEBAR_MIN_WIDTH),
+                layout.width,
+            )
+        } else {
+            let wanted = if layout.height > 0.0 {
+                layout.height
+            } else {
+                row
+            };
+            (row, ((screen.bottom() - top) / 3.0).max(row), wanted)
+        };
+        let panel = match layout.dock {
+            SidebarDock::Left => egui::Panel::left("sidebar"),
+            SidebarDock::Right => egui::Panel::right("sidebar_right"),
+            SidebarDock::Top => egui::Panel::top("sidebar_top"),
+            SidebarDock::Bottom => egui::Panel::bottom("sidebar_bottom"),
+        };
+        let shown = panel
+            .resizable(true)
+            .default_size(wanted.clamp(min, max))
+            .min_size(min)
+            .max_size(max)
+            .show(root_ui, |ui| self.draw_sidebar(ui, layout.dock));
+        // Remember a size the user dragged to, not one the window forced by
+        // getting smaller.
+        let size = if vertical {
+            shown.response.rect.width()
+        } else {
+            shown.response.rect.height()
+        };
+        let resizing = ctx.input(|i| i.pointer.any_down()) && self.sidebar_drag.is_none();
+        if resizing && (size - wanted).abs() > 0.5 {
+            if vertical {
+                self.windows.sidebar.width = size;
+            } else {
+                self.windows.sidebar.height = size;
+            }
+            self.windows.dirty = true;
+        }
+        if let Some(target) = self.sidebar_drag {
+            let area = egui::Rect::from_min_max(egui::pos2(screen.left(), top), screen.max);
+            let preview = match target {
+                SidebarDock::Left => egui::Rect::from_min_size(
+                    area.min,
+                    egui::vec2(layout.width.min(area.width() * 0.5), area.height()),
+                ),
+                SidebarDock::Right => egui::Rect::from_min_max(
+                    egui::pos2(
+                        area.right() - layout.width.min(area.width() * 0.5),
+                        area.top(),
+                    ),
+                    area.max,
+                ),
+                SidebarDock::Top => {
+                    egui::Rect::from_min_size(area.min, egui::vec2(area.width(), row * 1.5))
+                }
+                SidebarDock::Bottom => egui::Rect::from_min_max(
+                    egui::pos2(area.left(), area.bottom() - row * 1.5),
+                    area.max,
+                ),
+            };
+            let palette = super::theme::palette(ctx);
+            let painter = ctx.layer_painter(egui::LayerId::new(
+                egui::Order::Foreground,
+                egui::Id::unique("sidebar_dock_preview"),
+            ));
+            painter.rect_filled(preview, 8.0, palette.accent.gamma_multiply(0.25));
+            painter.rect_stroke(
+                preview,
+                8.0,
+                egui::Stroke::new(2.0, palette.accent),
+                egui::StrokeKind::Inside,
+            );
+        }
+    }
+
+    fn draw_sidebar(&mut self, ui: &mut egui::Ui, dock: super::windows::SidebarDock) {
+        if dock.vertical() {
+            let grip = super::widgets::grip(
+                ui,
+                egui::vec2(ui.available_width(), 14.0),
+                "Move the conversation list",
+            );
+            self.drag_sidebar(ui.ctx(), &grip);
+            egui::ScrollArea::vertical()
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    self.draw_conversation_rows(ui, false);
+                });
+        } else {
+            egui::ScrollArea::vertical()
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    ui.horizontal_wrapped(|ui| {
+                        let height = super::theme::control_height(ui);
+                        let grip = super::widgets::grip(
+                            ui,
+                            egui::vec2(14.0, height),
+                            "Move the conversation list",
+                        );
+                        self.drag_sidebar(ui.ctx(), &grip);
+                        self.draw_conversation_rows(ui, true);
+                    });
+                });
+        }
+    }
+
+    /// Dragging the list's handle shows where it would dock; letting go
+    /// docks it to the nearest edge of the window.
+    fn drag_sidebar(&mut self, ctx: &egui::Context, grip: &egui::Response) {
+        let grip = grip
+            .clone()
+            .on_hover_text("Drag to an edge of the window to move the conversation list");
+        if grip.dragged() {
+            ctx.set_cursor_icon(egui::CursorIcon::Grabbing);
+            if let Some(pointer) = ctx.pointer_interact_pos() {
+                self.sidebar_drag = Some(super::windows::SidebarDock::nearest(
+                    ctx.content_rect(),
+                    pointer,
+                ));
+            }
+        } else if grip.hovered() {
+            ctx.set_cursor_icon(egui::CursorIcon::Grab);
+        }
+        if grip.drag_stopped() {
+            if let Some(target) = self.sidebar_drag.take()
+                && target != self.windows.sidebar.dock
+            {
+                self.windows.sidebar.dock = target;
+                self.windows.dirty = true;
+            }
+        } else if !grip.dragged() {
+            self.sidebar_drag = None;
+        }
     }
 
     /// Every network's conversations as rows: the active one filled, unread
@@ -2650,7 +2792,9 @@ impl App {
     /// The rows are drawn straight from the sessions and borrow their names
     /// from them: nothing is gathered or copied per frame but the network
     /// labels.
-    fn draw_conversation_rows(&mut self, ui: &mut egui::Ui) -> bool {
+    /// `horizontal` lays them out across the window as chips (the list
+    /// docked to the top or bottom) instead of one per line.
+    fn draw_conversation_rows(&mut self, ui: &mut egui::Ui, horizontal: bool) -> bool {
         let palette = super::theme::palette(ui.ctx());
         let mut clicked = None;
         let mut close = None;
@@ -2673,7 +2817,7 @@ impl App {
         } = self;
         for (index, (session, label)) in sessions.iter().zip(&labels).enumerate() {
             if index > 0 {
-                ui.add_space(10.0);
+                ui.add_space(if horizontal { 16.0 } else { 10.0 });
             }
             let connected = session.is_connected();
             ui.horizontal(|ui| {
@@ -2705,28 +2849,46 @@ impl App {
                 let mentions = channel.map_or(0, |channel| channel.unread_mentions());
                 let detached = windows.get(&key).is_some_and(|w| w.detached);
                 let selected = windows.active.as_ref() == Some(&key);
-                let mut response = super::widgets::list_row(ui, selected, name, |ui| {
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if mentions > 0 {
-                            super::widgets::badge(ui, &format!("@ {mentions}"), palette.mention);
-                        } else if unread > 0 {
-                            super::widgets::badge(ui, &unread.to_string(), palette.accent);
-                        }
-                        ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
-                            let mut text = if selected || unread > 0 {
-                                super::widgets::strong(name).color(palette.text)
-                            } else {
-                                RichText::new(name).color(palette.muted)
-                            };
-                            // Detached windows are set in italics: a marker
-                            // glyph would depend on the fonts installed.
-                            if detached {
-                                text = text.italics();
+                let mut text = if selected || unread > 0 {
+                    super::widgets::strong(name).color(palette.text)
+                } else {
+                    RichText::new(name).color(palette.muted)
+                };
+                // Detached windows are set in italics: a marker glyph would
+                // depend on the fonts installed.
+                if detached {
+                    text = text.italics();
+                }
+                let badge = if mentions > 0 {
+                    Some((format!("@ {mentions}"), palette.mention))
+                } else if unread > 0 {
+                    Some((unread.to_string(), palette.accent))
+                } else {
+                    None
+                };
+                let mut response = if horizontal {
+                    super::widgets::chip(
+                        ui,
+                        selected,
+                        name,
+                        text,
+                        badge.as_ref().map(|(count, fill)| (count.as_str(), *fill)),
+                    )
+                } else {
+                    super::widgets::list_row(ui, selected, name, |ui| {
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if let Some((count, fill)) = &badge {
+                                super::widgets::badge(ui, count, *fill);
                             }
-                            super::widgets::truncated(ui, text);
+                            ui.with_layout(
+                                egui::Layout::left_to_right(egui::Align::Center),
+                                |ui| {
+                                    super::widgets::truncated(ui, text);
+                                },
+                            );
                         });
-                    });
-                });
+                    })
+                };
                 if detached {
                     response = response.on_hover_text("In its own window");
                 }
@@ -2773,7 +2935,7 @@ impl App {
                 let response = ui.add(
                     egui::TextEdit::singleline(join_text)
                         .hint_text("#channel")
-                        .desired_width(f32::INFINITY)
+                        .desired_width(if horizontal { 160.0 } else { f32::INFINITY })
                         .min_size(egui::vec2(0.0, height))
                         .align(egui::Align2::LEFT_CENTER),
                 );
@@ -2788,10 +2950,20 @@ impl App {
                     join_text.clear();
                 }
             } else {
-                let response = super::widgets::list_row(ui, false, "Join a channel", |ui| {
-                    ui.label(RichText::new("+").color(palette.muted));
-                    ui.label(RichText::new("Join a channel").color(palette.muted));
-                });
+                let response = if horizontal {
+                    super::widgets::chip(
+                        ui,
+                        false,
+                        "Join a channel",
+                        RichText::new("+ Join").color(palette.muted),
+                        None,
+                    )
+                } else {
+                    super::widgets::list_row(ui, false, "Join a channel", |ui| {
+                        ui.label(RichText::new("+").color(palette.muted));
+                        ui.label(RichText::new("Join a channel").color(palette.muted));
+                    })
+                };
                 if response.clicked() {
                     *join_row = Some(session.id);
                     join_text.clear();
@@ -7575,6 +7747,135 @@ mod tests {
 
     /// What one frame painted: every text with its rectangle and colour,
     /// and every filled rectangle.
+    /// Where `text` was painted, if it was.
+    fn text_rect(painted: &Painted, text: &str) -> Option<egui::Rect> {
+        painted
+            .texts
+            .iter()
+            .find(|(t, _, _)| t == text)
+            .map(|(_, rect, _)| *rect)
+    }
+
+    #[test]
+    fn the_conversation_list_docks_to_each_edge() {
+        use super::super::windows::SidebarDock;
+        for dock in SidebarDock::ALL {
+            let (mut app, _rx_a, _rx_b) = two_networks();
+            app.windows.sidebar.dock = dock;
+            let ctx = egui::Context::default();
+            let painted = settled(&mut app, &ctx, 1360.0);
+            let status = text_rect(&painted, "Status").expect("Status row");
+            let rust = text_rect(&painted, "#rust").expect("#rust row");
+            match dock {
+                SidebarDock::Left => assert!(rust.right() < 400.0, "{dock:?} {rust:?}"),
+                SidebarDock::Right => assert!(rust.left() > 960.0, "{dock:?} {rust:?}"),
+                SidebarDock::Top => assert!(rust.bottom() < 200.0, "{dock:?} {rust:?}"),
+                SidebarDock::Bottom => assert!(rust.top() > 600.0, "{dock:?} {rust:?}"),
+            }
+            if dock.vertical() {
+                assert!(rust.top() > status.bottom() - 1.0, "{dock:?}: one per line");
+            } else {
+                // Across the window: Status and #rust share a row.
+                assert!(
+                    (rust.center().y - status.center().y).abs() < 2.0
+                        && rust.left() > status.right(),
+                    "{dock:?}: {status:?} {rust:?}"
+                );
+            }
+        }
+    }
+
+    /// The grip's dots: the faint circles at the list's top-left corner.
+    fn sidebar_grip(painted: &Painted, ctx: &egui::Context) -> egui::Pos2 {
+        let faint = super::super::theme::palette(ctx).faint;
+        let dots: Vec<egui::Pos2> = painted
+            .circles
+            .iter()
+            .filter(|(_, fill, _)| *fill == faint)
+            .map(|(centre, _, _)| *centre)
+            .collect();
+        assert!(dots.len() >= 6, "grip dots: {dots:?}");
+        let sum = dots[..6]
+            .iter()
+            .fold(egui::Vec2::ZERO, |sum, dot| sum + dot.to_vec2());
+        (sum / 6.0).to_pos2()
+    }
+
+    fn drag_pointer(app: &mut App, ctx: &egui::Context, from: egui::Pos2, to: egui::Pos2) {
+        let button = |pos, pressed| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        paint(app, ctx, 1360.0, vec![egui::Event::PointerMoved(from)]);
+        paint(app, ctx, 1360.0, vec![button(from, true)]);
+        for step in 1..=8 {
+            let at = from + (to - from) * (step as f32 / 8.0);
+            paint(app, ctx, 1360.0, vec![egui::Event::PointerMoved(at)]);
+        }
+        paint(app, ctx, 1360.0, vec![button(to, false)]);
+        paint(app, ctx, 1360.0, Vec::new());
+    }
+
+    #[test]
+    fn dragging_the_grip_to_an_edge_docks_the_list_there() {
+        use super::super::windows::SidebarDock;
+        let (mut app, _rx_a, _rx_b) = two_networks();
+        let ctx = egui::Context::default();
+        let painted = settled(&mut app, &ctx, 1360.0);
+        let grip = sidebar_grip(&painted, &ctx);
+        app.layout_dirty_since = None;
+        drag_pointer(&mut app, &ctx, grip, egui::pos2(1340.0, 400.0));
+        assert_eq!(app.windows.sidebar.dock, SidebarDock::Right);
+        assert!(app.layout_dirty_since.is_some(), "the new dock is saved");
+        assert_eq!(app.sidebar_drag, None);
+        let painted = settled(&mut app, &ctx, 1360.0);
+        assert!(text_rect(&painted, "#rust").unwrap().left() > 960.0);
+
+        // And from the right edge down to the bottom.
+        let grip = sidebar_grip(&painted, &ctx);
+        drag_pointer(&mut app, &ctx, grip, egui::pos2(680.0, 760.0));
+        assert_eq!(app.windows.sidebar.dock, SidebarDock::Bottom);
+    }
+
+    #[test]
+    fn the_list_resizes_well_past_its_old_limits_and_remembers_the_size() {
+        let (mut app, _rx_a, _rx_b) = two_networks();
+        let ctx = egui::Context::default();
+        settled(&mut app, &ctx, 1360.0);
+        app.layout_dirty_since = None;
+        let edge = egui::pos2(app.windows.sidebar.width, 400.0);
+        drag_pointer(&mut app, &ctx, edge, egui::pos2(600.0, 400.0));
+        let width = app.windows.sidebar.width;
+        assert!((width - 600.0).abs() < 6.0, "dragged to {width}");
+        assert!(app.layout_dirty_since.is_some(), "the size is saved");
+        // Half the window at most, and down to 120 points.
+        drag_pointer(
+            &mut app,
+            &ctx,
+            egui::pos2(width, 400.0),
+            egui::pos2(1300.0, 400.0),
+        );
+        assert!(
+            (app.windows.sidebar.width - 680.0).abs() < 6.0,
+            "{}",
+            app.windows.sidebar.width
+        );
+        let width = app.windows.sidebar.width;
+        drag_pointer(
+            &mut app,
+            &ctx,
+            egui::pos2(width, 400.0),
+            egui::pos2(20.0, 400.0),
+        );
+        assert!(
+            (app.windows.sidebar.width - 120.0).abs() < 2.0,
+            "{}",
+            app.windows.sidebar.width
+        );
+    }
+
     struct Painted {
         texts: Vec<(String, egui::Rect, Color32)>,
         fills: Vec<(egui::Rect, Color32)>,
