@@ -2622,6 +2622,14 @@ impl Session {
         let Some(batch) = self.authtoken_batches.remove(batch_id) else {
             return;
         };
+        // A batch is only ever opened by the server, so an unlabelled one
+        // may answer the upload waiting for a token.
+        if upload_label.is_none()
+            && !batch.oversized
+            && self.complete_unlabeled_upload_token(&batch.service, &batch.token)
+        {
+            return;
+        }
         if self.complete_upload_token(
             &batch.service,
             if batch.oversized {

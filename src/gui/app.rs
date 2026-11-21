@@ -1310,7 +1310,7 @@ impl App {
                 self.tile_request = Some(TileRequest::Cascade);
             }
             WindowCommand::Maximize => self.windows.mode = LayoutMode::Maximized,
-            WindowCommand::Restore => self.windows.mode = LayoutMode::Floating,
+            WindowCommand::Restore => self.restore_floating(),
             WindowCommand::Detach => {
                 if self.windows.get(&key).is_some_and(|w| !w.detached) {
                     self.toggle_detached(&key);
@@ -1909,11 +1909,27 @@ impl App {
     }
 
     pub(crate) fn toggle_maximized(&mut self) {
-        self.windows.mode = match self.windows.mode {
-            LayoutMode::Maximized => LayoutMode::Floating,
-            LayoutMode::Floating => LayoutMode::Maximized,
-        };
+        match self.windows.mode {
+            LayoutMode::Maximized => self.restore_floating(),
+            LayoutMode::Floating => self.windows.mode = LayoutMode::Maximized,
+        }
         self.windows.dirty = true;
+    }
+
+    /// Leave maximized mode for floating windows. When any window has
+    /// never floated (the first Restore after an update, say) they are all
+    /// tiled: a first-time window would otherwise be cascaded over the
+    /// remembered ones.
+    fn restore_floating(&mut self) {
+        self.windows.mode = LayoutMode::Floating;
+        if self
+            .windows
+            .windows
+            .iter()
+            .any(|w| !w.detached && w.child_rect.is_none())
+        {
+            self.tile_request = Some(TileRequest::Tile);
+        }
     }
 
     /// Close a window the way mIRC does: a joined channel is parted (the
@@ -6375,6 +6391,77 @@ mod tests {
                 window.key
             );
         }
+    }
+
+    /// Restore from maximized when some windows have never floated (the
+    /// first Restore after an update, say) tiles them all, rather than
+    /// leaving first-time windows cascaded over the remembered ones.
+    #[test]
+    fn restore_tiles_windows_that_have_never_floated() {
+        let (mut app, _rx_a, _rx_b) = two_networks();
+        feed(&mut app, 0, ":me!u@h JOIN #linux");
+        app.sync_windows();
+        app.windows.mode = LayoutMode::Maximized;
+        // One window kept a floating rect from an earlier layout that
+        // covers the whole area; the others never floated.
+        let rust = target_key(&app, app.sessions[0].id, "#rust");
+        app.windows.get_mut(&rust).unwrap().child_rect = Some(egui::Rect::from_min_size(
+            egui::pos2(0.0, 0.0),
+            egui::vec2(1024.0, 768.0),
+        ));
+        let ctx = egui::Context::default();
+        for _ in 0..3 {
+            frame(&mut app, &ctx);
+        }
+        app.toggle_maximized();
+        for _ in 0..3 {
+            frame(&mut app, &ctx);
+        }
+        assert_eq!(app.windows.mode, LayoutMode::Floating);
+        let area = app.windows.area.expect("floating area");
+        let rects: Vec<egui::Rect> = app
+            .windows
+            .windows
+            .iter()
+            .filter(|w| !w.detached)
+            .map(|w| w.child_rect.expect("placed"))
+            .collect();
+        assert!(rects.len() >= 4, "{rects:?}");
+        for (i, rect) in rects.iter().enumerate() {
+            assert!(
+                area.expand(1.0).contains_rect(*rect),
+                "{rect:?} outside {area:?}"
+            );
+            for other in &rects[i + 1..] {
+                assert!(
+                    !rect.shrink(1.0).intersects(other.shrink(1.0)),
+                    "{rect:?} overlaps {other:?}"
+                );
+            }
+        }
+    }
+
+    /// Restore keeps a floating arrangement the user already has.
+    #[test]
+    fn restore_keeps_floating_windows_that_all_have_a_place() {
+        let (mut app, _rx_a, _rx_b) = two_networks();
+        app.windows.mode = LayoutMode::Floating;
+        let ctx = egui::Context::default();
+        app.tile_request = Some(TileRequest::Cascade);
+        for _ in 0..3 {
+            frame(&mut app, &ctx);
+        }
+        let before: Vec<Option<egui::Rect>> =
+            app.windows.windows.iter().map(|w| w.child_rect).collect();
+        app.toggle_maximized();
+        frame(&mut app, &ctx);
+        app.toggle_maximized();
+        for _ in 0..3 {
+            frame(&mut app, &ctx);
+        }
+        let after: Vec<Option<egui::Rect>> =
+            app.windows.windows.iter().map(|w| w.child_rect).collect();
+        assert_eq!(before, after);
     }
 
     #[test]

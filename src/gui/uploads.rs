@@ -641,6 +641,34 @@ impl Session {
         });
         true
     }
+    /// A server that answers a labelled TOKEN GENERATE without the label
+    /// (and then sends a labelled ACK, as AfterNET does) still answers the
+    /// upload waiting for it. Only the in-flight labelled request takes
+    /// such a token, and only when no unlabelled request (a manual
+    /// `/quote TOKEN`) is queued ahead, which FIFO order would give it to.
+    pub(crate) fn complete_unlabeled_upload_token(&mut self, service: &str, token: &str) -> bool {
+        let Some((job, _, Some(label), _)) = self.upload_discovery.pending.as_ref() else {
+            return false;
+        };
+        let (job, label) = (job.clone(), label.clone());
+        let mut matching = self
+            .upload_discovery
+            .requests
+            .iter()
+            .filter(|(expected, _, _)| service.eq_ignore_ascii_case(expected));
+        if matching
+            .clone()
+            .any(|(_, expected_label, _)| expected_label.is_none())
+        {
+            return false;
+        }
+        if !matching.any(|(_, expected_label, id)| {
+            expected_label.as_deref() == Some(label.as_str()) && id.as_deref() == Some(job.as_str())
+        }) {
+            return false;
+        }
+        self.complete_upload_token(service, token.to_owned(), Some(label))
+    }
     pub(crate) fn invalidate_upload_credentials(&mut self) {
         self.upload_discovery.credentials_stale = true;
     }
@@ -702,12 +730,31 @@ impl Session {
                     .first()
                     .is_some_and(|p| p.eq_ignore_ascii_case("GENERATE"))
                 {
-                    return self.complete_upload_token(
-                        params.get(1).map_or("", String::as_str),
-                        params.get(2).cloned().unwrap_or_default(),
-                        self.response_label(message),
-                    );
+                    let service = params.get(1).map_or("", String::as_str);
+                    let token = params.get(2).cloned().unwrap_or_default();
+                    let label = self.response_label(message);
+                    let from_server = message
+                        .prefix
+                        .as_deref()
+                        .is_none_or(|prefix| !prefix.contains(['!', '@']));
+                    if label.is_none()
+                        && from_server
+                        && self.complete_unlabeled_upload_token(service, &token)
+                    {
+                        return true;
+                    }
+                    return self.complete_upload_token(service, token, label);
                 }
+            }
+            // The labelled acknowledgement of our own upload token request:
+            // its reply, if any, came unlabelled and was handled above.
+            IrcCommand::Raw(line)
+                if line.eq_ignore_ascii_case("ACK")
+                    && message
+                        .get_tag("label")
+                        .is_some_and(|label| label.starts_with("lf-upload-")) =>
+            {
+                return true;
             }
             IrcCommand::StandardReply {
                 command,
@@ -1671,6 +1718,94 @@ mod tests {
                 )
                 .all(|message| !message.content.contains(expected))
         );
+    }
+
+    /// AfterNET answers a labelled TOKEN GENERATE with an unlabelled reply
+    /// followed by a labelled ACK. The token still belongs to the upload
+    /// waiting for it, and neither line is shown.
+    #[test]
+    fn an_unlabeled_reply_then_ack_completes_the_waiting_upload_privately() {
+        let mut session = pending_labeled_upload();
+        for line in [
+            "@time=2026-11-21T01:09:35.545Z :irc.example.org TOKEN GENERATE FILEHOST private-unlabeled-token",
+            "@label=lf-upload-job;time=2026-11-21T01:09:35.546Z :irc.example.org ACK",
+        ] {
+            session.handle_incoming_message(IrcMessage::parse(line).unwrap());
+        }
+        assert_private_upload_token(&session, "private-unlabeled-token");
+        assert!(
+            session
+                .server_messages
+                .iter()
+                .all(|message| !message.content.contains("ACK")),
+            "{:?}",
+            session
+                .server_messages
+                .iter()
+                .map(|m| &m.content)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn an_unlabeled_authtoken_batch_completes_the_waiting_upload_privately() {
+        let mut session = pending_labeled_upload();
+        for line in [
+            ":irc.example.org BATCH +token draft/authtoken FILEHOST",
+            "@batch=token :irc.example.org TOKEN GENERATE FILEHOST private-batch-",
+            "@batch=token :irc.example.org TOKEN GENERATE FILEHOST token",
+            ":irc.example.org BATCH -token",
+            "@label=lf-upload-job :irc.example.org ACK",
+        ] {
+            session.handle_incoming_message(IrcMessage::parse(line).unwrap());
+        }
+        assert_private_upload_token(&session, "private-batch-token");
+    }
+
+    /// Only the server can answer for it: a user cannot hand the waiting
+    /// upload a token of their choosing.
+    #[test]
+    fn an_unlabeled_token_from_a_user_does_not_complete_the_upload() {
+        let mut session = pending_labeled_upload();
+        session.handle_incoming_message(
+            IrcMessage::parse(":mallory!m@host TOKEN GENERATE FILEHOST attacker-token").unwrap(),
+        );
+        assert!(session.upload_discovery.pending.is_some());
+        assert!(
+            !session
+                .events
+                .iter()
+                .any(|event| matches!(event, SessionEvent::UploadTokenReady { .. }))
+        );
+    }
+
+    /// An unlabelled token goes only to the upload waiting now, never to an
+    /// earlier labelled request that already timed out.
+    #[test]
+    fn an_unlabeled_token_skips_a_timed_out_labeled_request() {
+        let (mut app, _key, _outgoing) = upload_app();
+        let session = &mut app.sessions[0];
+        session.enabled_caps.insert("labeled-response".into());
+        assert!(session.request_upload_token("old".into()));
+        session.upload_discovery.pending.as_mut().unwrap().3 =
+            Instant::now() - Duration::from_secs(21);
+        session.expire_upload_token();
+        session.events.clear();
+        assert!(session.request_upload_token("new".into()));
+        session.handle_incoming_message(
+            IrcMessage::parse(":irc.example.org TOKEN GENERATE FILEHOST fresh-token").unwrap(),
+        );
+        let ready: Vec<_> = session
+            .events
+            .iter()
+            .filter_map(|event| match event {
+                SessionEvent::UploadTokenReady { job_id, token } => {
+                    Some((job_id.as_str(), token.as_deref()))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(ready, [("new", Some("fresh-token"))]);
     }
 
     #[test]
