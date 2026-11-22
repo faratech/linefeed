@@ -1,8 +1,8 @@
 [package]
 name = "linefeed"
-version = "0.2.3"
+version = "0.2.4"
 edition = "2024"
-rust-version = "1.99.1"
+rust-version = "1.100.0"
 description = "Linefeed IRC Client"
 license = "CC-BY-4.0"
 repository = "https://github.com/faratech/linefeed"
@@ -39,7 +39,7 @@ rfd = "0.18.0"
 png = "0.18.1"
 mime_guess = "2.0.5"
 arboard = { version = "3.7.0", default-features = false, features = ["image-data"] }
-url = "2.5.8"
+url = "2.5.9"
 
 # Platform-specific: eframe with x11/wayland only on Linux
 [target.'cfg(target_os = "linux")'.dependencies]

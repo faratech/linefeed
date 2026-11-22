@@ -8617,10 +8617,7 @@ impl Session {
         // cannot be queued. Another cycle waits for its outcome instead of
         // sharing one pending bit across several PART/JOIN pairs.
         self.pending_cycles.insert(id);
-        if !self.send_rejoin(target, key) {
-            return false;
-        }
-        true
+        self.send_rejoin(target, key)
     }
 
     /// The user asked to join `channels` (a comma list is several requests):

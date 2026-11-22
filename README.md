@@ -125,7 +125,7 @@ macOS binaries are unsigned; on first run either right-click > Open, or run
 ### Building from Source
 
 **Requirements:**
-- Rust 1.99.1+
+- Rust 1.100.0+
 - Python 3.10+ (for build script)
 - llvm-mingw on `PATH` or `LLVM_MINGW_HOME` set when building Windows targets from Linux
 
