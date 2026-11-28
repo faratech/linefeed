@@ -26,7 +26,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libssl-dev pkg-config libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-dev libwayland-dev
       - name: Install Rust
-        run: rustup toolchain install 1.100.0 --profile minimal --component clippy && rustup default 1.100.0
+        run: rustup toolchain install 1.100.1 --profile minimal --component clippy && rustup default 1.100.1
       - uses: actions/setup-python@v7
         with:
           python-version: '3.13'
@@ -49,8 +49,8 @@ jobs:
           persist-credentials: false
       - name: Install Rust
         run: |
-          rustup toolchain install 1.100.0 --profile minimal --component clippy
-          rustup default 1.100.0
+          rustup toolchain install 1.100.1 --profile minimal --component clippy
+          rustup default 1.100.1
           rustup target add x86_64-apple-darwin aarch64-apple-darwin
       - name: Check both macOS architectures
         run: |
